@@ -1,0 +1,22 @@
+[package]
+name = "solaris"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "solaris terminal AI assistant"
+
+[[bin]]
+name = "solaris"
+path = "src/main.rs"
+
+[dependencies]
+solaris-core = { workspace = true }
+solaris-backend = { workspace = true }
+solaris-tui = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
