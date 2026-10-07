@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
 
-use crate::clipboard::{ClipboardWriter, system_writer};
+use crate::clipboard::Clipboard;
 use crate::commands;
 use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent};
 use crate::dialogs::{
@@ -89,8 +89,8 @@ pub struct AppOptions {
     pub overlay_flag: Rc<Cell<bool>>,
     /// The screen selection the framework tracks for a drag.
     pub selection: SelectionHandle,
-    /// Where a finished selection is copied.
-    pub clipboard: ClipboardWriter,
+    /// Where a finished selection is copied, and where a paste comes from.
+    pub clipboard: Clipboard,
 }
 
 impl AppOptions {
@@ -118,7 +118,7 @@ impl AppOptions {
             overlay_queue,
             overlay_flag,
             selection: Selection::handle(),
-            clipboard: system_writer(),
+            clipboard: Clipboard::system(),
         }
     }
 }
@@ -138,8 +138,8 @@ pub struct App {
     overlay_flag: Rc<Cell<bool>>,
     /// The screen selection the framework tracks, shared with `Tui`.
     selection: SelectionHandle,
-    /// Where a finished selection is copied.
-    clipboard: ClipboardWriter,
+    /// Where a finished selection is copied, and where a paste comes from.
+    clipboard: Clipboard,
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
@@ -357,7 +357,7 @@ impl App {
             return;
         }
 
-        if (self.clipboard)(text) {
+        if (self.clipboard.write)(text) {
             // One cell is an ordinary case now, so the count has to read
             // correctly for it too.
             let plural = if characters == 1 { "" } else { "s" };
@@ -366,6 +366,32 @@ impl App {
         } else {
             self.notifications
                 .warning("could not reach the system clipboard");
+        }
+    }
+
+    /// Put the clipboard into whatever is taking text, saying so when there is
+    /// nothing to put.
+    ///
+    /// claurst reads the clipboard on the same key and warns about an empty
+    /// one.
+    fn paste_from_clipboard(&mut self) {
+        match (self.clipboard.read)() {
+            Some(text) if !text.is_empty() => self.insert_pasted(&text),
+            _ => self.notifications.warning("clipboard is empty"),
+        }
+    }
+
+    /// Insert pasted text where it belongs: the wizard's field while it is up,
+    /// the prompt otherwise. The wizard drops a paste when its current step has
+    /// no field, rather than leaking the payload into the prompt behind it.
+    fn insert_pasted(&mut self, text: &str) {
+        match self.inline.as_mut() {
+            Some(flow) => {
+                flow.insert_paste(text);
+            }
+            None => {
+                self.editor.handle_paste(text);
+            }
         }
     }
 
@@ -1187,6 +1213,13 @@ impl Component for App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        // Paste first: a terminal that forwards ctrl+v expects it to work
+        // wherever text is typed, the wizard included.
+        if self.keybindings.matches("paste", &key) {
+            self.paste_from_clipboard();
+            return KeyResult::Handled;
+        }
+
         // The inline wizard owns the keyboard while it is up — including
         // Ctrl+C, which cancels the wizard rather than the application.
         if self.inline.is_some() {
@@ -1242,14 +1275,7 @@ impl Component for App {
     }
 
     fn handle_paste(&mut self, text: &str) -> KeyResult {
-        // The wizard takes a paste only when its current step has a field;
-        // otherwise the payload is dropped rather than leaking into the prompt.
-        if let Some(flow) = self.inline.as_mut() {
-            flow.insert_paste(text);
-            return KeyResult::Handled;
-        }
-
-        self.editor.handle_paste(text);
+        self.insert_pasted(text);
         KeyResult::Handled
     }
 
@@ -2079,6 +2105,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_v_pastes_the_clipboard_into_the_prompt() {
+        let (mut app, _) = app_with_clipboard_text(Some("pasted text"), true);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.text(), "pasted text");
+    }
+
+    #[tokio::test]
+    async fn ctrl_v_pastes_into_the_connect_wizard() {
+        let (mut app, _) = app_with_clipboard_text(Some("sk-pasted"), true);
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.auth
+                .credential("anthropic")
+                .and_then(Credential::secret),
+            Some("sk-pasted")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_cell_survives_a_copy_then_paste_round_trip() {
+        let mut app = app_with_live_clipboard();
+        let area = Rect::new(0, 0, 60, 12);
+
+        // Copy two blank cells, wherever this layout keeps them.
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+        let blank_run = |row: u16| {
+            (0..area.width - 4)
+                .find(|start| (*start..*start + 5).all(|x| buf[(x, row)].symbol() == " "))
+        };
+        let (row, column) = (0..area.height - 1)
+            .find_map(|row| blank_run(row).map(|column| (row, column)))
+            .expect("the frame has no blank run to drag over");
+
+        drag_select(&mut app, area, (column, row), (column + 1, row));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        // Paste them back: the prompt holds the blanks, invisible as they are.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.text(), "  ", "the blanks did not round-trip");
+        assert!(!app.editor.is_empty(), "the prompt still counts as empty");
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_only_prompt_is_not_sent() {
+        let (mut app, _) = app_with_clipboard_text(Some("   "), true);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Enter));
+
+        // Enter takes the text out of the prompt, and `submit` drops a prompt
+        // that holds nothing but blanks — the same as typing spaces by hand.
+        assert!(app.session.turns.is_empty(), "a blank prompt was sent");
+    }
+
+    #[tokio::test]
+    async fn an_empty_clipboard_says_so() {
+        let (mut app, _) = app_with_clipboard_text(None, true);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert!(app.editor.is_empty(), "something was pasted");
+        assert!(
+            rendered_text(&mut app, 60, 12).contains("clipboard is empty"),
+            "an empty clipboard went unmentioned"
+        );
+    }
+
+    #[tokio::test]
     async fn credentials_are_written_to_disk() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2293,8 +2396,16 @@ mod tests {
     }
 
     /// An app whose copies are recorded instead of written to the real
-    /// clipboard, plus the log they land in.
+    /// clipboard, plus the log they land in. Its clipboard holds no text.
     fn app_with_clipboard(succeeds: bool) -> (App, Rc<RefCell<Vec<String>>>) {
+        app_with_clipboard_text(None, succeeds)
+    }
+
+    /// The same, with `reads` sitting on the clipboard for a paste.
+    fn app_with_clipboard_text(
+        reads: Option<&str>,
+        succeeds: bool,
+    ) -> (App, Rc<RefCell<Vec<String>>>) {
         let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
@@ -2302,12 +2413,41 @@ mod tests {
         let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
         let log = Rc::clone(&copied);
+        let pasted = reads.map(str::to_string);
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
-        options.clipboard = Rc::new(move |text: &str| {
-            log.borrow_mut().push(text.to_string());
-            succeeds
-        });
+        options.clipboard = Clipboard {
+            write: Rc::new(move |text: &str| {
+                log.borrow_mut().push(text.to_string());
+                succeeds
+            }),
+            read: Rc::new(move || pasted.clone()),
+        };
         (App::new(options), copied)
+    }
+
+    /// An app whose clipboard is a single cell: what a copy writes is what a
+    /// paste reads back.
+    fn app_with_live_clipboard() -> App {
+        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let cell: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+        let writer = Rc::clone(&cell);
+        let reader = Rc::clone(&cell);
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.clipboard = Clipboard {
+            write: Rc::new(move |text: &str| {
+                *writer.borrow_mut() = text.to_string();
+                true
+            }),
+            read: Rc::new(move || {
+                let text = reader.borrow().clone();
+                (!text.is_empty()).then_some(text)
+            }),
+        };
+        App::new(options)
     }
 
     /// Drive the app's own selection handle the way `Tui` does: draw a frame,

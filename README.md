@@ -109,6 +109,7 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `Esc` | Cancel whatever is open |
 | `Ctrl+C` | Copy the selection, stop the running turn — press twice to quit |
 | `Ctrl+D` | Quit, when the prompt is empty |
+| `Ctrl+V` | Paste from the clipboard |
 
 ## Slash commands
 

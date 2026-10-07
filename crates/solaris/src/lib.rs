@@ -7,7 +7,7 @@
 //! - [`connect`] — the inline `/connect` wizard that takes over the prompt area
 //! - [`commands`] / [`keymap`] — the command registry and global bindings
 //! - [`transcript`] — turn views rendered into styled lines
-//! - [`clipboard`] — the platform clipboard, behind an injectable writer
+//! - [`clipboard`] — the platform clipboard, behind an injectable pair
 
 pub mod app;
 pub mod clipboard;
@@ -19,7 +19,7 @@ pub mod state;
 pub mod transcript;
 
 pub use app::{App, AppOptions};
-pub use clipboard::{ClipboardWriter, system_writer};
+pub use clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
 pub use connect::{
     ConnectFlow, ConnectOutcome, ConnectStep, ConnectStyles, ConnectSubmit, DeviceAuthEvent,
     DeviceAuthStatus,

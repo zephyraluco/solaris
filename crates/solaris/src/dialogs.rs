@@ -588,6 +588,7 @@ pub const KEY_HELP: &[(&str, &str)] = &[
     ("ctrl+c", "copy the selection, or stop the turn"),
     ("ctrl+c again", "quit"),
     ("ctrl+d", "quit, when the prompt is empty"),
+    ("ctrl+v", "paste from the clipboard"),
     ("?", "this help (when the prompt is empty)"),
 ];
 

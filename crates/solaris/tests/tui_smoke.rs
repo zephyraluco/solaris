@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use solaris::{App, AppOptions, ClipboardWriter};
+use solaris::{App, AppOptions, Clipboard};
 use solaris_backend::MockBackend;
 use solaris_core::Config;
 use solaris_tui::{Theme, Tui};
@@ -29,14 +29,32 @@ struct Harness {
     terminal: Terminal<TestBackend>,
 }
 
+/// A clipboard that records whatever is copied to it and hands back `paste`
+/// when asked, so tests never touch the machine's real one.
+fn clipboard_for(paste: Option<&str>) -> (Clipboard, Rc<RefCell<Vec<String>>>) {
+    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&copied);
+    let pasted = paste.map(str::to_string);
+
+    let clipboard = Clipboard {
+        write: Rc::new(move |text: &str| {
+            log.borrow_mut().push(text.to_string());
+            true
+        }),
+        read: Rc::new(move || pasted.clone()),
+    };
+    (clipboard, copied)
+}
+
 impl Harness {
-    /// A harness whose copies are dropped rather than written to the clipboard
-    /// of the machine running the tests.
+    /// A harness whose clipboard starts empty and drops whatever is copied to
+    /// it, so tests never touch the machine's real one.
     fn new() -> Self {
-        Self::with_clipboard(Rc::new(|_: &str| true))
+        let (clipboard, _) = clipboard_for(None);
+        Self::with_clipboard(clipboard)
     }
 
-    fn with_clipboard(clipboard: ClipboardWriter) -> Self {
+    fn with_clipboard(clipboard: Clipboard) -> Self {
         let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
         let mut tui = Tui::new();
         let mut options = AppOptions::new(
@@ -380,13 +398,21 @@ async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
 }
 
 #[tokio::test]
+async fn ctrl_v_pastes_the_clipboard_into_the_prompt() {
+    let (clipboard, _) = clipboard_for(Some("pasted into the prompt"));
+    let mut harness = Harness::with_clipboard(clipboard);
+    let _ = harness.draw();
+
+    harness.ctrl('v');
+
+    let text = harness.draw();
+    assert!(text.contains("pasted into the prompt"), "{text}");
+}
+
+#[tokio::test]
 async fn dragging_the_footer_then_ctrl_c_copies_what_it_shows() {
-    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let log = Rc::clone(&copied);
-    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
-        log.borrow_mut().push(text.to_string());
-        true
-    }));
+    let (clipboard, copied) = clipboard_for(None);
+    let mut harness = Harness::with_clipboard(clipboard);
 
     // The footer names the model, so it has known content whatever the
     // transcript above it happens to be showing.
@@ -491,12 +517,8 @@ async fn mode_toggle_repaints_the_footer() {
 
 #[tokio::test]
 async fn a_single_cell_drag_copies_that_cell() {
-    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let log = Rc::clone(&copied);
-    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
-        log.borrow_mut().push(text.to_string());
-        true
-    }));
+    let (clipboard, copied) = clipboard_for(None);
+    let mut harness = Harness::with_clipboard(clipboard);
 
     // The footer opens with a space, so its second cell holds the first
     // character of the model name whatever else is on screen.
@@ -526,12 +548,8 @@ async fn a_single_cell_drag_copies_that_cell() {
 
 #[tokio::test]
 async fn a_drag_over_blank_cells_copies_the_blanks() {
-    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let log = Rc::clone(&copied);
-    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
-        log.borrow_mut().push(text.to_string());
-        true
-    }));
+    let (clipboard, copied) = clipboard_for(None);
+    let mut harness = Harness::with_clipboard(clipboard);
 
     // Take a run of blank cells from the footer row, wherever this layout
     // keeps them, so the drag does not depend on the footer's wording.

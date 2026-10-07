@@ -191,7 +191,7 @@ while !quit {
 | 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag`、`selection` |
 | 跨线程通道 | `events_rx`（后端事件）、`dialog_rx` / `dialog_tx`（对话框结果）、`device_rx`（设备码授权进度） |
 | 持久化 | `auth` / `auth_path`、`buddy` / `buddy_path`、`recent` / `recent_path` |
-| 剪贴板 | `clipboard: ClipboardWriter`（`Rc<dyn Fn(&str) -> bool>`，生产环境是 `arboard`，测试注入记录器） |
+| 剪贴板 | `clipboard: Clipboard`（`write` / `read` 两个可注入的闭包，生产环境是 `arboard`） |
 | 展示与动画 | `version`、`greeting`、`tip`、`spinner_frame`、`buddy_step` / `buddy_started`、`queued_prompts` |
 
 `SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、token、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
@@ -219,6 +219,8 @@ while !quit {
 ```
 
 `Ctrl+D` 是同一个手势的另一半，只在输入框为空时生效 —— 否则按键留给编辑器。浮层存在时按键由浮层吃下，所以要先关掉对话框才能复制。
+
+`Ctrl+V` 走反方向：从剪贴板取文本，插进当前接受输入的地方 —— 内联 `/connect` 向导的字段在场就给它，否则给输入框；剪贴板为空时提示 `clipboard is empty`。claurst 就是在同一个键（它还接受 `Cmd+V`）上读剪贴板、并对空剪贴板报警的。
 
 ### 5.5 渲染管线
 
@@ -321,17 +323,17 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 | 新增主题 | [`solaris-tui/src/theme.rs`](../crates/solaris-tui/src/theme.rs)：加调色板 + 登记进 `Theme::NAMES`。 |
 | 新增 UI 组件 | 在 [`solaris-tui/src/components`](../crates/solaris-tui/src/components) 实现 `Component`，并加进 `components/mod.rs` 的再导出。 |
 | 调整快捷键 | [`keymap.rs`](../crates/solaris/src/keymap.rs) 的 `default_bindings`。 |
-| 换剪贴板实现 | [`clipboard.rs`](../crates/solaris/src/clipboard.rs) 的 `system_writer`，或在构造 `AppOptions` 时替换 `clipboard` 字段（测试就是这么注入记录器的）。 |
+| 换剪贴板实现 | [`clipboard.rs`](../crates/solaris/src/clipboard.rs) 的 `Clipboard::system()`，或在构造 `AppOptions` 时替换 `clipboard` 字段（测试就是这么注入记录器的）。 |
 | 加宽/加高某个区域 | 用 `layout::split` 的 `Entry` 表达意图（`grow` / `min` / `max`），不要手算坐标。 |
 
 ---
 
 ## 7. 测试策略
 
-工作区共 **306 个测试**，分两类：
+工作区共 **312 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 124、`solaris-backend` 7、`solaris` 库 115），覆盖纯逻辑、布局、按键、渲染与状态机。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（25 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 124、`solaris-backend` 7、`solaris` 库 120），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（26 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
 cargo build --workspace --all-targets
@@ -346,4 +348,5 @@ cargo test --workspace
 - **设备码授权是替身**。`spawn_device_auth` 只按固定延时发出预置事件，不联系任何授权服务器。
 - **Windows 上不启用 bracketed paste**，粘贴内容以按键事件到达（`Component::handle_paste` 不会被调用）。
 - **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，只是 `Ctrl+C` 会发一条「取不到剪贴板」的警告。
+- **剪贴板只走文本**。`Ctrl+V` 粘贴的是文本；图片、文件不在范围内 —— Claude Code 的 `Ctrl+V` 是「贴图片」，solaris 没有这条通路。终端若把 `ctrl+v` 留给自己（Windows Terminal 默认如此），按键不会到达应用，走的是终端自己的粘贴通路。
 - 伙伴素材是 claurst 十八个物种的一个子集；新增物种 = 一个 `Species` 变体 + 三帧 12 格宽的精灵图。
