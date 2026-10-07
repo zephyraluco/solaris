@@ -107,7 +107,8 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `PageUp` / `PageDown` | Scroll the transcript (the mouse wheel works too) |
 | `?` | This help, when the prompt is empty |
 | `Esc` | Cancel whatever is open |
-| `Ctrl+C` | Quit |
+| `Ctrl+C` | Copy the selection, stop the running turn — press twice to quit |
+| `Ctrl+D` | Quit, when the prompt is empty |
 
 ## Slash commands
 

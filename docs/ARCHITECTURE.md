@@ -207,7 +207,17 @@ while !quit {
 
 内联向导虽然不是浮层，但在此期间它拥有键盘 —— 例如 `Ctrl+C` 是「取消向导」而不是「退出」。
 
-全局快捷键里 `Ctrl+C` 名义上是「退出」，但只要当前**有选区**，它就改成复制选区（见 §4.4）；浮层存在时按键由浮层吃下，所以要先关掉对话框才能复制。
+全局快捷键里 `Ctrl+C` 走的是三家（claurst / Claude Code / pi）同一套阶梯：
+
+```text
+有选区            → 复制选区（pi-tui 把 ctrl+c 绑给 copy）
+正在流式生成      → 中断本次生成（丢掉事件接收端，后端任务随之结束；
+                     已生成的内容留在屏幕上，队列里的下一条接着跑）
+否则              → 清空输入框，并提示 "press ctrl+c again to quit"，
+                     2 秒内第二次按下才真的退出
+```
+
+`Ctrl+D` 是同一个手势的另一半，只在输入框为空时生效 —— 否则按键留给编辑器。浮层存在时按键由浮层吃下，所以要先关掉对话框才能复制。
 
 ### 5.5 渲染管线
 
@@ -317,10 +327,10 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 ## 7. 测试策略
 
-工作区共 **293 个测试**，分两类：
+工作区共 **299 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 121、`solaris-backend` 7、`solaris` 库 108），覆盖纯逻辑、布局、按键、渲染与状态机。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（22 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 121、`solaris-backend` 7、`solaris` 库 113），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（23 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
 cargo build --workspace --all-targets

@@ -58,6 +58,10 @@ const APP_NAME: &str = "solaris";
 /// claurst's fidget.
 const BUDDY_STEP_MS: u64 = 500;
 
+/// Two presses of `ctrl+c` — or of `ctrl+d` on an empty prompt — inside this
+/// window quit the app. claurst uses the same two seconds.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+
 /// Everything [`App::new`] needs to start.
 pub struct AppOptions {
     pub backend: Arc<dyn AgentBackend>,
@@ -162,6 +166,8 @@ pub struct App {
     /// Idle animation step of the companion, counted in 500 ms beats.
     buddy_step: u64,
     buddy_started: Instant,
+    /// Which quit key was pressed first, and when — the two-press quit.
+    quit_press: Option<(char, Instant)>,
     /// The inline `/connect` wizard while it owns the prompt region.
     inline: Option<ConnectFlow>,
     /// Events from the background device-auth task.
@@ -232,6 +238,7 @@ impl App {
             recent_path,
             buddy_step: 0,
             buddy_started: Instant::now(),
+            quit_press: None,
             inline: None,
             device_rx: None,
         }
@@ -356,6 +363,69 @@ impl App {
         } else {
             self.notifications
                 .warning("could not reach the system clipboard");
+        }
+    }
+
+    /// Ctrl+C: copy a selection, stop a turn that is streaming, or start the
+    /// two-press quit.
+    ///
+    /// That ladder is the one the reference terminals use — pi-tui binds
+    /// `ctrl+c` to a copy action, Claude Code and claurst interrupt first, and
+    /// only a key with nothing left to do asks about quitting.
+    fn interrupt(&mut self) {
+        let selected = self.selection.borrow().selected_text();
+        if !selected.is_empty() {
+            self.copy_selection(&selected);
+            return;
+        }
+
+        if self.session.is_streaming() {
+            self.cancel_turn();
+            return;
+        }
+
+        // With nothing running, the prompt is what the key clears — Claude
+        // Code and claurst both drop the typed text on the first press.
+        if !self.editor.is_empty() {
+            self.editor.clear();
+        }
+        self.confirm_quit('c');
+    }
+
+    /// Two presses of the same key inside [`QUIT_CONFIRM_WINDOW`] quit; the
+    /// first one arms the gesture and says so.
+    fn confirm_quit(&mut self, key_char: char) {
+        let now = Instant::now();
+        let armed = self.quit_press.is_some_and(|(armed_key, at)| {
+            armed_key == key_char && now.duration_since(at) <= QUIT_CONFIRM_WINDOW
+        });
+
+        if armed {
+            self.quit.set(true);
+            return;
+        }
+
+        self.quit_press = Some((key_char, now));
+        self.notifications
+            .info(format!("press ctrl+{key_char} again to quit"));
+    }
+
+    /// Stop the turn that is streaming; whatever it produced stays on screen.
+    ///
+    /// Dropping the receiver ends the backend task as well, because its next
+    /// send fails. Claude Code answers an interrupt by sending anything queued
+    /// next, so the queue keeps running in order instead of stalling.
+    fn cancel_turn(&mut self) {
+        self.events_rx = None;
+        if let Some(turn) = self.session.active_turn_mut() {
+            turn.complete = true;
+            self.session.status = None;
+            self.session.bump();
+        }
+        self.notifications.info("cancelled");
+
+        if let Some(next) = self.queued_prompts.pop_front() {
+            self.start_turn(next);
         }
     }
 
@@ -1119,14 +1189,14 @@ impl Component for App {
         }
 
         if self.keybindings.matches("quit", &key) {
-            // Ctrl+C is the copy gesture while something is selected, and only
-            // quits when there is nothing to take.
-            let selected = self.selection.borrow().selected_text();
-            if selected.is_empty() {
-                self.quit.set(true);
-            } else {
-                self.copy_selection(&selected);
-            }
+            self.interrupt();
+            return KeyResult::Handled;
+        }
+
+        // Ctrl+D is the other half of the same gesture, and only from an empty
+        // prompt: with text in it the key belongs to the editor.
+        if self.keybindings.matches("exit", &key) && self.editor.is_empty() {
+            self.confirm_quit('d');
             return KeyResult::Handled;
         }
 
@@ -2044,10 +2114,87 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_raises_the_quit_flag() {
+    fn ctrl_c_twice_quits_while_one_press_only_asks() {
         let mut app = app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_c);
+        assert!(!app.quit.get(), "one press must not quit");
+        assert!(app.notifications.current().is_some(), "no hint was shown");
+
+        app.handle_key(ctrl_c);
         assert!(app.quit.get());
+    }
+
+    #[test]
+    fn a_stale_quit_confirmation_does_not_quit() {
+        let mut app = app();
+        app.quit_press = Some(('c', Instant::now() - QUIT_CONFIRM_WINDOW));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit.get(), "the window had expired");
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_prompt_before_it_means_quit() {
+        let mut app = app();
+        for ch in "half typed".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert!(!app.editor.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.editor.is_empty(), "the prompt survived");
+        assert!(!app.quit.get());
+    }
+
+    #[test]
+    fn ctrl_d_only_quits_from_an_empty_prompt() {
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        let mut empty = app();
+        empty.handle_key(ctrl_d);
+        assert!(!empty.quit.get());
+        empty.handle_key(ctrl_d);
+        assert!(empty.quit.get());
+
+        // With text in the prompt the key belongs to the editor instead.
+        let mut typing = app();
+        typing.handle_key(key(KeyCode::Char('x')));
+        typing.handle_key(ctrl_d);
+        typing.handle_key(ctrl_d);
+        assert!(!typing.quit.get());
+        assert_eq!(typing.editor.text(), "x");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_stops_the_turn_that_is_streaming() {
+        let mut app = app();
+        app.submit("hello".to_string());
+        assert!(app.session.is_streaming());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!app.session.is_streaming(), "the turn kept streaming");
+        assert!(!app.quit.get(), "interrupting must not quit");
+        assert!(app.session.turns.iter().all(|turn| turn.complete));
+        assert!(app.notifications.current().is_some(), "no notice was shown");
+    }
+
+    #[tokio::test]
+    async fn interrupting_still_runs_a_queued_prompt() {
+        let mut app = app();
+        app.submit("first".to_string());
+        app.submit("second".to_string());
+        assert_eq!(app.queued_prompts.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        // Claude Code sends what is queued after an interrupt, so the queue is
+        // never left waiting on a turn that no longer exists.
+        assert!(app.queued_prompts.is_empty());
+        assert_eq!(app.session.turns.len(), 2);
+        assert!(app.session.is_streaming());
     }
 
     #[test]
@@ -2209,16 +2356,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_c_still_quits_when_nothing_is_selected() {
+    async fn a_press_without_a_drag_is_not_a_copy() {
         let (mut app, copied) = app_with_clipboard(true);
         app.submit("hello world".to_string());
 
         // A press-and-release in one cell is not a selection.
         drag_select(&mut app, Rect::new(0, 0, 60, 12), (3, 0), (3, 0));
-        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-
-        assert!(app.quit.get());
         assert!(copied.borrow().is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(copied.borrow().is_empty(), "there was nothing to copy");
     }
 
     #[tokio::test]

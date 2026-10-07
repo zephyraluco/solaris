@@ -490,11 +490,34 @@ async fn mode_toggle_repaints_the_footer() {
 }
 
 #[tokio::test]
-async fn quit_binding_raises_the_quit_flag() {
+async fn two_ctrl_c_presses_quit_while_one_only_asks() {
     let mut harness = Harness::new();
-    let flag = harness.tui.quit_flag();
+    let quit = harness.tui.quit_flag();
+    let _ = harness.draw();
+
     harness.ctrl('c');
-    assert!(flag.get());
+    let asked = harness.draw();
+    assert!(!quit.get(), "one press must not quit");
+    assert!(asked.contains("press ctrl+c again to quit"), "{asked}");
+
+    harness.ctrl('c');
+    assert!(quit.get());
+}
+
+#[tokio::test]
+async fn ctrl_c_stops_the_turn_that_is_streaming() {
+    let mut harness = Harness::new();
+    harness.type_str("hello");
+    harness.key(KeyCode::Enter);
+    let streaming = harness.draw();
+    assert!(streaming.contains("generating"), "{streaming}");
+
+    harness.ctrl('c');
+    let stopped = harness.draw();
+
+    assert!(!stopped.contains("generating"), "{stopped}");
+    assert!(stopped.contains("cancelled"), "{stopped}");
+    assert!(stopped.contains("hello"), "the prompt stays:\n{stopped}");
 }
 
 // --------------------------------------------------------------- /connect

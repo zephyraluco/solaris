@@ -17,6 +17,7 @@ pub fn default_bindings() -> Keybindings {
     bindings.set("submit", "enter");
     bindings.set("newline", "alt+enter");
     bindings.set("quit", "ctrl+c");
+    bindings.set("exit", "ctrl+d");
     bindings.set("palette", "ctrl+k");
     bindings.set("help", "f1");
     bindings.set("toggle_mode", "tab");
@@ -40,6 +41,7 @@ mod tests {
     fn default_bindings_cover_the_documented_shortcuts() {
         let bindings = default_bindings();
         assert!(bindings.matches("quit", &key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(bindings.matches("exit", &key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("palette", &key(KeyCode::Char('k'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("theme", &key(KeyCode::Char('t'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("clear", &key(KeyCode::Char('l'), KeyModifiers::CONTROL)));
