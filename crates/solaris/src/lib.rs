@@ -15,14 +15,14 @@ pub mod commands;
 pub mod connect;
 pub mod dialogs;
 pub mod keymap;
+pub mod model;
 pub mod state;
 pub mod transcript;
 
 pub use app::{App, AppOptions};
 pub use clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
 pub use connect::{
-    ConnectFlow, ConnectOutcome, ConnectStep, ConnectStyles, ConnectSubmit, DeviceAuthEvent,
-    DeviceAuthStatus,
+    ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent, DeviceAuthStatus,
 };
 pub use dialogs::{ConfirmAction, DialogMessage};
 pub use state::{NoticeKind, NotificationQueue, SessionState, Turn};

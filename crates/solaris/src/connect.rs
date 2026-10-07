@@ -15,16 +15,14 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use solaris_core::{PROVIDERS, ProviderSpec, mask_secret};
+use solaris_tui::components::inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};
 use solaris_tui::components::select_list::SelectItem;
 use solaris_tui::theme::Theme;
-use solaris_tui::util::{digit_count, display_width, truncate_to_width, wrap_text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Option rows shown at once.
-const MAX_LIST_ROWS: u16 = 8;
 /// Rows reserved for the pinned hint line.
 const FOOTER_ROWS: u16 = 1;
 
@@ -117,59 +115,18 @@ pub enum DeviceAuthEvent {
 }
 
 /// Colours and weights used while drawing the wizard.
-#[derive(Debug, Clone, Copy)]
-pub struct ConnectStyles {
-    pub title: Style,
-    pub text: Style,
-    pub muted: Style,
-    pub dim: Style,
-    pub tip: Style,
-    pub ok: Style,
-    pub warn: Style,
-    pub error: Style,
-}
-
-impl ConnectStyles {
-    /// Derive the palette from the active theme.
-    pub fn from_theme(theme: &Theme) -> Self {
-        Self {
-            title: Style::default()
-                .fg(theme.heading)
-                .add_modifier(Modifier::BOLD),
-            text: Style::default().fg(theme.fg),
-            muted: Style::default().fg(theme.muted),
-            dim: Style::default().fg(theme.dim),
-            tip: Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-            ok: Style::default().fg(theme.success),
-            warn: Style::default().fg(theme.warning),
-            error: Style::default().fg(theme.error),
-        }
-    }
-}
-
 /// Absolute or block-relative rows to `(row, entry index)` pairs, used for
 /// mouse hit-testing.
 type RowMap = Vec<(usize, usize)>;
 
-/// One built panel: its lines plus where the picks and fields landed.
-struct Block {
-    lines: Vec<Line<'static>>,
-    item_rows: RowMap,
-    field_rows: RowMap,
-}
-
 /// The `/connect` wizard.
 pub struct ConnectFlow {
     step: ConnectStep,
-    styles: ConnectStyles,
+    styles: InlineStyles,
 
-    // provider / model pickers
-    providers: Vec<SelectItem>,
-    models: Vec<SelectItem>,
-    selected: usize,
-    scroll: usize,
+    // the two inline pickers, provider and model
+    providers: InlineSelect,
+    models: InlineSelect,
 
     // the provider being set up
     provider_id: String,
@@ -188,14 +145,15 @@ pub struct ConnectFlow {
 
     // render state
     last_area: Rect,
-    item_rows: Vec<(u16, usize)>,
     field_rows: Vec<(u16, usize)>,
 }
 
 impl ConnectFlow {
     /// Step 1 — the provider picker, built from the catalogue.
+    /// Step 1 — the provider picker, built from the catalogue.
     pub fn new(theme: &Theme) -> Self {
-        let providers = PROVIDERS
+        let styles = InlineStyles::from_theme(theme);
+        let items = PROVIDERS
             .iter()
             .map(|spec| {
                 let item = SelectItem::new(spec.id, spec.name).description(spec.description);
@@ -206,13 +164,16 @@ impl ConnectFlow {
             })
             .collect();
 
+        let providers = InlineSelect::new(styles, "Connect", "Select a provider:", items).with_note(
+            "solaris can be used with a provider subscription or billed based on API usage through \
+             an API key.",
+        );
+
         Self {
             step: ConnectStep::Provider,
-            styles: ConnectStyles::from_theme(theme),
+            styles,
             providers,
-            models: Vec::new(),
-            selected: 0,
-            scroll: 0,
+            models: InlineSelect::new(styles, "Connect", "Select a model:", Vec::new()),
             provider_id: String::new(),
             provider_name: String::new(),
             input: String::new(),
@@ -222,16 +183,16 @@ impl ConnectFlow {
             user_code: String::new(),
             verification_uri: String::new(),
             last_area: Rect::default(),
-            item_rows: Vec::new(),
             field_rows: Vec::new(),
         }
     }
 
-    /// Restyle after a theme change.
+    /// Repaint with another theme's palette.
     pub fn set_theme(&mut self, theme: &Theme) {
-        self.styles = ConnectStyles::from_theme(theme);
+        self.styles = InlineStyles::from_theme(theme);
+        self.providers.set_styles(self.styles);
+        self.models.set_styles(self.styles);
     }
-
     /// Which panel is showing.
     pub fn step(&self) -> ConnectStep {
         self.step
@@ -282,11 +243,15 @@ impl ConnectFlow {
     }
 
     /// Step 3 — pick a model from the provider that just connected.
+    /// Step 3 — pick a model from the provider that just connected.
     pub fn enter_models(&mut self, models: Vec<SelectItem>) {
         self.step = ConnectStep::Model;
-        self.models = models;
-        self.selected = 0;
-        self.scroll = 0;
+        self.models = InlineSelect::new(
+            self.styles,
+            format!("Connect {}", self.provider_name),
+            "Select a model:",
+            models,
+        );
     }
 
     fn enter_text_step(&mut self, step: ConnectStep, provider_id: String, provider_name: String) {
@@ -296,7 +261,6 @@ impl ConnectFlow {
         self.input.clear();
         self.input2.clear();
         self.field = 0;
-        self.scroll = 0;
     }
 
     // -- device auth, driven from outside ----------------------------------
@@ -319,17 +283,10 @@ impl ConnectFlow {
     }
 
     /// The model highlighted on the model step.
+    /// The model highlighted on the model step.
     pub fn selected_model(&self) -> Option<&str> {
-        self.models
-            .get(self.selected)
-            .map(|item| item.value.as_str())
+        self.models.selected_value()
     }
-
-    // -- paste -------------------------------------------------------------
-
-    /// Route pasted text into the active field.
-    ///
-    /// Returns `false` when the current step has no text field, so the caller
     /// drops the paste instead of leaking it into the prompt behind.
     pub fn insert_paste(&mut self, data: &str) -> bool {
         let target = match self.step {
@@ -347,21 +304,6 @@ impl ConnectFlow {
 
     // -- navigation --------------------------------------------------------
 
-    fn item_count(&self) -> usize {
-        match self.step {
-            ConnectStep::Provider => self.providers.len(),
-            ConnectStep::Model => self.models.len(),
-            _ => 0,
-        }
-    }
-
-    fn items(&self) -> &[SelectItem] {
-        match self.step {
-            ConnectStep::Model => &self.models,
-            _ => &self.providers,
-        }
-    }
-
     fn field_count(&self) -> usize {
         match self.step {
             ConnectStep::CustomProvider => 2,
@@ -370,14 +312,6 @@ impl ConnectFlow {
     }
 
     /// Move the highlight, wrapping around both ends like the pickers do.
-    fn move_selection(&mut self, delta: isize) {
-        let count = self.item_count();
-        if count == 0 {
-            return;
-        }
-        self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
-    }
-
     /// Move between text fields, wrapping.
     fn move_field(&mut self, delta: isize) {
         let count = self.field_count();
@@ -424,57 +358,21 @@ impl ConnectFlow {
         }
 
         match self.step {
-            ConnectStep::Provider => self.picker_key(key),
-            ConnectStep::Model => self.model_key(key),
+            ConnectStep::Provider => match self.providers.on_key(key) {
+                InlineSelectOutcome::Picked(index) => self.confirm_provider(index),
+                InlineSelectOutcome::Handled => ConnectOutcome::Handled,
+            },
+            ConnectStep::Model => match self.models.on_key(key) {
+                InlineSelectOutcome::Picked(_) => self.confirm_model(),
+                InlineSelectOutcome::Handled => ConnectOutcome::Handled,
+            },
             ConnectStep::ApiKey => self.api_key_key(key),
             ConnectStep::CustomProvider => self.custom_provider_key(key),
             ConnectStep::DeviceAuth => self.device_auth_key(),
         }
     }
-
-    fn picker_key(&mut self, key: KeyEvent) -> ConnectOutcome {
-        match key.code {
-            KeyCode::Up => {
-                self.move_selection(-1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Down => {
-                self.move_selection(1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::PageUp => {
-                self.move_selection(-(MAX_LIST_ROWS as isize));
-                ConnectOutcome::Handled
-            }
-            KeyCode::PageDown => {
-                self.move_selection(MAX_LIST_ROWS as isize);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Home => {
-                self.selected = 0;
-                ConnectOutcome::Handled
-            }
-            KeyCode::End => {
-                self.selected = self.item_count().saturating_sub(1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Enter => self.confirm_provider(),
-            // Digits 1-9 jump straight to that row and confirm it, matching the
-            // numbers on screen. Zero is not a shortcut.
-            KeyCode::Char(c) if key.modifiers.is_empty() && c.is_ascii_digit() && c != '0' => {
-                let index = (c as u8 - b'1') as usize;
-                if index >= self.item_count() {
-                    return ConnectOutcome::Handled;
-                }
-                self.selected = index;
-                self.confirm_provider()
-            }
-            _ => ConnectOutcome::Handled,
-        }
-    }
-
-    fn confirm_provider(&mut self) -> ConnectOutcome {
-        let Some(item) = self.providers.get(self.selected) else {
+    fn confirm_provider(&mut self, index: usize) -> ConnectOutcome {
+        let Some(item) = self.providers.items().get(index) else {
             return ConnectOutcome::Handled;
         };
         ConnectOutcome::ProviderPicked {
@@ -483,39 +381,8 @@ impl ConnectFlow {
         }
     }
 
-    fn model_key(&mut self, key: KeyEvent) -> ConnectOutcome {
-        match key.code {
-            KeyCode::Up => {
-                self.move_selection(-1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Down => {
-                self.move_selection(1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Home => {
-                self.selected = 0;
-                ConnectOutcome::Handled
-            }
-            KeyCode::End => {
-                self.selected = self.item_count().saturating_sub(1);
-                ConnectOutcome::Handled
-            }
-            KeyCode::Enter => self.confirm_model(),
-            KeyCode::Char(c) if key.modifiers.is_empty() && c.is_ascii_digit() && c != '0' => {
-                let index = (c as u8 - b'1') as usize;
-                if index >= self.item_count() {
-                    return ConnectOutcome::Handled;
-                }
-                self.selected = index;
-                self.confirm_model()
-            }
-            _ => ConnectOutcome::Handled,
-        }
-    }
-
     fn confirm_model(&mut self) -> ConnectOutcome {
-        match self.selected_model() {
+        match self.models.selected_value() {
             Some(model_id) => ConnectOutcome::ModelPicked {
                 model_id: model_id.to_string(),
             },
@@ -611,41 +478,28 @@ impl ConnectFlow {
 
     /// Route a mouse event.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> ConnectOutcome {
-        if !rect_contains(self.last_area, mouse.column, mouse.row) {
-            return ConnectOutcome::Handled;
-        }
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.move_selection(-1);
-                ConnectOutcome::Handled
-            }
-            MouseEventKind::ScrollDown => {
-                self.move_selection(1);
-                ConnectOutcome::Handled
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = self.item_at_row(mouse.row) {
-                    self.selected = index;
-                    return match self.step {
-                        ConnectStep::Model => self.confirm_model(),
-                        _ => self.confirm_provider(),
-                    };
+        match self.step {
+            ConnectStep::Provider => match self.providers.on_mouse(mouse) {
+                InlineSelectOutcome::Picked(index) => self.confirm_provider(index),
+                InlineSelectOutcome::Handled => ConnectOutcome::Handled,
+            },
+            ConnectStep::Model => match self.models.on_mouse(mouse) {
+                InlineSelectOutcome::Picked(_) => self.confirm_model(),
+                InlineSelectOutcome::Handled => ConnectOutcome::Handled,
+            },
+            // The field and device steps only take a click on a field.
+            _ => {
+                if !rect_contains(self.last_area, mouse.column, mouse.row) {
+                    return ConnectOutcome::Handled;
                 }
-                if let Some(field) = self.field_at_row(mouse.row) {
-                    self.field = field;
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    if let Some(field) = self.field_at_row(mouse.row) {
+                        self.field = field;
+                    }
                 }
                 ConnectOutcome::Handled
             }
-            _ => ConnectOutcome::Handled,
         }
-    }
-
-    fn item_at_row(&self, row: u16) -> Option<usize> {
-        self.item_rows
-            .iter()
-            .find(|(r, _)| *r == row)
-            .map(|(_, index)| *index)
     }
 
     fn field_at_row(&self, row: u16) -> Option<usize> {
@@ -658,53 +512,32 @@ impl ConnectFlow {
     // -- layout ------------------------------------------------------------
 
     /// Rows the fixed part of the block occupies at `width`.
-    fn fixed_rows(&mut self, width: u16) -> u16 {
-        self.body(width, 0).lines.len() as u16
-    }
-
-    /// Rows the option list would like to occupy.
-    fn preferred_list_rows(&self) -> u16 {
-        match self.step {
-            ConnectStep::Provider | ConnectStep::Model => {
-                (self.item_count() as u16).min(MAX_LIST_ROWS)
-            }
-            _ => 0,
-        }
+    /// Rows the field and device steps occupy at `width`.
+    fn fixed_rows(&self, width: u16) -> u16 {
+        self.field_block(width).0.len() as u16
     }
 
     /// Total rows (block plus hint) the wizard wants at `width`.
-    pub fn desired_height(&mut self, width: u16) -> u16 {
-        self.fixed_rows(width) + self.preferred_list_rows() + FOOTER_ROWS
+    pub fn desired_height(&self, width: u16) -> u16 {
+        match self.step {
+            // The list steps are exactly their selector.
+            ConnectStep::Provider => self.providers.desired_height(width),
+            ConnectStep::Model => self.models.desired_height(width),
+            _ => self.fixed_rows(width) + FOOTER_ROWS,
+        }
     }
-
     /// Smallest height the wizard can still be used in.
     pub fn min_height(&self) -> u16 {
         4
     }
 
     fn title(&self) -> String {
-        match self.step {
-            ConnectStep::Provider => "Connect".to_string(),
-            _ => format!("Connect {}", self.provider_name),
-        }
-    }
-
-    fn description(&self, width: u16) -> Vec<String> {
-        match self.step {
-            ConnectStep::Provider => wrap_text(
-                "solaris can be used with a provider subscription or billed based on \
-                 API usage through an API key.",
-                width.saturating_sub(2).max(8) as usize,
-            ),
-            _ => Vec::new(),
-        }
+        format!("Connect {}", self.provider_name)
     }
 
     fn question(&self) -> String {
         match self.step {
-            ConnectStep::Provider => "Select a provider:".to_string(),
             ConnectStep::ApiKey => "Paste your API key:".to_string(),
-            ConnectStep::Model => "Select a model:".to_string(),
             _ => String::new(),
         }
     }
@@ -744,10 +577,12 @@ impl ConnectFlow {
     }
 
     fn hint_line(&self) -> Line<'static> {
+        // The list steps draw their own hint inside the selector.
+        if matches!(self.step, ConnectStep::Provider | ConnectStep::Model) {
+            return Line::from("");
+        }
+
         let hints: Vec<&str> = match self.step {
-            ConnectStep::Provider | ConnectStep::Model => {
-                vec!["↑/↓ select", "enter confirm"]
-            }
             ConnectStep::ApiKey => vec!["enter confirm"],
             ConnectStep::CustomProvider => vec!["tab switch field", "enter confirm"],
             ConnectStep::DeviceAuth => match self.device_status {
@@ -756,6 +591,7 @@ impl ConnectFlow {
                 }
                 _ => Vec::new(),
             },
+            ConnectStep::Provider | ConnectStep::Model => Vec::new(),
         };
 
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -777,90 +613,66 @@ impl ConnectFlow {
             spans.push(Span::styled("esc cancel", self.styles.dim));
         }
 
-        // Position counter for long lists.
-        if matches!(self.step, ConnectStep::Provider | ConnectStep::Model) && self.item_count() > 0
-        {
-            spans.push(Span::styled(
-                format!("   {}/{}", self.selected + 1, self.item_count()),
-                self.styles.dim,
-            ));
-        }
-
         Line::from(spans)
     }
-
     /// Draw the wizard into `area` (the prompt region of the layout).
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.last_area = area;
-        self.item_rows.clear();
         self.field_rows.clear();
 
         if area.width == 0 || area.height < 2 {
             return;
         }
 
+        match self.step {
+            ConnectStep::Provider => {
+                self.providers.render(buf, area);
+                return;
+            }
+            ConnectStep::Model => {
+                self.models.render(buf, area);
+                return;
+            }
+            _ => {}
+        }
+
         let width = area.width;
         // The hint row is pinned to the bottom so a squeezed layout still tells
         // the user how to get out.
         let body_area = Rect {
-            height: area.height - 1,
+            height: area.height - FOOTER_ROWS,
             ..area
         };
         let hint_area = Rect {
-            y: area.y + area.height - 1,
-            height: 1,
+            y: area.y + area.height - FOOTER_ROWS,
+            height: FOOTER_ROWS,
             ..area
         };
 
-        let list_rows = body_area.height.saturating_sub(self.fixed_rows(width)) as usize;
-        let block = self.body(width, list_rows);
-
-        for (row, line) in block
-            .lines
-            .iter()
-            .take(body_area.height as usize)
-            .enumerate()
-        {
+        let (lines, field_rows) = self.field_block(width);
+        for (row, line) in lines.iter().take(body_area.height as usize).enumerate() {
             buf.set_line(body_area.x, body_area.y + row as u16, line, body_area.width);
         }
         buf.set_line(hint_area.x, hint_area.y, &self.hint_line(), hint_area.width);
 
-        // Hit-testing works on absolute rows, so translate what `body` recorded.
-        self.item_rows = block
-            .item_rows
-            .into_iter()
-            .map(|(row, index)| (body_area.y.saturating_add(row as u16), index))
-            .collect();
-        self.field_rows = block
-            .field_rows
+        // Hit-testing works on absolute rows, so translate what the block
+        // recorded.
+        self.field_rows = field_rows
             .into_iter()
             .map(|(row, index)| (body_area.y.saturating_add(row as u16), index))
             .collect();
     }
 
-    /// Build the block, with row indices relative to its first line.
-    fn body(&mut self, width: u16, list_rows: usize) -> Block {
+    /// The block the field and device steps draw, with row indices relative to
+    /// its first line. The list steps are drawn by their selector instead.
+    fn field_block(&self, width: u16) -> (Vec<Line<'static>>, RowMap) {
+        let _ = width;
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut item_rows: RowMap = Vec::new();
         let mut field_rows: RowMap = Vec::new();
 
         lines.push(Line::from(Span::styled(self.title(), self.styles.title)));
 
-        let description = self.description(width);
-        if !description.is_empty() {
-            lines.push(Line::from(""));
-            for line in description {
-                lines.push(Line::from(Span::styled(line, self.styles.muted)));
-            }
-        }
-
         match self.step {
-            ConnectStep::Provider | ConnectStep::Model => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(self.question(), self.styles.text)));
-                lines.push(Line::from(""));
-                self.push_item_rows(width, list_rows, &mut lines, &mut item_rows);
-            }
             ConnectStep::ApiKey => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(self.question(), self.styles.text)));
@@ -887,115 +699,12 @@ impl ConnectFlow {
                     lines.push(line);
                 }
             }
+            // The list steps never reach here.
+            ConnectStep::Provider | ConnectStep::Model => {}
         }
 
-        Block {
-            lines,
-            item_rows,
-            field_rows,
-        }
+        (lines, field_rows)
     }
-
-    /// The option list, windowed so the highlighted row is always visible.
-    fn push_item_rows(
-        &mut self,
-        width: u16,
-        list_rows: usize,
-        lines: &mut Vec<Line<'static>>,
-        item_rows: &mut RowMap,
-    ) {
-        let total = self.item_count();
-        if total == 0 || list_rows == 0 {
-            return;
-        }
-
-        let visible = list_rows.min(MAX_LIST_ROWS as usize).min(total);
-        let mut start = self.scroll.min(total.saturating_sub(visible));
-        if self.selected < start {
-            start = self.selected;
-        }
-        if self.selected >= start + visible {
-            start = self.selected + 1 - visible;
-        }
-        self.scroll = start;
-
-        for index in start..start + visible {
-            item_rows.push((lines.len(), index));
-            lines.push(self.item_row(width, index));
-        }
-    }
-
-    /// One option row: `❯ 3. Title · description   BADGE`.
-    fn item_row(&self, width: u16, index: usize) -> Line<'static> {
-        let item = &self.items()[index];
-        let selected = index == self.selected;
-
-        let marker = if selected { "❯ " } else { "  " };
-        // Numbers are right-aligned across the list, matching the pickers.
-        let number = format!(
-            "{:>width$}. ",
-            index + 1,
-            width = digit_count(self.item_count())
-        );
-        let title_style = if selected {
-            self.styles.text.add_modifier(Modifier::BOLD)
-        } else {
-            self.styles.muted
-        };
-        let desc_style = if selected {
-            self.styles.text
-        } else {
-            self.styles.dim
-        };
-
-        let prefix_width = 2 + display_width(&number);
-        let badge = item.badge.as_deref().filter(|text| !text.is_empty());
-        let badge_width = badge.map_or(0, display_width);
-        let badge_space = if badge_width > 0 && badge_width + 3 < width as usize {
-            badge_width + 2
-        } else {
-            0
-        };
-
-        let mut text = item.label.clone();
-        if !item.description.is_empty() {
-            text.push_str(" · ");
-            text.push_str(&item.description);
-        }
-        let text = truncate_to_width(
-            &text,
-            (width as usize)
-                .saturating_sub(prefix_width)
-                .saturating_sub(badge_space),
-            "…",
-        );
-
-        // Split the truncated text back so title and description keep their own
-        // colours.
-        let (title, desc) = match text.split_once(" · ") {
-            Some((title, desc)) => (title.to_string(), Some(desc.to_string())),
-            None => (text, None),
-        };
-
-        let mut spans = vec![
-            Span::styled(marker.to_string(), self.styles.title),
-            Span::styled(number, self.styles.dim),
-            Span::styled(title, title_style),
-        ];
-        if let Some(desc) = desc {
-            spans.push(Span::styled(" · ", self.styles.dim));
-            spans.push(Span::styled(desc, desc_style));
-        }
-        if let Some(badge) = badge.filter(|_| badge_space > 0) {
-            let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
-            let gap = (width as usize).saturating_sub(used + badge_width);
-            spans.push(Span::styled(" ".repeat(gap), Style::default()));
-            spans.push(Span::styled(badge.to_string(), self.styles.tip));
-        }
-
-        Line::from(spans)
-    }
-
     /// A masked text field with a `_` cursor while it is active.
     fn secret_line(&self, value: &str, active: bool) -> Line<'static> {
         let (text, style) = if value.is_empty() {
@@ -1131,7 +840,14 @@ mod tests {
         let mut flow = new_flow();
         flow.on_key(key(KeyCode::End));
         flow.on_key(key(KeyCode::Down));
-        assert_eq!(flow.selected, 0, "down from the last row should wrap");
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ProviderPicked {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+            },
+            "down from the last row should wrap to the first"
+        );
     }
 
     #[test]
@@ -1153,19 +869,32 @@ mod tests {
             flow.on_key(key(KeyCode::Char('0'))),
             ConnectOutcome::Handled
         );
-        assert_eq!(flow.selected, 0);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ProviderPicked {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+            },
+            "zero must leave the highlight on the first row"
+        );
     }
 
     #[test]
     fn a_digit_beyond_the_list_is_ignored() {
         let mut flow = new_flow();
-        let count = flow.item_count();
-        let beyond = char::from_digit(count as u32 + 1, 10).expect("digit");
+        // The catalogue holds eight providers, so nine is out of range.
         assert_eq!(
-            flow.on_key(key(KeyCode::Char(beyond))),
+            flow.on_key(key(KeyCode::Char('9'))),
             ConnectOutcome::Handled
         );
-        assert_eq!(flow.selected, 0);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ProviderPicked {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+            },
+            "an out-of-range digit must leave the highlight alone"
+        );
     }
 
     #[test]
@@ -1338,14 +1067,12 @@ mod tests {
     #[test]
     fn clicking_an_option_row_confirms_it() {
         let mut flow = new_flow();
-        rendered(&mut flow, 60, 20);
+        let text = rendered(&mut flow, 60, 20);
 
-        let row = flow
-            .item_rows
-            .iter()
-            .find(|(_, index)| *index == 2)
-            .map(|(row, _)| *row)
-            .expect("row for the third provider");
+        let row = text
+            .lines()
+            .position(|line| line.contains("OpenAI"))
+            .expect("the OpenAI row") as u16;
 
         assert_eq!(
             flow.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, row)),
@@ -1362,14 +1089,27 @@ mod tests {
         rendered(&mut flow, 60, 20);
 
         flow.on_mouse(mouse(MouseEventKind::ScrollDown, 4, 3));
-        assert_eq!(flow.selected, 1);
-        flow.on_mouse(mouse(MouseEventKind::ScrollUp, 4, 3));
-        assert_eq!(flow.selected, 0);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ProviderPicked {
+                id: "claude-subscription".into(),
+                name: "Claude subscription".into(),
+            },
+            "the wheel should move the highlight"
+        );
 
         // Events outside the flow are ignored rather than moving the highlight.
+        flow.on_mouse(mouse(MouseEventKind::ScrollUp, 4, 3));
         let outside = mouse(MouseEventKind::ScrollDown, 4, 23);
         assert_eq!(flow.on_mouse(outside), ConnectOutcome::Handled);
-        assert_eq!(flow.selected, 0);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ProviderPicked {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+            },
+            "a wheel event outside the flow must not move the highlight"
+        );
     }
 
     #[test]
@@ -1392,7 +1132,7 @@ mod tests {
 
     #[test]
     fn desired_height_grows_with_the_list_and_is_at_least_min_height() {
-        let mut flow = new_flow();
+        let flow = new_flow();
         let height = flow.desired_height(60);
         assert!(
             (12..=20).contains(&height),
@@ -1433,25 +1173,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("1/8"));
-    }
-
-    #[test]
-    fn a_long_list_scrolls_so_the_highlighted_row_stays_visible() {
-        let mut flow = new_flow();
-        let mut providers: Vec<SelectItem> = (0..20)
-            .map(|i| SelectItem::new(format!("p{i}"), format!("provider {i}")))
-            .collect();
-        providers.truncate(20);
-        flow.providers = providers;
-
-        // Move past the window and check the list followed along.
-        for _ in 0..12 {
-            flow.on_key(key(KeyCode::Down));
-        }
-        let text = rendered(&mut flow, 60, 12);
-        assert!(text.contains("❯ 13. provider 12"), "{text}");
-        assert!(!text.contains("1. provider 0"), "{text}");
-        assert!(flow.scroll > 0);
     }
 
     #[test]

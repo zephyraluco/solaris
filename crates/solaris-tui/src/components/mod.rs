@@ -6,6 +6,7 @@
 
 pub mod editor;
 pub mod fuzzy;
+pub mod inline_select;
 pub mod loader;
 pub mod markdown;
 pub mod panel;
@@ -17,6 +18,7 @@ pub mod welcome;
 
 pub use editor::{CommandHint, Editor};
 pub use fuzzy::{fuzzy_match, fuzzy_score};
+pub use inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};
 pub use loader::Loader;
 pub use markdown::{MarkdownStyle, render_markdown};
 pub use panel::Panel;

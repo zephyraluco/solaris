@@ -49,6 +49,7 @@ use crate::dialogs::{
     stats_lines,
 };
 use crate::keymap;
+use crate::model::{ModelOutcome, ModelPicker};
 use crate::state::{NoticeKind, NotificationQueue, SessionState, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
@@ -169,7 +170,7 @@ pub struct App {
     /// Which quit key was pressed first, and when — the two-press quit.
     quit_press: Option<(char, Instant)>,
     /// The inline `/connect` wizard while it owns the prompt region.
-    inline: Option<ConnectFlow>,
+    inline: Option<Inline>,
     /// Events from the background device-auth task.
     device_rx: Option<UnboundedReceiver<DeviceAuthEvent>>,
 }
@@ -251,12 +252,12 @@ impl App {
 
     /// Whether the `/connect` wizard is on screen.
     pub fn connect_open(&self) -> bool {
-        self.inline.is_some()
+        self.inline.as_ref().is_some_and(Inline::is_connect)
     }
 
     /// The wizard's current step, when it is open.
     pub fn connect_step(&self) -> Option<ConnectStep> {
-        self.inline.as_ref().map(|flow| flow.step())
+        self.inline.as_ref().and_then(|inline| inline.step())
     }
 
     /// The active agent mode.
@@ -552,7 +553,7 @@ impl App {
             }
             "model" => {
                 if args.is_empty() {
-                    self.open_model_dialog();
+                    self.open_model_picker();
                 } else {
                     self.set_model(args);
                 }
@@ -643,7 +644,6 @@ impl App {
         match message {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
-            DialogMessage::Model(name) => self.set_model(&name),
             DialogMessage::Command(text) => self.submit(text),
             DialogMessage::Confirm {
                 action: ConfirmAction::ClearTranscript,
@@ -798,29 +798,18 @@ impl App {
         );
     }
 
-    fn open_model_dialog(&mut self) {
+    /// Open the model picker in the prompt region — the `/connect` look rather
+    /// than a modal — with the active model highlighted.
+    fn open_model_picker(&mut self) {
         let current = self.config.model.clone();
-        let items = Config::MODEL_OPTIONS
+        let models = Config::MODEL_OPTIONS
             .iter()
             .map(|(name, description)| SelectItem::new(*name, *name).description(*description))
             .collect::<Vec<_>>();
-        let count = Config::MODEL_OPTIONS.len();
-        let dialog = SelectDialog::new(
-            "Model",
-            HINT_SELECT,
-            items,
-            &self.theme,
-            self.dialog_tx.clone(),
-            |value| DialogMessage::Model(value.to_string()),
-        )
-        .label("Select a model:")
-        .selected(&current);
-        self.push_overlay(
-            Box::new(dialog),
-            OverlayOptions::centered()
-                .width(SizeValue::Percent(66))
-                .height(SizeValue::Cells(SelectDialog::height_for(count))),
-        );
+        let picker = ModelPicker::new(&self.theme, models, Some(&current));
+        self.inline = Some(Inline::Model(picker));
+        self.device_rx = None;
+        self.notifications.clear();
     }
 
     fn open_clear_confirm(&mut self) {
@@ -844,35 +833,49 @@ impl App {
 
     /// Open the `/connect` wizard in the prompt region.
     fn open_connect(&mut self) {
-        self.inline = Some(ConnectFlow::new(&self.theme));
+        self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
         self.device_rx = None;
         self.notifications.clear();
     }
 
     /// Drop the wizard and any device-auth task feeding it.
-    fn close_connect(&mut self) {
+    fn close_inline(&mut self) {
         self.inline = None;
         self.device_rx = None;
     }
 
     fn handle_inline_key(&mut self, key: KeyEvent) {
         let outcome = match self.inline.as_mut() {
-            Some(flow) => flow.on_key(key),
+            Some(inline) => inline.on_key(key),
             None => return,
         };
-        self.apply_connect_outcome(outcome);
+        match outcome {
+            InlineOutcome::Connect(outcome) => self.apply_connect_outcome(outcome),
+            InlineOutcome::Model(outcome) => self.apply_model_outcome(outcome),
+        }
     }
 
     fn apply_connect_outcome(&mut self, outcome: ConnectOutcome) {
         match outcome {
             ConnectOutcome::Handled => {}
-            ConnectOutcome::Closed => self.close_connect(),
+            ConnectOutcome::Closed => self.close_inline(),
             ConnectOutcome::ProviderPicked { id, name } => self.begin_provider_setup(&id, &name),
             ConnectOutcome::Submit(submit) => self.apply_connect_submit(submit),
             ConnectOutcome::ModelPicked { model_id } => {
-                self.config.model = model_id.clone();
-                self.notifications.info(format!("model: {model_id}"));
-                self.close_connect();
+                self.set_model(&model_id);
+                self.close_inline();
+            }
+        }
+    }
+
+    /// Apply what the `/model` picker decided.
+    fn apply_model_outcome(&mut self, outcome: ModelOutcome) {
+        match outcome {
+            ModelOutcome::Handled => {}
+            ModelOutcome::Closed => self.close_inline(),
+            ModelOutcome::Picked { model_id } => {
+                self.set_model(&model_id);
+                self.close_inline();
             }
         }
     }
@@ -882,7 +885,7 @@ impl App {
         let Some(spec) = solaris_core::provider(provider_id) else {
             self.notifications
                 .error(format!("unknown provider {provider_id}"));
-            self.close_connect();
+            self.close_inline();
             return;
         };
 
@@ -976,7 +979,7 @@ impl App {
 
         match self.inline.as_mut() {
             Some(flow) if !models.is_empty() => flow.enter_models(models),
-            _ => self.close_connect(),
+            _ => self.close_inline(),
         }
     }
 
@@ -1248,13 +1251,16 @@ impl Component for App {
         let over_wizard = self
             .inline
             .as_ref()
-            .is_some_and(|flow| rect_contains(flow.area(), event.column, event.row));
+            .is_some_and(|inline| rect_contains(inline.area(), event.column, event.row));
         if over_wizard {
             let outcome = match self.inline.as_mut() {
-                Some(flow) => flow.on_mouse(event),
-                None => ConnectOutcome::Handled,
+                Some(inline) => inline.on_mouse(event),
+                None => return MouseResult::Handled,
             };
-            self.apply_connect_outcome(outcome);
+            match outcome {
+                InlineOutcome::Connect(outcome) => self.apply_connect_outcome(outcome),
+                InlineOutcome::Model(outcome) => self.apply_model_outcome(outcome),
+            }
             return MouseResult::Handled;
         }
 
@@ -1516,6 +1522,142 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
         cursor: Style::default().add_modifier(Modifier::REVERSED),
+    }
+}
+
+/// Which inline surface owns the prompt region.
+///
+/// A command that picks or asks takes the input line over — the way claurst's
+/// wizard and Claude Code's `/login` screen do — instead of opening an overlay.
+/// Both surfaces draw through the framework's `InlineSelect`, so only their
+/// policy differs; `App` keeps them behind one type and dispatches here.
+// The wizard is a big state machine and the picker is a thin one; boxing the
+// former would only add indirection to a value that lives for one screen.
+#[allow(clippy::large_enum_variant)]
+enum Inline {
+    /// The `/connect` wizard.
+    Connect(ConnectFlow),
+    /// The `/model` picker.
+    Model(ModelPicker),
+}
+
+/// What an inline surface made of an event.
+enum InlineOutcome {
+    Connect(ConnectOutcome),
+    Model(ModelOutcome),
+}
+
+impl Inline {
+    fn is_connect(&self) -> bool {
+        matches!(self, Self::Connect(_))
+    }
+
+    fn step(&self) -> Option<ConnectStep> {
+        match self {
+            Self::Connect(flow) => Some(flow.step()),
+            Self::Model(_) => None,
+        }
+    }
+
+    fn area(&self) -> Rect {
+        match self {
+            Self::Connect(flow) => flow.area(),
+            Self::Model(picker) => picker.area(),
+        }
+    }
+
+    fn set_theme(&mut self, theme: &Theme) {
+        match self {
+            Self::Connect(flow) => flow.set_theme(theme),
+            Self::Model(picker) => picker.set_theme(theme),
+        }
+    }
+
+    fn insert_paste(&mut self, text: &str) -> bool {
+        match self {
+            Self::Connect(flow) => flow.insert_paste(text),
+            Self::Model(picker) => picker.insert_paste(text),
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> InlineOutcome {
+        match self {
+            Self::Connect(flow) => InlineOutcome::Connect(flow.on_key(key)),
+            Self::Model(picker) => InlineOutcome::Model(picker.on_key(key)),
+        }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) -> InlineOutcome {
+        match self {
+            Self::Connect(flow) => InlineOutcome::Connect(flow.on_mouse(mouse)),
+            Self::Model(picker) => InlineOutcome::Model(picker.on_mouse(mouse)),
+        }
+    }
+
+    fn desired_height(&mut self, width: u16) -> u16 {
+        match self {
+            Self::Connect(flow) => flow.desired_height(width),
+            Self::Model(picker) => picker.desired_height(width),
+        }
+    }
+
+    fn render(&mut self, buf: &mut Buffer, area: Rect) {
+        match self {
+            Self::Connect(flow) => flow.render(buf, area),
+            Self::Model(picker) => picker.render(buf, area),
+        }
+    }
+
+    // Wizard-only steps: no-ops unless the connect flow is the one on screen.
+    fn enter_api_key(&mut self, provider_id: impl Into<String>, provider_name: impl Into<String>) {
+        if let Self::Connect(flow) = self {
+            flow.enter_api_key(provider_id.into(), provider_name.into());
+        }
+    }
+
+    fn enter_custom_provider(
+        &mut self,
+        provider_id: impl Into<String>,
+        provider_name: impl Into<String>,
+        current: Option<String>,
+    ) {
+        if let Self::Connect(flow) = self {
+            flow.enter_custom_provider(provider_id.into(), provider_name.into(), current);
+        }
+    }
+
+    fn enter_device_auth(
+        &mut self,
+        provider_id: impl Into<String>,
+        provider_name: impl Into<String>,
+    ) {
+        if let Self::Connect(flow) = self {
+            flow.enter_device_auth(provider_id.into(), provider_name.into());
+        }
+    }
+
+    fn enter_models(&mut self, models: Vec<SelectItem>) {
+        if let Self::Connect(flow) = self {
+            flow.enter_models(models);
+        }
+    }
+
+    fn device_set_code(&mut self, user_code: String, verification_uri: String) {
+        if let Self::Connect(flow) = self {
+            flow.device_set_code(user_code, verification_uri);
+        }
+    }
+
+    fn device_set_success(&mut self, token: String) {
+        if let Self::Connect(flow) = self {
+            flow.device_set_success(token);
+        }
+    }
+
+    fn device_set_error(&mut self, message: String) {
+        if let Self::Connect(flow) = self {
+            flow.device_set_error(message);
+        }
     }
 }
 
@@ -1816,23 +1958,72 @@ mod tests {
     }
 
     #[test]
-    fn bare_commands_queue_dialogs() {
+    fn bare_commands_open_their_surface() {
         let mut app = app();
         app.submit("/theme".to_string());
         assert_eq!(app.overlay_queue.borrow().len(), 1);
-        app.submit("/model".to_string());
-        assert_eq!(app.overlay_queue.borrow().len(), 2);
         app.submit("/stats".to_string());
-        assert_eq!(app.overlay_queue.borrow().len(), 3);
+        assert_eq!(app.overlay_queue.borrow().len(), 2);
     }
 
     #[test]
-    fn dialog_choice_updates_theme_and_model() {
+    fn the_model_command_opens_the_inline_picker() {
+        let mut app = app();
+        let current = app.model().to_string();
+
+        app.submit("/model".to_string());
+
+        // It takes the prompt region like `/connect`, and leaves the overlay
+        // stack alone.
+        assert!(app.overlay_queue.borrow().is_empty());
+        assert!(app.inline.is_some());
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("Select a model:"), "{text}");
+        assert!(text.contains(current.as_str()), "{text}");
+
+        // The active model is the highlighted row, so Enter keeps it.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.model(), current);
+        assert!(app.inline.is_none(), "the picker stayed open");
+    }
+
+    #[test]
+    fn the_inline_model_picker_switches_the_model() {
+        let mut app = app();
+        let names: Vec<&str> = Config::MODEL_OPTIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let start = names
+            .iter()
+            .position(|name| *name == app.model())
+            .expect("the active model is on the list");
+
+        app.submit("/model".to_string());
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.model(), names[(start + 1) % names.len()]);
+        assert!(app.inline.is_none(), "the picker stayed open");
+    }
+
+    #[test]
+    fn escaping_the_model_picker_keeps_the_model() {
+        let mut app = app();
+        let current = app.model().to_string();
+
+        app.submit("/model".to_string());
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.model(), current);
+        assert!(app.inline.is_none());
+    }
+
+    #[test]
+    fn dialog_choice_updates_the_theme() {
         let mut app = app();
         app.on_dialog_message(DialogMessage::Theme("light".into()));
-        app.on_dialog_message(DialogMessage::Model("solaris-mock-1-mini".into()));
         assert_eq!(app.theme_name(), "light");
-        assert_eq!(app.model(), "solaris-mock-1-mini");
     }
 
     #[test]
@@ -2071,10 +2262,13 @@ mod tests {
         // The background task issues a code, then a token.
         for _ in 0..600 {
             app.tick();
-            let succeeded = app
-                .inline
-                .as_ref()
-                .is_some_and(|flow| matches!(flow.device_status(), DeviceAuthStatus::Success(_)));
+            let succeeded = app.inline.as_ref().is_some_and(|inline| {
+                matches!(
+                    inline,
+                    Inline::Connect(flow)
+                        if matches!(flow.device_status(), DeviceAuthStatus::Success(_))
+                )
+            });
             if succeeded {
                 break;
             }

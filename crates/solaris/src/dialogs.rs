@@ -24,8 +24,6 @@ pub enum DialogMessage {
     Cancelled,
     /// A theme was chosen.
     Theme(String),
-    /// A model was chosen.
-    Model(String),
     /// A slash command should be executed (from the palette).
     Command(String),
     /// A confirmation was answered.

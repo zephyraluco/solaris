@@ -398,6 +398,26 @@ async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
 }
 
 #[tokio::test]
+async fn the_model_command_opens_the_inline_picker() {
+    let mut harness = Harness::new();
+    harness.type_str("/model");
+    harness.key(KeyCode::Enter);
+
+    // It takes the prompt region like `/connect`: no overlay joins the stack,
+    // and the wizard's own list renders there.
+    assert!(harness.tui.overlay_queue().borrow().is_empty());
+    let frame = harness.draw();
+    assert!(frame.contains("Select a model:"), "{frame}");
+
+    harness.key(KeyCode::Down);
+    harness.key(KeyCode::Enter);
+
+    let after = harness.draw();
+    assert!(!after.contains("Select a model:"), "the picker stayed up");
+    assert!(after.contains("model:"), "the choice was not announced");
+}
+
+#[tokio::test]
 async fn ctrl_v_pastes_the_clipboard_into_the_prompt() {
     let (clipboard, _) = clipboard_for(Some("pasted into the prompt"));
     let mut harness = Harness::with_clipboard(clipboard);

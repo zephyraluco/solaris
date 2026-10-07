@@ -170,7 +170,7 @@ while !quit {
 
 同一个 crate 同时提供**库**与**二进制**：库（`lib.rs`）承载全部 UI 与状态逻辑，`main.rs` 只做参数解析与装配。这样集成测试可以 `use solaris::{App, AppOptions}` 直接驱动真实技术栈。
 
-模块划分：`app`（根组件）、`state`（会话与通知）、`dialogs`（浮层对话框）、`connect`（内联向导）、`transcript`（转录渲染与缓存）、`commands`（命令注册表）、`keymap`（全局按键与页脚提示）、`clipboard`（平台剪贴板，藏在可注入的 `ClipboardWriter` 后面）。
+模块划分：`app`（根组件）、`state`（会话与通知）、`dialogs`（浮层对话框）、`connect`（内联向导，以及复用它渲染的 `/model` 选择器）、`transcript`（转录渲染与缓存）、`commands`（命令注册表）、`keymap`（全局按键与页脚提示）、`clipboard`（平台剪贴板，藏在可注入的 `Clipboard` 后面）。
 
 ### 5.2 启动装配（`main.rs`）
 
@@ -203,7 +203,7 @@ while !quit {
 根组件 `handle_key` 的分发顺序固定为：
 
 ```text
-最顶层浮层（由框架拦截）  →  内联 /connect 向导  →  会话（编辑器 + 全局快捷键）
+最顶层浮层（由框架拦截）  →  内联向导 / 选择器  →  会话（编辑器 + 全局快捷键）
 ```
 
 内联向导虽然不是浮层，但在此期间它拥有键盘 —— 例如 `Ctrl+C` 是「取消向导」而不是「退出」。
@@ -220,7 +220,7 @@ while !quit {
 
 `Ctrl+D` 是同一个手势的另一半，只在输入框为空时生效 —— 否则按键留给编辑器。浮层存在时按键由浮层吃下，所以要先关掉对话框才能复制。
 
-`Ctrl+V` 走反方向：从剪贴板取文本，插进当前接受输入的地方 —— 内联 `/connect` 向导的字段在场就给它，否则给输入框；剪贴板为空时提示 `clipboard is empty`。claurst 就是在同一个键（它还接受 `Cmd+V`）上读剪贴板、并对空剪贴板报警的。
+`Ctrl+V` 走反方向：从剪贴板取文本，插进当前接受输入的地方 —— 内联向导的字段在场就给它，否则给输入框；剪贴板为空时提示 `clipboard is empty`。claurst 就是在同一个键（它还接受 `Cmd+V`）上读剪贴板、并对空剪贴板报警的。
 
 ### 5.5 渲染管线
 
@@ -282,19 +282,21 @@ Tui::render
 对话框（[`dialogs`](../crates/solaris/src/dialogs.rs)）有一条**唯一**的模态路径：每个对话框都是普通 `Component`，被压入框架的浮层栈，结果通过 `mpsc` 回传，而不是反向持有应用引用。
 
 ```rust
-enum DialogMessage { Cancelled, Theme(String), Model(String), Command(String),
+enum DialogMessage { Cancelled, Theme(String), Command(String),
                      Confirm { action: ConfirmAction, accepted: bool } }
 ```
 
-应用侧只暴露 `open_help` / `open_stats` / `open_buddy` / `open_palette` / `open_theme_dialog` / `open_model_dialog` / `open_clear_confirm`，内部统一走 `push_overlay`。
+应用侧只暴露 `open_help` / `open_stats` / `open_buddy` / `open_palette` / `open_theme_dialog` / `open_clear_confirm`，内部统一走 `push_overlay`。
 
-`/connect` 是**刻意的例外**：它不弹浮层，而是接管输入区（与 Claude Code 的 `/login` 视觉一致）。[`ConnectFlow`](../crates/solaris/src/connect.rs) 是一个状态机：
+**列表类选择器走内联**：`/connect` 与 `/model` 都不弹浮层，而是接管输入区（与 Claude Code 的 `/login` 视觉一致）。[`ConnectFlow`](../crates/solaris/src/connect.rs) 是一个状态机：
 
 ```text
 ConnectStep:   Provider → ApiKey | CustomProvider | DeviceAuth → Model
 ConnectOutcome: Handled | Closed | ProviderPicked | Submit | ModelPicked
 DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 ```
+
+`/model` 由 [`model.rs`](../crates/solaris/src/model.rs) 实现：它只写下这个命令的策略（列表说什么、选中意味着什么），列表本身是框架组件 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs) —— 标题、说明、问题行、`❯` 行、底部提示、按键、滚轮与命中测试都在那里，`/connect` 的 provider / model 两步用的也是它，所以两者样式不会漂移。`App` 用一个 `Inline` 枚举持有两者并转发事件。
 
 流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、拉起授权任务）归 `App`，因为那是应用状态而非流程状态。设备码授权的网络侧尚未实现，目前是一个替身任务：延时后发出一个设备码，再发一条「已获得 token」。
 
@@ -330,10 +332,10 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 ## 7. 测试策略
 
-工作区共 **312 个测试**，分两类：
+工作区共 **327 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 124、`solaris-backend` 7、`solaris` 库 120），覆盖纯逻辑、布局、按键、渲染与状态机。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（26 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 130、`solaris-backend` 7、`solaris` 库 128），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（27 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
 cargo build --workspace --all-targets
