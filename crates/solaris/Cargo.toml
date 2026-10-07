@@ -20,3 +20,6 @@ futures = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# Text only: the image and wayland-data-control features would drag in far more
+# than a TUI chat client needs.
+arboard = { version = "3", default-features = false }

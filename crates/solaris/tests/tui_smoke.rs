@@ -4,14 +4,16 @@
 //! framework components and the mock backend — and render into a ratatui
 //! `TestBackend`, so the whole UI path is exercised without needing a terminal.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use solaris::{App, AppOptions};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use solaris::{App, AppOptions, ClipboardWriter};
 use solaris_backend::MockBackend;
 use solaris_core::Config;
-use solaris_tui::Tui;
+use solaris_tui::{Theme, Tui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -19,6 +21,8 @@ const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
 /// Row of the transcript's last visible line (above the editor and footer).
 const BOTTOM: usize = 21;
+/// The status footer, the last row of the frame.
+const FOOTER: u16 = HEIGHT - 1;
 
 struct Harness {
     tui: Tui,
@@ -26,17 +30,27 @@ struct Harness {
 }
 
 impl Harness {
+    /// A harness whose copies are dropped rather than written to the clipboard
+    /// of the machine running the tests.
     fn new() -> Self {
+        Self::with_clipboard(Rc::new(|_: &str| true))
+    }
+
+    fn with_clipboard(clipboard: ClipboardWriter) -> Self {
         let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
         let mut tui = Tui::new();
-        let app = App::new(AppOptions::new(
+        let mut options = AppOptions::new(
             backend,
             Config::default(),
             tui.quit_flag(),
             tui.overlay_queue(),
             tui.overlay_flag(),
-        ));
-        tui.set_root(Box::new(app));
+        );
+        // The app only sees a selection when it shares the driver's handle,
+        // which is exactly what `main` wires up.
+        options.selection = tui.selection();
+        options.clipboard = clipboard;
+        tui.set_root(Box::new(App::new(options)));
 
         let terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
         Self { tui, terminal }
@@ -62,6 +76,16 @@ impl Harness {
     fn ctrl(&mut self, c: char) {
         self.tui
             .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    /// Send a mouse event through the driver, the way the event loop does.
+    fn mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        self.tui.handle_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
     }
 
     fn type_str(&mut self, text: &str) {
@@ -353,6 +377,91 @@ async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
         harness.draw(),
         "scrolling back to the end should restore the followed view"
     );
+}
+
+#[tokio::test]
+async fn dragging_the_footer_copies_what_it_shows() {
+    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&copied);
+    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
+        log.borrow_mut().push(text.to_string());
+        true
+    }));
+
+    // The footer names the model, so it has known content whatever the
+    // transcript above it happens to be showing.
+    let frame = harness.draw();
+    let footer: Vec<char> = frame
+        .lines()
+        .nth(FOOTER as usize)
+        .expect("a footer row")
+        .chars()
+        .collect();
+    let expected: String = footer[1..=14].iter().collect();
+    assert!(
+        expected.contains("solaris"),
+        "unexpected footer: {expected:?}"
+    );
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 1, FOOTER);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 14, FOOTER);
+    let _ = harness.draw();
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 14, FOOTER);
+    harness.tui.tick();
+
+    assert_eq!(copied.borrow().as_slice(), [expected]);
+}
+
+#[tokio::test]
+async fn the_dragged_range_is_highlighted_until_it_is_dismissed() {
+    let mut harness = Harness::new();
+    let _ = harness.draw();
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 1, FOOTER);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 6, FOOTER);
+    let _ = harness.draw();
+
+    let highlight = Theme::dark().selection_bg;
+    let buffer = harness.terminal.backend().buffer();
+    for column in 1..=6 {
+        assert_eq!(buffer[(column, FOOTER)].bg, highlight, "column {column}");
+    }
+    assert_ne!(buffer[(0, FOOTER)].bg, highlight, "before the anchor");
+    assert_ne!(buffer[(7, FOOTER)].bg, highlight, "after the focus");
+
+    // Escape drops the highlight but still reaches whatever is below it.
+    harness.key(KeyCode::Esc);
+    let _ = harness.draw();
+    let buffer = harness.terminal.backend().buffer();
+    assert_ne!(buffer[(1, FOOTER)].bg, highlight);
+}
+
+#[tokio::test]
+async fn cells_inside_a_dialog_are_selectable_too() {
+    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&copied);
+    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
+        log.borrow_mut().push(text.to_string());
+        true
+    }));
+
+    harness.key(KeyCode::F(1));
+    let frame = harness.draw();
+    let row = frame
+        .lines()
+        .position(|line| line.contains("Keyboard"))
+        .expect("the help dialog never opened") as u16;
+
+    // "Keyboard" is the dialog's first content line, one cell in from its left
+    // edge — so this drag must take the dialog's cells and not the welcome box
+    // showing through beside it.
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 13, row);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 30, row);
+    let _ = harness.draw();
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 30, row);
+    harness.tui.tick();
+
+    assert_eq!(copied.borrow().as_slice(), ["Keyboard".to_string()]);
 }
 
 #[tokio::test]

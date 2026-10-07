@@ -584,6 +584,7 @@ pub const KEY_HELP: &[(&str, &str)] = &[
     ("ctrl+o", "toggle thinking blocks"),
     ("ctrl+l", "clear the transcript"),
     ("page up / down", "scroll the transcript"),
+    ("drag", "select any text — releasing copies it"),
     ("?", "this help (when the prompt is empty)"),
     ("ctrl+c", "quit"),
 ];

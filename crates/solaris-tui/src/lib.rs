@@ -14,6 +14,7 @@ pub mod components;
 pub mod keys;
 pub mod layout;
 pub mod overlay;
+pub mod selection;
 pub mod terminal;
 pub mod theme;
 pub mod tui;
@@ -27,6 +28,7 @@ pub use components::{
 pub use keys::Keybindings;
 pub use layout::{Axis, Basis, Entry, split};
 pub use overlay::{Anchor, OverlayOptions, SizeValue, resolve};
+pub use selection::{Selection, SelectionHandle};
 pub use terminal::{PiTerminal, install_panic_hook, restore_terminal, setup_terminal};
 pub use theme::Theme;
 pub use tui::{OverlayQueue, QuitFlag, Tui};

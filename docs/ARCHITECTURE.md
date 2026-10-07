@@ -124,6 +124,7 @@ pub trait Component {
 - `OverlayQueue = Rc<RefCell<Vec<(Box<dyn Component>, OverlayOptions)>>>` —— 根组件用它**请求**打开浮层，不在渲染中途直接改动栈。
 - `QuitFlag = Rc<Cell<bool>>` —— 根组件用它请求退出。
 - `overlay_flag: Rc<Cell<bool>>` —— 报告「当前有浮层」，根组件据此让编辑器失焦（即便浮层是被点击外部关闭的）。
+- `SelectionHandle = Rc<RefCell<Selection>>` —— 全屏拖选状态，见 §4.5。
 
 主循环（`poll_interval` 16 ms）：
 
@@ -144,9 +145,18 @@ while !quit {
 - 无浮层时输入交给根组件。
 - 鼠标左键点在顶层浮层之外 = 关闭该浮层。
 
+**拖选**（[`selection`](../crates/solaris-tui/src/selection.rs)）不走这条单一路径，而是横切过去：
+
+- `handle_mouse` 先让选区**观察**事件，再照常下传 —— 于是一次按下既会移动编辑器的光标，也会起一个选区；只有拖拽才把它变成真正的选择。滚轮事件选区不碰，仍由组件处理。
+- `render` 的最后一步在**画完的帧**上重刷选中单元格的颜色，并记下每一行此刻显示的文字，供双击取词、三击取段使用。因为跑在最后，浮层里的单元格同样可选。
+- 选区范围按行主序归一化并夹到帧内，拖到屏幕外会延伸到边缘而不是取消。
+- 尺寸变化会清空选区（旧坐标已失效），`Esc` 也会清空，但仍继续下传，不会吞掉对话框自己的 `Esc`。
+- 框架**不碰剪贴板**：拖拽结束时抽出的文本被放进句柄里，由应用层取走（§5.3）。
+
 ### 4.5 组件集、主题与终端
 
 - 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
+- 拖选（[`selection`](../crates/solaris-tui/src/selection.rs)）：`Selection` 记锚点 / 焦点、按 `selection_bg` / `selection_fg` 给单元格上色、抽取文本；`Tui::selection()` 把句柄交给应用层。
 - 主题（[`theme`](../crates/solaris-tui/src/theme.rs)）：`Theme` 含约二十个颜色槽位（含 build / plan 两种强调色），`Theme::NAMES = ["dark", "light"]`，未知名称回退到 dark。
 - 按键（[`keys`](../crates/solaris-tui/src/keys.rs)）：`ctrl` / `alt` / `plain_char` / `is_submit` / `is_newline` 等匹配助手、`parse_key_spec`（支持 `ctrl+k`、`alt+enter`、`f1`…）、以及 action → 按键的 `Keybindings` 表。
 - 终端生命周期（[`terminal`](../crates/solaris-tui/src/terminal.rs)）：进入 raw mode + 备用屏幕 + 鼠标捕获（Windows 上**不**开启 bracketed paste，因为 Windows Terminal 的转义序列不会被控制台后端解码为粘贴事件），并安装 panic hook —— 先恢复终端再交给原 hook，保证 panic 不会把用户留在 raw mode。`restore_terminal` 通过原子标志保证幂等。
@@ -159,7 +169,7 @@ while !quit {
 
 同一个 crate 同时提供**库**与**二进制**：库（`lib.rs`）承载全部 UI 与状态逻辑，`main.rs` 只做参数解析与装配。这样集成测试可以 `use solaris::{App, AppOptions}` 直接驱动真实技术栈。
 
-模块划分：`app`（根组件）、`state`（会话与通知）、`dialogs`（浮层对话框）、`connect`（内联向导）、`transcript`（转录渲染与缓存）、`commands`（命令注册表）、`keymap`（全局按键与页脚提示）。
+模块划分：`app`（根组件）、`state`（会话与通知）、`dialogs`（浮层对话框）、`connect`（内联向导）、`transcript`（转录渲染与缓存）、`commands`（命令注册表）、`keymap`（全局按键与页脚提示）、`clipboard`（平台剪贴板，藏在可注入的 `ClipboardWriter` 后面）。
 
 ### 5.2 启动装配（`main.rs`）
 
@@ -168,7 +178,7 @@ while !quit {
 3. 读取 `auth.json`、`companion.json`、`recent.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。
 4. 用 `MockBackend::with_delay(--chunk-delay-ms)` 构造后端（`Arc<dyn AgentBackend>`）。
 5. 若给了 `--print-config`，打印解析结果后直接返回，不进入界面。
-6. 否则：建 tokio runtime 并 `enter()`，安装 panic hook，`setup_terminal()`，建 `Tui` 与 `App`，`tui.set_root(app)`，`tui.run(&mut terminal)`，最后无论如何都 `restore_terminal()`。
+6. 否则：建 tokio runtime 并 `enter()`，安装 panic hook，`setup_terminal()`，建 `Tui` 与 `App`（四个句柄 —— `quit`、`overlay_queue`、`overlay_flag`、`selection` —— 都取自 `Tui`，外加 `system_writer()` 作剪贴板），`tui.set_root(app)`，`tui.run(&mut terminal)`，最后无论如何都 `restore_terminal()`。
 
 ### 5.3 App 的状态组成
 
@@ -177,12 +187,15 @@ while !quit {
 | 依赖与配置 | `backend: Arc<dyn AgentBackend>`、`config`、`theme` |
 | 会话 | `session: SessionState`、`transcript: TranscriptView`、`notifications: NotificationQueue` |
 | 输入 | `editor: Editor`、`keybindings`、`inline: Option<ConnectFlow>` |
-| 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag` |
+| 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag`、`selection` |
 | 跨线程通道 | `events_rx`（后端事件）、`dialog_rx` / `dialog_tx`（对话框结果）、`device_rx`（设备码授权进度） |
 | 持久化 | `auth` / `auth_path`、`buddy` / `buddy_path`、`recent` / `recent_path` |
+| 剪贴板 | `clipboard: ClipboardWriter`（`Rc<dyn Fn(&str) -> bool>`，生产环境是 `arboard`，测试注入记录器） |
 | 展示与动画 | `version`、`greeting`、`tip`、`spinner_frame`、`buddy_step` / `buddy_started`、`queued_prompts` |
 
 `SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、token、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
+
+`tick` 的第一件事，是从共享的 `selection` 句柄里取出**刚刚结束**的拖选文本并复制（[`clipboard`](../crates/solaris/src/clipboard.rs)），成功与否各发一条通知。放在 `tick` 而不是鼠标回调里，是因为拖拽期间事件可能被上层对话框吃掉，而根组件的 `tick` 每帧都会被调到。
 
 ### 5.4 输入优先级
 
@@ -295,16 +308,17 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 | 新增主题 | [`solaris-tui/src/theme.rs`](../crates/solaris-tui/src/theme.rs)：加调色板 + 登记进 `Theme::NAMES`。 |
 | 新增 UI 组件 | 在 [`solaris-tui/src/components`](../crates/solaris-tui/src/components) 实现 `Component`，并加进 `components/mod.rs` 的再导出。 |
 | 调整快捷键 | [`keymap.rs`](../crates/solaris/src/keymap.rs) 的 `default_bindings`。 |
+| 换剪贴板实现 | [`clipboard.rs`](../crates/solaris/src/clipboard.rs) 的 `system_writer`，或在构造 `AppOptions` 时替换 `clipboard` 字段（测试就是这么注入记录器的）。 |
 | 加宽/加高某个区域 | 用 `layout::split` 的 `Entry` 表达意图（`grow` / `min` / `max`），不要手算坐标。 |
 
 ---
 
 ## 7. 测试策略
 
-工作区共 **266 个测试**，分两类：
+工作区共 **291 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 102、`solaris-backend` 7、`solaris` 库 103），覆盖纯逻辑、布局、按键、渲染与状态机。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（19 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 119、`solaris-backend` 7、`solaris` 库 108），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（22 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
 cargo build --workspace --all-targets
@@ -318,4 +332,5 @@ cargo test --workspace
 - **只有 mock 后端**。没有任何 provider 客户端；`/connect` 会收集并保存凭据、也能记录当前 provider，但回答始终来自 mock。
 - **设备码授权是替身**。`spawn_device_auth` 只按固定延时发出预置事件，不联系任何授权服务器。
 - **Windows 上不启用 bracketed paste**，粘贴内容以按键事件到达（`Component::handle_paste` 不会被调用）。
+- **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，但只发一条「取不到剪贴板」的警告。
 - 伙伴素材是 claurst 十八个物种的一个子集；新增物种 = 一个 `Species` 变体 + 三帧 12 格宽的精灵图。

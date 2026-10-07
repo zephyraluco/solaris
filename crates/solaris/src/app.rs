@@ -29,6 +29,7 @@ use solaris_tui::components::welcome::{WelcomeData, WelcomeEntry};
 use solaris_tui::keys::Keybindings;
 use solaris_tui::layout::{self, Axis, Entry};
 use solaris_tui::overlay::{OverlayOptions, SizeValue};
+use solaris_tui::selection::{Selection, SelectionHandle};
 use solaris_tui::theme::Theme;
 use solaris_tui::tui::{OverlayQueue, QuitFlag};
 use solaris_tui::util::{display_width, pad_to_width, rect_contains, truncate_to_width};
@@ -40,6 +41,7 @@ use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
 
+use crate::clipboard::{ClipboardWriter, system_writer};
 use crate::commands;
 use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent};
 use crate::dialogs::{
@@ -81,6 +83,10 @@ pub struct AppOptions {
     pub quit: QuitFlag,
     pub overlay_queue: OverlayQueue,
     pub overlay_flag: Rc<Cell<bool>>,
+    /// The screen selection the framework tracks for a drag.
+    pub selection: SelectionHandle,
+    /// Where a finished selection is copied.
+    pub clipboard: ClipboardWriter,
 }
 
 impl AppOptions {
@@ -107,6 +113,8 @@ impl AppOptions {
             quit,
             overlay_queue,
             overlay_flag,
+            selection: Selection::handle(),
+            clipboard: system_writer(),
         }
     }
 }
@@ -124,6 +132,10 @@ pub struct App {
     quit: QuitFlag,
     overlay_queue: OverlayQueue,
     overlay_flag: Rc<Cell<bool>>,
+    /// The screen selection the framework tracks, shared with `Tui`.
+    selection: SelectionHandle,
+    /// Where a finished selection is copied.
+    clipboard: ClipboardWriter,
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
@@ -174,9 +186,14 @@ impl App {
             quit,
             overlay_queue,
             overlay_flag,
+            selection,
+            clipboard,
         } = options;
 
         let theme = Theme::by_name(&config.theme);
+        selection
+            .borrow_mut()
+            .set_style(theme.selection_fg, theme.selection_bg);
         let (dialog_tx, dialog_rx) = unbounded_channel();
 
         let mut editor = Editor::with_placeholder("Ask anything…  /help for commands");
@@ -195,6 +212,8 @@ impl App {
             quit,
             overlay_queue,
             overlay_flag,
+            selection,
+            clipboard,
             dialog_tx,
             dialog_rx,
             events_rx: None,
@@ -324,6 +343,22 @@ impl App {
         self.session.follow_end = false;
     }
 
+    /// Copy a selection the user just dragged out, and say so either way.
+    fn copy_selection(&mut self, text: &str) {
+        let characters = text.chars().count();
+        if characters == 0 {
+            return;
+        }
+
+        if (self.clipboard)(text) {
+            self.notifications
+                .info(format!("copied {characters} characters"));
+        } else {
+            self.notifications
+                .warning("could not reach the system clipboard");
+        }
+    }
+
     fn toggle_mode(&mut self) {
         self.config.mode = self.config.mode.next();
         self.notifications
@@ -340,6 +375,9 @@ impl App {
         self.config.theme = theme.name.clone();
         self.theme = theme;
         self.editor.set_styles(editor_styles(&self.theme));
+        self.selection
+            .borrow_mut()
+            .set_style(self.theme.selection_fg, self.theme.selection_bg);
         self.transcript.invalidate();
         if let Some(flow) = self.inline.as_mut() {
             flow.set_theme(&self.theme);
@@ -1133,6 +1171,15 @@ impl Component for App {
     fn tick(&mut self) -> bool {
         let mut dirty = false;
 
+        // A drag that finished since the last frame is waiting in the shared
+        // handle. Taking it here rather than in a mouse handler means the copy
+        // happens whoever consumed the event — the app or a dialog on top.
+        let selected = self.selection.borrow_mut().take_finalized();
+        if let Some(text) = selected {
+            self.copy_selection(&text);
+            dirty = true;
+        }
+
         // Drain backend events without holding a borrow across the handler.
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -1374,6 +1421,7 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 mod tests {
     use super::*;
     use crate::connect::DeviceAuthStatus;
+    use crossterm::event::MouseButton;
     use solaris_backend::MockBackend;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -2089,5 +2137,108 @@ mod tests {
         // Deltas were attributed to the right turn.
         assert!(app.session.turns[0].reply.contains("first"));
         assert!(app.session.turns[1].reply.contains("second"));
+    }
+
+    /// An app whose copies are recorded instead of written to the real
+    /// clipboard, plus the log they land in.
+    fn app_with_clipboard(succeeds: bool) -> (App, Rc<RefCell<Vec<String>>>) {
+        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let log = Rc::clone(&copied);
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.clipboard = Rc::new(move |text: &str| {
+            log.borrow_mut().push(text.to_string());
+            succeeds
+        });
+        (App::new(options), copied)
+    }
+
+    /// Drag the screen the way `Tui` does: draw a frame, then press, move and
+    /// release over the app's own selection handle.
+    fn drag_select(app: &mut App, area: Rect, from: (u16, u16), to: (u16, u16)) {
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+
+        let mut selection = app.selection.borrow_mut();
+        selection.set_area(area);
+        selection.highlight(&mut buf);
+        for (kind, (column, row)) in [
+            (MouseEventKind::Down(MouseButton::Left), from),
+            (MouseEventKind::Drag(MouseButton::Left), to),
+            (MouseEventKind::Up(MouseButton::Left), to),
+        ] {
+            selection.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_selection_reaches_the_clipboard() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("hello world".to_string());
+
+        // The prompt echo is the first transcript row.
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
+        app.tick();
+
+        assert_eq!(copied.borrow().as_slice(), ["› hello world".to_string()]);
+        assert!(
+            rendered_text(&mut app, 60, 12).contains("copied 13 characters"),
+            "the footer never announced the copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_press_without_a_drag_copies_nothing() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("hello world".to_string());
+
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (3, 0), (3, 0));
+        app.tick();
+
+        assert!(copied.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clipboard_that_refuses_is_reported() {
+        let (mut app, copied) = app_with_clipboard(false);
+        app.submit("hello world".to_string());
+
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
+        app.tick();
+
+        assert_eq!(copied.borrow().len(), 1, "the write was attempted");
+        assert!(
+            rendered_text(&mut app, 60, 12).contains("clipboard"),
+            "a failed copy went unreported"
+        );
+    }
+
+    #[test]
+    fn the_selection_is_painted_in_the_theme_colours() {
+        let (app, _) = app_with_clipboard(true);
+        let theme = Theme::by_name(&app.config.theme);
+
+        let style = app.selection.borrow().style();
+        assert_eq!(style.fg, Some(theme.selection_fg));
+        assert_eq!(style.bg, Some(theme.selection_bg));
+    }
+
+    #[test]
+    fn a_theme_switch_repaints_the_selection() {
+        let (mut app, _) = app_with_clipboard(true);
+        app.set_theme("light");
+
+        let style = app.selection.borrow().style();
+        assert_eq!(style.fg, Some(Theme::light().selection_fg));
+        assert_eq!(style.bg, Some(Theme::light().selection_bg));
     }
 }

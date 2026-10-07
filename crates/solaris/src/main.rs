@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use solaris::{App, AppOptions};
+use solaris::{App, AppOptions, system_writer};
 use solaris_backend::{AgentBackend, MockBackend};
 use solaris_core::{AuthStore, Companion, Config, Mode, RecentActivity, Soul, tips};
 use solaris_tui::Tui;
@@ -146,6 +146,8 @@ fn main() -> Result<()> {
         quit: tui.quit_flag(),
         overlay_queue: tui.overlay_queue(),
         overlay_flag: tui.overlay_flag(),
+        selection: tui.selection(),
+        clipboard: system_writer(),
     });
     tui.set_root(Box::new(app));
 

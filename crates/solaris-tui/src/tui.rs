@@ -5,6 +5,10 @@
 //!
 //! Input routing is deliberately single-path: while any overlay is visible it
 //! captures every key and mouse event, and only the root sees input otherwise.
+//!
+//! Selection cuts across that path rather than joining it: it observes every
+//! pointer event on the way through and paints itself over the finished frame,
+//! so any cell the app or an overlay drew can be dragged over and copied.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -12,7 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -21,6 +25,7 @@ use ratatui::widgets::{Clear, Widget};
 
 use crate::component::Component;
 use crate::overlay::{self, OverlayOptions};
+use crate::selection::{Selection, SelectionHandle};
 use crate::terminal::PiTerminal;
 use crate::util::rect_contains;
 
@@ -43,6 +48,7 @@ pub struct Tui {
     queue: OverlayQueue,
     quit: QuitFlag,
     overlay_flag: Rc<Cell<bool>>,
+    selection: SelectionHandle,
     frame: u64,
     poll_interval: Duration,
 }
@@ -62,6 +68,7 @@ impl Tui {
             queue: Rc::new(RefCell::new(Vec::new())),
             quit: Rc::new(Cell::new(false)),
             overlay_flag: Rc::new(Cell::new(false)),
+            selection: Selection::handle(),
             frame: 0,
             poll_interval: Duration::from_millis(16),
         }
@@ -88,6 +95,14 @@ impl Tui {
     /// even when the dialog is dismissed by a click outside of it.
     pub fn overlay_flag(&self) -> Rc<Cell<bool>> {
         Rc::clone(&self.overlay_flag)
+    }
+
+    /// Handle giving the application access to the screen selection.
+    ///
+    /// The driver tracks the drag and extracts the text; the application sets
+    /// the highlight colours and decides what to do with a finished selection.
+    pub fn selection(&self) -> SelectionHandle {
+        Rc::clone(&self.selection)
     }
 
     /// Ask the loop to exit after the current frame.
@@ -161,6 +176,7 @@ impl Tui {
     /// Render the root component and then every overlay, bottom to top.
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.frame = self.frame.wrapping_add(1);
+        self.selection.borrow_mut().set_area(area);
 
         // Promote overlays queued by the root since the previous frame, then
         // refresh the visibility flag the root reads to drop focus.
@@ -187,10 +203,20 @@ impl Tui {
                 entry.component.render(buf, rect);
             }
         }
+
+        // The selection paints over the finished frame, so it covers the root
+        // and every overlay, and it records what each row now says.
+        self.selection.borrow_mut().highlight(buf);
     }
 
     /// Route a key event. Overlays are modal and swallow everything.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Escape drops the highlight but still reaches the component below, so
+        // dismissing a selection never swallows a dialog's own Escape.
+        if key.code == KeyCode::Esc {
+            self.selection.borrow_mut().clear();
+        }
+
         if let Some(top) = self.overlays.last_mut() {
             let result = top.component.handle_key(key);
             if result.is_close() {
@@ -206,6 +232,11 @@ impl Tui {
 
     /// Route a mouse event. A left click outside the top overlay closes it.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // The selection watches first: it has to see the whole drag even when a
+        // component below consumes the press, and even when the press lands on
+        // an overlay.
+        self.selection.borrow_mut().handle_mouse(mouse);
+
         if let Some(top) = self.overlays.last_mut() {
             let inside = rect_contains(top.rect, mouse.column, mouse.row);
             if !inside {
