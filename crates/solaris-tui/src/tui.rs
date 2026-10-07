@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -211,12 +211,6 @@ impl Tui {
 
     /// Route a key event. Overlays are modal and swallow everything.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // Escape drops the highlight but still reaches the component below, so
-        // dismissing a selection never swallows a dialog's own Escape.
-        if key.code == KeyCode::Esc {
-            self.selection.borrow_mut().clear();
-        }
-
         if let Some(top) = self.overlays.last_mut() {
             let result = top.component.handle_key(key);
             if result.is_close() {

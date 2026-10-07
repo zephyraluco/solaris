@@ -148,10 +148,10 @@ while !quit {
 **拖选**（[`selection`](../crates/solaris-tui/src/selection.rs)）不走这条单一路径，而是横切过去：
 
 - `handle_mouse` 先让选区**观察**事件，再照常下传 —— 于是一次按下既会移动编辑器的光标，也会起一个选区；只有拖拽才把它变成真正的选择。滚轮事件选区不碰，仍由组件处理。
+- **松手不会取消选区**：释放后高亮留在原地，直到下一次按下另起一个选区、尺寸变化，或应用层主动清掉（例如 `/clear` 清空对话记录时）。框架也不会自动复制任何东西。
 - `render` 的最后一步在**画完的帧**上重刷选中单元格的颜色，并记下每一行此刻显示的文字，供双击取词、三击取段使用。因为跑在最后，浮层里的单元格同样可选。
 - 选区范围按行主序归一化并夹到帧内，拖到屏幕外会延伸到边缘而不是取消。
-- 尺寸变化会清空选区（旧坐标已失效），`Esc` 也会清空，但仍继续下传，不会吞掉对话框自己的 `Esc`。
-- 框架**不碰剪贴板**：拖拽结束时抽出的文本被放进句柄里，由应用层取走（§5.3）。
+- 抽文本由应用层发起：`Selection::selected_text()` 给出当前选区的文字。solaris 把它绑在 `Ctrl+C` 上（§5.4）。
 
 ### 4.5 组件集、主题与终端
 
@@ -195,7 +195,7 @@ while !quit {
 
 `SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、token、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
 
-`tick` 的第一件事，是从共享的 `selection` 句柄里取出**刚刚结束**的拖选文本并复制（[`clipboard`](../crates/solaris/src/clipboard.rs)），成功与否各发一条通知。放在 `tick` 而不是鼠标回调里，是因为拖拽期间事件可能被上层对话框吃掉，而根组件的 `tick` 每帧都会被调到。
+复制发生在 `handle_key`：`Ctrl+C` 命中 `quit` 绑定时，先看共享的 `selection` 句柄里有没有文本 —— 有就交给 [`clipboard`](../crates/solaris/src/clipboard.rs) 并通知结果，没有才真的退出。
 
 ### 5.4 输入优先级
 
@@ -206,6 +206,8 @@ while !quit {
 ```
 
 内联向导虽然不是浮层，但在此期间它拥有键盘 —— 例如 `Ctrl+C` 是「取消向导」而不是「退出」。
+
+全局快捷键里 `Ctrl+C` 名义上是「退出」，但只要当前**有选区**，它就改成复制选区（见 §4.4）；浮层存在时按键由浮层吃下，所以要先关掉对话框才能复制。
 
 ### 5.5 渲染管线
 
@@ -315,9 +317,9 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 ## 7. 测试策略
 
-工作区共 **291 个测试**，分两类：
+工作区共 **293 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 119、`solaris-backend` 7、`solaris` 库 108），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 121、`solaris-backend` 7、`solaris` 库 108），覆盖纯逻辑、布局、按键、渲染与状态机。
 - **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（22 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
@@ -332,5 +334,5 @@ cargo test --workspace
 - **只有 mock 后端**。没有任何 provider 客户端；`/connect` 会收集并保存凭据、也能记录当前 provider，但回答始终来自 mock。
 - **设备码授权是替身**。`spawn_device_auth` 只按固定延时发出预置事件，不联系任何授权服务器。
 - **Windows 上不启用 bracketed paste**，粘贴内容以按键事件到达（`Component::handle_paste` 不会被调用）。
-- **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，但只发一条「取不到剪贴板」的警告。
+- **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，只是 `Ctrl+C` 会发一条「取不到剪贴板」的警告。
 - 伙伴素材是 claurst 十八个物种的一个子集；新增物种 = 一个 `Species` 变体 + 三帧 12 格宽的精灵图。

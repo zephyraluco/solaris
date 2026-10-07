@@ -2,13 +2,14 @@
 //!
 //! The framework owns selection the way it owns the overlay stack: pointer
 //! events move an anchor and a focus, and a post-render pass inverts every cell
-//! between them and extracts its text. The design follows claurst's transcript
+//! between them and keeps their text. The design follows claurst's transcript
 //! selection with the area restriction lifted — every cell of the frame is fair
 //! game, so dragging over any component selects what it drew.
 //!
-//! The framework never touches the clipboard. When a drag ends the extracted
-//! text is parked for the application via [`Selection::take_finalized`], which
-//! decides whether to copy it and what to tell the user.
+//! A selection is not a transient gesture. Releasing the button leaves the
+//! range on screen until something replaces it, and the framework never copies
+//! anything on its own: the application calls [`Selection::selected_text`] when
+//! the user asks for the text.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -45,8 +46,6 @@ pub struct Selection {
     style: Style,
     /// Rendered text of every row in `area`, snapshotted after each frame.
     rows: Vec<String>,
-    /// Text of a finished selection, waiting for the application to take it.
-    finalized: Option<String>,
     click_cell: Option<Point>,
     click_at: Option<Instant>,
     click_count: u8,
@@ -67,7 +66,6 @@ impl Selection {
             area: Rect::default(),
             style: Style::default().add_modifier(Modifier::REVERSED),
             rows: Vec::new(),
-            finalized: None,
             click_cell: None,
             click_at: None,
             click_count: 0,
@@ -136,14 +134,6 @@ impl Selection {
         out.trim_end().to_string()
     }
 
-    /// Take the text of a selection that just finished, if any.
-    ///
-    /// A drag that selected nothing — a plain click, or a range of blanks —
-    /// never reaches here.
-    pub fn take_finalized(&mut self) -> Option<String> {
-        self.finalized.take()
-    }
-
     /// Observe a pointer event, returning whether the highlight changed.
     ///
     /// The selection sees every event, whether or not a component underneath
@@ -184,18 +174,10 @@ impl Selection {
                 self.click_count = 0;
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.anchor.is_none() {
-                    return false;
-                }
-                let text = self.selected_text();
-                if text.is_empty() {
-                    self.clear();
-                } else {
-                    self.finalized = Some(text);
-                }
-                true
-            }
+            // Releasing keeps the range: the highlight stays on screen until a
+            // new press replaces it, the frame resizes, or the application
+            // clears it. Nothing is copied here — that is the user's move.
+            MouseEventKind::Up(MouseButton::Left) => false,
             _ => false,
         }
     }
@@ -487,17 +469,30 @@ mod tests {
         selection.handle_mouse(down(0, 0));
         selection.handle_mouse(drag_to(4, 1));
 
-        assert!(selection.is_active());
-        assert_eq!(
-            selection.take_finalized(),
-            None,
-            "nothing is handed over until the button is released"
-        );
+        assert_eq!(selection.selected_text(), "hello world\nsecon");
+    }
 
-        selection.handle_mouse(up(4, 1));
-        assert_eq!(selection.take_finalized().unwrap(), "hello world\nsecon");
-        // The handover is one-shot.
-        assert_eq!(selection.take_finalized(), None);
+    #[test]
+    fn the_selection_outlives_the_release() {
+        let (mut selection, mut buf) = selection_with(&["hello world"]);
+        swipe(&mut selection, (0, 0), (4, 0));
+        selection.highlight(&mut buf);
+
+        assert!(selection.is_active(), "releasing must not cancel it");
+        assert_eq!(selection.selected_text(), "hello");
+        assert_eq!(buf[(1, 0)].bg, Color::White, "still highlighted");
+    }
+
+    #[test]
+    fn a_new_press_replaces_the_selection() {
+        let (mut selection, _) = selection_with(&["hello world"]);
+        swipe(&mut selection, (0, 0), (4, 0));
+        assert!(selection.is_active());
+
+        selection.handle_mouse(down(8, 0));
+        assert_eq!(selection.selected_text(), "");
+        selection.handle_mouse(up(8, 0));
+        assert_eq!(selection.selected_text(), "");
     }
 
     #[test]
@@ -505,7 +500,7 @@ mod tests {
         let (mut selection, _) = selection_with(&["ab", "", "cd"]);
         swipe(&mut selection, (0, 0), (19, 2));
 
-        assert_eq!(selection.take_finalized().unwrap(), "ab\n\ncd");
+        assert_eq!(selection.selected_text(), "ab\n\ncd");
     }
 
     #[test]
@@ -516,7 +511,7 @@ mod tests {
 
         selection.handle_mouse(up(3, 0));
         assert!(!selection.is_active());
-        assert_eq!(selection.take_finalized(), None);
+        assert_eq!(selection.selected_text(), "");
     }
 
     #[test]
@@ -524,10 +519,7 @@ mod tests {
         let (mut selection, _) = selection_with(&["hello world", "second line"]);
         swipe(&mut selection, (0, 0), (500, 500));
 
-        assert_eq!(
-            selection.take_finalized().unwrap(),
-            "hello world\nsecond line"
-        );
+        assert_eq!(selection.selected_text(), "hello world\nsecond line");
     }
 
     #[test]
@@ -536,7 +528,7 @@ mod tests {
         swipe(&mut selection, (50, 50), (3, 0));
 
         assert!(!selection.is_active());
-        assert_eq!(selection.take_finalized(), None);
+        assert_eq!(selection.selected_text(), "");
     }
 
     #[test]
@@ -548,7 +540,7 @@ mod tests {
         }
 
         assert!(selection.is_active());
-        assert_eq!(selection.take_finalized().unwrap(), "world");
+        assert_eq!(selection.selected_text(), "world");
     }
 
     #[test]
@@ -559,7 +551,7 @@ mod tests {
             selection.handle_mouse(up(1, 1));
         }
 
-        assert_eq!(selection.take_finalized().unwrap(), "one two\nthree four");
+        assert_eq!(selection.selected_text(), "one two\nthree four");
     }
 
     #[test]
@@ -622,7 +614,7 @@ mod tests {
         let (mut selection, _) = selection_with(&["中文字"]);
         swipe(&mut selection, (0, 0), (5, 0));
 
-        assert_eq!(selection.take_finalized().unwrap(), "中文字");
+        assert_eq!(selection.selected_text(), "中文字");
     }
 
     #[test]
@@ -635,7 +627,7 @@ mod tests {
             selection.handle_mouse(up(1, 0));
         }
 
-        assert_eq!(selection.take_finalized().unwrap(), "hello");
+        assert_eq!(selection.selected_text(), "hello");
     }
 
     #[test]
@@ -647,16 +639,16 @@ mod tests {
             selection.handle_mouse(up(3, 0));
         }
 
-        assert_eq!(selection.take_finalized().unwrap(), "中文");
+        assert_eq!(selection.selected_text(), "中文");
     }
 
     #[test]
-    fn a_selection_of_blanks_is_not_handed_over() {
+    fn a_selection_of_blanks_has_no_text() {
         let (mut selection, _) = selection_with(&["hello", "", ""]);
         swipe(&mut selection, (0, 1), (5, 2));
 
-        assert_eq!(selection.take_finalized(), None);
-        assert!(!selection.is_active());
+        assert!(selection.is_active(), "the range is still there");
+        assert_eq!(selection.selected_text(), "");
     }
 
     #[test]

@@ -343,7 +343,7 @@ impl App {
         self.session.follow_end = false;
     }
 
-    /// Copy a selection the user just dragged out, and say so either way.
+    /// Copy the current selection to the system clipboard, saying so either way.
     fn copy_selection(&mut self, text: &str) {
         let characters = text.chars().count();
         if characters == 0 {
@@ -551,6 +551,8 @@ impl App {
                 self.session.scroll = 0;
                 self.session.follow_end = true;
                 self.session.bump();
+                // The highlight points at rows that no longer exist.
+                self.selection.borrow_mut().clear();
                 self.notifications.info("transcript cleared");
             }
             DialogMessage::Confirm {
@@ -1117,7 +1119,14 @@ impl Component for App {
         }
 
         if self.keybindings.matches("quit", &key) {
-            self.quit.set(true);
+            // Ctrl+C is the copy gesture while something is selected, and only
+            // quits when there is nothing to take.
+            let selected = self.selection.borrow().selected_text();
+            if selected.is_empty() {
+                self.quit.set(true);
+            } else {
+                self.copy_selection(&selected);
+            }
             return KeyResult::Handled;
         }
 
@@ -1170,15 +1179,6 @@ impl Component for App {
 
     fn tick(&mut self) -> bool {
         let mut dirty = false;
-
-        // A drag that finished since the last frame is waiting in the shared
-        // handle. Taking it here rather than in a mouse handler means the copy
-        // happens whoever consumed the event — the app or a dialog on top.
-        let selected = self.selection.borrow_mut().take_finalized();
-        if let Some(text) = selected {
-            self.copy_selection(&text);
-            dirty = true;
-        }
 
         // Drain backend events without holding a borrow across the handler.
         let mut events = Vec::new();
@@ -2181,7 +2181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_finished_selection_reaches_the_clipboard() {
+    async fn ctrl_c_copies_what_was_dragged() {
         let (mut app, copied) = app_with_clipboard(true);
         app.submit("hello world".to_string());
 
@@ -2189,7 +2189,19 @@ mod tests {
         drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
         app.tick();
 
+        assert!(
+            copied.borrow().is_empty(),
+            "a drag must not copy anything by itself"
+        );
+        assert!(
+            app.selection.borrow().is_active(),
+            "the selection outlives the release"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
         assert_eq!(copied.borrow().as_slice(), ["› hello world".to_string()]);
+        assert!(!app.quit.get(), "copying a selection must not quit");
         assert!(
             rendered_text(&mut app, 60, 12).contains("copied 13 characters"),
             "the footer never announced the copy"
@@ -2197,13 +2209,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_press_without_a_drag_copies_nothing() {
+    async fn ctrl_c_still_quits_when_nothing_is_selected() {
         let (mut app, copied) = app_with_clipboard(true);
         app.submit("hello world".to_string());
 
+        // A press-and-release in one cell is not a selection.
         drag_select(&mut app, Rect::new(0, 0, 60, 12), (3, 0), (3, 0));
-        app.tick();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
+        assert!(app.quit.get());
         assert!(copied.borrow().is_empty());
     }
 
@@ -2213,7 +2227,7 @@ mod tests {
         app.submit("hello world".to_string());
 
         drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
-        app.tick();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert_eq!(copied.borrow().len(), 1, "the write was attempted");
         assert!(

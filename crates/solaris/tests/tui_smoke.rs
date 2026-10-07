@@ -380,7 +380,7 @@ async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
 }
 
 #[tokio::test]
-async fn dragging_the_footer_copies_what_it_shows() {
+async fn dragging_the_footer_then_ctrl_c_copies_what_it_shows() {
     let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let log = Rc::clone(&copied);
     let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
@@ -409,16 +409,27 @@ async fn dragging_the_footer_copies_what_it_shows() {
     harness.mouse(MouseEventKind::Up(MouseButton::Left), 14, FOOTER);
     harness.tui.tick();
 
+    assert!(
+        copied.borrow().is_empty(),
+        "dragging copied to the clipboard by itself"
+    );
+
+    let quit = harness.tui.quit_flag();
+    harness.ctrl('c');
+    harness.tui.tick();
+
     assert_eq!(copied.borrow().as_slice(), [expected]);
+    assert!(!quit.get(), "copying a selection quit the app");
 }
 
 #[tokio::test]
-async fn the_dragged_range_is_highlighted_until_it_is_dismissed() {
+async fn the_dragged_range_stays_highlighted_after_the_release() {
     let mut harness = Harness::new();
     let _ = harness.draw();
 
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 1, FOOTER);
     harness.mouse(MouseEventKind::Drag(MouseButton::Left), 6, FOOTER);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 6, FOOTER);
     let _ = harness.draw();
 
     let highlight = Theme::dark().selection_bg;
@@ -429,8 +440,8 @@ async fn the_dragged_range_is_highlighted_until_it_is_dismissed() {
     assert_ne!(buffer[(0, FOOTER)].bg, highlight, "before the anchor");
     assert_ne!(buffer[(7, FOOTER)].bg, highlight, "after the focus");
 
-    // Escape drops the highlight but still reaches whatever is below it.
-    harness.key(KeyCode::Esc);
+    // A press somewhere else starts a new range, so the old one goes away.
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 20, FOOTER);
     let _ = harness.draw();
     let buffer = harness.terminal.backend().buffer();
     assert_ne!(buffer[(1, FOOTER)].bg, highlight);
@@ -438,14 +449,9 @@ async fn the_dragged_range_is_highlighted_until_it_is_dismissed() {
 
 #[tokio::test]
 async fn cells_inside_a_dialog_are_selectable_too() {
-    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let log = Rc::clone(&copied);
-    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
-        log.borrow_mut().push(text.to_string());
-        true
-    }));
-
+    let mut harness = Harness::new();
     harness.key(KeyCode::F(1));
+
     let frame = harness.draw();
     let row = frame
         .lines()
@@ -453,15 +459,23 @@ async fn cells_inside_a_dialog_are_selectable_too() {
         .expect("the help dialog never opened") as u16;
 
     // "Keyboard" is the dialog's first content line, one cell in from its left
-    // edge — so this drag must take the dialog's cells and not the welcome box
-    // showing through beside it.
+    // edge — so this drag has to take the dialog's own cells, not the welcome
+    // box showing through beside it.
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 13, row);
     harness.mouse(MouseEventKind::Drag(MouseButton::Left), 30, row);
-    let _ = harness.draw();
     harness.mouse(MouseEventKind::Up(MouseButton::Left), 30, row);
-    harness.tui.tick();
+    let _ = harness.draw();
 
-    assert_eq!(copied.borrow().as_slice(), ["Keyboard".to_string()]);
+    let highlight = Theme::dark().selection_bg;
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(buffer[(13, row)].bg, highlight, "inside the dialog");
+    assert_eq!(buffer[(20, row)].bg, highlight, "inside the dialog");
+    assert_ne!(buffer[(12, row)].bg, highlight, "outside the dialog");
+
+    // Escape closes the dialog without taking the selection with it.
+    harness.key(KeyCode::Esc);
+    let _ = harness.draw();
+    assert_eq!(harness.terminal.backend().buffer()[(20, row)].bg, highlight);
 }
 
 #[tokio::test]
