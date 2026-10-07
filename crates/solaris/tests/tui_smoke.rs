@@ -490,6 +490,77 @@ async fn mode_toggle_repaints_the_footer() {
 }
 
 #[tokio::test]
+async fn a_single_cell_drag_copies_that_cell() {
+    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&copied);
+    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
+        log.borrow_mut().push(text.to_string());
+        true
+    }));
+
+    // The footer opens with a space, so its second cell holds the first
+    // character of the model name whatever else is on screen.
+    let frame = harness.draw();
+    let expected: String = frame
+        .lines()
+        .nth(FOOTER as usize)
+        .expect("a footer row")
+        .chars()
+        .nth(1)
+        .expect("a footer cell")
+        .to_string();
+    assert_ne!(expected, " ", "the footer moved");
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 1, FOOTER);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 1, FOOTER);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 1, FOOTER);
+    let _ = harness.draw();
+
+    let quit = harness.tui.quit_flag();
+    harness.ctrl('c');
+    harness.tui.tick();
+
+    assert_eq!(copied.borrow().as_slice(), [expected]);
+    assert!(!quit.get(), "a one-cell selection asked to quit");
+}
+
+#[tokio::test]
+async fn a_drag_over_blank_cells_copies_the_blanks() {
+    let copied: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let log = Rc::clone(&copied);
+    let mut harness = Harness::with_clipboard(Rc::new(move |text: &str| {
+        log.borrow_mut().push(text.to_string());
+        true
+    }));
+
+    // Take a run of blank cells from the footer row, wherever this layout
+    // keeps them, so the drag does not depend on the footer's wording.
+    let frame = harness.draw();
+    let footer: Vec<char> = frame
+        .lines()
+        .nth(FOOTER as usize)
+        .expect("a footer row")
+        .chars()
+        .collect();
+    let column = (0..footer.len() - 10)
+        .find(|start| footer[*start..*start + 10].iter().all(|cell| *cell == ' '))
+        .expect("the footer has no blank run") as u16;
+    let last = column + 9;
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, FOOTER);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), last, FOOTER);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), last, FOOTER);
+    let _ = harness.draw();
+
+    let quit = harness.tui.quit_flag();
+    harness.ctrl('c');
+    harness.tui.tick();
+
+    assert_eq!(copied.borrow().as_slice(), [" ".repeat(10)]);
+    assert!(!quit.get(), "a blank selection asked to quit");
+}
+
+#[tokio::test]
 async fn two_ctrl_c_presses_quit_while_one_only_asks() {
     let mut harness = Harness::new();
     let quit = harness.tui.quit_flag();

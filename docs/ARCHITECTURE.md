@@ -148,10 +148,11 @@ while !quit {
 **拖选**（[`selection`](../crates/solaris-tui/src/selection.rs)）不走这条单一路径，而是横切过去：
 
 - `handle_mouse` 先让选区**观察**事件，再照常下传 —— 于是一次按下既会移动编辑器的光标，也会起一个选区；只有拖拽才把它变成真正的选择。滚轮事件选区不碰，仍由组件处理。
+- **一个单元格也算选区**：只要这次按下变成过拖拽（或双击取词、三击取段），单格范围就会高亮、也能复制。单纯按一下（没有拖拽）不选中任何东西 —— 它只是点击，编辑器要用它移动光标，claurst 也是这么丢弃的。
 - **松手不会取消选区**：释放后高亮留在原地，直到下一次按下另起一个选区、尺寸变化，或应用层主动清掉（例如 `/clear` 清空对话记录时）。框架也不会自动复制任何东西。
 - `render` 的最后一步在**画完的帧**上重刷选中单元格的颜色，并记下每一行此刻显示的文字，供双击取词、三击取段使用。因为跑在最后，浮层里的单元格同样可选。
 - 选区范围按行主序归一化并夹到帧内，拖到屏幕外会延伸到边缘而不是取消。
-- 抽文本由应用层发起：`Selection::selected_text()` 给出当前选区的文字。solaris 把它绑在 `Ctrl+C` 上（§5.4）。
+- 抽文本由应用层发起：`Selection::selected_text()` 给出当前选区的文字（按行去掉尾随空白；整块都是空白的选区则原样保留，所以缩进也能复制）。solaris 把它绑在 `Ctrl+C` 上，而且**只要有选区就复制** —— 空白选区不会掉进「清空输入框 / 退出」那一档（§5.4）。
 
 ### 4.5 组件集、主题与终端
 
@@ -327,10 +328,10 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 ## 7. 测试策略
 
-工作区共 **299 个测试**，分两类：
+工作区共 **306 个测试**，分两类：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 121、`solaris-backend` 7、`solaris` 库 113），覆盖纯逻辑、布局、按键、渲染与状态机。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（23 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
+- **单元测试**贴着被测代码放在各模块内（`solaris-core` 35、`solaris-tui` 124、`solaris-backend` 7、`solaris` 库 115），覆盖纯逻辑、布局、按键、渲染与状态机。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（25 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + mock 后端），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。
 
 ```bash
 cargo build --workspace --all-targets

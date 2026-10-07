@@ -358,8 +358,11 @@ impl App {
         }
 
         if (self.clipboard)(text) {
+            // One cell is an ordinary case now, so the count has to read
+            // correctly for it too.
+            let plural = if characters == 1 { "" } else { "s" };
             self.notifications
-                .info(format!("copied {characters} characters"));
+                .info(format!("copied {characters} character{plural}"));
         } else {
             self.notifications
                 .warning("could not reach the system clipboard");
@@ -373,8 +376,11 @@ impl App {
     /// `ctrl+c` to a copy action, Claude Code and claurst interrupt first, and
     /// only a key with nothing left to do asks about quitting.
     fn interrupt(&mut self) {
-        let selected = self.selection.borrow().selected_text();
-        if !selected.is_empty() {
+        // A drawn range copies even when it holds nothing but blanks, and it
+        // must never fall through to clearing the prompt or asking to quit.
+        let has_selection = self.selection.borrow().is_active();
+        if has_selection {
+            let selected = self.selection.borrow().selected_text();
             self.copy_selection(&selected);
             return;
         }
@@ -2304,27 +2310,37 @@ mod tests {
         (App::new(options), copied)
     }
 
-    /// Drag the screen the way `Tui` does: draw a frame, then press, move and
-    /// release over the app's own selection handle.
-    fn drag_select(app: &mut App, area: Rect, from: (u16, u16), to: (u16, u16)) {
+    /// Drive the app's own selection handle the way `Tui` does: draw a frame,
+    /// then replay a pointer gesture over it.
+    fn gesture(app: &mut App, area: Rect, steps: &[(MouseEventKind, (u16, u16))]) {
         let mut buf = Buffer::empty(area);
         app.render(&mut buf, area);
 
         let mut selection = app.selection.borrow_mut();
         selection.set_area(area);
         selection.highlight(&mut buf);
-        for (kind, (column, row)) in [
-            (MouseEventKind::Down(MouseButton::Left), from),
-            (MouseEventKind::Drag(MouseButton::Left), to),
-            (MouseEventKind::Up(MouseButton::Left), to),
-        ] {
-            selection.handle_mouse(MouseEvent {
-                kind,
-                column,
-                row,
+        for (kind, (column, row)) in steps {
+            let event = MouseEvent {
+                kind: *kind,
+                column: *column,
+                row: *row,
                 modifiers: KeyModifiers::empty(),
-            });
+            };
+            selection.handle_mouse(event);
         }
+    }
+
+    /// Press, drag, release — the gesture behind a mouse selection.
+    fn drag_select(app: &mut App, area: Rect, from: (u16, u16), to: (u16, u16)) {
+        gesture(
+            app,
+            area,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), from),
+                (MouseEventKind::Drag(MouseButton::Left), to),
+                (MouseEventKind::Up(MouseButton::Left), to),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -2356,13 +2372,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_cell_drag_copies_that_cell() {
+        let (mut app, copied) = app_with_clipboard(true);
+        let area = Rect::new(0, 0, 60, 12);
+
+        // The footer opens with a space, so its second cell holds the first
+        // character of the model name.
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+        let row = area.height - 1;
+        let expected = buf[(1, row)].symbol().to_string();
+        assert_ne!(expected, " ", "the footer moved");
+
+        // Press, drag and release without ever leaving the cell.
+        drag_select(&mut app, area, (1, row), (1, row));
+        assert!(app.selection.borrow().is_active());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().as_slice(), [expected]);
+        assert!(!app.quit.get(), "a one-cell selection asked to quit");
+    }
+
+    #[tokio::test]
+    async fn a_blank_selection_is_copied_like_any_other() {
+        let (mut app, copied) = app_with_clipboard(true);
+        let area = Rect::new(0, 0, 60, 12);
+
+        // Drag over a run of blank cells — wherever this layout keeps them —
+        // so the test says nothing about what is on screen.
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+        let blank_run = |row: u16| {
+            (0..area.width - 4)
+                .find(|start| (*start..*start + 5).all(|x| buf[(x, row)].symbol() == " "))
+        };
+        let (row, column) = (0..area.height - 1)
+            .find_map(|row| blank_run(row).map(|column| (row, column)))
+            .expect("the frame has no blank run to drag over");
+
+        drag_select(&mut app, area, (column, row), (column + 4, row));
+        assert!(app.selection.borrow().is_active());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().as_slice(), [" ".repeat(5)]);
+        assert!(!app.quit.get(), "a blank selection asked to quit");
+        assert!(
+            app.quit_press.is_none(),
+            "a blank selection armed the quit sequence"
+        );
+    }
+
+    #[tokio::test]
     async fn a_press_without_a_drag_is_not_a_copy() {
         let (mut app, copied) = app_with_clipboard(true);
         app.submit("hello world".to_string());
 
-        // A press-and-release in one cell is not a selection.
-        drag_select(&mut app, Rect::new(0, 0, 60, 12), (3, 0), (3, 0));
-        assert!(copied.borrow().is_empty());
+        // A press and release with no drag in between is a click: it moves the
+        // editor's caret and selects nothing.
+        let area = Rect::new(0, 0, 60, 12);
+        gesture(
+            &mut app,
+            area,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), (3, 0)),
+                (MouseEventKind::Up(MouseButton::Left), (3, 0)),
+            ],
+        );
+        assert!(!app.selection.borrow().is_active());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(copied.borrow().is_empty(), "there was nothing to copy");

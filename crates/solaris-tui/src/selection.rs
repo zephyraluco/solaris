@@ -40,6 +40,12 @@ const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
 pub struct Selection {
     anchor: Option<Point>,
     focus: Option<Point>,
+    /// Whether the press in progress became a drag, or a word/paragraph pick.
+    ///
+    /// A bare press selects nothing at all — it is a click, and the editor
+    /// wants the caret from it — but one cell is a legitimate range once the
+    /// pointer has been dragged over it.
+    marked: bool,
     /// The frame the pointer coordinates refer to, set by the render pass.
     area: Rect,
     /// Style painted over selected cells.
@@ -63,6 +69,7 @@ impl Selection {
         Self {
             anchor: None,
             focus: None,
+            marked: false,
             area: Rect::default(),
             style: Style::default().add_modifier(Modifier::REVERSED),
             rows: Vec::new(),
@@ -105,33 +112,55 @@ impl Selection {
     pub fn clear(&mut self) {
         self.anchor = None;
         self.focus = None;
+        self.marked = false;
     }
 
     /// Whether a range is currently highlighted.
+    ///
+    /// One cell counts once it has been marked by a drag or a word pick. A bare
+    /// press is a click — it only moves the editor's caret — which is also the
+    /// press claurst throws away.
     pub fn is_active(&self) -> bool {
-        self.bounds().is_some_and(|(start, end)| start != end)
+        self.bounds()
+            .is_some_and(|(start, end)| start != end || self.marked)
     }
 
     /// The text of the current selection, read from the last rendered frame.
+    ///
+    /// One cell is as good as many: a range the user marked by dragging, or a
+    /// word picked with a double click, hands back its text either way.
+    ///
+    /// Trailing blanks are dropped, so a drag across a paragraph copies its
+    /// words rather than the padding to the right of them. A range that holds
+    /// nothing *but* blanks keeps them: it is still a range the user drew, and
+    /// an indentation block is worth copying.
     pub fn selected_text(&self) -> String {
         let Some((start, end)) = self.bounds() else {
             return String::new();
         };
-        if start == end {
+        if !self.is_active() {
             return String::new();
         }
 
-        let mut out = String::new();
-        for row in start.1..=end.1 {
-            if row > start.1 {
-                out.push('\n');
-            }
-            let from = if row == start.1 { start.0 } else { self.area.x };
-            let to = if row == end.1 { end.0 } else { self.right() };
-            out.push_str(self.row_slice(row, from, to).trim_end());
+        let lines: Vec<String> = (start.1..=end.1)
+            .map(|row| {
+                let from = if row == start.1 { start.0 } else { self.area.x };
+                let to = if row == end.1 { end.0 } else { self.right() };
+                self.row_slice(row, from, to)
+            })
+            .collect();
+
+        let trimmed = lines
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = trimmed.trim_end();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
 
-        out.trim_end().to_string()
+        lines.join("\n")
     }
 
     /// Observe a pointer event, returning whether the highlight changed.
@@ -151,9 +180,18 @@ impl Selection {
                     self.clear();
                     return had;
                 }
+                self.marked = false;
                 match self.escalate(point) {
-                    2 => self.select_word(point),
-                    3 => self.select_paragraph(point),
+                    // A word or a paragraph is a deliberate pick even when it
+                    // is one cell wide, so those count as a marked range.
+                    2 => {
+                        self.select_word(point);
+                        self.marked = true;
+                    }
+                    3 => {
+                        self.select_paragraph(point);
+                        self.marked = true;
+                    }
                     _ => {
                         self.anchor = Some(point);
                         self.focus = Some(point);
@@ -165,9 +203,14 @@ impl Selection {
                 if self.anchor.is_none() {
                     return false;
                 }
+                // A drag that never leaves its cell still marks it: the
+                // smallest selection is one cell, not two.
+                let marked = !self.marked;
+                self.marked = true;
+
                 let point = self.clamp(point);
                 if self.focus == Some(point) {
-                    return false;
+                    return marked;
                 }
                 self.focus = Some(point);
                 // A drag is no longer part of a click sequence.
@@ -190,7 +233,7 @@ impl Selection {
         let Some((start, end)) = self.bounds() else {
             return;
         };
-        if start == end {
+        if !self.is_active() {
             return;
         }
 
@@ -504,6 +547,39 @@ mod tests {
     }
 
     #[test]
+    fn a_single_cell_drag_selects_that_cell() {
+        let (mut selection, mut buf) = selection_with(&["hello"]);
+        swipe(&mut selection, (1, 0), (1, 0));
+
+        assert!(selection.is_active(), "one cell is a range too");
+        assert_eq!(selection.selected_text(), "e");
+
+        selection.highlight(&mut buf);
+        assert_eq!(buf[(1, 0)].bg, Color::White, "the one cell is painted");
+        assert_ne!(buf[(0, 0)].bg, Color::White);
+        assert_ne!(buf[(2, 0)].bg, Color::White);
+    }
+
+    #[test]
+    fn a_single_blank_cell_drag_copies_its_blank() {
+        let (mut selection, _) = selection_with(&["a b"]);
+        swipe(&mut selection, (1, 0), (1, 0));
+
+        assert_eq!(selection.selected_text(), " ");
+    }
+
+    #[test]
+    fn a_double_click_on_a_single_character_takes_it() {
+        let (mut selection, _) = selection_with(&["a b"]);
+        for _ in 0..2 {
+            selection.handle_mouse(down(0, 0));
+            selection.handle_mouse(up(0, 0));
+        }
+
+        assert_eq!(selection.selected_text(), "a");
+    }
+
+    #[test]
     fn a_press_alone_selects_nothing() {
         let (mut selection, _) = selection_with(&["hello world"]);
         selection.handle_mouse(down(3, 0));
@@ -643,12 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_of_blanks_has_no_text() {
+    fn a_selection_of_blanks_keeps_them() {
         let (mut selection, _) = selection_with(&["hello", "", ""]);
-        swipe(&mut selection, (0, 1), (5, 2));
+        swipe(&mut selection, (1, 1), (4, 1));
 
         assert!(selection.is_active(), "the range is still there");
-        assert_eq!(selection.selected_text(), "");
+        assert_eq!(selection.selected_text(), "    ");
     }
 
     #[test]
