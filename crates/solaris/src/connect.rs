@@ -19,7 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_provider::mask_secret;
-use solaris_provider::{PROVIDERS, ProviderSpec};
+use solaris_provider::PROVIDERS;
 use solaris_tui::components::inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};
 use solaris_tui::components::select_list::SelectItem;
 use solaris_tui::theme::Theme;
@@ -825,11 +825,6 @@ fn plain_text_key(key: &KeyEvent) -> bool {
 
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     solaris_tui::util::rect_contains(rect, x, y)
-}
-
-/// Look up the catalogue entry a provider id belongs to.
-pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
-    solaris_provider::provider(id)
 }
 
 #[cfg(test)]

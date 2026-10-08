@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 use solaris::{App, AppOptions, BackendFactory, Clipboard};
 use solaris_core::{Companion, Config, Mode, RecentActivity, Soul, tips};
-use solaris_provider::{AuthStore, context_window_for, provider};
+use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tools::{ToolRegistry, ToolSelection};
 use solaris_tui::Tui;
@@ -90,7 +90,7 @@ fn main() -> Result<()> {
 
     // `--provider` moves this run without rewriting the saved choice.
     if let Some(id) = &args.provider {
-        if provider(id).is_none() {
+        if provider_spec(id).is_none() {
             anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
         }
         auth.activate(id.clone());

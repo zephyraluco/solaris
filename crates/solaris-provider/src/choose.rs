@@ -14,7 +14,9 @@ use std::sync::Arc;
 use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan, Wire};
 use solaris_core::{BackendError, TurnRequest};
 
-use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, max_output_for, price_for, provider};
+use crate::providers::{
+    AuthKind, PROVIDERS, ProviderSpec, max_output_for, price_for, provider_spec,
+};
 use crate::{AuthStore, Credential};
 
 /// The backend that stands in while nothing is connected.
@@ -368,7 +370,7 @@ pub fn build_backend(
 /// is already in the environment — so `ANTHROPIC_API_KEY=… solaris` works with
 /// no setup at all.
 fn active_provider(auth: &AuthStore, lookup: EnvLookup<'_>) -> Option<&'static ProviderSpec> {
-    if let Some(spec) = auth.active_provider().and_then(provider) {
+    if let Some(spec) = auth.active_provider().and_then(provider_spec) {
         return Some(spec);
     }
     PROVIDERS

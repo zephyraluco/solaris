@@ -22,7 +22,7 @@ pub use solaris_backend::Wire;
 
 pub use providers::{
     AuthKind, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelSpec, PROVIDERS, ProviderSpec,
-    context_window_for, max_output_for, model_spec, models, price_for, provider,
+    context_window_for, max_output_for, model_spec, models, price_for, provider_spec,
 };
 
 use std::collections::BTreeMap;

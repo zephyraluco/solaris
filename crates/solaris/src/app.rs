@@ -1092,7 +1092,7 @@ impl App {
     /// context windows for the models we ship while leaving a gateway's own
     /// list intact. With nothing reported, the catalogue is the whole answer.
     fn model_choices(&self) -> Vec<SelectItem> {
-        let catalogue = self.provider_id.and_then(solaris_provider::provider);
+        let catalogue = self.provider_id.and_then(solaris_provider::provider_spec);
 
         if self.discovered.is_empty() {
             return catalogue
@@ -1228,7 +1228,7 @@ impl App {
 
     /// Route a picked provider to the step its auth kind needs.
     fn begin_provider_setup(&mut self, provider_id: &str, name: &str) {
-        let Some(spec) = solaris_provider::provider(provider_id) else {
+        let Some(spec) = solaris_provider::provider_spec(provider_id) else {
             self.notifications
                 .error(format!("unknown provider {provider_id}"));
             self.close_inline();
@@ -1331,7 +1331,7 @@ impl App {
         // answer lands. With nothing to offer and nothing on its way there is no
         // step to take, so the wizard closes rather than parking the user on an
         // empty screen.
-        let models: Vec<SelectItem> = solaris_provider::provider(&provider_id)
+        let models: Vec<SelectItem> = solaris_provider::provider_spec(&provider_id)
             .map(|spec| {
                 spec.models
                     .iter()
@@ -2644,7 +2644,7 @@ mod tests {
     #[test]
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
-        let names: Vec<&str> = solaris_provider::provider("anthropic")
+        let names: Vec<&str> = solaris_provider::provider_spec("anthropic")
             .expect("a known provider")
             .models
             .iter()

@@ -275,7 +275,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
 ];
 
 /// Look up a provider by id.
-pub fn provider(id: &str) -> Option<&'static ProviderSpec> {
+pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|spec| spec.id == id)
 }
 
@@ -331,9 +331,12 @@ mod tests {
         assert_eq!(ids.len(), count, "duplicate provider id");
 
         for spec in PROVIDERS {
-            assert_eq!(provider(spec.id).map(|found| found.name), Some(spec.name));
+            assert_eq!(
+                provider_spec(spec.id).map(|found| found.name),
+                Some(spec.name)
+            );
         }
-        assert!(provider("nope").is_none());
+        assert!(provider_spec("nope").is_none());
     }
 
     #[test]
@@ -404,7 +407,7 @@ mod tests {
     #[test]
     fn only_openai_itself_leaves_the_compatibility_floor() {
         assert_eq!(
-            provider("openai").expect("a known provider").wire,
+            provider_spec("openai").expect("a known provider").wire,
             Wire::OpenAiResponses
         );
 
@@ -412,7 +415,7 @@ mod tests {
         // every other compatible upstream stays on the floor.
         for id in ["new-api", "openrouter", "google", "local", "custom"] {
             assert_eq!(
-                provider(id).expect("a known provider").wire,
+                provider_spec(id).expect("a known provider").wire,
                 Wire::OpenAiChat,
                 "{id} should speak chat completions"
             );
@@ -421,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_gateway_collects_its_own_endpoint() {
-        let gateway = provider("new-api").expect("a known provider");
+        let gateway = provider_spec("new-api").expect("a known provider");
 
         // A self-hosted gateway has no address in this table, so it takes the
         // wizard's URL step the way `custom` does.
