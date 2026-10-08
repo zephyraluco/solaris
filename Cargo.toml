@@ -37,6 +37,21 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 clap = { version = "4", features = ["derive"] }
 
+# Clippy needs no extra flags: `cargo clippy --all-targets --all-features
+# --locked` picks all of this up. Anything below is an error, so a new warning
+# cannot land quietly.
+[workspace.lints.rust]
+future-incompatible = "warn"
+# A group, so it needs a priority below the individual lints it covers.
+nonstandard_style = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+# Nursery, but the one lint worth the noise: it is the only check that catches
+# a clone kept alive for nothing. Fixes are local; `#[expect]` with a reason if
+# a clone really is needed.
+redundant_clone = { level = "deny", priority = 9 }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

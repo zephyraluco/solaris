@@ -10,6 +10,9 @@ description = "solaris terminal AI assistant"
 name = "solaris"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 solaris-core = { workspace = true }
 solaris-provider = { workspace = true }

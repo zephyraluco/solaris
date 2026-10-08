@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn the_registry_holds_one_shell_for_this_platform() {
         let registry = registry();
-        assert_eq!(registry.get(SHELL_TOOL).is_some(), true);
+        assert!(registry.get(SHELL_TOOL).is_some());
         let other = if SHELL_TOOL == "bash" { "powershell" } else { "bash" };
         assert!(registry.get(other).is_none(), "only one shell can run here");
         assert_eq!(registry.get("read").expect("read").name(), "read");

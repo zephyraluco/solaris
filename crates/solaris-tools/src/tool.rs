@@ -263,6 +263,8 @@ mod tests {
         cancel.cancel();
         assert!(cancel.is_cancelled());
         // Clones share the flag, which is the point.
-        assert!(cancel.clone().is_cancelled());
+        let clone = cancel.clone();
+        assert!(cancel.is_cancelled());
+        assert!(clone.is_cancelled());
     }
 }

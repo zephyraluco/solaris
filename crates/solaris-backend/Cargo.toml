@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Agent backend abstraction and provider clients for solaris"
 
+[lints]
+workspace = true
+
 [dependencies]
 solaris-core = { workspace = true }
 async-trait = { workspace = true }

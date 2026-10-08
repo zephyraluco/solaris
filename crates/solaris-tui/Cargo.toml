@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Reusable terminal UI framework for solaris"
 
+[lints]
+workspace = true
+
 [dependencies]
 ratatui = { workspace = true }
 crossterm = { workspace = true }

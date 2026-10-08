@@ -101,7 +101,7 @@ mod tests {
             }
             .is_terminal()
         );
-        assert!(AgentEvent::TextDelta("hi".to_string()).is_terminal() == false);
+        assert!(!AgentEvent::TextDelta("hi".to_string()).is_terminal());
         assert!(AgentEvent::Error("boom".to_string()).is_terminal());
     }
 

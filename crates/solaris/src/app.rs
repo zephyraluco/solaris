@@ -1906,7 +1906,7 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 /// policy differs; `App` keeps them behind one type and dispatches here.
 // The wizard is a big state machine and the picker is a thin one; boxing the
 // former would only add indirection to a value that lives for one screen.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 enum Inline {
     /// The `/connect` wizard.
     Connect(ConnectFlow),
