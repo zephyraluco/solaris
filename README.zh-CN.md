@@ -182,7 +182,7 @@ solaris --exclude-tools 'bash'
 
 `/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、OpenCode Zen、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
 
-三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Zen 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。
+三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Zen 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。key 本身按它所属平台的方式走：Anthropic 的 key 放在 `x-api-key`，而网关的 key 即使访问 Messages API 也放在 `Authorization`——因为那把 key 是网关签发的，不是 Anthropic 的。
 
 ### 环境变量
 
