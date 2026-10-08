@@ -941,10 +941,16 @@ impl App {
                         self.rebuild_backend();
                     }
                 }
-                self.notifications.info(format!(
-                    "{} model(s) available — /model to choose",
-                    self.discovered.len()
-                ));
+                let count = self.discovered.len();
+                if self.connect_is_choosing_a_model() {
+                    // The list is on screen; pointing at `/model` would only
+                    // send the user somewhere they already are.
+                    self.notifications
+                        .info(format!("{count} model(s) reported"));
+                } else {
+                    self.notifications
+                        .info(format!("{count} model(s) available — /model to choose"));
+                }
             }
             Ok(_) => {
                 // An empty list is an answer rather than a failure — the
@@ -966,6 +972,41 @@ impl App {
                     ));
                 }
             }
+        }
+
+        self.fill_in_models();
+    }
+
+    /// Whether `/connect` is sitting on the step that picks a model.
+    fn connect_is_choosing_a_model(&self) -> bool {
+        self.inline
+            .as_ref()
+            .and_then(Inline::step)
+            .is_some_and(|step| step == ConnectStep::Model)
+    }
+
+    /// Put the answer to model discovery into the wizard's model step.
+    ///
+    /// `/connect` opens that step the moment the credential lands, before the
+    /// provider has said what it offers — a gateway has no catalogue to hand it
+    /// over from — so the list can only arrive this way. A provider that names
+    /// nothing and has no catalogue behind it leaves the step with nothing to
+    /// pick, and the notice the answer produced already says how to name a model
+    /// by hand.
+    fn fill_in_models(&mut self) {
+        if !self.connect_is_choosing_a_model() {
+            return;
+        }
+
+        let models = self.model_choices();
+        if models.is_empty() {
+            self.close_inline();
+            return;
+        }
+
+        let current = self.config.model.clone();
+        if let Some(flow) = self.inline.as_mut() {
+            flow.enter_models(models, Some(&current));
         }
     }
 
@@ -1208,7 +1249,13 @@ impl App {
         }
         self.refresh_models();
 
-        // Continue into the model picker, the way claurst's wizard does.
+        // Continue into the model picker, the way claurst's wizard does. The
+        // list can still be empty — a gateway or a custom endpoint publishes its
+        // models over the wire rather than in the catalogue, and discovery is a
+        // background task — so the step opens anyway and is filled in when the
+        // answer lands. With nothing to offer and nothing on its way there is no
+        // step to take, so the wizard closes rather than parking the user on an
+        // empty screen.
         let models: Vec<SelectItem> = solaris_provider::provider(&provider_id)
             .map(|spec| {
                 spec.models
@@ -1217,9 +1264,13 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let pending = self.models_rx.is_some();
+        let current = self.config.model.clone();
 
         match self.inline.as_mut() {
-            Some(flow) if !models.is_empty() => flow.enter_models(models),
+            Some(flow) if !models.is_empty() || pending => {
+                flow.enter_models(models, Some(&current));
+            }
             _ => self.close_inline(),
         }
     }
@@ -1894,9 +1945,9 @@ impl Inline {
         }
     }
 
-    fn enter_models(&mut self, models: Vec<SelectItem>) {
+    fn enter_models(&mut self, models: Vec<SelectItem>, current: Option<&str>) {
         if let Self::Connect(flow) = self {
-            flow.enter_models(models);
+            flow.enter_models(models, current);
         }
     }
 
@@ -2001,6 +2052,27 @@ mod tests {
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.discover_models = true;
+        App::new(options)
+    }
+
+    /// An app that answers model discovery with `models` while resolving as
+    /// `provider`. A gateway is exactly this: no catalogue, so its list can
+    /// only come from what the wire says.
+    fn app_reporting_models_as(provider: &'static str, models: &[&str]) -> App {
+        let pinned = fake_backend_reporting(models);
+        let resolved = Arc::clone(&pinned);
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(pinned, Config::default(), quit, queue, flag);
+        options.discover_models = true;
+        options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            backend: Arc::clone(&resolved),
+            provider_id: Some(provider),
+            base_url: None,
+            model: model.to_string(),
+            source: CredentialSource::None,
+        });
         App::new(options)
     }
 
@@ -2133,6 +2205,17 @@ mod tests {
         app.submit("/connect".to_string());
         app.handle_key(key(KeyCode::Enter)); // row 1 — Anthropic
         for ch in key_text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    /// Walk the wizard down the gateway path — row 5, New API — and confirm the
+    /// URL, which is the only thing it asks for.
+    fn connect_with_a_gateway_url(app: &mut App) {
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Char('5')));
+        for ch in "https://gateway.test/v1".chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
         app.handle_key(key(KeyCode::Enter));
@@ -2730,6 +2813,47 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.model(), "claude-sonnet-4-5");
         assert!(!app.connect_open());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_reaches_the_model_step_before_its_list_arrives() {
+        // A gateway has no catalogue to hand the wizard, so its model step can
+        // only be filled from the wire. It opens the moment the credential
+        // lands, and the provider's answer is what completes it.
+        let mut app = app_reporting_models_as("new-api", &["gpt-4o", "gpt-4o-mini"]);
+        connect_with_a_gateway_url(&mut app);
+
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("Select a model:"), "{text}");
+        assert!(text.contains("Asking New API"), "{text}");
+
+        settle_discovery(&mut app).await;
+
+        let text = rendered_text(&mut app, 80, 24);
+        assert!(text.contains("gpt-4o-mini"), "{text}");
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.model(), "gpt-4o");
+        assert!(!app.connect_open());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_names_no_models_leaves_nothing_to_pick() {
+        // An empty list is an answer, not a failure: the gateway is saying this
+        // credential reaches no models. The step has nothing to offer, so it
+        // goes away and the notice says how to name one by hand.
+        let mut app = app_reporting_models_as("new-api", &[]);
+        connect_with_a_gateway_url(&mut app);
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+
+        settle_discovery(&mut app).await;
+
+        assert!(!app.connect_open());
+        let (kind, text) = app.notifications.current().expect("a notice was shown");
+        assert_eq!(kind, NoticeKind::Warning);
+        assert!(text.contains("listed no models"), "{text}");
     }
 
     #[tokio::test]

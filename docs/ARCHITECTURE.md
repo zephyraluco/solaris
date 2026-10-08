@@ -215,7 +215,7 @@ while !quit {
 
 **后端在会话中途会被重新解析**：`/connect` 写入凭据、`/model` 改模型时都调 `App::rebuild_backend()` → `resolve_backend()`。它做三件事，而不只是换一个后端：把凭据与模型交给 `backend_factory`；**采纳真正会被询问的模型**（模型名为空时换成该 provider 提供的第一个模型，因为 provider 不会接受空模型名）；按模型目录更新 `config.context_window`，footer 的占比条据此才诚实。`AppOptions::new()` 会把传进来的那个后端**钉死**成一个固定工厂（并把模型原样回传），所以测试驱动的永远是它自己交给 app 的后端；生产环境则用真实的 `choose_backend`。
 
-**模型发现在后台跑**：`App::new` 与 `/connect` 之后各调一次 `App::refresh_models()`，它把 `backend.models()` 丢进 tokio 任务，答案经 channel 在 `tick()` 里收。发现只做加法——没落地时选择器就用内置目录，永远不落地就一直用它。清单到手后：若模型还没命名，取其中的第一个并重建后端（与目录提供首个模型是同一套替换）；选择器改用它，并从目录里补上已知模型的描述与单价。`AppOptions::discover_models` 控制是否发起这次请求：**二进制里开着，`AppOptions::new()` 里关着**，所以测试即使驱动真实 `choose_backend` 也不会自己联网。
+**模型发现在后台跑**：`App::new` 与 `/connect` 之后各调一次 `App::refresh_models()`，它把 `backend.models()` 丢进 tokio 任务，答案经 channel 在 `tick()` 里收。发现只做加法——没落地时选择器就用内置目录，永远不落地就一直用它。清单到手后：若模型还没命名，取其中的第一个并重建后端（与目录提供首个模型是同一套替换）；选择器改用它，并从目录里补上已知模型的描述与单价。`AppOptions::discover_models` 控制是否发起这次请求：**二进制里开着，`AppOptions::new()` 里关着**，所以测试即使驱动真实 `choose_backend` 也不会自己联网。**`/connect` 的模型步不等这份清单**：网关与自定义端点的目录里本来就没有名字，所以凭据一落地就进入 Model 步（列表还空着时由选择器的说明行交代正在向 provider 要），答案到手后 `App::fill_in_models()` 把它填进同一个选择器——否则这一步只会在有内置目录的 provider 上出现，网关用户存完 key 就被直接弹回会话。清单是空的、而目录也没得退时这一步没有东西可选，于是收掉向导，只留下那条「name one with /model <name>」的通知。
 
 复制发生在 `handle_key`：`Ctrl+C` 命中 `quit` 绑定时，先看共享的 `selection` 句柄里有没有文本 —— 有就交给 [`clipboard`](../crates/solaris/src/clipboard.rs) 并通知结果，没有才真的退出。
 
@@ -318,6 +318,8 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 ```
 
 `/model` 由 [`model.rs`](../crates/solaris/src/model.rs) 实现：它只写下这个命令的策略（列表说什么、选中意味着什么），列表本身是框架组件 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs) —— 标题、说明、问题行、`❯` 行、底部提示、按键、滚轮与命中测试都在那里，`/connect` 的 provider / model 两步用的也是它，所以两者样式不会漂移。`App` 用一个 `Inline` 枚举持有两者并转发事件。
+
+Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/solaris/src/connect.rs) 接受空列表（此时给选择器加一行「正在问 provider」的说明），provider 的答案到达后同一个方法再调一次，把列表填上并把当前模型设为高亮行，回车即沿用——所以网关用户看到的第三步和内置目录的 provider 完全一样，只是晚半秒。
 
 流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。文本步骤会从 `AuthStore` 回填该 provider 已存的 URL 与 key（key 照常掩码显示），所以重新 `/connect` 看到的是已保存的内容而不是空字段，直接回车即沿用；`ctrl+u` 清空当前字段，用来换成另一个 key。设备码授权的网络侧尚未实现，所以向导的这一步会直接报「not implemented」并让用户改用 API key —— 编一个占位 token 更糟：它会连上一个回答不了的 provider，然后第一轮以一个解释不了任何事的认证错误失败。
 

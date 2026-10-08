@@ -264,15 +264,28 @@ impl ConnectFlow {
     }
 
     /// Step 3 — pick a model from the provider that just connected.
-    /// Step 3 — pick a model from the provider that just connected.
-    pub fn enter_models(&mut self, models: Vec<SelectItem>) {
+    ///
+    /// The list may still be empty: a gateway or a custom endpoint publishes
+    /// its models over the wire rather than in the catalogue, and that answer
+    /// arrives from a background task. The step opens anyway and says the list
+    /// is on its way; calling this again with the reported list fills it in.
+    /// `current` is highlighted when it is on the list, the way `/model` does.
+    pub fn enter_models(&mut self, models: Vec<SelectItem>, current: Option<&str>) {
         self.step = ConnectStep::Model;
-        self.models = InlineSelect::new(
+
+        let mut picker = InlineSelect::new(
             self.styles,
             format!("Connect {}", self.provider_name),
             "Select a model:",
             models,
         );
+        if picker.is_empty() {
+            picker = picker.with_note(format!("Asking {} what it offers…", self.provider_name));
+        }
+        if let Some(current) = current.filter(|name| !name.is_empty()) {
+            picker.select_value(current);
+        }
+        self.models = picker;
     }
 
     fn enter_text_step(&mut self, step: ConnectStep, provider_id: String, provider_name: String) {
@@ -1247,10 +1260,13 @@ mod tests {
     #[test]
     fn the_model_step_picks_a_model() {
         let mut flow = new_flow();
-        flow.enter_models(vec![
-            SelectItem::new("m-one", "m-one").description("first"),
-            SelectItem::new("m-two", "m-two").description("second"),
-        ]);
+        flow.enter_models(
+            vec![
+                SelectItem::new("m-one", "m-one").description("first"),
+                SelectItem::new("m-two", "m-two").description("second"),
+            ],
+            None,
+        );
 
         flow.on_key(key(KeyCode::Down));
         assert_eq!(
@@ -1260,6 +1276,43 @@ mod tests {
             }
         );
         assert_eq!(flow.on_key(key(KeyCode::Esc)), ConnectOutcome::Closed);
+    }
+
+    #[test]
+    fn the_model_step_opens_before_the_provider_has_answered() {
+        let mut flow = new_flow();
+        flow.enter_custom_provider(
+            "new-api".into(),
+            "New API".into(),
+            Some("https://gateway.test/v1".into()),
+            None,
+        );
+        flow.enter_models(Vec::new(), None);
+
+        // The step is up even though there is nothing to pick yet, and it says
+        // why — parking the user on a bare question would read as a dead end.
+        let text = rendered(&mut flow, 70, 18);
+        assert!(text.contains("Select a model:"), "{text}");
+        assert!(text.contains("Asking New API"), "{text}");
+
+        // The answer fills the same step in, with the model already in use as
+        // the highlighted row so Enter keeps it.
+        flow.enter_models(
+            vec![
+                SelectItem::new("m-one", "m-one"),
+                SelectItem::new("m-two", "m-two"),
+            ],
+            Some("m-two"),
+        );
+
+        let text = rendered(&mut flow, 70, 18);
+        assert!(!text.contains("Asking New API"), "{text}");
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::ModelPicked {
+                model_id: "m-two".into()
+            }
+        );
     }
 
     #[test]
