@@ -180,9 +180,9 @@ solaris --exclude-tools 'bash'
 
 ## Provider
 
-`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、OpenCode Zen、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
+`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、OpenCode Go、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
 
-三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Zen 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。key 本身按它所属平台的方式走：Anthropic 的 key 放在 `x-api-key`，而网关的 key 即使访问 Messages API 也放在 `Authorization`——因为那把 key 是网关签发的，不是 Anthropic 的。
+三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Go 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。key 按承载它的那条 wire 的方式走：`x-api-key` 走 Messages API、Bearer 走 OpenAI 系 —— opencode 的 Go 网关也是这个规矩（它的 `/v1/messages` 只认 `x-api-key`，OpenAI 兼容路径认 Bearer）。按会话路由的平台还会被明确告知当前是哪个会话，Go 就是靠它把请求归到订阅计划、而不是扣到按量计费的余额上。
 
 ### 环境变量
 
@@ -205,7 +205,7 @@ solaris --exclude-tools 'bash'
 - **上下文**。`/stats` 分别给出 `session tokens`（本会话累计花掉的）和 `context used`。只有后者说明窗口有多满：它等于最后一轮上报的用量，加上其后新提交内容的估算量。把整个会话的轮次相加会无限增长，对「单次请求的窗口」毫无意义。
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
 - **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。不指定模型名就用其中的第一个，因为空模型名 provider 不会接受。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
-- **错误。** key 被拒、模型不存在、触发限流，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
+- **错误。** key 被拒、模型不存在、触发限流、账户余额不足，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
 
 ---
 

@@ -15,7 +15,7 @@ mod wire;
 
 pub use client::{Endpoint, HttpBackend, TurnPlan};
 pub use http::IDLE_TIMEOUT;
-pub use wire::{KeyAuth, Wire};
+pub use wire::Wire;
 
 use std::pin::Pin;
 

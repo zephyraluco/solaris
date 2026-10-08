@@ -46,21 +46,6 @@ impl Wire {
     }
 }
 
-/// How a platform wants its key presented.
-///
-/// A key belongs to the platform it was issued by, which is not always the
-/// platform whose protocol a model is reached through: a gateway answers Claude
-/// models on the Messages API with a key of its own, and that key travels the
-/// way the gateway says rather than the way Anthropic's does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyAuth {
-    /// The wire's own convention: `x-api-key` on the Messages API, a bearer
-    /// token on the OpenAI ones.
-    Wire,
-    /// A bearer token, whichever wire the model speaks.
-    Bearer,
-}
-
 /// Build the request body `wire` wants for one turn.
 ///
 /// `prompt_cache_key` is sent to OpenAI alone: its caching is automatic, and

@@ -167,7 +167,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     let endpoint = Endpoint {
         wire,
-        key_auth: spec.key_auth,
+        session_header: spec.session_header,
         base_url,
         secret,
         name: spec.name,
@@ -549,8 +549,8 @@ mod tests {
             "http://one-api.test/api/v1"
         );
         assert_eq!(
-            endpoint_base_url("https://opencode.ai/zen/v1"),
-            "https://opencode.ai/zen/v1"
+            endpoint_base_url("https://opencode.ai/zen/go/v1"),
+            "https://opencode.ai/zen/go/v1"
         );
         assert_eq!(endpoint_base_url("   "), "");
     }
@@ -822,17 +822,17 @@ mod tests {
         let auth = auth_with(
             "opencode",
             Some(Credential::ApiKey {
-                key: "sk-zen".to_string(),
+                key: "sk-go".to_string(),
             }),
         );
 
-        for model in ["gpt-5.5", "claude-sonnet-4-5", "qwen3.8-max"] {
+        for model in ["grok-4.7", "claude-haiku-5-5", "qwen3.8-max"] {
             let choice = choose_backend(&auth, model, options());
             assert_eq!(choice.source, CredentialSource::Stored, "{model}");
             assert_eq!(choice.provider_id, Some("opencode"), "{model}");
             assert_eq!(
                 choice.base_url.as_deref(),
-                Some("https://opencode.ai/zen/v1"),
+                Some("https://opencode.ai/zen/go/v1"),
                 "{model}"
             );
         }
