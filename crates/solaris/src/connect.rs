@@ -9,8 +9,8 @@
 //!
 //! [`ConnectFlow`] is a state machine over [`ConnectStep`] that owns key
 //! handling, mouse hit-testing and rendering. The *effects* — storing the
-//! credential, activating the provider, spawning the device-auth task — live in
-//! [`crate::app`], because they touch application state rather than flow state.
+//! credential and activating the provider — live in [`crate::app`], because
+//! they touch application state rather than flow state.
 //! [`ConnectOutcome`] is the single funnel out of this module.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -36,8 +36,6 @@ pub enum ConnectStep {
     ApiKey,
     /// Step 2b — a custom OpenAI-compatible endpoint (URL plus optional key).
     CustomProvider,
-    /// Step 2c — device-code OAuth, driven by a background task.
-    DeviceAuth,
     /// Step 3 — pick a model from the provider that just connected.
     Model,
 }
@@ -63,12 +61,6 @@ pub enum ConnectSubmit {
         base_url: String,
         api_key: String,
     },
-    /// Device auth finished — store the token and activate the provider.
-    DeviceAuthToken {
-        provider_id: String,
-        provider_name: String,
-        token: String,
-    },
 }
 
 /// What a key or mouse event did to the flow.
@@ -84,35 +76,6 @@ pub enum ConnectOutcome {
     Submit(ConnectSubmit),
     /// A model was chosen for the provider that just connected.
     ModelPicked { model_id: String },
-}
-
-/// Progress of the device-code OAuth step.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceAuthStatus {
-    /// Not started.
-    Idle,
-    /// Waiting for the authorization server to issue a code.
-    WaitingForCode,
-    /// The user code is on screen; waiting for the user to authorize.
-    ShowingCode,
-    /// A token was obtained.
-    Success(String),
-    /// Something went wrong.
-    Error(String),
-}
-
-/// Messages the background device-auth task sends back to the event loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceAuthEvent {
-    /// A device code was issued — show it and the verification URI.
-    GotCode {
-        user_code: String,
-        verification_uri: String,
-    },
-    /// The access token was obtained.
-    TokenReceived(String),
-    /// The attempt failed.
-    Error(String),
 }
 
 /// Colours and weights used while drawing the wizard.
@@ -143,11 +106,6 @@ pub struct ConnectFlow {
     /// a secret the user never touched; any edit clears the flag.
     seeded: [bool; 2],
 
-    // device auth
-    device_status: DeviceAuthStatus,
-    user_code: String,
-    verification_uri: String,
-
     // render state
     last_area: Rect,
     field_rows: Vec<(u16, usize)>,
@@ -169,10 +127,8 @@ impl ConnectFlow {
             })
             .collect();
 
-        let providers = InlineSelect::new(styles, "Connect", "Select a provider:", items).with_note(
-            "solaris can be used with a provider subscription or billed based on API usage through \
-             an API key.",
-        );
+        let providers = InlineSelect::new(styles, "Connect", "Select a provider:", items)
+            .with_note("solaris can be used with a provider API key, billed based on usage.");
 
         Self {
             step: ConnectStep::Provider,
@@ -185,9 +141,6 @@ impl ConnectFlow {
             input2: String::new(),
             field: 0,
             seeded: [false, false],
-            device_status: DeviceAuthStatus::Idle,
-            user_code: String::new(),
-            verification_uri: String::new(),
             last_area: Rect::default(),
             field_rows: Vec::new(),
         }
@@ -212,11 +165,6 @@ impl ConnectFlow {
     /// The provider's display name.
     pub fn provider_name(&self) -> &str {
         &self.provider_name
-    }
-
-    /// Device-auth progress.
-    pub fn device_status(&self) -> &DeviceAuthStatus {
-        &self.device_status
     }
 
     /// Area painted last frame (empty until the first render).
@@ -257,12 +205,6 @@ impl ConnectFlow {
         self.seeded = [!self.input.is_empty(), !self.input2.is_empty()];
     }
 
-    /// Step 2c — device-code OAuth for a provider.
-    pub fn enter_device_auth(&mut self, provider_id: String, provider_name: String) {
-        self.enter_text_step(ConnectStep::DeviceAuth, provider_id, provider_name);
-        self.device_status = DeviceAuthStatus::WaitingForCode;
-    }
-
     /// Step 3 — pick a model from the provider that just connected.
     ///
     /// The list may still be empty: a gateway or a custom endpoint publishes
@@ -296,25 +238,6 @@ impl ConnectFlow {
         self.input2.clear();
         self.field = 0;
         self.seeded = [false, false];
-    }
-
-    // -- device auth, driven from outside ----------------------------------
-
-    /// A device code was issued.
-    pub fn device_set_code(&mut self, user_code: String, verification_uri: String) {
-        self.user_code = user_code;
-        self.verification_uri = verification_uri;
-        self.device_status = DeviceAuthStatus::ShowingCode;
-    }
-
-    /// The access token arrived.
-    pub fn device_set_success(&mut self, token: String) {
-        self.device_status = DeviceAuthStatus::Success(token);
-    }
-
-    /// The attempt failed.
-    pub fn device_set_error(&mut self, message: String) {
-        self.device_status = DeviceAuthStatus::Error(message);
     }
 
     /// The model highlighted on the model step.
@@ -429,7 +352,6 @@ impl ConnectFlow {
             },
             ConnectStep::ApiKey => self.api_key_key(key),
             ConnectStep::CustomProvider => self.custom_provider_key(key),
-            ConnectStep::DeviceAuth => self.device_auth_key(),
         }
     }
     fn confirm_provider(&mut self, index: usize) -> ConnectOutcome {
@@ -514,23 +436,6 @@ impl ConnectFlow {
         }
     }
 
-    fn device_auth_key(&mut self) -> ConnectOutcome {
-        match &self.device_status {
-            // Success: any key continues, and the app stores the credential.
-            DeviceAuthStatus::Success(token) => {
-                ConnectOutcome::Submit(ConnectSubmit::DeviceAuthToken {
-                    provider_id: self.provider_id.clone(),
-                    provider_name: self.provider_name.clone(),
-                    token: token.clone(),
-                })
-            }
-            // Error: any key dismisses.
-            DeviceAuthStatus::Error(_) => ConnectOutcome::Closed,
-            // While the background task works, every key is swallowed.
-            _ => ConnectOutcome::Handled,
-        }
-    }
-
     // -- mouse -------------------------------------------------------------
 
     /// Route a mouse event.
@@ -544,7 +449,7 @@ impl ConnectFlow {
                 InlineSelectOutcome::Picked(_) => self.confirm_model(),
                 InlineSelectOutcome::Handled => ConnectOutcome::Handled,
             },
-            // The field and device steps only take a click on a field.
+            // The field steps only take a click on a field.
             _ => {
                 if !rect_contains(self.last_area, mouse.column, mouse.row) {
                     return ConnectOutcome::Handled;
@@ -569,7 +474,7 @@ impl ConnectFlow {
     // -- layout ------------------------------------------------------------
 
     /// Rows the fixed part of the block occupies at `width`.
-    /// Rows the field and device steps occupy at `width`.
+    /// Rows the field step occupies at `width`.
     fn fixed_rows(&self, width: u16) -> u16 {
         self.field_block(width).0.len() as u16
     }
@@ -599,40 +504,6 @@ impl ConnectFlow {
         }
     }
 
-    fn device_lines(&self) -> Vec<Line<'static>> {
-        match &self.device_status {
-            DeviceAuthStatus::Idle | DeviceAuthStatus::WaitingForCode => vec![Line::from(
-                Span::styled("Requesting device code…", self.styles.warn),
-            )],
-            DeviceAuthStatus::ShowingCode => vec![
-                Line::from(Span::styled("Waiting for authorization…", self.styles.warn)),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Enter this code in the browser:",
-                    self.styles.muted,
-                )),
-                Line::from(Span::styled(
-                    format!("    {}", self.user_code),
-                    self.styles.text.add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {}", self.verification_uri),
-                    self.styles.muted,
-                )),
-            ],
-            DeviceAuthStatus::Success(_) => vec![Line::from(Span::styled(
-                "✓ Authorized — press any key to continue",
-                self.styles.ok,
-            ))],
-            DeviceAuthStatus::Error(message) => vec![
-                Line::from(Span::styled(format!("✗ {message}"), self.styles.error)),
-                Line::from(""),
-                Line::from(Span::styled("Press any key to dismiss.", self.styles.muted)),
-            ],
-        }
-    }
-
     fn hint_line(&self) -> Line<'static> {
         // The list steps draw their own hint inside the selector.
         if matches!(self.step, ConnectStep::Provider | ConnectStep::Model) {
@@ -644,12 +515,6 @@ impl ConnectFlow {
             ConnectStep::CustomProvider => {
                 vec!["tab switch field", "enter confirm", "ctrl+u clear"]
             }
-            ConnectStep::DeviceAuth => match self.device_status {
-                DeviceAuthStatus::Success(_) | DeviceAuthStatus::Error(_) => {
-                    vec!["any key continue"]
-                }
-                _ => Vec::new(),
-            },
             ConnectStep::Provider | ConnectStep::Model => Vec::new(),
         };
 
@@ -661,16 +526,11 @@ impl ConnectFlow {
             spans.push(Span::styled(hint.to_string(), self.styles.dim));
         }
 
-        // Esc always cancels — except once the flow is already done, where the
-        // hint line says what the next key does instead.
-        let finished = self.step == ConnectStep::DeviceAuth
-            && matches!(self.device_status, DeviceAuthStatus::Success(_));
-        if !finished {
-            if !spans.is_empty() {
-                spans.push(Span::styled("   ", self.styles.dim));
-            }
-            spans.push(Span::styled("esc cancel", self.styles.dim));
+        // Esc always cancels.
+        if !spans.is_empty() {
+            spans.push(Span::styled("   ", self.styles.dim));
         }
+        spans.push(Span::styled("esc cancel", self.styles.dim));
 
         Line::from(spans)
     }
@@ -722,8 +582,8 @@ impl ConnectFlow {
             .collect();
     }
 
-    /// The block the field and device steps draw, with row indices relative to
-    /// its first line. The list steps are drawn by their selector instead.
+    /// The block the field steps draw, with row indices relative to its first
+    /// line. The list steps are drawn by their selector instead.
     fn field_block(&self, width: u16) -> (Vec<Line<'static>>, RowMap) {
         let _ = width;
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -751,12 +611,6 @@ impl ConnectFlow {
                 )));
                 field_rows.push((lines.len(), 1));
                 lines.push(self.secret_line(&self.input2, self.field == 1));
-            }
-            ConnectStep::DeviceAuth => {
-                lines.push(Line::from(""));
-                for line in self.device_lines() {
-                    lines.push(line);
-                }
             }
             // The list steps never reach here.
             ConnectStep::Provider | ConnectStep::Model => {}
@@ -872,8 +726,8 @@ mod tests {
         assert_eq!(
             flow.on_key(key(KeyCode::Enter)),
             ConnectOutcome::ProviderPicked {
-                id: "claude-subscription".into(),
-                name: "Claude subscription".into(),
+                id: "opencode".into(),
+                name: "OpenCode Zen".into(),
             }
         );
     }
@@ -1145,40 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn device_auth_swallows_keys_until_it_finishes() {
-        let mut flow = new_flow();
-        flow.enter_device_auth("claude-subscription".into(), "Claude subscription".into());
-
-        assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Handled);
-        assert_eq!(
-            flow.on_key(key(KeyCode::Char('x'))),
-            ConnectOutcome::Handled
-        );
-
-        flow.device_set_code("ABCD-1234".into(), "https://example.test/device".into());
-        assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Handled);
-
-        flow.device_set_success("token-1".into());
-        assert_eq!(
-            flow.on_key(key(KeyCode::Char(' '))),
-            ConnectOutcome::Submit(ConnectSubmit::DeviceAuthToken {
-                provider_id: "claude-subscription".into(),
-                provider_name: "Claude subscription".into(),
-                token: "token-1".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn a_device_auth_error_is_dismissed_by_any_key() {
-        let mut flow = new_flow();
-        flow.enter_device_auth("claude-subscription".into(), "Claude subscription".into());
-        flow.device_set_error("timed out".into());
-
-        assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Closed);
-    }
-
-    #[test]
     fn paste_lands_in_the_active_field_only() {
         let mut flow = new_flow();
         // The provider step has no field, so the paste is refused.
@@ -1232,8 +1052,8 @@ mod tests {
         assert_eq!(
             flow.on_key(key(KeyCode::Enter)),
             ConnectOutcome::ProviderPicked {
-                id: "claude-subscription".into(),
-                name: "Claude subscription".into(),
+                id: "opencode".into(),
+                name: "OpenCode Zen".into(),
             },
             "the wheel should move the highlight"
         );
@@ -1335,10 +1155,10 @@ mod tests {
 
         assert_eq!(rows[0], "Connect");
         assert_eq!(rows[1], "");
-        assert!(rows[2].starts_with("solaris can be used with a provider subscription"));
+        assert!(rows[2].starts_with("solaris can be used with a provider API key"));
         assert!(text.contains("Select a provider:"));
         assert!(text.contains("❯ 1. Anthropic · Claude models — API key"));
-        assert!(text.contains("  2. Claude subscription · Sign in with a Pro or Max plan"));
+        assert!(text.contains("  2. OpenCode Zen · Tested models — API key"));
         assert!(
             text.contains("5. New API · Self-hosted OpenAI-compatible gateway"),
             "the gateway row should render:\n{text}"
@@ -1379,31 +1199,6 @@ mod tests {
         flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         let text = rendered(&mut flow, 60, 10);
         assert!(text.contains("paste your API key here…_"), "{text}");
-    }
-
-    #[test]
-    fn the_device_auth_step_shows_the_user_code() {
-        let mut flow = new_flow();
-        flow.enter_device_auth("claude-subscription".into(), "Claude subscription".into());
-
-        let waiting = rendered(&mut flow, 60, 10);
-        assert!(waiting.contains("Requesting device code…"), "{waiting}");
-
-        flow.device_set_code("SO-4F7Q-9X2M".into(), "https://example.test/device".into());
-        let showing = rendered(&mut flow, 60, 12);
-        assert!(showing.contains("Waiting for authorization…"), "{showing}");
-        assert!(showing.contains("SO-4F7Q-9X2M"), "{showing}");
-        assert!(showing.contains("https://example.test/device"), "{showing}");
-        assert!(showing.contains("esc cancel"), "{showing}");
-
-        flow.device_set_success("token".into());
-        let done = rendered(&mut flow, 60, 10);
-        assert!(
-            done.contains("Authorized — press any key to continue"),
-            "{done}"
-        );
-        // Once authorized the hint no longer offers a cancel.
-        assert!(!done.contains("esc cancel"), "{done}");
     }
 
     #[test]

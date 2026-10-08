@@ -245,9 +245,6 @@ fn describe_source(source: CredentialSource) -> String {
         CredentialSource::Env(name) => format!("environment ({name})"),
         CredentialSource::None => "none needed".to_string(),
         CredentialSource::Missing => "none — not connected".to_string(),
-        CredentialSource::NotImplemented => {
-            "sign-in is not implemented yet — connect an API key".to_string()
-        }
         CredentialSource::NoModel => "present — no model named for it yet".to_string(),
     }
 }

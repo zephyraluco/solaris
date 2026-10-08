@@ -125,37 +125,9 @@ impl Inline {
         }
     }
 
-    pub(crate) fn enter_device_auth(
-        &mut self,
-        provider_id: impl Into<String>,
-        provider_name: impl Into<String>,
-    ) {
-        if let Self::Connect(flow) = self {
-            flow.enter_device_auth(provider_id.into(), provider_name.into());
-        }
-    }
-
     pub(crate) fn enter_models(&mut self, models: Vec<SelectItem>, current: Option<&str>) {
         if let Self::Connect(flow) = self {
             flow.enter_models(models, current);
-        }
-    }
-
-    pub(crate) fn device_set_code(&mut self, user_code: String, verification_uri: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_code(user_code, verification_uri);
-        }
-    }
-
-    pub(crate) fn device_set_success(&mut self, token: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_success(token);
-        }
-    }
-
-    pub(crate) fn device_set_error(&mut self, message: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_error(message);
         }
     }
 }

@@ -47,7 +47,7 @@ use tokio::sync::mpsc::{
 
 use crate::clipboard::Clipboard;
 use crate::commands;
-use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent};
+use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 use crate::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
     stats_lines,
@@ -257,8 +257,6 @@ pub struct App {
     quit_press: Option<(char, Instant)>,
     /// The inline `/connect` wizard while it owns the prompt region.
     inline: Option<Inline>,
-    /// Events from the background device-auth task.
-    device_rx: Option<UnboundedReceiver<DeviceAuthEvent>>,
     /// Models the active provider reported, once it has reported any. Empty
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
@@ -356,7 +354,6 @@ impl App {
             buddy_started: Instant::now(),
             quit_press: None,
             inline: None,
-            device_rx: None,
             discovered: Vec::new(),
             models_rx: None,
             discover_models,
@@ -1145,7 +1142,6 @@ impl App {
         let current = self.config.model.clone();
         let picker = ModelPicker::new(&self.theme, models, Some(&current));
         self.inline = Some(Inline::Model(picker));
-        self.device_rx = None;
         self.notifications.clear();
     }
 
@@ -1171,14 +1167,12 @@ impl App {
     /// Open the `/connect` wizard in the prompt region.
     fn open_connect(&mut self) {
         self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
-        self.device_rx = None;
         self.notifications.clear();
     }
 
-    /// Drop the wizard and any device-auth task feeding it.
+    /// Drop the wizard.
     fn close_inline(&mut self) {
         self.inline = None;
-        self.device_rx = None;
     }
 
     fn handle_inline_key(&mut self, key: KeyEvent) {
@@ -1268,12 +1262,6 @@ impl App {
                     flow.enter_custom_provider(id, provider_name, url, key);
                 }
             }
-            AuthKind::DeviceCode => {
-                self.device_rx = Some(spawn_device_auth(provider_id));
-                if let Some(flow) = self.inline.as_mut() {
-                    flow.enter_device_auth(id, provider_name);
-                }
-            }
         }
     }
 
@@ -1299,15 +1287,6 @@ impl App {
                 provider_name,
                 Some(Credential::Endpoint { base_url, api_key }),
             ),
-            ConnectSubmit::DeviceAuthToken {
-                provider_id,
-                provider_name,
-                token,
-            } => (
-                provider_id,
-                provider_name,
-                Some(Credential::Token { token }),
-            ),
         };
 
         if let Some(credential) = credential {
@@ -1319,9 +1298,6 @@ impl App {
         // Connecting is what resolves a real client, so the backend is rebuilt
         // before the model step — and the new provider is asked what it offers.
         match self.rebuild_backend() {
-            CredentialSource::NotImplemented => self.notifications.warning(
-                "subscription sign-in is not implemented yet — connect an API key instead",
-            ),
             CredentialSource::Missing => self
                 .notifications
                 .warning("no usable credential — turns will say so until /connect succeeds"),
@@ -1722,38 +1698,6 @@ impl Component for App {
             self.on_dialog_message(message);
         }
 
-        // Device-auth progress from the background task.
-        let mut device_events = Vec::new();
-        let mut device_done = false;
-        if let Some(rx) = self.device_rx.as_mut() {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => device_events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        device_done = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if device_done {
-            self.device_rx = None;
-        }
-        for event in device_events {
-            dirty = true;
-            if let Some(flow) = self.inline.as_mut() {
-                match event {
-                    DeviceAuthEvent::GotCode {
-                        user_code,
-                        verification_uri,
-                    } => flow.device_set_code(user_code, verification_uri),
-                    DeviceAuthEvent::TokenReceived(token) => flow.device_set_success(token),
-                    DeviceAuthEvent::Error(message) => flow.device_set_error(message),
-                }
-            }
-        }
-
         // Models the provider reported to the background discovery task.
         let mut discovered = Vec::new();
         let mut discovery_done = false;
@@ -1882,21 +1826,6 @@ fn theme_description(name: &str) -> &'static str {
     }
 }
 
-/// Start the device-code task for `provider_id`.
-///
-/// The network half of OAuth is not implemented, so there is no code to issue
-/// and no token to collect, and that is what this reports. Handing back a
-/// placeholder token would be worse than saying nothing: it would connect a
-/// provider that cannot answer, and the first turn would fail with an
-/// authentication error that explains nothing about why.
-fn spawn_device_auth(provider_id: &str) -> UnboundedReceiver<DeviceAuthEvent> {
-    let (tx, rx) = unbounded_channel();
-    let _ = tx.send(DeviceAuthEvent::Error(format!(
-        "signing in to {provider_id} is not implemented yet — connect an API key instead"
-    )));
-    rx
-}
-
 /// Editor styles derived from the active theme.
 pub fn editor_styles(theme: &Theme) -> EditorStyles {
     EditorStyles {
@@ -1918,7 +1847,6 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::DeviceAuthStatus;
     use crossterm::event::MouseButton;
     use solaris_backend::AgentEventStream;
     use solaris_core::{BackendError, ToolCall, ToolResult, Usage};
@@ -2961,34 +2889,6 @@ mod tests {
                 .and_then(Credential::secret),
             Some("sk-test")
         );
-    }
-
-    #[tokio::test]
-    async fn device_auth_reports_that_sign_in_is_not_implemented() {
-        let mut app = app();
-        app.submit("/connect".to_string());
-
-        // Row 2 is the subscription provider, which signs in over OAuth.
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.connect_step(), Some(ConnectStep::DeviceAuth));
-
-        app.tick();
-        let message = app.inline.as_ref().and_then(|inline| match inline {
-            Inline::Connect(flow) => match flow.device_status() {
-                DeviceAuthStatus::Error(message) => Some(message.clone()),
-                _ => None,
-            },
-            _ => None,
-        });
-        let message = message.expect("the wizard should report that it cannot sign in");
-        assert!(message.contains("not implemented"), "{message}");
-
-        // Dismissing it must leave no credential behind: a placeholder token
-        // would make the first real turn fail with an unexplained 401.
-        app.handle_key(key(KeyCode::Char('x')));
-        assert!(!app.auth.is_connected("claude-subscription"));
-        assert!(!app.connect_open());
     }
 
     #[test]

@@ -851,7 +851,7 @@ mod tests {
         let mut dialog = SelectDialog::new("Login", "hint", items(), &theme, tx, |value| {
             DialogMessage::Theme(value.to_string())
         })
-        .body("Sign in with a subscription, or bill per API call.")
+        .body("Sign in with an API key, billed per API call.")
         .label("Select a method:");
 
         let area = Rect::new(0, 0, 52, 14);
@@ -861,7 +861,7 @@ mod tests {
 
         assert!(text.contains("Login"), "{text}");
         assert!(
-            text.contains("Sign in with a subscription, or bill per API call."),
+            text.contains("Sign in with an API key, billed per API call."),
             "{text}"
         );
         assert!(text.contains("Select a method:"), "{text}");

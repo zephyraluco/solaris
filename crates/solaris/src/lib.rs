@@ -29,8 +29,6 @@ mod inline;
 
 pub use app::{App, AppOptions, BackendFactory};
 pub use clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
-pub use connect::{
-    ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent, DeviceAuthStatus,
-};
+pub use connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 pub use dialogs::{ConfirmAction, DialogMessage};
 pub use state::{NoticeKind, NotificationQueue, SessionState, Turn};

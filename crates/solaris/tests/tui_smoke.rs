@@ -824,20 +824,15 @@ fn connecting_an_api_key_flows_into_the_model_picker() {
     );
 }
 
-#[tokio::test]
-async fn device_auth_reports_that_sign_in_is_unavailable() {
+#[test]
+fn the_second_provider_row_opens_its_api_key_step() {
     let mut harness = Harness::new();
     harness.type_str("/connect");
     harness.key(KeyCode::Enter);
-    harness.key(KeyCode::Down); // the subscription provider
+    harness.key(KeyCode::Down); // the second row — OpenCode Zen
     harness.key(KeyCode::Enter);
 
-    harness.tui.tick();
     let text = harness.draw();
-
-    // The sign-in flow is not built, and saying so is better than walking the
-    // user through a code that mints a token nothing can use.
-    assert!(text.contains("not implemented"), "{text}");
-    assert!(text.contains("Press any key to dismiss"), "{text}");
-    assert!(!text.contains("Enter this code in the browser:"), "{text}");
+    assert!(text.contains("Connect OpenCode Zen"), "{text}");
+    assert!(text.contains("Paste your API key:"), "{text}");
 }
