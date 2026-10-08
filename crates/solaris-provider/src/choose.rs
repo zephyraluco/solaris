@@ -425,6 +425,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_stored_secret_is_used() {
+        assert_eq!(
+            secret_of(&Credential::ApiKey {
+                key: " sk-1 ".to_string()
+            }),
+            Some("sk-1".to_string()),
+            "a key is trimmed before it is sent"
+        );
+        assert_eq!(
+            secret_of(&Credential::Endpoint {
+                base_url: "http://localhost:8080/v1".to_string(),
+                api_key: "  ".to_string(),
+            }),
+            None,
+            "an endpoint with no key sends no auth header"
+        );
+        assert_eq!(
+            secret_of(&Credential::Token {
+                token: "oauth".to_string()
+            }),
+            Some("oauth".to_string())
+        );
+    }
+
+    #[test]
+    fn only_openais_own_host_gets_the_cache_key() {
+        assert!(is_openai_host("https://api.openai.com/v1"));
+        assert!(!is_openai_host("https://openrouter.ai/api/v1"));
+        assert!(!is_openai_host(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ));
+        assert!(!is_openai_host("http://localhost:11434/v1"));
+        // A lookalike host must not qualify — hence comparing the host rather
+        // than searching the URL for a substring.
+        assert!(!is_openai_host("https://api.openai.com.example.test/v1"));
+        assert!(!is_openai_host("not a url"));
+    }
+
     #[tokio::test]
     async fn a_named_model_is_required_when_the_catalogue_has_none() {
         // A gateway's catalogue is empty, so an unnamed model leaves nothing to
