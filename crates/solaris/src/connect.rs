@@ -727,7 +727,7 @@ mod tests {
             flow.on_key(key(KeyCode::Enter)),
             ConnectOutcome::ProviderPicked {
                 id: "opencode".into(),
-                name: "OpenCode Zen".into(),
+                name: "OpenCode Go".into(),
             }
         );
     }
@@ -1053,7 +1053,7 @@ mod tests {
             flow.on_key(key(KeyCode::Enter)),
             ConnectOutcome::ProviderPicked {
                 id: "opencode".into(),
-                name: "OpenCode Zen".into(),
+                name: "OpenCode Go".into(),
             },
             "the wheel should move the highlight"
         );
@@ -1158,7 +1158,7 @@ mod tests {
         assert!(rows[2].starts_with("solaris can be used with a provider API key"));
         assert!(text.contains("Select a provider:"));
         assert!(text.contains("❯ 1. Anthropic · Claude models — API key"));
-        assert!(text.contains("  2. OpenCode Zen · Tested models — API key"));
+        assert!(text.contains("  2. OpenCode Go · Monthly plan — open coding models"));
         assert!(
             text.contains("5. New API · Self-hosted OpenAI-compatible gateway"),
             "the gateway row should render:\n{text}"

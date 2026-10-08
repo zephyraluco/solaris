@@ -829,10 +829,10 @@ fn the_second_provider_row_opens_its_api_key_step() {
     let mut harness = Harness::new();
     harness.type_str("/connect");
     harness.key(KeyCode::Enter);
-    harness.key(KeyCode::Down); // the second row — OpenCode Zen
+    harness.key(KeyCode::Down); // the second row — OpenCode Go
     harness.key(KeyCode::Enter);
 
     let text = harness.draw();
-    assert!(text.contains("Connect OpenCode Zen"), "{text}");
+    assert!(text.contains("Connect OpenCode Go"), "{text}");
     assert!(text.contains("Paste your API key:"), "{text}");
 }

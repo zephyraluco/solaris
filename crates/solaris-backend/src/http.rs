@@ -101,6 +101,9 @@ pub fn describe(status: StatusCode, body: &str, provider: &str, env_keys: &[&str
             Some(key) => format!(" — run /connect to replace the key, or check {key}"),
             None => " — run /connect to sign in again".to_string(),
         }
+    } else if status == StatusCode::PAYMENT_REQUIRED {
+        " — the account has no funds left, so top it up or check the plan in the provider's console"
+            .to_string()
     } else if status == StatusCode::NOT_FOUND {
         " — the model or endpoint may be wrong, check /model".to_string()
     } else if status == StatusCode::TOO_MANY_REQUESTS {
@@ -256,6 +259,19 @@ mod tests {
         // A provider with no environment variable gets the generic advice.
         let message = describe(StatusCode::UNAUTHORIZED, "", "Custom endpoint", &[]);
         assert!(message.contains("run /connect"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_account_says_where_to_top_it_up() {
+        let message = describe(
+            StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"message":"Insufficient account funds"}}"#,
+            "OpenCode Go",
+            &[],
+        );
+        assert!(message.contains("OpenCode Go returned 402"), "{message}");
+        assert!(message.contains("console"), "{message}");
+        assert!(message.contains("Insufficient account funds"), "{message}");
     }
 
     #[test]
