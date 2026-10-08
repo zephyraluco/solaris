@@ -23,8 +23,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_backend::AgentBackend;
 use solaris_core::{
-    AgentEvent, Companion, Config, Mode, RecentActivity, SlashCommand, Soul, TurnRequest, buddy,
-    parse_slash_command, recent,
+    AgentEvent, Companion, Config, Mode, Preferences, RecentActivity, SlashCommand, Soul,
+    TurnRequest, buddy, parse_slash_command, recent,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -99,6 +99,11 @@ pub struct AppOptions {
     pub recent: RecentActivity,
     /// Where recent activity is persisted; `None` keeps it session-scoped.
     pub recent_path: Option<PathBuf>,
+    /// What the last session left behind: theme, mode and the model chosen for
+    /// its provider.
+    pub preferences: Preferences,
+    /// Where the preferences are persisted; `None` keeps them session-scoped.
+    pub settings_path: Option<PathBuf>,
     pub quit: QuitFlag,
     pub overlay_queue: OverlayQueue,
     pub overlay_flag: Rc<Cell<bool>>,
@@ -148,6 +153,8 @@ impl AppOptions {
             tip: solaris_core::tips::select(0).content.to_string(),
             recent: RecentActivity::new(),
             recent_path: None,
+            preferences: Preferences::default(),
+            settings_path: None,
             quit,
             overlay_queue,
             overlay_flag,
@@ -250,6 +257,10 @@ pub struct App {
     /// Prompts recorded by earlier sessions, and where they are saved.
     recent: RecentActivity,
     recent_path: Option<PathBuf>,
+    /// Theme, mode and model as the last session left them, and where they are
+    /// saved.
+    preferences: Preferences,
+    settings_path: Option<PathBuf>,
     /// Idle animation step of the companion, counted in 500 ms beats.
     buddy_step: u64,
     buddy_started: Instant,
@@ -291,6 +302,8 @@ impl App {
             tip,
             recent,
             recent_path,
+            preferences,
+            settings_path,
             quit,
             overlay_queue,
             overlay_flag,
@@ -350,6 +363,8 @@ impl App {
             tip,
             recent,
             recent_path,
+            preferences,
+            settings_path,
             buddy_step: 0,
             buddy_started: Instant::now(),
             quit_press: None,
@@ -616,6 +631,7 @@ impl App {
 
     fn toggle_mode(&mut self) {
         self.config.mode = self.config.mode.next();
+        self.persist_settings();
         self.notifications
             .info(format!("{} mode", self.config.mode.label()));
     }
@@ -628,6 +644,7 @@ impl App {
     fn set_theme(&mut self, name: &str) {
         let theme = Theme::by_name(name);
         self.config.theme = theme.name.clone();
+        self.persist_settings();
         self.theme = theme;
         self.editor.set_styles(editor_styles(&self.theme));
         self.selection
@@ -643,6 +660,13 @@ impl App {
 
     fn set_model(&mut self, name: &str) {
         self.config.model = name.to_string();
+        // A model belongs to the provider that offers it, so it is remembered
+        // beside that provider rather than in the settings file.
+        if let Some(provider) = self.provider_id {
+            self.auth.activate(provider);
+        }
+        self.auth.remember_model(name);
+        self.persist_auth();
         // The model decides the payload, the price and the size of the context
         // window, so the backend is resolved again.
         self.rebuild_backend();
@@ -1382,6 +1406,32 @@ impl App {
         }
     }
 
+    /// Remember the theme and the mode, best-effort.
+    ///
+    /// Only choices the user made reach here: a resolved default belongs to a
+    /// flag, and writing one down would turn a fallback into a decision. The
+    /// model is not written here — it is remembered with the provider it was
+    /// chosen for, in `auth.json`.
+    fn persist_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+
+        self.preferences.theme = Some(self.config.theme.clone());
+        self.preferences.mode = Some(self.config.mode);
+
+        let written = self
+            .preferences
+            .to_json()
+            .map_err(|error| error.to_string())
+            .and_then(|json| write_json(&path, &json));
+
+        if let Err(error) = written {
+            self.notifications
+                .warning(format!("could not save preferences: {error}"));
+        }
+    }
+
     /// Best-effort persistence of the companion's name.
     fn persist_buddy(&mut self) {
         let Some(soul) = self.buddy.soul.clone() else {
@@ -1999,6 +2049,46 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.recent_path = Some(path);
         App::new(options)
+    }
+
+    /// An app that persists its preferences to `path`.
+    fn app_with_settings_path(path: std::path::PathBuf) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.settings_path = Some(path);
+        App::new(options)
+    }
+
+    #[test]
+    fn the_theme_the_mode_and_the_model_are_all_remembered() {
+        let dir = std::env::temp_dir().join(format!("solaris-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let settings_path = dir.join("settings.json");
+        let auth_path = dir.join("auth.json");
+
+        let mut app = app_with_settings_path(settings_path.clone());
+        app.auth_path = Some(auth_path.clone());
+        app.provider_id = Some("opencode");
+        app.set_model("minimax-m3");
+        app.toggle_mode();
+        app.set_theme("light");
+
+        // Theme and mode are session preferences…
+        let text = std::fs::read_to_string(&settings_path).expect("settings were written");
+        let stored = Preferences::from_json(&text).expect("decodes");
+        assert_eq!(stored.theme.as_deref(), Some("light"));
+        assert_eq!(stored.mode, Some(Mode::Plan));
+
+        // …while the model is remembered beside the provider that offers it.
+        let text = std::fs::read_to_string(&auth_path).expect("credentials were written");
+        let auth = AuthStore::from_json(&text).expect("decodes");
+        assert_eq!(auth.active_provider(), Some("opencode"));
+        assert_eq!(auth.active_model(), Some("minimax-m3"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An app whose companion is named and persisted to `path`.

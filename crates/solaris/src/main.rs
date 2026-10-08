@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use solaris::{App, AppOptions, BackendFactory, Clipboard};
-use solaris_core::{Companion, Config, Mode, RecentActivity, Soul, tips};
+use solaris_core::{Companion, Config, Mode, Preferences, RecentActivity, Soul, tips};
 use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tools::{ToolRegistry, ToolSelection};
@@ -25,9 +25,9 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    /// Colour theme to start with.
-    #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
-    theme: String,
+    /// Colour theme to start with; omitted means the remembered one, or `dark`.
+    #[arg(long, value_parser = ["dark", "light"])]
+    theme: Option<String>,
 
     /// Start in plan mode instead of build mode.
     #[arg(long)]
@@ -56,7 +56,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let mut config = Config {
-        theme: args.theme.clone(),
+        theme: args
+            .theme
+            .clone()
+            .unwrap_or_else(|| Config::default().theme),
         mode: if args.plan { Mode::Plan } else { Mode::Build },
         ..Config::default()
     };
@@ -82,11 +85,13 @@ fn main() -> Result<()> {
     let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
     let buddy_path = state_dir.as_ref().map(|dir| dir.join("companion.json"));
     let recent_path = state_dir.as_ref().map(|dir| dir.join("recent.json"));
+    let settings_path = state_dir.as_ref().map(|dir| dir.join("settings.json"));
 
     let mut auth = load_auth(auth_path.as_deref());
     let user = user_id();
     let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
     let recent = load_recent(recent_path.as_deref());
+    let settings = load_settings(settings_path.as_deref());
 
     // `--provider` moves this run without rewriting the saved choice.
     if let Some(id) = &args.provider {
@@ -94,6 +99,29 @@ fn main() -> Result<()> {
             anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
         }
         auth.activate(id.clone());
+    }
+
+    // What the last session left, unless this run overrides it: a flag always
+    // wins, so `--plan` in a script keeps meaning plan. The model follows the
+    // provider it was chosen for, and is kept in `auth.json` beside it.
+    if args.theme.is_none() {
+        if let Some(theme) = &settings.theme {
+            config.theme = theme.clone();
+        }
+    }
+    if !args.plan {
+        if let Some(mode) = settings.mode {
+            config.mode = mode;
+        }
+    }
+
+    // Without `--model`, a session starts on the model this provider was last
+    // used with: the catalogue's first entry is a fallback, not a decision, and
+    // reconnecting should not quietly move the user onto it.
+    if args.model.is_none() {
+        if let Some(model) = auth.active_model() {
+            config.model = model.to_string();
+        }
     }
 
     let backend_options = BackendOptions::default();
@@ -198,6 +226,8 @@ fn main() -> Result<()> {
         tip: tips::select(recent.len()).content.to_string(),
         recent,
         recent_path,
+        preferences: settings,
+        settings_path,
         quit: tui.quit_flag(),
         overlay_queue: tui.overlay_queue(),
         overlay_flag: tui.overlay_flag(),
@@ -294,6 +324,17 @@ fn load_recent(path: Option<&Path>) -> RecentActivity {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| RecentActivity::from_json(&text).ok())
+        .unwrap_or_default()
+}
+
+/// The preferences saved last time, or none when there is no usable record.
+fn load_settings(path: Option<&Path>) -> Preferences {
+    let Some(path) = path else {
+        return Preferences::default();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| Preferences::from_json(&text).ok())
         .unwrap_or_default()
 }
 

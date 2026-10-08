@@ -299,7 +299,7 @@ while !quit {
 
 1. `clap` 解析参数；构造 `Config`（`--plan` 映射到 `Mode::Plan`，`--model` 未给时模型名留空，由 provider 决定）。`--tools` / `--exclude-tools` 解析成 `ToolSelection`：白名单与 `+name`/`-name` 两种写法不能混用（混用直接报错，而不是猜），匹配不到任何工具的名字在启动时被指出来。
 2. `config_dir()` 解析状态目录，优先级：`$SOLARIS_CONFIG_DIR` → Windows 的 `%APPDATA%\solaris` → `$XDG_CONFIG_HOME/solaris`，回退 `~/.config/solaris`。
-3. 读取 `auth.json`、`companion.json`、`recent.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。
+3. 读取 `auth.json`、`companion.json`、`recent.json`、`settings.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。
 4. `--provider`（可选）覆盖本次运行的 provider，只改内存里的 `auth`，不重写 `auth.json`；未知 id 直接报错并列出可选值。
 5. 用 `choose_backend(&auth, &model, BackendOptions::default())` 解析出初始后端；显式给了 `--provider` 却解析不出凭据时，向 stderr 说明「先运行 /connect 或设置环境变量」，以免静默降级。解析出的后端随即由 `with_tools` 包上一层 `ToolLoop`，注册表与工具选择在 `App` 里只建一次——`edit` 与 `write` 的按路径锁因此整个会话共用一张。
 6. 若给了 `--print-config`，打印解析结果（含 backend / endpoint / 凭据来源）后直接返回，不进入界面。
@@ -441,7 +441,8 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 | 文件 | 内容 | 写入时机 |
 | --- | --- | --- |
-| `auth.json` | `AuthStore`：凭据（按 provider id）+ 当前 provider 与模型 | `/connect` 产生变更后 |
+| `auth.json` | `AuthStore`：凭据（按 provider id）+ 当前 provider 与它上次用的模型 | `/connect` 产生变更后、以及用户选过模型后 |
+| `settings.json` | `Preferences`：主题与模式 | `/theme`、Tab 切换模式后 |
 | `companion.json` | 伙伴的「灵魂」：名字、性格、孵化时间 | `/buddy name <name>` 之后 |
 | `recent.json` | 最近提示词 | 每次提交提示词后 |
 
@@ -474,9 +475,9 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ## 8. 测试策略
 
-工作区共 **623 个测试**，分三层：
+工作区共 **628 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 47、`solaris-core` 41、`solaris-tui` 130、`solaris-backend` 92、`solaris-tools` 114、`solaris` 库 159），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`ToolLoop` 的多轮与轮数上限、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 49、`solaris-core` 43、`solaris-tui` 130、`solaris-backend` 92、`solaris-tools` 114、`solaris` 库 160），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`ToolLoop` 的多轮与轮数上限、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
 - **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
 - **工具往返的回路测试** [`crates/solaris-tools/tests/loopback.rs`](../crates/solaris-tools/tests/loopback.rs)（2 个）：同一套真 socket 手法，但服务端先回一个 `tool_call`、再回最终文本，于是「请求体带上了 `tools` → 调用被解析出来 → 真的 `read` 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。
 ead 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。

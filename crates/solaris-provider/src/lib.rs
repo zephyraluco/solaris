@@ -81,13 +81,49 @@ pub fn mask_secret(value: &str) -> String {
     format!("{}{}", "\u{2022}".repeat(chars.len() - 4), tail)
 }
 
-/// Credentials for this installation plus the active provider.
+/// The provider requests go to, and the model chosen for it.
+///
+/// The two travel together because a model is chosen *for* a provider: a model
+/// id means nothing to a provider that never offered it, so switching providers
+/// must not carry the choice across.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Active {
+    /// Provider id.
+    pub provider: String,
+    /// Model identifier, empty until one is chosen.
+    #[serde(default)]
+    pub model: String,
+}
+
+/// Read the active selection, accepting the bare provider id older files hold.
+fn active_from_json<'de, D>(deserializer: D) -> Result<Option<Active>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Provider(String),
+        Selection(Active),
+    }
+
+    Ok(match Option::<Shape>::deserialize(deserializer)? {
+        None => None,
+        Some(Shape::Provider(provider)) => Some(Active {
+            provider,
+            model: String::new(),
+        }),
+        Some(Shape::Selection(active)) => Some(active),
+    })
+}
+
+/// Credentials for this installation plus the active provider and model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthStore {
     #[serde(default)]
     entries: BTreeMap<String, Credential>,
-    #[serde(default)]
-    active: Option<String>,
+    #[serde(default, deserialize_with = "active_from_json")]
+    active: Option<Active>,
 }
 
 impl AuthStore {
@@ -114,25 +150,51 @@ impl AuthStore {
     /// Drop a provider's credential, clearing the active provider if it was it.
     pub fn remove(&mut self, provider_id: &str) -> bool {
         let removed = self.entries.remove(provider_id).is_some();
-        if removed && self.active.as_deref() == Some(provider_id) {
+        if removed && self.active_provider() == Some(provider_id) {
             self.active = None;
         }
         removed
     }
 
     /// Mark a provider as the one requests go to.
+    ///
+    /// A model chosen for another provider is dropped with it; re-activating the
+    /// same provider keeps the model it was used with.
     pub fn activate(&mut self, provider_id: impl Into<String>) {
-        self.active = Some(provider_id.into());
+        let provider = provider_id.into();
+        let unchanged = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.provider == provider);
+        if !unchanged {
+            self.active = Some(Active {
+                provider,
+                model: String::new(),
+            });
+        }
     }
 
     /// The active provider id, when one is set.
     pub fn active_provider(&self) -> Option<&str> {
-        self.active.as_deref()
+        self.active.as_ref().map(|active| active.provider.as_str())
+    }
+
+    /// Remember the model the active provider should be asked for.
+    pub fn remember_model(&mut self, model: impl Into<String>) {
+        if let Some(active) = self.active.as_mut() {
+            active.model = model.into();
+        }
+    }
+
+    /// The model chosen for the active provider, when one has been.
+    pub fn active_model(&self) -> Option<&str> {
+        let model = self.active.as_ref()?.model.as_str();
+        (!model.is_empty()).then_some(model)
     }
 
     /// The active provider's credential.
     pub fn active_credential(&self) -> Option<&Credential> {
-        self.active.as_deref().and_then(|id| self.credential(id))
+        self.active_provider().and_then(|id| self.credential(id))
     }
 
     /// Whether nothing has been connected yet.
@@ -210,6 +272,39 @@ mod tests {
         assert!(store.remove("groq"));
         assert_eq!(store.active_provider(), None);
         assert!(!store.remove("groq"));
+    }
+
+    #[test]
+    fn the_model_is_kept_for_the_provider_it_was_chosen_for() {
+        let mut store = AuthStore::new();
+        store.store("opencode", Credential::ApiKey { key: "k".into() });
+        store.activate("opencode");
+        assert_eq!(store.active_model(), None);
+
+        store.remember_model("minimax-m3");
+        assert_eq!(store.active_model(), Some("minimax-m3"));
+
+        // Re-activating the same provider keeps its model.
+        store.activate("opencode");
+        assert_eq!(store.active_model(), Some("minimax-m3"));
+
+        // Another provider would not know that model, so it does not inherit it.
+        store.store("anthropic", Credential::ApiKey { key: "a".into() });
+        store.activate("anthropic");
+        assert_eq!(store.active_model(), None);
+    }
+
+    #[test]
+    fn a_file_holding_only_a_provider_id_still_loads() {
+        // Older builds wrote `"active": "anthropic"`; the model simply is not
+        // remembered yet, and the credentials must survive the upgrade.
+        let json =
+            r#"{"entries":{"anthropic":{"kind":"api_key","key":"sk-1"}},"active":"anthropic"}"#;
+
+        let store = AuthStore::from_json(json).expect("decode");
+        assert_eq!(store.active_provider(), Some("anthropic"));
+        assert_eq!(store.active_model(), None);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

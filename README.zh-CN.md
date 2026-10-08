@@ -204,7 +204,7 @@ solaris --exclude-tools 'bash'
 - **prompt 缓存**。solaris 是**主动请求**缓存的：Anthropic 走 `cache_control` 断点（打在最后一条消息上），OpenAI 只在端点是 OpenAI 自家时发 `prompt_cache_key`。`/stats` 里那两行缓存数字之所以会有值就是因为这个；也是长对话每轮越来越便宜的原因 —— 不变的前缀会以缓存读的价格回来。
 - **上下文**。`/stats` 分别给出 `session tokens`（本会话累计花掉的）和 `context used`。只有后者说明窗口有多满：它等于最后一轮上报的用量，加上其后新提交内容的估算量。把整个会话的轮次相加会无限增长，对「单次请求的窗口」毫无意义。
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
-- **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。不指定模型名就用其中的第一个，因为空模型名 provider 不会接受。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
+- **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。**上次为该 provider 选的模型会被记住** —— 就存在 `auth.json` 里（与「当前 provider」同一处），新会话直接沿用它；没有记录时才用其中的第一个，因为空模型名 provider 不会接受。主题与模式同样会被记住，存在 `settings.json`。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
 - **错误。** key 被拒、模型不存在、触发限流、账户余额不足，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
 
 ---

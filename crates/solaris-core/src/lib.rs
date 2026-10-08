@@ -23,7 +23,7 @@ pub use command::{
     PROMPT_SLASH_COMMANDS, SlashCommand, SlashCommandSpec, matching_slash_commands,
     parse_slash_command,
 };
-pub use config::{Config, Mode};
+pub use config::{Config, Mode, Preferences};
 pub use event::{AgentEvent, BackendError, TurnRequest};
 pub use message::{Content, Message, Role};
 pub use recent::{RecentActivity, RecentEntry};
