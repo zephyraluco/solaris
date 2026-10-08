@@ -5,13 +5,13 @@
 //! except while it is empty, when the welcome box's animated companion needs a
 //! fresh frame every tick.
 
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::welcome::{WelcomeData, WelcomeStyles, render_welcome};
 use solaris_tui::theme::Theme;
 use solaris_tui::util::wrap_text;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 
 use crate::state::{SessionState, Turn};
 

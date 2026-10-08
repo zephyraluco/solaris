@@ -6,15 +6,15 @@
 //! `mpsc` channel instead of reaching back into the application.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::select_list::{SelectItem, SelectList, SelectListTheme};
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{display_width, rect_contains, truncate_to_width, wrap_text};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Result of an interaction with a dialog.
@@ -591,7 +591,10 @@ pub const KEY_HELP: &[(&str, &str)] = &[
 ];
 
 /// Build the help dialog contents.
-pub fn help_lines(theme: &Theme, commands: &[solaris_core::SlashCommandSpec]) -> Vec<Line<'static>> {
+pub fn help_lines(
+    theme: &Theme,
+    commands: &[solaris_core::SlashCommandSpec],
+) -> Vec<Line<'static>> {
     let heading = Style::default()
         .fg(theme.heading)
         .add_modifier(Modifier::BOLD);
