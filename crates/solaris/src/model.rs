@@ -117,8 +117,8 @@ mod tests {
 
     fn items() -> Vec<SelectItem> {
         vec![
-            SelectItem::new("mock-1", "mock-1").description("the default"),
-            SelectItem::new("mock-2", "mock-2").description("the quick one"),
+            SelectItem::new("model-a", "model-a").description("the default"),
+            SelectItem::new("model-b", "model-b").description("the quick one"),
         ]
     }
 
@@ -132,36 +132,36 @@ mod tests {
 
     #[test]
     fn the_active_model_starts_highlighted() {
-        assert_eq!(picker(Some("mock-2")).selected_model(), Some("mock-2"));
+        assert_eq!(picker(Some("model-b")).selected_model(), Some("model-b"));
     }
 
     #[test]
     fn an_unknown_active_model_falls_back_to_the_first_row() {
-        assert_eq!(picker(Some("gone")).selected_model(), Some("mock-1"));
+        assert_eq!(picker(Some("gone")).selected_model(), Some("model-a"));
     }
 
     #[test]
     fn enter_takes_the_highlighted_model() {
-        let mut picker = picker(Some("mock-2"));
+        let mut picker = picker(Some("model-b"));
 
         assert_eq!(
             picker.on_key(key(KeyCode::Enter)),
             ModelOutcome::Picked {
-                model_id: "mock-2".into()
+                model_id: "model-b".into()
             }
         );
     }
 
     #[test]
     fn arrows_move_and_digits_jump() {
-        let mut picker = picker(Some("mock-1"));
+        let mut picker = picker(Some("model-a"));
         assert_eq!(picker.on_key(key(KeyCode::Down)), ModelOutcome::Handled);
-        assert_eq!(picker.selected_model(), Some("mock-2"));
+        assert_eq!(picker.selected_model(), Some("model-b"));
 
         assert_eq!(
             picker.on_key(key(KeyCode::Char('1'))),
             ModelOutcome::Picked {
-                model_id: "mock-1".into()
+                model_id: "model-a".into()
             }
         );
     }

@@ -8,6 +8,10 @@
 //! - [`commands`] / [`keymap`] — the command registry and global bindings
 //! - [`transcript`] — turn views rendered into styled lines
 //! - [`clipboard`] — the platform clipboard, behind an injectable pair
+//!
+//! The app never talks to a provider itself: [`BackendFactory`] resolves an
+//! `AgentBackend` from the credentials and the model, and the app only knows
+//! the label it reports.
 
 pub mod app;
 pub mod clipboard;
@@ -19,7 +23,7 @@ pub mod model;
 pub mod state;
 pub mod transcript;
 
-pub use app::{App, AppOptions};
+pub use app::{App, AppOptions, BackendFactory};
 pub use clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
 pub use connect::{
     ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent, DeviceAuthStatus,

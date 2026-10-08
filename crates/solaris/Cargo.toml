@@ -23,3 +23,7 @@ tokio = { workspace = true }
 # Text only: the image and wayland-data-control features would drag in far more
 # than a TUI chat client needs.
 arboard = { version = "3", default-features = false }
+
+[dev-dependencies]
+# The test suites implement `AgentBackend` for their own local fake backend.
+async-trait = { workspace = true }

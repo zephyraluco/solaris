@@ -12,6 +12,7 @@ pub mod message;
 pub mod provider;
 pub mod recent;
 pub mod tips;
+pub mod usage;
 
 pub use auth::{AuthError, AuthStore, Credential, mask_secret};
 pub use buddy::{Bones, BuddyError, Companion, Hat, Rarity, Soul, Species};
@@ -22,6 +23,10 @@ pub use command::{
 pub use config::{Config, Mode};
 pub use event::{AgentEvent, BackendError, TurnRequest};
 pub use message::{Message, Role};
-pub use provider::{AuthKind, PROVIDERS, ProviderSpec, provider};
+pub use provider::{
+    AuthKind, ModelSpec, PROVIDERS, ProviderSpec, Wire, context_window_for, max_output_for,
+    model_spec, price_for, provider,
+};
 pub use recent::{RecentActivity, RecentEntry};
 pub use tips::{TIPS, Tip};
+pub use usage::{Price, Usage, tokens_for_characters};

@@ -4,10 +4,28 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Agent backend abstraction and mock implementation for solaris"
+description = "Agent backend abstraction and provider clients for solaris"
 
 [dependencies]
 solaris-core = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bytes = "1"
+# `rustls` rather than the platform TLS stack: no OpenSSL to link on Linux and
+# no schannel surprises on Windows. Only the pieces a streaming chat client
+# needs — cookie jars, compression, multipart and the blocking client are all
+# dead weight here.
+reqwest = { version = "0.13", default-features = false, features = [
+	"json",
+	"stream",
+	"rustls",
+	"system-proxy",
+] }
+
+[dev-dependencies]
+# Only the loopback tests need a listening socket.
+tokio = { workspace = true, features = ["net"] }

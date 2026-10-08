@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use solaris_backend::AgentBackend;
+use solaris_backend::{AgentBackend, BackendChoice, CredentialSource};
 use solaris_core::{
     AgentEvent, AuthKind, AuthStore, Companion, Config, Credential, Mode, RecentActivity,
-    SlashCommand, Soul, TurnRequest, buddy, parse_slash_command, recent,
+    SlashCommand, Soul, TurnRequest, buddy, context_window_for, parse_slash_command, recent,
 };
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
@@ -63,9 +63,18 @@ const BUDDY_STEP_MS: u64 = 500;
 /// window quit the app. claurst uses the same two seconds.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
+/// Builds the backend for the current credentials and model.
+///
+/// A closure rather than a fixed backend, because `/connect` and `/model` both
+/// change the answer mid-session — and because it is the seam that lets the app
+/// stay ignorant of which provider, if any, is behind it.
+pub type BackendFactory = Arc<dyn Fn(&AuthStore, &str) -> BackendChoice + Send + Sync>;
+
 /// Everything [`App::new`] needs to start.
 pub struct AppOptions {
-    pub backend: Arc<dyn AgentBackend>,
+    /// Resolves the backend at start-up and again after every change to the
+    /// credentials or the model.
+    pub backend_factory: BackendFactory,
     pub config: Config,
     /// Credentials already on disk, if any.
     pub auth: AuthStore,
@@ -96,6 +105,9 @@ pub struct AppOptions {
 
 impl AppOptions {
     /// Options with no stored credentials and no persistence — handy in tests.
+    ///
+    /// The factory pinned here always returns `backend`, so a test drives the
+    /// backend it handed in whatever the wizard does to the credentials.
     pub fn new(
         backend: Arc<dyn AgentBackend>,
         config: Config,
@@ -104,7 +116,13 @@ impl AppOptions {
         overlay_flag: Rc<Cell<bool>>,
     ) -> Self {
         Self {
-            backend,
+            backend_factory: Arc::new(move |_, model| BackendChoice {
+                backend: Arc::clone(&backend),
+                provider_id: None,
+                base_url: None,
+                model: model.to_string(),
+                source: CredentialSource::None,
+            }),
             config,
             auth: AuthStore::new(),
             auth_path: None,
@@ -124,9 +142,36 @@ impl AppOptions {
     }
 }
 
+/// Resolve the backend for the current credentials, adopting the model that
+/// will really be asked for.
+///
+/// Adopting matters as soon as a provider is connected: with no model named
+/// yet, the resolution layer asks for the first model that provider offers, and
+/// the app takes that on so the footer and `/stats` report what is really being
+/// asked for. The context window follows the model, because the footer gauge is
+/// only honest if it measures against the window the model really has.
+fn resolve_backend(
+    factory: &BackendFactory,
+    auth: &AuthStore,
+    config: &mut Config,
+) -> BackendChoice {
+    let choice = factory(auth, &config.model);
+    if choice.provider_id.is_some() {
+        config.model = choice.model.clone();
+    }
+    config.context_window = u64::from(context_window_for(&config.model));
+    choice
+}
+
 /// The solaris application root component.
 pub struct App {
     pub(crate) backend: Arc<dyn AgentBackend>,
+    /// Resolves the backend again whenever the credentials or model change.
+    backend_factory: BackendFactory,
+    /// Provider the current backend was resolved to, when one was. The model
+    /// picker lists this provider's models, so it needs the id rather than the
+    /// backend's display label.
+    provider_id: Option<&'static str>,
     pub(crate) config: Config,
     pub(crate) theme: Theme,
     pub(crate) session: SessionState,
@@ -179,7 +224,7 @@ impl App {
     /// Build the application.
     pub fn new(options: AppOptions) -> Self {
         let AppOptions {
-            backend,
+            backend_factory,
             config,
             auth,
             auth_path,
@@ -197,6 +242,11 @@ impl App {
             clipboard,
         } = options;
 
+        let mut config = config;
+        let choice = resolve_backend(&backend_factory, &auth, &mut config);
+        let backend = choice.backend;
+        let provider_id = choice.provider_id;
+
         let theme = Theme::by_name(&config.theme);
         selection
             .borrow_mut()
@@ -209,6 +259,8 @@ impl App {
 
         Self {
             backend,
+            backend_factory,
+            provider_id,
             config,
             theme,
             session: SessionState::new(),
@@ -273,6 +325,22 @@ impl App {
     /// The active model name.
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// The label of the backend answering turns right now.
+    pub fn backend_label(&self) -> &str {
+        self.backend.label()
+    }
+
+    /// Resolve the backend again after the credentials or the model changed.
+    ///
+    /// Returns where the credential came from, so a caller can explain a choice
+    /// that did not land where the user pointed.
+    fn rebuild_backend(&mut self) -> CredentialSource {
+        let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+        self.backend = choice.backend;
+        self.provider_id = choice.provider_id;
+        choice.source
     }
 
     /// Whether an overlay is currently visible.
@@ -491,6 +559,9 @@ impl App {
 
     fn set_model(&mut self, name: &str) {
         self.config.model = name.to_string();
+        // The model decides the payload, the price and the size of the context
+        // window, so the backend is resolved again.
+        self.rebuild_backend();
         self.notifications
             .info(format!("model: {}", self.config.model));
     }
@@ -618,10 +689,10 @@ impl App {
                 }
             }
             AgentEvent::Status(text) => self.session.status = Some(text),
-            AgentEvent::TurnComplete { tokens, cost_usd } => {
+            AgentEvent::TurnComplete { usage, cost_usd } => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
-                    turn.tokens = tokens;
+                    turn.usage = usage;
                     turn.cost_usd = cost_usd;
                 }
                 self.session.status = None;
@@ -687,10 +758,17 @@ impl App {
     }
 
     fn open_stats(&mut self) {
+        let backend = self.backend.label().to_string();
+        let model = if self.config.model.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            self.config.model.clone()
+        };
         let lines = stats_lines(
             &self.theme,
             &self.session,
-            &self.config.model,
+            &model,
+            &backend,
             self.config.mode,
             self.config.context_window,
         );
@@ -800,12 +878,29 @@ impl App {
 
     /// Open the model picker in the prompt region — the `/connect` look rather
     /// than a modal — with the active model highlighted.
+    ///
+    /// The list is whatever the connected provider offers, since no other
+    /// provider's models can be asked for. With nothing connected there is
+    /// nothing to choose between, so the user is told what to do instead.
     fn open_model_picker(&mut self) {
+        let models = self
+            .provider_id
+            .and_then(solaris_core::provider)
+            .map(|spec| {
+                spec.models
+                    .iter()
+                    .map(|model| SelectItem::new(model.id, model.id).description(model.description))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            self.notifications
+                .warning("no provider is connected — run /connect to choose a model");
+            return;
+        }
+
         let current = self.config.model.clone();
-        let models = Config::MODEL_OPTIONS
-            .iter()
-            .map(|(name, description)| SelectItem::new(*name, *name).description(*description))
-            .collect::<Vec<_>>();
         let picker = ModelPicker::new(&self.theme, models, Some(&current));
         self.inline = Some(Inline::Model(picker));
         self.device_rx = None;
@@ -964,15 +1059,27 @@ impl App {
         }
         self.auth.activate(provider_id.clone());
         self.persist_auth();
-        self.notifications
-            .info(format!("connected to {provider_name}"));
+
+        // Connecting is what resolves a real client, so the backend is rebuilt
+        // before the model step.
+        match self.rebuild_backend() {
+            CredentialSource::NotImplemented => self.notifications.warning(
+                "subscription sign-in is not implemented yet — connect an API key instead",
+            ),
+            CredentialSource::Missing => self
+                .notifications
+                .warning("no usable credential — turns will say so until /connect succeeds"),
+            _ => self
+                .notifications
+                .info(format!("connected to {provider_name}")),
+        }
 
         // Continue into the model picker, the way claurst's wizard does.
         let models: Vec<SelectItem> = solaris_core::provider(&provider_id)
             .map(|spec| {
                 spec.models
                     .iter()
-                    .map(|(id, description)| SelectItem::new(*id, *id).description(*description))
+                    .map(|spec| SelectItem::new(spec.id, spec.id).description(spec.description))
                     .collect()
             })
             .unwrap_or_default();
@@ -1178,19 +1285,16 @@ impl App {
             area.width
         };
 
-        let left = format!(
-            " {} · {} · {} tok · ${:.4} ",
-            self.config.model,
-            self.config.mode.label(),
-            self.session.total_tokens(),
-            self.session.total_cost()
-        );
-        // A connected provider is prepended so the footer says where requests
-        // would go, even though the backend is still the mock one.
-        let left = match self.auth.active_provider() {
-            Some(provider) => format!(" {provider} · {}", &left[1..]),
-            None => left,
-        };
+        // The model slot disappears while no model is named, so the footer
+        // never shows an empty gap between two separators.
+        let mut facts = vec![self.backend.label().to_string()];
+        if !self.config.model.is_empty() {
+            facts.push(self.config.model.clone());
+        }
+        facts.push(self.config.mode.label().to_string());
+        facts.push(format!("{} tok", self.session.total_tokens()));
+        facts.push(format!("${:.4}", self.session.total_cost()));
+        let left = format!(" {} ", facts.join(" · "));
         buf.set_string(
             area.x,
             area.y,
@@ -1473,37 +1577,18 @@ fn theme_description(name: &str) -> &'static str {
     }
 }
 
-/// How long the stand-in device-auth task "waits for the code".
-const DEVICE_CODE_DELAY: Duration = Duration::from_millis(300);
-/// How long it "polls" before reporting success.
-const DEVICE_POLL_DELAY: Duration = Duration::from_millis(1_500);
-
 /// Start the device-code task for `provider_id`.
 ///
-/// The network half of OAuth is not implemented — no provider can actually be
-/// contacted yet — so this stands in with the same event shape a real
-/// implementation emits: a code is issued, then a token arrives. It is the
-/// single seam to replace when a provider client lands.
+/// The network half of OAuth is not implemented, so there is no code to issue
+/// and no token to collect, and that is what this reports. Handing back a
+/// placeholder token would be worse than saying nothing: it would connect a
+/// provider that cannot answer, and the first turn would fail with an
+/// authentication error that explains nothing about why.
 fn spawn_device_auth(provider_id: &str) -> UnboundedReceiver<DeviceAuthEvent> {
     let (tx, rx) = unbounded_channel();
-    let verification_uri = format!("https://{provider_id}.example.test/device");
-
-    tokio::spawn(async move {
-        tokio::time::sleep(DEVICE_CODE_DELAY).await;
-        let issued = tx.send(DeviceAuthEvent::GotCode {
-            user_code: "SO-4F7Q-9X2M".to_string(),
-            verification_uri,
-        });
-        if issued.is_err() {
-            return;
-        }
-
-        tokio::time::sleep(DEVICE_POLL_DELAY).await;
-        let _ = tx.send(DeviceAuthEvent::TokenReceived(
-            "simulated-oauth-token".to_string(),
-        ));
-    });
-
+    let _ = tx.send(DeviceAuthEvent::Error(format!(
+        "signing in to {provider_id} is not implemented yet — connect an API key instead"
+    )));
     rx
 }
 
@@ -1666,12 +1751,46 @@ mod tests {
     use super::*;
     use crate::connect::DeviceAuthStatus;
     use crossterm::event::MouseButton;
-    use solaris_backend::MockBackend;
+    use solaris_backend::{AgentEventStream, BackendOptions};
+    use solaris_core::{BackendError, Usage};
     use std::cell::RefCell;
     use std::time::Duration;
 
+    /// A backend that answers with a prompt-echoing markdown reply, so the app's
+    /// own behaviour can be driven without a provider and without a network.
+    struct FakeBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FakeBackend {
+        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            let reply = format!(
+                "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
+                request.prompt.trim()
+            );
+            let events = vec![
+                AgentEvent::ThinkingDelta("thinking ".to_string()),
+                AgentEvent::Status("composing reply".to_string()),
+                AgentEvent::TextDelta(reply),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(4, 2),
+                    cost_usd: 0.0,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        fn label(&self) -> &str {
+            "fake"
+        }
+    }
+
+    /// The fake, type-erased the way `AppOptions` wants it.
+    fn fake_backend() -> Arc<dyn AgentBackend> {
+        Arc::new(FakeBackend)
+    }
+
     fn app() -> App {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1686,7 +1805,7 @@ mod tests {
 
     /// An app that persists credentials to `path`.
     fn app_with_auth_path(path: std::path::PathBuf) -> App {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1697,7 +1816,7 @@ mod tests {
 
     /// An app that persists recent activity to `path`.
     fn app_with_recent_path(path: std::path::PathBuf) -> App {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1708,13 +1827,58 @@ mod tests {
 
     /// An app whose companion is named and persisted to `path`.
     fn app_with_buddy_path(path: std::path::PathBuf) -> App {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.buddy_path = Some(path);
         App::new(options)
+    }
+
+    /// An app that resolves backends from credentials, the way the binary does.
+    fn app_with_real_backends(auth: AuthStore) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.auth = auth;
+        options.backend_factory = Arc::new(|auth: &AuthStore, model: &str| {
+            solaris_backend::choose_backend(
+                auth,
+                model,
+                BackendOptions {
+                    environment: solaris_backend::empty_environment(),
+                },
+            )
+        });
+        App::new(options)
+    }
+
+    /// An app with one provider connected by API key, so a provider's own model
+    /// list and the resolved backend are both available.
+    fn app_connected_to(provider: &str) -> App {
+        let mut auth = AuthStore::new();
+        auth.store(
+            provider,
+            Credential::ApiKey {
+                key: "sk-test".to_string(),
+            },
+        );
+        auth.activate(provider);
+        app_with_real_backends(auth)
+    }
+
+    /// The bottom line of a rendered frame.
+    fn footer_text(app: &mut App) -> String {
+        let area = Rect::new(0, 0, 100, 8);
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+
+        (0..area.width)
+            .map(|x| buf[(x, area.height - 1)].symbol())
+            .collect()
     }
 
     /// Render the app into a buffer and return the visible text.
@@ -1932,19 +2096,18 @@ mod tests {
     fn theme_and_model_arguments_apply_immediately() {
         let mut app = app();
         app.submit("/theme light".to_string());
-        app.submit("/model solaris-mock-reason".to_string());
+        app.submit("/model claude-opus-4-1".to_string());
         assert_eq!(app.theme_name(), "light");
-        assert_eq!(app.model(), "solaris-mock-reason");
+        assert_eq!(app.model(), "claude-opus-4-1");
     }
 
     #[test]
-    fn model_dialog_options_come_from_the_model_table() {
-        // The picker must offer exactly the models the config advertises.
-        assert_eq!(Config::MODEL_OPTIONS.len(), 3);
-        for (name, description) in Config::MODEL_OPTIONS {
-            assert!(!name.is_empty());
-            assert!(!description.is_empty(), "{name} has no picker description");
-        }
+    fn a_named_model_with_nothing_connected_is_kept() {
+        // `/model <name>` is the user's explicit choice, so it is not second
+        // guessed even when no provider could serve it.
+        let mut app = app();
+        app.submit("/model some-model-nobody-lists".to_string());
+        assert_eq!(app.model(), "some-model-nobody-lists");
     }
 
     #[test]
@@ -1968,8 +2131,10 @@ mod tests {
 
     #[test]
     fn the_model_command_opens_the_inline_picker() {
-        let mut app = app();
+        let mut app = app_connected_to("anthropic");
+        // Nothing was named, so the provider's first model was adopted.
         let current = app.model().to_string();
+        assert_eq!(current, "claude-sonnet-4-5");
 
         app.submit("/model".to_string());
 
@@ -1980,6 +2145,9 @@ mod tests {
         let text = rendered_text(&mut app, 80, 24);
         assert!(text.contains("Select a model:"), "{text}");
         assert!(text.contains(current.as_str()), "{text}");
+        // Exactly what the connected provider offers, and nothing else.
+        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert!(text.contains("claude-haiku-4-5"), "{text}");
 
         // The active model is the highlighted row, so Enter keeps it.
         app.handle_key(key(KeyCode::Enter));
@@ -1988,11 +2156,26 @@ mod tests {
     }
 
     #[test]
-    fn the_inline_model_picker_switches_the_model() {
+    fn a_model_picker_with_nothing_connected_says_so() {
         let mut app = app();
-        let names: Vec<&str> = Config::MODEL_OPTIONS
+        app.submit("/model".to_string());
+
+        // Nothing to choose between, so the picker stays shut and the notice
+        // says what to do about it.
+        assert!(app.inline.is_none());
+        let (kind, text) = app.notifications.current().expect("a notice was shown");
+        assert_eq!(kind, NoticeKind::Warning);
+        assert!(text.contains("/connect"), "{text}");
+    }
+
+    #[test]
+    fn the_inline_model_picker_switches_the_model() {
+        let mut app = app_connected_to("anthropic");
+        let names: Vec<&str> = solaris_core::provider("anthropic")
+            .expect("a known provider")
+            .models
             .iter()
-            .map(|(name, _)| *name)
+            .map(|model| model.id)
             .collect();
         let start = names
             .iter()
@@ -2009,7 +2192,7 @@ mod tests {
 
     #[test]
     fn escaping_the_model_picker_keeps_the_model() {
-        let mut app = app();
+        let mut app = app_connected_to("anthropic");
         let current = app.model().to_string();
 
         app.submit("/model".to_string());
@@ -2059,14 +2242,16 @@ mod tests {
         app.apply_event(AgentEvent::TextDelta("hello ".into()));
         app.apply_event(AgentEvent::TextDelta("world".into()));
         app.apply_event(AgentEvent::TurnComplete {
-            tokens: 7,
+            usage: Usage::new(5, 2),
             cost_usd: 0.001,
         });
 
         let turn = &app.session.turns[0];
         assert_eq!(turn.thinking, "hmm ");
         assert_eq!(turn.reply, "hello world");
-        assert_eq!(turn.tokens, 7);
+        assert_eq!(turn.tokens(), 7);
+        assert_eq!(turn.usage.input_tokens, 5);
+        assert_eq!(turn.usage.output_tokens, 2);
         assert!(turn.complete);
         assert!(!app.session.is_streaming());
     }
@@ -2250,35 +2435,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_auth_stores_the_token_once_it_completes() {
+    async fn device_auth_reports_that_sign_in_is_not_implemented() {
         let mut app = app();
         app.submit("/connect".to_string());
 
-        // Row 2 is the subscription provider, which uses device auth.
+        // Row 2 is the subscription provider, which signs in over OAuth.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.connect_step(), Some(ConnectStep::DeviceAuth));
 
-        // The background task issues a code, then a token.
-        for _ in 0..600 {
-            app.tick();
-            let succeeded = app.inline.as_ref().is_some_and(|inline| {
-                matches!(
-                    inline,
-                    Inline::Connect(flow)
-                        if matches!(flow.device_status(), DeviceAuthStatus::Success(_))
-                )
-            });
-            if succeeded {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        app.tick();
+        let message = app.inline.as_ref().and_then(|inline| match inline {
+            Inline::Connect(flow) => match flow.device_status() {
+                DeviceAuthStatus::Error(message) => Some(message.clone()),
+                _ => None,
+            },
+            _ => None,
+        });
+        let message = message.expect("the wizard should report that it cannot sign in");
+        assert!(message.contains("not implemented"), "{message}");
 
-        // Any key continues and stores the token.
+        // Dismissing it must leave no credential behind: a placeholder token
+        // would make the first real turn fail with an unexplained 401.
         app.handle_key(key(KeyCode::Char('x')));
-        assert!(app.auth.is_connected("claude-subscription"));
-        assert_eq!(app.active_provider(), Some("claude-subscription"));
+        assert!(!app.auth.is_connected("claude-subscription"));
+        assert!(!app.connect_open());
     }
 
     #[test]
@@ -2399,21 +2580,58 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_names_the_connected_provider() {
-        let mut app = app();
-        app.auth
-            .store("anthropic", Credential::ApiKey { key: "k".into() });
-        app.auth.activate("anthropic");
+    fn the_footer_names_the_backend_that_answers() {
+        // Nothing connected: the footer says `unconnected` rather than naming a
+        // provider that would never be called.
+        let mut app = app_with_real_backends(AuthStore::new());
+        assert_eq!(app.backend_label(), "unconnected");
+        let footer = footer_text(&mut app);
+        assert!(footer.contains(" unconnected · "), "{footer:?}");
+        // No model was named, so the footer leaves the slot out entirely.
+        assert!(!footer.contains(" ·  · "), "{footer:?}");
 
-        let area = Rect::new(0, 0, 100, 8);
-        let mut buf = Buffer::empty(area);
-        app.render(&mut buf, area);
-        let footer: String = (0..area.width)
-            .map(|x| buf[(x, area.height - 1)].symbol())
-            .collect();
+        // A stored key turns the same app into a real client.
+        let mut auth = AuthStore::new();
+        auth.store("anthropic", Credential::ApiKey { key: "k".into() });
+        auth.activate("anthropic");
 
-        assert!(footer.contains("anthropic"), "{footer:?}");
+        let mut app = app_with_real_backends(auth);
+        assert_eq!(app.backend_label(), "anthropic");
+        let footer = footer_text(&mut app);
         assert!(footer.contains(" anthropic · "), "{footer:?}");
+        assert!(footer.contains("claude-sonnet-4-5"), "{footer:?}");
+    }
+
+    #[tokio::test]
+    async fn connecting_switches_the_backend_away_from_unconnected() {
+        let mut app = app_with_real_backends(AuthStore::new());
+        assert_eq!(app.backend_label(), "unconnected");
+        assert_eq!(app.model(), "");
+
+        connect_with_api_key(&mut app, "sk-test");
+
+        // Connecting a provider replaces both the backend and the model: with
+        // nothing named, the provider's own first model is adopted.
+        assert_eq!(app.backend_label(), "anthropic");
+        assert_eq!(app.model(), "claude-sonnet-4-5");
+        assert_eq!(app.config.context_window, 200_000);
+
+        // The wizard's model step can still change it.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.model(), "claude-opus-4-1");
+        assert_eq!(app.config.context_window, 200_000);
+    }
+
+    #[tokio::test]
+    async fn a_session_without_credentials_stays_unconnected() {
+        let mut app = app_with_real_backends(AuthStore::new());
+        app.tick();
+
+        // Nothing to connect: no model is named and no provider answers.
+        assert_eq!(app.backend_label(), "unconnected");
+        assert_eq!(app.model(), "");
+        assert_eq!(app.config.context_window, 128_000);
     }
 
     #[test]
@@ -2547,7 +2765,7 @@ mod tests {
         assert!(!app.session.is_streaming(), "turn never completed");
         assert!(app.session.turns[0].complete);
         assert!(app.session.turns[0].reply.contains("hello"));
-        assert!(app.session.turns[0].tokens > 0);
+        assert_eq!(app.session.turns[0].usage, Usage::new(4, 2));
     }
 
     #[tokio::test]
@@ -2600,7 +2818,7 @@ mod tests {
         reads: Option<&str>,
         succeeds: bool,
     ) -> (App, Rc<RefCell<Vec<String>>>) {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -2622,7 +2840,7 @@ mod tests {
     /// An app whose clipboard is a single cell: what a copy writes is what a
     /// paste reads back.
     fn app_with_live_clipboard() -> App {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));

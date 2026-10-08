@@ -647,6 +647,7 @@ pub fn stats_lines(
     theme: &Theme,
     session: &crate::state::SessionState,
     model: &str,
+    backend: &str,
     mode: solaris_core::Mode,
     context_window: u64,
 ) -> Vec<Line<'static>> {
@@ -657,10 +658,12 @@ pub fn stats_lines(
     let value = Style::default().fg(theme.fg);
 
     let tokens = session.total_tokens();
+    let usage = session.total_usage();
+    let context = session.context_tokens();
     let used_ratio = if context_window == 0 {
         0.0
     } else {
-        tokens as f64 / context_window as f64
+        f64::from(context) / context_window as f64
     };
 
     let row = |name: &str, value_text: String| {
@@ -670,22 +673,43 @@ pub fn stats_lines(
         ])
     };
 
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled("Session", heading)),
         Line::default(),
+        row("backend", backend.to_string()),
         row("model", model.to_string()),
         row("mode", mode.label().to_string()),
         row("turns", session.turns.len().to_string()),
-        row("tokens", tokens.to_string()),
+        row("session tokens", tokens.to_string()),
+        row("input", usage.input_tokens.to_string()),
+        row("output", usage.output_tokens.to_string()),
+        row("cache read", usage.cache_read_tokens.to_string()),
+        row("cache write", usage.cache_write_tokens.to_string()),
         row("cost", format!("${:.4}", session.total_cost())),
         row("context window", context_window.to_string()),
-        row("context used", format!("{:.1}%", used_ratio * 100.0)),
+        row(
+            "context used",
+            format!("{:.1}% ({context} tok)", used_ratio * 100.0),
+        ),
         Line::default(),
         Line::from(Span::styled(
             "  Token and cost figures come from the active backend.",
             label,
         )),
-    ]
+        Line::from(Span::styled(
+            "  Costs use the bundled list-price snapshot, so a bill may differ.",
+            label,
+        )),
+    ];
+
+    if usage.estimated {
+        lines.push(Line::from(Span::styled(
+            "  ≈ a provider reported no usage, so part of this is an estimate.",
+            label,
+        )));
+    }
+
+    lines
 }
 
 /// Render markdown into dialog lines (used by future text dialogs).
@@ -989,21 +1013,95 @@ mod tests {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
         session.turns.push(crate::state::Turn {
-            tokens: 120,
+            usage: solaris_core::Usage::new(120, 30),
             cost_usd: 0.01,
             complete: true,
             ..Default::default()
         });
 
-        let lines = stats_lines(&theme, &session, "solaris-mock-1", solaris_core::Mode::Build, 1000);
+        let lines = stats_lines(
+            &theme,
+            &session,
+            "claude-sonnet-4-5",
+            "anthropic",
+            solaris_core::Mode::Build,
+            1000,
+        );
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("solaris-mock-1"));
+        assert!(text.contains("anthropic"));
+        assert!(text.contains("claude-sonnet-4-5"));
+        assert!(text.contains("150"), "the buckets are summed: {text}");
         assert!(text.contains("120"));
         assert!(text.contains("BUILD"));
-        assert!(text.contains("12.0%"));
+        assert!(text.contains("15.0%"));
+        // A measured session makes no apology for its numbers.
+        assert!(!text.contains('≈'), "{text}");
+    }
+
+    /// Flatten rendered lines back into text, for assertions.
+    fn stats_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_context_gauge_measures_the_window_not_the_session() {
+        let theme = Theme::dark();
+        let mut session = crate::state::SessionState::new();
+        for _ in 0..3 {
+            session.turns.push(crate::state::Turn {
+                prompt: "hi".to_string(),
+                usage: solaris_core::Usage::new(100, 50),
+                complete: true,
+                ..Default::default()
+            });
+        }
+
+        let text = stats_text(&stats_lines(
+            &theme,
+            &session,
+            "claude-sonnet-4-5",
+            "anthropic",
+            solaris_core::Mode::Build,
+            1000,
+        ));
+
+        // 450 tokens went by in total, but only the last turn describes what is
+        // in the window; summing them would claim 45% of a window that is 15%
+        // full.
+        assert!(text.contains("450"), "the session total: {text}");
+        assert!(text.contains("15.0% (150 tok)"), "the context: {text}");
+    }
+
+    #[test]
+    fn stats_lines_admit_an_estimated_turn() {
+        let theme = Theme::dark();
+        let mut session = crate::state::SessionState::new();
+        session.turns.push(crate::state::Turn {
+            usage: solaris_core::Usage::estimate(400, 400),
+            ..Default::default()
+        });
+
+        let lines = stats_lines(
+            &theme,
+            &session,
+            "llama3.2",
+            "local",
+            solaris_core::Mode::Plan,
+            1000,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('≈'), "{text}");
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::config::Mode;
 use crate::message::Message;
+use crate::usage::Usage;
 use thiserror::Error;
 
 /// A single incremental event produced while answering a turn.
@@ -14,7 +15,13 @@ pub enum AgentEvent {
     /// Transient status line (e.g. "thinking…", "tool call").
     Status(String),
     /// Terminal event: the turn finished successfully.
-    TurnComplete { tokens: u32, cost_usd: f64 },
+    TurnComplete {
+        /// What the turn consumed, measured by the provider or estimated when
+        /// it reported nothing.
+        usage: Usage,
+        /// What that usage costs at the model's list price, in USD.
+        cost_usd: f64,
+    },
     /// Terminal event: the turn failed.
     Error(String),
 }

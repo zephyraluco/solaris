@@ -123,9 +123,9 @@ mod tests {
 
     #[test]
     fn tolerates_leading_whitespace() {
-        let cmd = parse_slash_command("   /model solaris-mock-1  ").expect("parsed");
+        let cmd = parse_slash_command("   /model claude-opus-4-1  ").expect("parsed");
         assert_eq!(cmd.name, "model");
-        assert_eq!(cmd.args, "solaris-mock-1");
+        assert_eq!(cmd.args, "claude-opus-4-1");
     }
 
     #[test]

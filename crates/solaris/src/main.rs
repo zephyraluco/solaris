@@ -7,22 +7,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use solaris::{App, AppOptions, Clipboard};
-use solaris_backend::{AgentBackend, MockBackend};
-use solaris_core::{AuthStore, Companion, Config, Mode, RecentActivity, Soul, tips};
+use solaris::{App, AppOptions, BackendFactory, Clipboard};
+use solaris_backend::{BackendOptions, CredentialSource, choose_backend};
+use solaris_core::{
+    AuthStore, Companion, Config, Mode, RecentActivity, Soul, context_window_for, provider, tips,
+};
 use solaris_tui::Tui;
 
 /// A terminal AI assistant.
 #[derive(Debug, Parser)]
 #[command(name = "solaris", version, about = "A terminal AI assistant")]
 struct Args {
-    /// Model identifier.
-    #[arg(long, default_value = "solaris-mock-1")]
-    model: String,
+    /// Model identifier; omitted means the connected provider chooses.
+    #[arg(long)]
+    model: Option<String>,
 
     /// Colour theme to start with.
     #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
@@ -32,9 +33,9 @@ struct Args {
     #[arg(long)]
     plan: bool,
 
-    /// Per-chunk streaming delay for the mock backend, in milliseconds.
-    #[arg(long, default_value_t = 24)]
-    chunk_delay_ms: u64,
+    /// Provider to send requests to, overriding the one `/connect` activated.
+    #[arg(long)]
+    provider: Option<String>,
 
     /// Print the resolved configuration and exit without starting the UI.
     #[arg(long)]
@@ -44,33 +45,51 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let config = Config {
-        model: args.model.clone(),
+    let mut config = Config {
         theme: args.theme.clone(),
         mode: if args.plan { Mode::Plan } else { Mode::Build },
         ..Config::default()
     };
+    if let Some(model) = &args.model {
+        config.model = model.clone();
+    }
 
     let state_dir = config_dir();
     let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
     let buddy_path = state_dir.as_ref().map(|dir| dir.join("companion.json"));
     let recent_path = state_dir.as_ref().map(|dir| dir.join("recent.json"));
 
-    let auth = load_auth(auth_path.as_deref());
+    let mut auth = load_auth(auth_path.as_deref());
     let user = user_id();
     let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
     let recent = load_recent(recent_path.as_deref());
 
-    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_delay(Duration::from_millis(
-        args.chunk_delay_ms,
-    )));
+    // `--provider` moves this run without rewriting the saved choice.
+    if let Some(id) = &args.provider {
+        if provider(id).is_none() {
+            anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
+        }
+        auth.activate(id.clone());
+    }
+
+    let backend_options = BackendOptions::default();
+    // Resolved here for reporting, and again by the app whenever the
+    // credentials or the model change.
+    let choice = choose_backend(&auth, &config.model, backend_options.clone());
+
+    if args.provider.is_some() && choice.provider_id.is_none() {
+        eprintln!(
+            "solaris: {} has no usable credentials — run /connect, or set its key in the environment",
+            args.provider.as_deref().unwrap_or_default()
+        );
+    }
 
     if args.print_config {
-        println!("backend: {}", backend.label());
-        println!("model: {}", config.model);
+        println!("backend: {}", choice.backend.label());
+        println!("model: {}", describe_model(&choice.model));
         println!("theme: {}", config.theme);
         println!("mode: {}", config.mode.label());
-        println!("context window: {}", config.context_window);
+        println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {
             Some(path) => println!("credentials: {}", path.display()),
             None => println!("credentials: (unsaved — no config directory)"),
@@ -87,6 +106,11 @@ fn main() -> Result<()> {
             "active provider: {}",
             auth.active_provider().unwrap_or("none")
         );
+        println!(
+            "endpoint: {}",
+            choice.base_url.as_deref().unwrap_or("(not connected)")
+        );
+        println!("credential source: {}", describe_source(choice.source));
         let buddy_name = match &buddy.soul {
             Some(soul) => format!("{} the {}", soul.name, buddy.bones.species.as_str()),
             None => format!("{} (unnamed)", buddy.bones.species.as_str()),
@@ -131,8 +155,11 @@ fn main() -> Result<()> {
     let mut terminal = solaris_tui::setup_terminal()?;
 
     let mut tui = Tui::new();
+    let factory: BackendFactory = Arc::new(move |auth: &AuthStore, model: &str| {
+        choose_backend(auth, model, backend_options.clone())
+    });
     let app = App::new(AppOptions {
-        backend,
+        backend_factory: factory,
         config,
         auth,
         auth_path,
@@ -158,6 +185,38 @@ fn main() -> Result<()> {
     outcome?;
 
     Ok(())
+}
+
+/// Every provider id the catalogue knows, for the `--provider` error message.
+fn provider_ids() -> String {
+    solaris_core::PROVIDERS
+        .iter()
+        .map(|spec| spec.id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The model a run will ask for, or an explanation when none was named and no
+/// provider was around to supply one.
+fn describe_model(model: &str) -> &str {
+    if model.is_empty() {
+        "(none yet — run /connect)"
+    } else {
+        model
+    }
+}
+
+/// Where the credential a backend will use came from, for `--print-config`.
+fn describe_source(source: CredentialSource) -> String {
+    match source {
+        CredentialSource::Stored => "auth.json".to_string(),
+        CredentialSource::Env(name) => format!("environment ({name})"),
+        CredentialSource::None => "none needed".to_string(),
+        CredentialSource::Missing => "none — not connected".to_string(),
+        CredentialSource::NotImplemented => {
+            "sign-in is not implemented yet — connect an API key".to_string()
+        }
+    }
 }
 
 /// Where solaris keeps its state: `$SOLARIS_CONFIG_DIR` when set, otherwise the

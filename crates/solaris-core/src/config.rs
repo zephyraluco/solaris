@@ -29,7 +29,11 @@ impl Mode {
 /// User-visible configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Model identifier; the mock backend echoes it back.
+    /// Model identifier.
+    ///
+    /// Empty means no model has been named yet, so the connected provider is
+    /// asked for the first model it offers. Anything set here — by `--model`,
+    /// `/model` or the `/connect` wizard — is sent exactly as written.
     pub model: String,
     /// Theme name (`dark` or `light`).
     pub theme: String,
@@ -42,21 +46,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "solaris-mock-1".to_string(),
+            model: String::new(),
             theme: "dark".to_string(),
             mode: Mode::default(),
             context_window: 128_000,
         }
     }
-}
-
-impl Config {
-    /// Theme names the theme dialog offers.
-    /// Models the model dialog offers: name plus the one-line description shown
-    /// after the ` · ` separator in the picker.
-    pub const MODEL_OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("solaris-mock-1", "balanced mock replies"),
-        ("solaris-mock-1-mini", "shorter, faster replies"),
-        ("solaris-mock-reason", "longer thinking trace"),
-    ];
 }

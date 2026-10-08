@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use solaris_core::Mode;
+use solaris_core::{Mode, Usage, tokens_for_characters};
 
 /// One prompt/response exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -16,12 +16,19 @@ pub struct Turn {
     pub thinking: String,
     /// Whether the thinking block is expanded.
     pub thinking_expanded: bool,
-    /// Tokens reported for this turn.
-    pub tokens: u32,
+    /// Tokens the turn consumed, as the backend reported or estimated them.
+    pub usage: Usage,
     /// Cost reported for this turn.
     pub cost_usd: f64,
     /// Whether streamed events for this turn finished.
     pub complete: bool,
+}
+
+impl Turn {
+    /// Every token the turn touched.
+    pub fn tokens(&self) -> u32 {
+        self.usage.total()
+    }
 }
 
 /// The conversation plus its streaming state.
@@ -68,9 +75,64 @@ impl SessionState {
         self.active_turn().is_some()
     }
 
-    /// Total tokens reported across all turns.
+    /// Total tokens across all turns.
+    ///
+    /// This is a session total, not a measure of the context window; see
+    /// [`SessionState::context_tokens`] for that.
     pub fn total_tokens(&self) -> u32 {
-        self.turns.iter().map(|turn| turn.tokens).sum()
+        self.turns.iter().map(Turn::tokens).sum()
+    }
+
+    /// Tokens the conversation currently occupies in the model's context.
+    ///
+    /// Only the last measured turn can say this: its usage counts everything
+    /// the provider had read up to and including that turn, and the next turn
+    /// sends the same prefix again. Summing a session's turns instead grows
+    /// without bound and says nothing about how full the window is. Prompts
+    /// submitted since that turn are added as a size estimate.
+    pub fn context_tokens(&self) -> u32 {
+        match self
+            .turns
+            .iter()
+            .rposition(|turn| turn.complete && turn.tokens() > 0)
+        {
+            Some(index) => {
+                let trailing: usize = self.turns[index + 1..]
+                    .iter()
+                    .map(|turn| turn.prompt.chars().count())
+                    .sum();
+                self.turns[index]
+                    .tokens()
+                    .saturating_add(tokens_for_characters(trailing))
+            }
+            // Nothing has been measured yet, so estimate the prompts rather
+            // than report an empty context.
+            None => tokens_for_characters(
+                self.turns
+                    .iter()
+                    .map(|turn| turn.prompt.chars().count())
+                    .sum(),
+            ),
+        }
+    }
+
+    /// Every bucket summed across all turns, for the stats dialog.
+    ///
+    /// The result is flagged as an estimate when any turn in it was one.
+    pub fn total_usage(&self) -> Usage {
+        self.turns
+            .iter()
+            .fold(Usage::default(), |total, turn| Usage {
+                input_tokens: total.input_tokens.saturating_add(turn.usage.input_tokens),
+                output_tokens: total.output_tokens.saturating_add(turn.usage.output_tokens),
+                cache_read_tokens: total
+                    .cache_read_tokens
+                    .saturating_add(turn.usage.cache_read_tokens),
+                cache_write_tokens: total
+                    .cache_write_tokens
+                    .saturating_add(turn.usage.cache_write_tokens),
+                estimated: total.estimated || turn.usage.estimated,
+            })
     }
 
     /// Total cost reported across all turns.
@@ -252,19 +314,119 @@ mod tests {
     fn totals_sum_across_turns() {
         let mut session = SessionState::new();
         session.turns.push(Turn {
-            tokens: 10,
+            usage: Usage::new(6, 4).with_cache(0, 0),
             cost_usd: 0.5,
             complete: true,
             ..Default::default()
         });
         session.turns.push(Turn {
-            tokens: 5,
+            usage: Usage::new(5, 0),
             cost_usd: 0.25,
             complete: true,
             ..Default::default()
         });
         assert_eq!(session.total_tokens(), 15);
         assert!((session.total_cost() - 0.75).abs() < f64::EPSILON);
+
+        let usage = session.total_usage();
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 4);
+        assert!(!usage.estimated, "nothing in this session was estimated");
+    }
+
+    #[test]
+    fn the_context_is_measured_by_the_last_reported_turn() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "a".into(),
+            usage: Usage::new(10, 5),
+            complete: true,
+            ..Default::default()
+        });
+        session.turns.push(Turn {
+            prompt: "b".into(),
+            usage: Usage::new(100, 50),
+            complete: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            session.total_tokens(),
+            165,
+            "the session total keeps summing"
+        );
+        assert_eq!(
+            session.context_tokens(),
+            150,
+            "only the newest turn says what is in the window"
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_has_not_been_answered_yet_is_estimated() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "a".into(),
+            usage: Usage::new(100, 0),
+            complete: true,
+            ..Default::default()
+        });
+        // 41 characters is 11 tokens at the usual four-per-token.
+        session.turns.push(Turn {
+            prompt: "x".repeat(41),
+            ..Default::default()
+        });
+
+        assert_eq!(session.context_tokens(), 111);
+    }
+
+    #[test]
+    fn an_unmeasured_session_estimates_its_prompts() {
+        let mut session = SessionState::new();
+        assert_eq!(session.context_tokens(), 0);
+
+        session.turns.push(Turn {
+            prompt: "x".repeat(8),
+            ..Default::default()
+        });
+        assert_eq!(session.context_tokens(), 2);
+    }
+
+    #[test]
+    fn a_turn_that_reported_nothing_does_not_reset_the_gauge() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "a".into(),
+            usage: Usage::new(100, 0),
+            complete: true,
+            ..Default::default()
+        });
+        // A turn that failed before reporting usage leaves the last real
+        // measurement in place; only its own prompt is added as an estimate.
+        session.turns.push(Turn {
+            prompt: "b".into(),
+            complete: true,
+            ..Default::default()
+        });
+
+        assert_eq!(session.context_tokens(), 101);
+    }
+
+    #[test]
+    fn a_session_with_an_estimated_turn_says_so() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            usage: Usage::new(10, 20),
+            ..Default::default()
+        });
+        session.turns.push(Turn {
+            usage: Usage::estimate(40, 80),
+            ..Default::default()
+        });
+
+        let usage = session.total_usage();
+        assert_eq!(usage.total(), 60);
+        assert!(usage.estimated, "the sum must admit one guess");
     }
 
     #[test]

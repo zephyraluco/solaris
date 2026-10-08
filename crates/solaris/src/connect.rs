@@ -1160,8 +1160,8 @@ mod tests {
         assert!(text.contains("❯ 1. Anthropic · Claude models — API key"));
         assert!(text.contains("  2. Claude subscription · Sign in with a Pro or Max plan"));
         assert!(
-            text.contains("FREE"),
-            "the Groq badge should render:\n{text}"
+            text.contains("5. New API · Self-hosted OpenAI-compatible gateway"),
+            "the gateway row should render:\n{text}"
         );
         assert!(
             text.contains("LOCAL"),

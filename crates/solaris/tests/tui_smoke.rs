@@ -1,7 +1,7 @@
 //! End-to-end smoke tests.
 //!
 //! These drive the real stack — `Tui` event routing, the `App` component, the
-//! framework components and the mock backend — and render into a ratatui
+//! framework components and a scripted test backend — and render into a ratatui
 //! `TestBackend`, so the whole UI path is exercised without needing a terminal.
 
 use std::cell::RefCell;
@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use solaris::{App, AppOptions, Clipboard};
-use solaris_backend::MockBackend;
-use solaris_core::Config;
+use solaris_backend::{AgentBackend, AgentEventStream, BackendOptions};
+use solaris_core::{AgentEvent, BackendError, Config, TurnRequest, Usage};
 use solaris_tui::{Theme, Tui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -23,6 +23,33 @@ const HEIGHT: u16 = 26;
 const BOTTOM: usize = 21;
 /// The status footer, the last row of the frame.
 const FOOTER: u16 = HEIGHT - 1;
+
+/// A backend that streams a prompt-echoing markdown reply, so the whole UI path
+/// can be driven without a provider and without a network.
+struct FakeBackend;
+
+#[async_trait::async_trait]
+impl AgentBackend for FakeBackend {
+    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        let reply = format!(
+            "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
+            request.prompt.trim()
+        );
+        let events = vec![
+            AgentEvent::ThinkingDelta("thinking ".to_string()),
+            AgentEvent::TextDelta(reply),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(4, 2),
+                cost_usd: 0.0,
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    fn label(&self) -> &str {
+        "fake"
+    }
+}
 
 struct Harness {
     tui: Tui,
@@ -55,7 +82,7 @@ impl Harness {
     }
 
     fn with_clipboard(clipboard: Clipboard) -> Self {
-        let backend = Arc::new(MockBackend::with_delay(Duration::ZERO));
+        let backend = Arc::new(FakeBackend);
         let mut tui = Tui::new();
         let mut options = AppOptions::new(
             backend,
@@ -68,6 +95,23 @@ impl Harness {
         // which is exactly what `main` wires up.
         options.selection = tui.selection();
         options.clipboard = clipboard;
+        // Resolve backends from the credentials the way the binary does, so the
+        // footer reports what a real session would. No test has credentials and
+        // the network is off limits, so an unresolved choice is filled in with
+        // the fake — the UI path under test is the same either way.
+        options.backend_factory = Arc::new(|auth, model| {
+            let mut choice = solaris_backend::choose_backend(
+                auth,
+                model,
+                BackendOptions {
+                    environment: solaris_backend::empty_environment(),
+                },
+            );
+            if choice.provider_id.is_none() {
+                choice.backend = Arc::new(FakeBackend);
+            }
+            choice
+        });
         tui.set_root(Box::new(App::new(options)));
 
         let terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
@@ -162,7 +206,9 @@ fn the_first_frame_is_the_terminal_ready_for_input() {
     );
     assert!(text.contains("Ask anything"), "{text}");
     assert!(text.contains("BUILD"), "{text}");
-    assert!(text.contains("solaris-mock-1"), "{text}");
+    // The footer names the backend that would answer, which under test is the
+    // stand-in rather than a provider.
+    assert!(text.contains("fake"), "{text}");
 
     // Typing works immediately, with no key press needed to "enter".
     harness.type_str("hi");
@@ -332,12 +378,12 @@ async fn prompt_streams_a_reply_rendered_as_markdown() {
     harness.type_str("hello");
     harness.key(KeyCode::Enter);
 
-    let text = harness.settle_on("What you can try").await;
+    let text = harness.settle_on("You said: hello").await;
 
     assert!(text.contains("hello"), "prompt missing:\n{text}");
     // Markdown headings lose their `##` marker when rendered.
-    assert!(text.contains("What you can try"), "reply missing:\n{text}");
-    assert!(!text.contains("## What"), "raw markdown leaked:\n{text}");
+    assert!(text.contains("Reply"), "reply missing:\n{text}");
+    assert!(!text.contains("## Reply"), "raw markdown leaked:\n{text}");
     assert!(!text.contains("generating"), "spinner stuck:\n{text}");
     // The footer reports the tokens the backend reported.
     assert!(text.contains("tok"), "token counter missing:\n{text}");
@@ -398,16 +444,33 @@ async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
 }
 
 #[tokio::test]
-async fn the_model_command_opens_the_inline_picker() {
+async fn the_model_command_needs_a_provider_then_lists_its_models() {
     let mut harness = Harness::new();
+
+    // With nothing connected there is no model list to choose from, so the
+    // command explains itself instead of opening an empty picker.
     harness.type_str("/model");
     harness.key(KeyCode::Enter);
+    let frame = harness.draw();
+    assert!(!frame.contains("Select a model:"), "{frame}");
+    assert!(frame.contains("/connect"), "no advice was shown:\n{frame}");
 
-    // It takes the prompt region like `/connect`: no overlay joins the stack,
-    // and the wizard's own list renders there.
+    // Connect a provider by API key; the wizard's own model step takes the
+    // first model it offers.
+    harness.type_str("/connect");
+    harness.key(KeyCode::Enter);
+    harness.key(KeyCode::Enter); // pick Anthropic
+    harness.type_str("sk-live-1234");
+    harness.key(KeyCode::Enter); // confirm the key
+    harness.key(KeyCode::Enter); // take the model the wizard offers
+
+    // Now the picker lists that provider's models, in the prompt region.
+    harness.type_str("/model");
+    harness.key(KeyCode::Enter);
     assert!(harness.tui.overlay_queue().borrow().is_empty());
     let frame = harness.draw();
     assert!(frame.contains("Select a model:"), "{frame}");
+    assert!(frame.contains("claude-opus-4-1"), "{frame}");
 
     harness.key(KeyCode::Down);
     harness.key(KeyCode::Enter);
@@ -434,8 +497,8 @@ async fn dragging_the_footer_then_ctrl_c_copies_what_it_shows() {
     let (clipboard, copied) = clipboard_for(None);
     let mut harness = Harness::with_clipboard(clipboard);
 
-    // The footer names the model, so it has known content whatever the
-    // transcript above it happens to be showing.
+    // The footer names the backend and the mode, so it has known content
+    // whatever the transcript above it happens to be showing.
     let frame = harness.draw();
     let footer: Vec<char> = frame
         .lines()
@@ -445,7 +508,7 @@ async fn dragging_the_footer_then_ctrl_c_copies_what_it_shows() {
         .collect();
     let expected: String = footer[1..=14].iter().collect();
     assert!(
-        expected.contains("solaris"),
+        expected.contains("fake") && expected.contains("BUILD"),
         "unexpected footer: {expected:?}"
     );
 
@@ -571,23 +634,24 @@ async fn a_drag_over_blank_cells_copies_the_blanks() {
     let (clipboard, copied) = clipboard_for(None);
     let mut harness = Harness::with_clipboard(clipboard);
 
-    // Take a run of blank cells from the footer row, wherever this layout
-    // keeps them, so the drag does not depend on the footer's wording.
+    // Take a run of blank cells from wherever this layout keeps them, so the
+    // drag does not depend on any one row's wording.
     let frame = harness.draw();
-    let footer: Vec<char> = frame
+    let (column, row) = frame
         .lines()
-        .nth(FOOTER as usize)
-        .expect("a footer row")
-        .chars()
-        .collect();
-    let column = (0..footer.len() - 10)
-        .find(|start| footer[*start..*start + 10].iter().all(|cell| *cell == ' '))
-        .expect("the footer has no blank run") as u16;
+        .enumerate()
+        .find_map(|(row, line)| {
+            let cells: Vec<char> = line.chars().collect();
+            (0..cells.len().saturating_sub(10))
+                .find(|start| cells[*start..*start + 10].iter().all(|cell| *cell == ' '))
+                .map(|column| (column as u16, row as u16))
+        })
+        .expect("no row has a blank run");
     let last = column + 9;
 
-    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, FOOTER);
-    harness.mouse(MouseEventKind::Drag(MouseButton::Left), last, FOOTER);
-    harness.mouse(MouseEventKind::Up(MouseButton::Left), last, FOOTER);
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), last, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), last, row);
     let _ = harness.draw();
 
     let quit = harness.tui.quit_flag();
@@ -686,27 +750,19 @@ fn connecting_an_api_key_flows_into_the_model_picker() {
 }
 
 #[tokio::test]
-async fn device_auth_shows_the_user_code() {
+async fn device_auth_reports_that_sign_in_is_unavailable() {
     let mut harness = Harness::new();
     harness.type_str("/connect");
     harness.key(KeyCode::Enter);
     harness.key(KeyCode::Down); // the subscription provider
     harness.key(KeyCode::Enter);
 
-    let mut text = harness.draw();
-    for _ in 0..200 {
-        harness.tui.tick();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        text = harness.draw();
-        if text.contains("Enter this code in the browser:") {
-            break;
-        }
-    }
+    harness.tui.tick();
+    let text = harness.draw();
 
-    assert!(text.contains("Waiting for authorization"), "{text}");
-    assert!(text.contains("SO-4F7Q-9X2M"), "{text}");
-    assert!(
-        text.contains("claude-subscription.example.test/device"),
-        "{text}"
-    );
+    // The sign-in flow is not built, and saying so is better than walking the
+    // user through a code that mints a token nothing can use.
+    assert!(text.contains("not implemented"), "{text}");
+    assert!(text.contains("Press any key to dismiss"), "{text}");
+    assert!(!text.contains("Enter this code in the browser:"), "{text}");
 }
