@@ -85,12 +85,12 @@ pub trait AgentBackend: Send + Sync {
   - [`sse`](../crates/solaris-backend/src/sse.rs) —— 跨 chunk 的 SSE 帧解码，**按字节**缓冲，所以帧切在多字节字符中间也不会损坏。
   - [`http`](../crates/solaris-backend/src/http.rs) —— 共享的 `reqwest` 客户端（10s 连接超时，无整请求超时，因为一轮本来就要流几分钟）、状态码 → 可操作的错误文案、退避重试。
   - [`wire`](../crates/solaris-backend/src/wire.rs) —— 按 `Wire` 分发请求体构造与流解析。跨协议但**只有 OpenAI 需要**的字段在这里补上：`prompt_cache_key` 只在 `Wire::is_openai()` 且端点主机就是 `api.openai.com` 时发送（OpenAI 的缓存本来就是自动的，这个键只影响路由，而兼容网关可能因为不认识它而拒掉整个请求，不值得冒险）。
-- **模型发现**：`AgentBackend::models()` 是可选能力（默认实现直接报「本后端不会列模型」），`ProviderBackend` 用 `Endpoint::models_url()`（Messages API 走 `/v1/models?limit=1000`，OpenAI 兼容走 `/models`）发一次 GET，复用同一套认证；`parse_models` 从 `{"data":[{"id":…}]}` 里取 id——两条 wire 的清单形状相同。**不重试**：它只喂选择器，慢或不可达的代价应当是退回目录，而不是让用户等。
+- **模型发现**：`AgentBackend::models()` 是可选能力（默认实现直接报「本后端不会列模型」），`ProviderBackend` 用 `Endpoint::models_url()`（Messages API 走 `/v1/models?limit=1000`，OpenAI 兼容走 `/models`）发一次 GET，复用同一套认证；`parse_models` 从 `{"data":[{"id":…}]}` 里取 id——两条 wire 的清单形状相同。**不重试**：它只喂选择器，慢或不可达的代价应当是退回目录，而不是让用户等。**网关的 `/v1` 在解析层补齐**：OpenAI 兼容网关的 API 挂在 `/v1` 下，而 `/connect` 收集来的 URL 常常只写到主机，于是请求打到的是网关的网页前端——它用 200 + HTML 回答，`parse_models` 读不出任何 id，于是「没有模型」而不是一个看得见的错误。所以 `resolve()` 会给没有路径的 base URL 补上 `/v1`（带路径的一律按原样使用：只有部署者知道 API 挂在哪），Messages API 不在其列——它的 base 就是主机本身。**200 但不成清单的回复是一种要报出来的失败**：`parse_models` 返回 `Option`，`None` 表示这压根不是清单（代理的 HTML 页、被包进 200 的错误），此时错误信息指名 URL 并转述网关自己的说法，而不是当成一个没有模型的 provider。真正空的清单（`{"data":[]}`）则是答案——网关在说这个凭据够不到任何模型；没有目录可退时这一条也会告知用户。这两者必须分得开，否则「URL 打错地方」和「网关不给模型」看起来一模一样。
 - **重试只在第一个事件发出之前**（429 / 5xx / 传输错误；指数退避并尊重 `Retry-After`，最多 3 次）。已经吐过字就绝不再试，否则会重复输出。中断靠丢掉接收端：app 放弃 `rx` 后 `send` 失败、任务结束、`reqwest` 的流随之被 drop，请求被取消。
 - **计费**：`Usage` 把各家的报告归一成四个互不重叠的桶（两家 OpenAI 协议都把缓存读计入 `input_tokens` / `prompt_tokens`，会被减掉）；提供商什么都没报时退回按字符估算并置位 `estimated`，`/stats` 会据此显示 `≈`。价格来自 `provider` 表的内置快照，未知模型不收费。生成的 token 还是 0 的 `usage` 块不算「报告过」。
 - **上下文 vs 会话总量**：`SessionState::total_tokens()` 是全会话累计（帧脚把它和累计费用并排显示），`SessionState::context_tokens()` 才是「窗口有多满」——取最后一轮有上报的 usage，加上其后新提交内容的估算；没有任何上报时退化为对提示词取估算。把累计量拿去比窗口是错的，因为窗口是每请求的，而累计会无限增长。
 - **没有可用凭据时**，`lib.rs` 里的 `UnconnectedBackend` 接管：它不发任何请求，而是把每一轮直接变成一条可操作的错误（「run /connect」，或指名该 provider 的环境变量），页脚也会写 `unconnected`。这样既不会假装有回复，也不会发一个必然 401 的请求。
-- [`lib.rs`](../crates/solaris-backend/src/lib.rs) 的 `choose_backend(auth, model, options)` 是应用唯一需要知道的入口：按「环境变量 > `auth.json` > 本机运行时无需凭据」解析出一个 `BackendChoice`（后端 + provider id + 端点 + 凭据来源）。解析不出可用凭据就交给 `UnconnectedBackend`（`CredentialSource::Missing`）；OAuth 类 provider 在签名流程落地前明确报告 `NotImplemented`，同样不发请求。模型名为空时（用户还没选过模型）换成该 provider 提供的第一个模型；用户明确给过的名字则原样送出。`BackendOptions` 里的 `environment` 可注入，测试因此既不继承 shell 里的 key、也碰不到网络。
+- [`lib.rs`](../crates/solaris-backend/src/lib.rs) 的 `choose_backend(auth, model, options)` 是应用唯一需要知道的入口：按「环境变量 > `auth.json` > 本机运行时无需凭据」解析出一个 `BackendChoice`（后端 + provider id + 端点 + 凭据来源）。解析不出可用凭据就交给 `UnconnectedBackend`（`CredentialSource::Missing`）；OAuth 类 provider 在签名流程落地前明确报告 `NotImplemented`，同样不发请求。模型名为空时（用户还没选过模型）换成该 provider 提供的第一个模型；用户明确给过的名字则原样送出。**目录里也没有名字时**（网关与自定义端点就是这样）凭据一样解析出端点，只是包成 `NamelessBackend`：turn 照旧拒绝——空模型名只会换来 400——但 `models()` 直通真正的客户端，因为那份清单正是名字的唯一来源，否则 `/model` 会永远空着（`CredentialSource::NoModel`，provider id 仍然给出来）。`BackendOptions` 里的 `environment` 可注入，测试因此既不继承 shell 里的 key、也碰不到网络。
 - `AgentBackend` 是唯一扩展点：再实现一个即可接入新协议，UI 零改动。
 
 ---
@@ -319,7 +319,7 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 `/model` 由 [`model.rs`](../crates/solaris/src/model.rs) 实现：它只写下这个命令的策略（列表说什么、选中意味着什么），列表本身是框架组件 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs) —— 标题、说明、问题行、`❯` 行、底部提示、按键、滚轮与命中测试都在那里，`/connect` 的 provider / model 两步用的也是它，所以两者样式不会漂移。`App` 用一个 `Inline` 枚举持有两者并转发事件。
 
-流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。设备码授权的网络侧尚未实现，所以向导的这一步会直接报「not implemented」并让用户改用 API key —— 编一个占位 token 更糟：它会连上一个回答不了的 provider，然后第一轮以一个解释不了任何事的认证错误失败。
+流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。文本步骤会从 `AuthStore` 回填该 provider 已存的 URL 与 key（key 照常掩码显示），所以重新 `/connect` 看到的是已保存的内容而不是空字段，直接回车即沿用；`ctrl+u` 清空当前字段，用来换成另一个 key。设备码授权的网络侧尚未实现，所以向导的这一步会直接报「not implemented」并让用户改用 API key —— 编一个占位 token 更糟：它会连上一个回答不了的 provider，然后第一轮以一个解释不了任何事的认证错误失败。
 
 ### 5.8 持久化
 

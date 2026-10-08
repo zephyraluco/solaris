@@ -946,7 +946,16 @@ impl App {
                     self.discovered.len()
                 ));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                // An empty list is an answer rather than a failure — the
+                // provider says this credential reaches no models — but with no
+                // catalogue to fall back on (a gateway, a custom endpoint) the
+                // picker would come up empty with no explanation of why.
+                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                    self.notifications
+                        .warning("the provider listed no models — name one with /model <name>");
+                }
+            }
             Err(message) => {
                 // Only worth saying when there was no catalogue to fall back on;
                 // otherwise a provider that will not answer is not the user's
@@ -1082,6 +1091,25 @@ impl App {
         }
     }
 
+    /// The secret already stored for an API-key provider, so `/connect` shows
+    /// it (masked) instead of asking for it again.
+    fn stored_api_key(&self, provider_id: &str) -> Option<String> {
+        match self.auth.credential(provider_id) {
+            Some(Credential::ApiKey { key }) => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// The gateway URL and key already stored for an endpoint provider.
+    fn stored_endpoint(&self, provider_id: &str) -> (Option<String>, Option<String>) {
+        match self.auth.credential(provider_id) {
+            Some(Credential::Endpoint { base_url, api_key }) => {
+                (Some(base_url.clone()), Some(api_key.clone()))
+            }
+            _ => (None, None),
+        }
+    }
+
     /// Route a picked provider to the step its auth kind needs.
     fn begin_provider_setup(&mut self, provider_id: &str, name: &str) {
         let Some(spec) = solaris_provider::provider(provider_id) else {
@@ -1103,20 +1131,15 @@ impl App {
                 }));
             }
             AuthKind::ApiKey => {
+                let current = self.stored_api_key(provider_id);
                 if let Some(flow) = self.inline.as_mut() {
-                    flow.enter_api_key(id, provider_name);
+                    flow.enter_api_key(id, provider_name, current);
                 }
             }
             AuthKind::ApiKeyWithUrl => {
-                let current =
-                    self.auth
-                        .credential(provider_id)
-                        .and_then(|credential| match credential {
-                            Credential::Endpoint { base_url, .. } => Some(base_url.clone()),
-                            _ => None,
-                        });
+                let (url, key) = self.stored_endpoint(provider_id);
                 if let Some(flow) = self.inline.as_mut() {
-                    flow.enter_custom_provider(id, provider_name, current);
+                    flow.enter_custom_provider(id, provider_name, url, key);
                 }
             }
             AuthKind::DeviceCode => {
@@ -1363,7 +1386,8 @@ impl App {
             return;
         }
 
-        let (right, style) = if let Some((kind, text)) = self.notifications.current() {
+        let notice = self.notifications.current();
+        let (right, style) = if let Some((kind, text)) = notice {
             let style = match kind {
                 NoticeKind::Error => Style::default()
                     .fg(self.theme.error)
@@ -1387,11 +1411,14 @@ impl App {
         };
 
         // The right slot wins the space it needs; the left one is truncated to
-        // whatever remains so the two never overlap.
+        // whatever remains so the two never overlap. A notice is shown even
+        // when it is wider than the footer — truncated, because dropping it
+        // would hide the one message that says what just went wrong — while the
+        // standing hint and the spinner give way to the facts beside them.
         let right_width = display_width(&right) as u16;
-        let show_right = right_width + 4 < area.width;
+        let show_right = notice.is_some() || right_width + 4 < area.width;
         let left_budget = if show_right {
-            area.width.saturating_sub(right_width)
+            area.width.saturating_sub(right_width.min(area.width))
         } else {
             area.width
         };
@@ -1414,10 +1441,11 @@ impl App {
         );
 
         if show_right {
+            let width = right_width.min(area.width);
             buf.set_string(
-                area.x + area.width - right_width,
+                area.x + area.width - width,
                 area.y,
-                truncate_to_width(&right, area.width as usize, "…"),
+                truncate_to_width(&right, width as usize, "…"),
                 style,
             );
         }
@@ -1828,9 +1856,14 @@ impl Inline {
     }
 
     // Wizard-only steps: no-ops unless the connect flow is the one on screen.
-    fn enter_api_key(&mut self, provider_id: impl Into<String>, provider_name: impl Into<String>) {
+    fn enter_api_key(
+        &mut self,
+        provider_id: impl Into<String>,
+        provider_name: impl Into<String>,
+        current_key: Option<String>,
+    ) {
         if let Self::Connect(flow) = self {
-            flow.enter_api_key(provider_id.into(), provider_name.into());
+            flow.enter_api_key(provider_id.into(), provider_name.into(), current_key);
         }
     }
 
@@ -1838,10 +1871,16 @@ impl Inline {
         &mut self,
         provider_id: impl Into<String>,
         provider_name: impl Into<String>,
-        current: Option<String>,
+        current_url: Option<String>,
+        current_key: Option<String>,
     ) {
         if let Self::Connect(flow) = self {
-            flow.enter_custom_provider(provider_id.into(), provider_name.into(), current);
+            flow.enter_custom_provider(
+                provider_id.into(),
+                provider_name.into(),
+                current_url,
+                current_key,
+            );
         }
     }
 
@@ -2391,6 +2430,20 @@ mod tests {
         assert!(text.contains("/model <name>"), "{text}");
     }
 
+    #[tokio::test]
+    async fn a_provider_that_lists_no_models_says_so() {
+        // A gateway has no catalogue to fall back on, so an empty answer leaves
+        // `/model` with nothing — which is what a URL that misses the API looks
+        // like from here. It has to be said, or the picker just comes up empty.
+        let mut app = app_connected_to_but_faked("new-api");
+        app.on_models_discovered(Ok(Vec::new()));
+
+        let (kind, text) = app.notifications.current().expect("a notice was shown");
+        assert_eq!(kind, NoticeKind::Warning);
+        assert!(text.contains("listed no models"), "{text}");
+        assert!(text.contains("/model <name>"), "{text}");
+    }
+
     #[test]
     fn the_model_command_opens_the_inline_picker() {
         let mut app = app_connected_to("anthropic");
@@ -2573,6 +2626,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_notice_wider_than_the_footer_is_ellipsised_not_dropped() {
+        let mut app = app();
+        app.notifications.warning(
+            "the provider listed no models — check its URL in /connect, or name one with \
+             /model <name>",
+        );
+
+        // Narrower than the notice: the facts give way, and the message is cut
+        // short rather than hidden — it is the only place the failure is said.
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+
+        let footer: String = (0..area.width)
+            .map(|x| buf[(x, area.height - 1)].symbol())
+            .collect();
+        assert!(footer.starts_with("! the provider listed no"), "{footer:?}");
+        assert!(footer.ends_with('…'), "{footer:?}");
+    }
+
     // ------------------------------------------------------------- /connect
 
     #[test]
@@ -2658,6 +2732,34 @@ mod tests {
         assert!(!app.connect_open());
     }
 
+    #[tokio::test]
+    async fn a_connected_gateway_is_named_in_the_footer_before_a_model_is_chosen() {
+        // The credential is stored and the endpoint is resolved even though no
+        // model is named yet, so the session is not "unconnected": the footer
+        // names the platform, and reconnecting says what is still missing.
+        let mut auth = AuthStore::new();
+        auth.store(
+            "new-api",
+            Credential::Endpoint {
+                base_url: "https://gateway.test/v1".to_string(),
+                api_key: "k".to_string(),
+            },
+        );
+        auth.activate("new-api");
+        let mut app = app_with_real_backends(auth);
+
+        let footer = footer_text(&mut app);
+        assert!(footer.contains(" new-api · "), "{footer:?}");
+
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Char('5'))); // row 5 — New API
+        app.handle_key(key(KeyCode::Enter));
+
+        let (kind, text) = app.notifications.current().expect("a notice was shown");
+        assert_eq!(kind, NoticeKind::Info);
+        assert!(text.contains("/model <name>"), "{text}");
+    }
+
     #[test]
     fn a_local_provider_connects_without_collecting_anything() {
         let mut app = app();
@@ -2694,6 +2796,56 @@ mod tests {
         ));
         // The custom provider has no model list, so the wizard closes.
         assert!(!app.connect_open());
+    }
+
+    #[test]
+    fn reconnecting_a_gateway_shows_the_stored_url_and_key() {
+        let mut auth = AuthStore::new();
+        auth.store(
+            "new-api",
+            Credential::Endpoint {
+                base_url: "http://one-api.test".to_string(),
+                api_key: "sk-stored-1234".to_string(),
+            },
+        );
+        let mut app = app_with_real_backends(auth);
+
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Char('5'))); // row 5 — New API
+        assert_eq!(app.connect_step(), Some(ConnectStep::CustomProvider));
+
+        let text = rendered_text(&mut app, 100, 24);
+        assert!(text.contains("http://one-api.test"), "{text}");
+        assert!(
+            text.contains(&format!("{}1234", "\u{2022}".repeat(8))),
+            "the stored key should show masked:\n{text}"
+        );
+        assert!(!text.contains("sk-stored-1234"), "the key leaked:\n{text}");
+    }
+
+    #[test]
+    fn reconnecting_an_api_key_provider_keeps_the_stored_key() {
+        let mut app = app_connected_to("anthropic");
+
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Enter)); // row 1 — Anthropic
+
+        // `mask_secret("sk-test")` — three bullets and the tail.
+        let text = rendered_text(&mut app, 100, 24);
+        assert!(
+            text.contains(&format!("{}test", "\u{2022}".repeat(3))),
+            "the stored key should show masked:\n{text}"
+        );
+        assert!(!text.contains("sk-test"), "the key leaked:\n{text}");
+
+        // Confirming the untouched field stores the same key back.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.auth
+                .credential("anthropic")
+                .and_then(Credential::secret),
+            Some("sk-test")
+        );
     }
 
     #[tokio::test]
@@ -2748,6 +2900,37 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
 
         assert_eq!(app.editor.text(), "pasted text");
+    }
+
+    #[test]
+    fn pasting_a_key_over_a_stored_one_replaces_it() {
+        let mut auth = AuthStore::new();
+        auth.store(
+            "anthropic",
+            Credential::ApiKey {
+                key: "sk-stored".to_string(),
+            },
+        );
+        auth.activate("anthropic");
+
+        let mut app = app_with_real_backends(auth);
+        app.clipboard = Clipboard {
+            write: Rc::new(|_| true),
+            read: Rc::new(|| Some("sk-pasted".to_string())),
+        };
+
+        app.submit("/connect".to_string());
+        app.handle_key(key(KeyCode::Enter)); // row 1 — Anthropic
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.auth
+                .credential("anthropic")
+                .and_then(Credential::secret),
+            Some("sk-pasted"),
+            "the paste should replace the stored key, not extend it"
+        );
     }
 
     #[tokio::test]

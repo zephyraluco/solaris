@@ -138,6 +138,10 @@ pub struct ConnectFlow {
     input: String,
     input2: String,
     field: usize,
+    /// Per field: whether it still holds exactly what `/connect` opened it
+    /// with. A paste replaces such a field whole instead of being appended to
+    /// a secret the user never touched; any edit clears the flag.
+    seeded: [bool; 2],
 
     // device auth
     device_status: DeviceAuthStatus,
@@ -180,6 +184,7 @@ impl ConnectFlow {
             input: String::new(),
             input2: String::new(),
             field: 0,
+            seeded: [false, false],
             device_status: DeviceAuthStatus::Idle,
             user_code: String::new(),
             verification_uri: String::new(),
@@ -222,19 +227,34 @@ impl ConnectFlow {
     // -- step transitions --------------------------------------------------
 
     /// Step 2a — collect an API key for a provider.
-    pub fn enter_api_key(&mut self, provider_id: String, provider_name: String) {
+    ///
+    /// A key already stored for the provider pre-fills the field, masked, so
+    /// reconnecting shows what is saved instead of a blank one.
+    pub fn enter_api_key(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        current_key: Option<String>,
+    ) {
         self.enter_text_step(ConnectStep::ApiKey, provider_id, provider_name);
+        self.input = current_key.unwrap_or_default();
+        self.seeded[0] = !self.input.is_empty();
     }
 
     /// Step 2b — collect an endpoint URL and an optional key.
+    ///
+    /// Both fields pre-fill from what is already stored for the provider.
     pub fn enter_custom_provider(
         &mut self,
         provider_id: String,
         provider_name: String,
         current_url: Option<String>,
+        current_key: Option<String>,
     ) {
         self.enter_text_step(ConnectStep::CustomProvider, provider_id, provider_name);
         self.input = current_url.unwrap_or_default();
+        self.input2 = current_key.unwrap_or_default();
+        self.seeded = [!self.input.is_empty(), !self.input2.is_empty()];
     }
 
     /// Step 2c — device-code OAuth for a provider.
@@ -262,6 +282,7 @@ impl ConnectFlow {
         self.input.clear();
         self.input2.clear();
         self.field = 0;
+        self.seeded = [false, false];
     }
 
     // -- device auth, driven from outside ----------------------------------
@@ -290,16 +311,20 @@ impl ConnectFlow {
     }
     /// drops the paste instead of leaking it into the prompt behind.
     pub fn insert_paste(&mut self, data: &str) -> bool {
-        let target = match self.step {
-            ConnectStep::ApiKey => &mut self.input,
-            ConnectStep::CustomProvider => match self.field {
-                0 => &mut self.input,
-                _ => &mut self.input2,
-            },
-            _ => return false,
-        };
+        if self.active_input_mut().is_none() {
+            return false;
+        }
+
+        // A field still holding what it was opened with is replaced whole: a
+        // pasted key or URL is a new value, not a suffix for a stored one.
+        let untouched = std::mem::take(&mut self.seeded[self.field]);
         let cleaned: String = data.chars().filter(|c| !c.is_control()).collect();
-        target.push_str(&cleaned);
+        if let Some(input) = self.active_input_mut() {
+            if untouched {
+                input.clear();
+            }
+            input.push_str(&cleaned);
+        }
         true
     }
 
@@ -337,8 +362,20 @@ impl ConnectFlow {
     }
 
     fn backspace(&mut self) {
+        self.seeded[self.field] = false;
         if let Some(input) = self.active_input_mut() {
             input.pop();
+        }
+    }
+
+    /// Append a typed character to the active field.
+    ///
+    /// Typing edits whatever is there — a stored secret included — so the field
+    /// stops counting as untouched and a later paste appends to it.
+    fn type_char(&mut self, c: char) {
+        self.seeded[self.field] = false;
+        if let Some(input) = self.active_input_mut() {
+            input.push(c);
         }
     }
 
@@ -356,6 +393,16 @@ impl ConnectFlow {
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             return ConnectOutcome::Closed;
+        }
+
+        // Ctrl+U kills the active field, matching the editor's kill-to-start:
+        // the way out of a field that opened holding a stored secret.
+        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.seeded[self.field] = false;
+            if let Some(input) = self.active_input_mut() {
+                input.clear();
+            }
+            return ConnectOutcome::Handled;
         }
 
         match self.step {
@@ -410,9 +457,7 @@ impl ConnectFlow {
                 ConnectOutcome::Handled
             }
             KeyCode::Char(c) if plain_text_key(&key) => {
-                if let Some(input) = self.active_input_mut() {
-                    input.push(c);
-                }
+                self.type_char(c);
                 ConnectOutcome::Handled
             }
             _ => ConnectOutcome::Handled,
@@ -449,9 +494,7 @@ impl ConnectFlow {
                 ConnectOutcome::Handled
             }
             KeyCode::Char(c) if plain_text_key(&key) => {
-                if let Some(input) = self.active_input_mut() {
-                    input.push(c);
-                }
+                self.type_char(c);
                 ConnectOutcome::Handled
             }
             _ => ConnectOutcome::Handled,
@@ -584,8 +627,10 @@ impl ConnectFlow {
         }
 
         let hints: Vec<&str> = match self.step {
-            ConnectStep::ApiKey => vec!["enter confirm"],
-            ConnectStep::CustomProvider => vec!["tab switch field", "enter confirm"],
+            ConnectStep::ApiKey => vec!["enter confirm", "ctrl+u clear"],
+            ConnectStep::CustomProvider => {
+                vec!["tab switch field", "enter confirm", "ctrl+u clear"]
+            }
             ConnectStep::DeviceAuth => match self.device_status {
                 DeviceAuthStatus::Success(_) | DeviceAuthStatus::Error(_) => {
                     vec!["any key continue"]
@@ -924,7 +969,7 @@ mod tests {
     #[test]
     fn the_api_key_step_submits_the_trimmed_value() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         for ch in "  sk-abc  ".chars() {
             flow.on_key(key(KeyCode::Char(ch)));
         }
@@ -942,14 +987,14 @@ mod tests {
     #[test]
     fn the_api_key_step_ignores_enter_while_empty() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Handled);
     }
 
     #[test]
     fn text_fields_ignore_control_characters() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
 
         // Ctrl+V must not be inserted as a literal 'v'.
         flow.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
@@ -963,7 +1008,7 @@ mod tests {
     #[test]
     fn the_custom_provider_requires_a_url_before_submitting() {
         let mut flow = new_flow();
-        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None);
+        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None, None);
 
         assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Handled);
         assert_eq!(flow.field, 0, "the cursor should sit on the missing URL");
@@ -988,21 +1033,107 @@ mod tests {
     }
 
     #[test]
-    fn the_custom_provider_prefills_the_stored_url() {
+    fn the_custom_provider_prefills_the_stored_url_and_key() {
         let mut flow = new_flow();
         flow.enter_custom_provider(
             "custom".into(),
             "Custom endpoint".into(),
             Some("https://stored.test/v1".into()),
+            Some("sk-stored-9876".into()),
         );
 
         assert_eq!(flow.input, "https://stored.test/v1");
+        assert_eq!(flow.input2, "sk-stored-9876");
         assert_eq!(flow.field, 0);
         // Tab and arrows both switch fields, wrapping.
         flow.on_key(key(KeyCode::Tab));
         assert_eq!(flow.field, 1);
         flow.on_key(key(KeyCode::Up));
         assert_eq!(flow.field, 0);
+
+        // The stored key shows masked, and only masked.
+        let text = rendered(&mut flow, 70, 12);
+        assert!(
+            text.contains(&format!("{}9876", "\u{2022}".repeat(10))),
+            "{text}"
+        );
+        assert!(!text.contains("sk-stored-9876"), "the key leaked:\n{text}");
+    }
+
+    #[test]
+    fn the_api_key_step_prefills_the_stored_key() {
+        let mut flow = new_flow();
+        flow.enter_api_key(
+            "anthropic".into(),
+            "Anthropic".into(),
+            Some("sk-live-1234".into()),
+        );
+
+        let text = rendered(&mut flow, 60, 10);
+        assert!(
+            text.contains(&format!("{}1234", "\u{2022}".repeat(8))),
+            "the stored key should be masked:\n{text}"
+        );
+        assert!(!text.contains("sk-live-1234"), "the key leaked:\n{text}");
+
+        // Confirming the untouched field resubmits what was already stored,
+        // rather than an empty key that would wipe it.
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            ConnectOutcome::Submit(ConnectSubmit::ApiKey {
+                provider_id: "anthropic".into(),
+                provider_name: "Anthropic".into(),
+                key: "sk-live-1234".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_paste_replaces_an_untouched_prefilled_field() {
+        let mut flow = new_flow();
+        flow.enter_custom_provider(
+            "custom".into(),
+            "Custom endpoint".into(),
+            Some("https://stored.test/v1".into()),
+            Some("sk-stored-9876".into()),
+        );
+
+        assert!(flow.insert_paste("https://new.test/v1"));
+        assert_eq!(flow.input, "https://new.test/v1");
+        // A second paste lands in a field that has been edited, so it appends.
+        assert!(flow.insert_paste("/v2"));
+        assert_eq!(flow.input, "https://new.test/v1/v2");
+
+        flow.on_key(key(KeyCode::Tab));
+        assert!(flow.insert_paste("sk-new"));
+        assert_eq!(flow.input2, "sk-new");
+
+        // Typing counts as editing too, so the field is no longer untouched.
+        flow.on_key(key(KeyCode::Char('x')));
+        assert!(flow.insert_paste("-tail"));
+        assert_eq!(flow.input2, "sk-newx-tail");
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_active_field_only() {
+        let mut flow = new_flow();
+        flow.enter_custom_provider(
+            "custom".into(),
+            "Custom endpoint".into(),
+            Some("https://stored.test/v1".into()),
+            Some("sk-stored-9876".into()),
+        );
+
+        flow.on_key(key(KeyCode::Tab));
+        flow.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(flow.input, "https://stored.test/v1");
+        assert_eq!(flow.input2, "");
+
+        // A new key can be typed straight into the emptied field.
+        for ch in "sk-new".chars() {
+            flow.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(flow.input2, "sk-new");
     }
 
     #[test]
@@ -1045,12 +1176,12 @@ mod tests {
         // The provider step has no field, so the paste is refused.
         assert!(!flow.insert_paste("sk-leak"));
 
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         assert!(flow.insert_paste("sk-pasted"));
         assert_eq!(flow.input, "sk-pasted");
 
         let mut flow = new_flow();
-        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None);
+        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None, None);
         flow.on_key(key(KeyCode::Tab));
         assert!(flow.insert_paste("second"));
         assert_eq!(flow.input, "");
@@ -1060,7 +1191,7 @@ mod tests {
     #[test]
     fn pasted_control_characters_are_stripped() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         assert!(flow.insert_paste("sk-a\nb\tc"));
         assert_eq!(flow.input, "sk-abc");
     }
@@ -1141,7 +1272,7 @@ mod tests {
         );
 
         let mut small = new_flow();
-        small.enter_api_key("anthropic".into(), "Anthropic".into());
+        small.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         assert!(
             small.desired_height(60) >= small.min_height(),
             "a text step must not shrink below the minimum"
@@ -1179,7 +1310,7 @@ mod tests {
     #[test]
     fn the_api_key_step_masks_all_but_the_last_four_characters() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         for ch in "sk-1234567890".chars() {
             flow.on_key(key(KeyCode::Char(ch)));
         }
@@ -1197,7 +1328,7 @@ mod tests {
     #[test]
     fn the_empty_api_key_field_shows_a_placeholder() {
         let mut flow = new_flow();
-        flow.enter_api_key("anthropic".into(), "Anthropic".into());
+        flow.enter_api_key("anthropic".into(), "Anthropic".into(), None);
         let text = rendered(&mut flow, 60, 10);
         assert!(text.contains("paste your API key here…_"), "{text}");
     }
@@ -1230,7 +1361,7 @@ mod tests {
     #[test]
     fn the_custom_endpoint_step_renders_both_fields() {
         let mut flow = new_flow();
-        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None);
+        flow.enter_custom_provider("custom".into(), "Custom endpoint".into(), None, None);
         let text = rendered(&mut flow, 70, 12);
 
         assert!(text.contains("Connect Custom endpoint"), "{text}");
@@ -1255,7 +1386,7 @@ mod tests {
     #[test]
     fn the_title_names_the_provider_being_connected() {
         let mut flow = new_flow();
-        flow.enter_api_key("openai".into(), "OpenAI".into());
+        flow.enter_api_key("openai".into(), "OpenAI".into(), None);
         assert!(rendered(&mut flow, 60, 8).contains("Connect OpenAI"));
     }
 }

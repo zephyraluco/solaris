@@ -157,6 +157,19 @@ impl HttpBackend {
             http::describe_transport(error)
         ))
     }
+
+    /// Why a successful response carried no model list.
+    fn not_a_model_list(&self, url: &str, body: &str) -> String {
+        let name = self.endpoint.name;
+        if body.trim_start().starts_with('<') {
+            return format!("{name} answered {url} with a web page, not a model list");
+        }
+
+        let reason = http::provider_message(body)
+            .map(|message| format!(": {message}"))
+            .unwrap_or_default();
+        format!("{name} did not answer with a model list at {url}{reason}")
+    }
 }
 
 #[async_trait::async_trait]
@@ -247,8 +260,9 @@ impl AgentBackend for HttpBackend {
     /// One attempt, no retries: this feeds a picker, so a slow or unreachable
     /// provider should cost nothing more than falling back to the catalogue.
     async fn models(&self) -> Result<Vec<String>, BackendError> {
+        let url = self.endpoint.models_url();
         let response = self
-            .authorize(self.client.get(self.endpoint.models_url()))
+            .authorize(self.client.get(&url))
             .header("accept", "application/json")
             .send()
             .await
@@ -266,28 +280,36 @@ impl AgentBackend for HttpBackend {
             )));
         }
 
-        Ok(parse_models(&body))
+        // A 200 that is not a model list is a failure, not an empty provider: a
+        // base URL that stops short of a gateway's API gets its web front end
+        // back, which answers 200 with a page, and reading that as "no models"
+        // would hide a wrong URL behind a plausible-looking answer.
+        let Some(models) = parse_models(&body) else {
+            return Err(BackendError::new(self.not_a_model_list(&url, &body)));
+        };
+
+        Ok(models)
     }
 }
 
 /// Model ids out of a `{"data": [{"id": …}]}` list.
 ///
-/// Both wires answer with this shape. Anything else — an error body, a proxy's
-/// HTML — reads as "no models", which the caller treats as a fallback rather
-/// than an error worth reporting.
-fn parse_models(body: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
-    let Some(entries) = value["data"].as_array() else {
-        return Vec::new();
-    };
+/// Both wires answer with this shape. `None` means the body was not a model
+/// list at all — a proxy's HTML page, an error wrapped in a 200 — which the
+/// caller reports instead of passing off as a provider with nothing to offer.
+/// An empty `data` array is a list: the provider answered, and its answer is
+/// that this credential can reach no models.
+fn parse_models(body: &str) -> Option<Vec<String>> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let entries = value["data"].as_array()?;
 
-    entries
-        .iter()
-        .filter_map(|entry| entry["id"].as_str())
-        .map(str::to_owned)
-        .collect()
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// Read a failed response's body for the provider's own explanation.
@@ -466,7 +488,7 @@ mod tests {
         // An OpenAI-compatible server.
         assert_eq!(
             parse_models(r#"{"object":"list","data":[{"id":"glm-5.3"},{"id":"kimi-k3"}]}"#),
-            vec!["glm-5.3", "kimi-k3"]
+            Some(vec!["glm-5.3".to_string(), "kimi-k3".to_string()])
         );
 
         // The Messages API answers with the same `data[].id`, surrounded by
@@ -475,20 +497,28 @@ mod tests {
             parse_models(
                 r#"{"data":[{"id":"claude-sonnet-4-5","display_name":"Sonnet"}],"has_more":false}"#
             ),
-            vec!["claude-sonnet-4-5"]
+            Some(vec!["claude-sonnet-4-5".to_string()])
         );
     }
 
     #[test]
     fn anything_that_is_not_a_model_list_reads_as_none() {
-        assert!(parse_models("").is_empty());
-        assert!(parse_models("<html>a proxy said no</html>").is_empty());
-        assert!(parse_models(r#"{"error":{"message":"invalid api key"}}"#).is_empty());
-        assert!(parse_models(r#"{"data":"not a list"}"#).is_empty());
+        assert_eq!(parse_models(""), None);
+        assert_eq!(parse_models("<html>a proxy said no</html>"), None);
+        assert_eq!(
+            parse_models(r#"{"error":{"message":"invalid api key"}}"#),
+            None
+        );
+        assert_eq!(parse_models(r#"{"data":"not a list"}"#), None);
         // An entry without an id is skipped rather than invented.
         assert_eq!(
             parse_models(r#"{"data":[{"object":"model"},{"id":"ok"}]}"#),
-            vec!["ok"]
+            Some(vec!["ok".to_string()])
+        );
+        // An empty list is a list: the provider answered, with nothing.
+        assert_eq!(
+            parse_models(r#"{"object":"list","data":[]}"#),
+            Some(Vec::new())
         );
     }
 

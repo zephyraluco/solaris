@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan};
+use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan, Wire};
 use solaris_core::{BackendError, TurnRequest};
 
 use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, max_output_for, price_for, provider};
@@ -177,20 +177,6 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     let model = real_model(spec, model);
 
-    if model.is_empty() {
-        // No model was named and the catalogue offers none to substitute, so
-        // the request could only carry an empty name and earn a 400. Saying so
-        // here is cheaper than the round trip, and `/model <name>` fixes it.
-        return BackendChoice::unconnected(
-            CredentialSource::NoModel,
-            format!(
-                "no model is named for {} — run /model <name> to pick one",
-                spec.name
-            ),
-            &model,
-        );
-    }
-
     let endpoint = Endpoint {
         wire: spec.wire,
         base_url,
@@ -215,6 +201,27 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     match HttpBackend::new(plan) {
         Ok(backend) => {
             let base_url = backend.base_url().to_string();
+
+            // With no model named and none in the catalogue there is nothing a
+            // turn could ask for, but the endpoint is real: the model list is
+            // exactly how a name gets chosen in the first place, so it is still
+            // fetched instead of being refused along with the turn.
+            if model.is_empty() {
+                return BackendChoice {
+                    backend: Arc::new(NamelessBackend {
+                        endpoint: backend,
+                        message: format!(
+                            "no model is named for {} — run /model <name> to pick one",
+                            spec.name
+                        ),
+                    }),
+                    provider_id: Some(spec.id),
+                    base_url: Some(base_url),
+                    model,
+                    source: CredentialSource::NoModel,
+                };
+            }
+
             BackendChoice {
                 backend: Arc::new(backend),
                 provider_id: Some(spec.id),
@@ -231,6 +238,34 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             format!("could not set up HTTP for {}: {error}", spec.name),
             &model,
         ),
+    }
+}
+
+/// A connected provider that has no model named yet.
+///
+/// A turn would carry an empty model name and earn a 400, so it is refused
+/// here. The endpoint is real all the same, and asking it what it offers is how
+/// a name gets picked — a gateway ships no catalogue to choose from — so the
+/// model list is still fetched.
+struct NamelessBackend {
+    /// The client the credential resolved to, used for the model list.
+    endpoint: HttpBackend,
+    /// What a turn says instead of being sent.
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for NamelessBackend {
+    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        Err(BackendError::new(self.message.clone()))
+    }
+
+    fn label(&self) -> &str {
+        self.endpoint.label()
+    }
+
+    async fn models(&self) -> Result<Vec<String>, BackendError> {
+        self.endpoint.models().await
     }
 }
 
@@ -251,6 +286,36 @@ fn is_openai_host(base_url: &str) -> bool {
         .split(['/', '?', '#'])
         .next()
         .is_some_and(|host| host == "api.openai.com")
+}
+
+/// The base URL `wire` should really be called at, given what was configured.
+///
+/// An OpenAI-compatible gateway serves its API under `/v1` — the paths appended
+/// to the base are `/models` and `/chat/completions`, so the prefix has to be
+/// part of it — while the URL a person types into `/connect` or exports as
+/// `OPENAI_BASE_URL` usually stops at the host. `GET …/models` then lands on the
+/// gateway's web front end, which answers 200 with a page that parses as "this
+/// provider has no models at all": an empty provider rather than a visible
+/// error, and the reason a self-hosted gateway appears to list nothing.
+///
+/// A URL with no path of its own therefore gets the prefix, and one that
+/// already carries a path is left exactly as written — only its owner knows
+/// where the API is mounted. The Messages API is never touched: its base *is*
+/// the host, and `/v1` is part of the path appended here.
+fn endpoint_base_url(wire: Wire, base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if wire == Wire::AnthropicMessages || trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    // Everything after the scheme up to the first path, query or fragment: a
+    // bare authority is the only shape that is missing its prefix.
+    let authority = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    if authority.contains(['/', '?', '#']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
 }
 
 /// The secret a stored credential carries, or `None` when it carries none.
@@ -335,6 +400,7 @@ fn resolve(
             _ => return None,
         },
     };
+    let base_url = endpoint_base_url(spec.wire, &base_url);
 
     if let Some((name, key)) = lookup(spec.env_keys) {
         return Some((base_url, Some(key), CredentialSource::Env(name)));
@@ -464,8 +530,39 @@ mod tests {
         assert!(!is_openai_host("not a url"));
     }
 
+    #[test]
+    fn a_gateway_url_without_a_path_gets_the_openai_prefix() {
+        // The paths appended to a base are `/models` and `/chat/completions`,
+        // so a gateway's `/v1` has to be part of the base. A URL that stops at
+        // the host is the one shape that is certainly missing it.
+        assert_eq!(
+            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test"),
+            "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url(Wire::OpenAiChat, "  http://one-api.test/  "),
+            "http://one-api.test/v1"
+        );
+        // A path is left exactly as written: only whoever deployed the gateway
+        // knows where its API is mounted.
+        assert_eq!(
+            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test/v1"),
+            "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test/api/v1"),
+            "http://one-api.test/api/v1"
+        );
+        // The Messages API takes the host itself and appends `/v1` on its own.
+        assert_eq!(
+            endpoint_base_url(Wire::AnthropicMessages, "https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(endpoint_base_url(Wire::OpenAiChat, "   "), "");
+    }
+
     #[tokio::test]
-    async fn a_named_model_is_required_when_the_catalogue_has_none() {
+    async fn a_named_model_is_required_before_a_turn_but_not_to_list_models() {
         // A gateway's catalogue is empty, so an unnamed model leaves nothing to
         // send. Refusing here beats sending an empty name and collecting a 400.
         let auth = auth_with(
@@ -478,7 +575,11 @@ mod tests {
 
         let choice = choose_backend(&auth, "", options());
         assert_eq!(choice.source, CredentialSource::NoModel);
-        assert_eq!(choice.backend.label(), "unconnected");
+        // The endpoint is resolved all the same: it is the provider that will
+        // be asked what it offers, since nothing else can name a model here.
+        assert_eq!(choice.provider_id, Some("new-api"));
+        assert_eq!(choice.backend.label(), "new-api");
+        assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
         let error = match choice.backend.run_turn(request()).await {
             Ok(_) => panic!("a model-less provider must not be asked"),
@@ -491,6 +592,29 @@ mod tests {
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.model, "glm-5.3");
         assert_eq!(choice.source, CredentialSource::Stored);
+    }
+
+    #[tokio::test]
+    async fn a_nameless_gateway_still_asks_its_endpoint_for_models() {
+        // Nothing is listening on this port, so the point is which error comes
+        // back: a transport one from the client proves the request went out,
+        // rather than being refused as "this backend cannot list models".
+        let auth = auth_with(
+            "new-api",
+            Some(Credential::Endpoint {
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                api_key: "k".to_string(),
+            }),
+        );
+        let choice = choose_backend(&auth, "", options());
+
+        let error = choice
+            .backend
+            .models()
+            .await
+            .expect_err("nothing is listening");
+        let message = error.to_string();
+        assert!(message.contains("could not reach New API"), "{message}");
     }
 
     #[test]
@@ -631,6 +755,39 @@ mod tests {
             &auth,
             "llama3.2",
             options_with(&[("SOLARIS_LOCAL_BASE_URL", "http://127.0.0.1:8080/v1")]),
+        );
+
+        assert_eq!(choice.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    }
+
+    #[test]
+    fn a_gateway_stored_without_a_path_still_reaches_its_api() {
+        // What someone types into `/connect` is `http://host`, which used to be
+        // called as `http://host/models` — the gateway's web front end, whose
+        // 200 + HTML page parses as "this provider lists no models".
+        let auth = auth_with(
+            "new-api",
+            Some(Credential::Endpoint {
+                base_url: "http://one-api.server22.jz".to_string(),
+                api_key: "sk-test".to_string(),
+            }),
+        );
+        let choice = choose_backend(&auth, "gpt-4o", options());
+
+        assert_eq!(choice.provider_id, Some("new-api"));
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("http://one-api.server22.jz/v1")
+        );
+    }
+
+    #[test]
+    fn a_local_runtime_endpoint_override_without_a_path_is_completed() {
+        let auth = auth_with("local", None);
+        let choice = choose_backend(
+            &auth,
+            "llama3.2",
+            options_with(&[("SOLARIS_LOCAL_BASE_URL", "http://127.0.0.1:8080")]),
         );
 
         assert_eq!(choice.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));

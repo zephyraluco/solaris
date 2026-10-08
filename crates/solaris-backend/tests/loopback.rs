@@ -284,6 +284,64 @@ async fn a_refused_model_list_is_an_error_the_caller_falls_back_on() {
 }
 
 #[tokio::test]
+async fn a_web_page_where_the_model_list_should_be_is_reported_as_one() {
+    // What a base URL that misses the gateway's API gets: its web front end,
+    // which answers 200 with a page. Reading that as "no models" would hide a
+    // wrong URL behind a plausible-looking answer.
+    let (addr, _seen) = serve(response("200 OK", "text/html", "<html>hi</html>")).await;
+
+    let error = backend(addr)
+        .models()
+        .await
+        .expect_err("a web page is not a model list");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("with a web page, not a model list"),
+        "{message}"
+    );
+    assert!(message.contains("/v1/models"), "{message}");
+}
+
+#[tokio::test]
+async fn an_error_wrapped_in_a_200_is_reported_with_the_providers_words() {
+    // New API answers 200 with `{"success": false, "message": …}` when it
+    // cannot work out which models the token may use.
+    let body = r#"{"success":false,"message":"get user group failed"}"#;
+    let (addr, _seen) = serve(response("200 OK", "application/json", body)).await;
+
+    let error = backend(addr)
+        .models()
+        .await
+        .expect_err("an error body is not a model list");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("did not answer with a model list"),
+        "{message}"
+    );
+    assert!(message.contains("get user group failed"), "{message}");
+}
+
+#[tokio::test]
+async fn an_empty_model_list_is_an_answer_not_a_failure() {
+    // The gateway answered: this credential simply reaches no models, which the
+    // caller has to be able to tell apart from "that URL is not an API".
+    let (addr, _seen) = serve(response(
+        "200 OK",
+        "application/json",
+        r#"{"object":"list","data":[]}"#,
+    ))
+    .await;
+
+    let models = backend(addr)
+        .models()
+        .await
+        .expect("an empty list is a list");
+    assert!(models.is_empty());
+}
+
+#[tokio::test]
 async fn a_rejected_key_is_reported_with_the_providers_words() {
     let body = r#"{"error":{"message":"invalid api key provided"}}"#;
     let (addr, _seen) = serve(response("401 Unauthorized", "application/json", body)).await;
