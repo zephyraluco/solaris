@@ -32,7 +32,7 @@ impl CommandOutput {
     }
 
     /// The best explanation available for a non-zero exit.
-    pub fn failure(&self) -> String {
+    pub fn failure_message(&self) -> String {
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
             return stderr.to_string();
@@ -147,13 +147,13 @@ pub(crate) mod tests {
             stderr: "  rg: regex parse error  \n".to_string(),
             code: Some(2),
         };
-        assert_eq!(output.failure(), "rg: regex parse error");
+        assert_eq!(output.failure_message(), "rg: regex parse error");
         assert!(!output.succeeded());
 
         let silent = CommandOutput {
             code: Some(1),
             ..Default::default()
         };
-        assert_eq!(silent.failure(), "the command exited with code 1");
+        assert_eq!(silent.failure_message(), "the command exited with code 1");
     }
 }

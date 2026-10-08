@@ -73,7 +73,7 @@ impl Tool for WriteTool {
         let bytes = content.len();
 
         self.queue
-            .with(&absolute, async {
+            .with_lock(&absolute, || async {
                 if let Some(parent) = absolute.parent().filter(|parent| !parent.as_os_str().is_empty()) {
                     if let Err(error) = tokio::fs::create_dir_all(parent).await {
                         return ToolOutput::error(format!(

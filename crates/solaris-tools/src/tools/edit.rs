@@ -86,7 +86,7 @@ impl Tool for EditTool {
         }
 
         self.queue
-            .with(&absolute, async {
+            .with_lock(&absolute, || async {
                 let raw = match tokio::fs::read(&absolute).await {
                     Ok(raw) => raw,
                     Err(error) => {

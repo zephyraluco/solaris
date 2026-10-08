@@ -135,7 +135,7 @@ impl Tool for GrepTool {
         // Ripgrep exits 1 when nothing matched, which is an answer rather than a
         // failure; anything else is a real problem, usually a bad pattern.
         if !output.succeeded() && output.code != Some(1) {
-            return ToolOutput::error(format!("ripgrep failed: {}", output.failure()));
+            return ToolOutput::error(format!("ripgrep failed: {}", output.failure_message()));
         }
 
         let (matches, capped) = parse_ripgrep(&output.stdout, limit);

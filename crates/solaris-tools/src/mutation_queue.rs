@@ -14,6 +14,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// One lock per path.
+///
+/// A path's lock is kept for the life of the queue rather than dropped when it
+/// goes idle: a session touches a bounded set of paths, and keeping every entry
+/// is what guarantees two callers asking for one path always meet on the same
+/// lock.
 #[derive(Debug, Default)]
 pub struct FileMutationQueue {
     locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
@@ -26,13 +31,20 @@ impl FileMutationQueue {
     }
 
     /// Run `f` with `path`'s lock held, waiting for whoever holds it first.
-    pub async fn with<T>(&self, path: &Path, f: impl Future<Output = T>) -> T {
+    ///
+    /// `f` is called once the lock is held, so nothing it captures runs before
+    /// its turn.
+    pub async fn with_lock<T, F, Fut>(&self, path: &Path, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
         let lock = {
             let mut locks = self.locks.lock().await;
             Arc::clone(locks.entry(path.to_path_buf()).or_default())
         };
         let _guard = lock.lock().await;
-        f.await
+        f().await
     }
 }
 
@@ -52,7 +64,7 @@ mod tests {
             let log = Arc::clone(&log);
             tasks.push(tokio::spawn(async move {
                 queue
-                    .with(Path::new("same.txt"), async {
+                    .with_lock(Path::new("same.txt"), || async {
                         log.lock().await.push(step);
                         tokio::time::sleep(Duration::from_millis(5)).await;
                         log.lock().await.push("done");
@@ -77,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn the_closure_result_comes_back() {
         let queue = FileMutationQueue::new();
-        let value = queue.with(Path::new("a.txt"), async { 7 }).await;
+        let value = queue.with_lock(Path::new("a.txt"), || async { 7 }).await;
         assert_eq!(value, 7);
     }
 }

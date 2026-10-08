@@ -96,7 +96,7 @@ impl Tool for FindTool {
             Err(error) => return ToolOutput::error(error),
         };
         if !output.succeeded() {
-            return ToolOutput::error(format!("fd failed: {}", output.failure()));
+            return ToolOutput::error(format!("fd failed: {}", output.failure_message()));
         }
 
         let mut paths: Vec<String> = output
