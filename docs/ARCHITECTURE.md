@@ -6,26 +6,28 @@
 
 ## 1. 总览
 
-solaris 是一个用 Rust 编写的终端 AI 助手：一个全屏 TUI 聊天客户端，外带一套可复用的终端 UI 框架。仓库是一个 Cargo workspace（edition 2024，Rust 1.85+），由四个 crate 组成，依赖严格单向：
+solaris 是一个用 Rust 编写的终端 AI 助手：一个全屏 TUI 聊天客户端，外带一套可复用的终端 UI 框架。仓库是一个 Cargo workspace（edition 2024，Rust 1.85+），由五个 crate 组成，依赖严格单向：
 
 ```text
 solaris              应用：根组件、对话框、/connect 向导、转录渲染、按键映射、CLI 入口
 ├── solaris-tui      可复用终端 UI 框架（不依赖工作区其他 crate）
 ├── solaris-backend  后端抽象：ProviderBackend（真实 HTTP 客户端）/ UnconnectedBackend（无凭据时的占位）
-└── solaris-core     领域类型与纯逻辑（不依赖工作区其他 crate）
+├── solaris-core     领域类型与纯逻辑（不依赖工作区其他 crate）
+└── solaris-provider     凭据存储：Credential / AuthStore / mask_secret（不依赖工作区其他 crate）
 ```
 
 两条硬性约束：
 
-1. **依赖只能向下**。`solaris-core` 与 `solaris-tui` 位于最底层且互不依赖；应用层只向上组合它们。
+1. **依赖只能向下**。`solaris-core`、`solaris-tui` 与 `solaris-provider` 位于最底层且互不依赖；应用层只向上组合它们。
 2. **UI 不认识任何 provider**。界面把一次请求交给 `AgentBackend`，只消费它回流的 `AgentEvent` 流；换成真实模型服务只需实现这个 trait。
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
-| `solaris-core` | [`crates/solaris-core`](../crates/solaris-core) | `serde`、`serde_json`、`thiserror` | 领域类型与纯逻辑：斜杠命令解析、配置、provider 目录、消息与事件、凭据存储、伙伴、提示轮换。不涉及终端、渲染与网络。 |
+| `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `serde`、`serde_json`、`thiserror` | 凭据：`Credential`（API key / OpenAI 兼容端点 / OAuth token）、`AuthStore`（含当前激活的 provider）、`mask_secret`。只做序列化与领域判断，文件读写在应用层。 |
+| `solaris-core` | [`crates/solaris-core`](../crates/solaris-core) | `serde`、`serde_json`、`thiserror` | 领域类型与纯逻辑：斜杠命令解析、配置、provider 目录、消息与事件、token 计费、伙伴、提示轮换。不涉及终端、渲染、凭据存储与网络。 |
 | `solaris-tui` | [`crates/solaris-tui`](../crates/solaris-tui) | `ratatui`、`crossterm`、`unicode-width`、`unicode-segmentation` | 终端 UI 框架：组件模型、类 flex 布局、浮层、主题、按键匹配、组件集、终端生命周期。 |
-| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `solaris-core`、`async-trait`、`futures`、`tokio`、`reqwest`（rustls）、`bytes`、`serde`、`serde_json`、`thiserror` | 后端抽象：三条协议的 provider 客户端、SSE 解码、重试与计费；没有可用凭据时由一个拒绝作答的占位后端接管。 |
-| `solaris` | [`crates/solaris`](../crates/solaris) | 上述三个 + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio` | 应用本体，同时产出库与 `solaris` 二进制。 |
+| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `solaris-core`、`solaris-provider`、`async-trait`、`futures`、`tokio`、`reqwest`（rustls）、`bytes`、`serde`、`serde_json`、`thiserror` | 后端抽象：三条协议的 provider 客户端、SSE 解码、重试与计费；没有可用凭据时由一个拒绝作答的占位后端接管。 |
+| `solaris` | [`crates/solaris`](../crates/solaris) | 上述四个 + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio` | 应用本体，同时产出库与 `solaris` 二进制。 |
 
 ---
 
@@ -41,7 +43,7 @@ solaris              应用：根组件、对话框、/connect 向导、转录�
 | `message` | `Message` / `Role`，供转录与历史构造使用。 |
 | `command` | `SlashCommandSpec` 与 `PROMPT_SLASH_COMMANDS` 命令表；`parse_slash_command`、`matching_slash_commands` 是纯函数，供编辑器补全、命令面板与帮助对话框共用。 |
 | `provider` | `ProviderSpec` / `AuthKind` / `Wire` / `ModelSpec` / `PROVIDERS`：每个 provider 的 id、展示名、认证方式、徽章、wire 协议、固定端点与环境变量名，以及每个模型的上下文窗口、最大输出与单价。向导步骤、模型选择器、HTTP 客户端与计费表都从这一张表读取。 |
-| `auth` | `Credential`（API key / OpenAI 兼容端点 / OAuth token）、`AuthStore`、`mask_secret`（只保留末四位）。**只做序列化与领域判断，文件读写在应用层**。 |
+| `auth` | 已迁至 [`solaris-provider`](../crates/solaris-provider)：`Credential`、`AuthStore`、`mask_secret`。核心层只保留 `AuthKind`——它和 `Wire`、`base_url` 一样是「怎么连上这个 provider」的目录元数据，不是凭据本身。 |
 | `buddy` | `Companion` / `Bones` / `Soul` / `Species` / `Rarity` / `Hat`：由用户 id 经 FNV-1a 播种，用 Mulberry32 掷出「骨架」，因此稳定且不可手工篡改。 |
 | `recent` | `RecentActivity` / `RecentEntry`：历史提示词，用于欢迎框与提示轮换。 |
 | `tips` | `TIPS` / `select(index)`：欢迎框里的起步提示，按会话序号轮换。 |
@@ -84,6 +86,7 @@ pub trait AgentBackend: Send + Sync {
   - [`sse`](../crates/solaris-backend/src/sse.rs) —— 跨 chunk 的 SSE 帧解码，**按字节**缓冲，所以帧切在多字节字符中间也不会损坏。
   - [`http`](../crates/solaris-backend/src/http.rs) —— 共享的 `reqwest` 客户端（10s 连接超时，无整请求超时，因为一轮本来就要流几分钟）、状态码 → 可操作的错误文案、退避重试。
   - [`wire`](../crates/solaris-backend/src/wire.rs) —— 按 `Wire` 分发请求体构造与流解析。跨协议但**只有 OpenAI 需要**的字段在这里补上：`prompt_cache_key` 只在 `Wire::is_openai()` 且端点主机就是 `api.openai.com` 时发送（OpenAI 的缓存本来就是自动的，这个键只影响路由，而兼容网关可能因为不认识它而拒掉整个请求，不值得冒险）。
+- **模型发现**：`AgentBackend::models()` 是可选能力（默认实现直接报「本后端不会列模型」），`ProviderBackend` 用 `Endpoint::models_url()`（Messages API 走 `/v1/models?limit=1000`，OpenAI 兼容走 `/models`）发一次 GET，复用同一套认证；`parse_models` 从 `{"data":[{"id":…}]}` 里取 id——两条 wire 的清单形状相同。**不重试**：它只喂选择器，慢或不可达的代价应当是退回目录，而不是让用户等。
 - **重试只在第一个事件发出之前**（429 / 5xx / 传输错误；指数退避并尊重 `Retry-After`，最多 3 次）。已经吐过字就绝不再试，否则会重复输出。中断靠丢掉接收端：app 放弃 `rx` 后 `send` 失败、任务结束、`reqwest` 的流随之被 drop，请求被取消。
 - **计费**：`Usage` 把各家的报告归一成四个互不重叠的桶（两家 OpenAI 协议都把缓存读计入 `input_tokens` / `prompt_tokens`，会被减掉）；提供商什么都没报时退回按字符估算并置位 `estimated`，`/stats` 会据此显示 `≈`。价格来自 `provider` 表的内置快照，未知模型不收费。生成的 token 还是 0 的 `usage` 块不算「报告过」。
 - **上下文 vs 会话总量**：`SessionState::total_tokens()` 是全会话累计（帧脚把它和累计费用并排显示），`SessionState::context_tokens()` 才是「窗口有多满」——取最后一轮有上报的 usage，加上其后新提交内容的估算；没有任何上报时退化为对提示词取估算。把累计量拿去比窗口是错的，因为窗口是每请求的，而累计会无限增长。
@@ -212,6 +215,8 @@ while !quit {
 `SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、`Usage`、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
 
 **后端在会话中途会被重新解析**：`/connect` 写入凭据、`/model` 改模型时都调 `App::rebuild_backend()` → `resolve_backend()`。它做三件事，而不只是换一个后端：把凭据与模型交给 `backend_factory`；**采纳真正会被询问的模型**（模型名为空时换成该 provider 提供的第一个模型，因为 provider 不会接受空模型名）；按模型目录更新 `config.context_window`，footer 的占比条据此才诚实。`AppOptions::new()` 会把传进来的那个后端**钉死**成一个固定工厂（并把模型原样回传），所以测试驱动的永远是它自己交给 app 的后端；生产环境则用真实的 `choose_backend`。
+
+**模型发现在后台跑**：`App::new` 与 `/connect` 之后各调一次 `App::refresh_models()`，它把 `backend.models()` 丢进 tokio 任务，答案经 channel 在 `tick()` 里收。发现只做加法——没落地时选择器就用内置目录，永远不落地就一直用它。清单到手后：若模型还没命名，取其中的第一个并重建后端（与目录提供首个模型是同一套替换）；选择器改用它，并从目录里补上已知模型的描述与单价。`AppOptions::discover_models` 控制是否发起这次请求：**二进制里开着，`AppOptions::new()` 里关着**，所以测试即使驱动真实 `choose_backend` 也不会自己联网。
 
 复制发生在 `handle_key`：`Ctrl+C` 命中 `quit` 绑定时，先看共享的 `selection` 句柄里有没有文本 —— 有就交给 [`clipboard`](../crates/solaris/src/clipboard.rs) 并通知结果，没有才真的退出。
 
@@ -350,10 +355,10 @@ DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 
 ## 7. 测试策略
 
-工作区共 **433 个测试**，分三层：
+工作区共 **445 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-core` 48、`solaris-tui` 130、`solaris-backend` 87、`solaris` 库 138），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、缓存断点与 `prompt_cache_key` 的门控、上下文与累计口径、选后端 / 选模型与状态机。
-- **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（5 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 6、`solaris-core` 43、`solaris-tui` 130、`solaris-backend` 90、`solaris` 库 142），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。
+- **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（7 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
 - **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（27 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。它自带一个只回显提示词的 `FakeBackend` 顶替真实 provider，并把 `environment` 换成空表，所以既不会继承 shell 里的 key，也不会联网。
 
 ```bash

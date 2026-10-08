@@ -17,10 +17,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use solaris_backend::{AgentBackend, BackendChoice, CredentialSource};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use solaris_backend::AgentBackend;
 use solaris_core::{
-    AgentEvent, AuthKind, AuthStore, Companion, Config, Credential, Mode, RecentActivity,
-    SlashCommand, Soul, TurnRequest, buddy, context_window_for, parse_slash_command, recent,
+    AgentEvent, Companion, Config, Mode, RecentActivity, SlashCommand, Soul, TurnRequest, buddy,
+    parse_slash_command, recent,
+};
+use solaris_provider::{
+    AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
 };
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
@@ -33,10 +40,6 @@ use solaris_tui::selection::{Selection, SelectionHandle};
 use solaris_tui::theme::Theme;
 use solaris_tui::tui::{OverlayQueue, QuitFlag};
 use solaris_tui::util::{display_width, pad_to_width, rect_contains, truncate_to_width};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
@@ -101,13 +104,21 @@ pub struct AppOptions {
     pub selection: SelectionHandle,
     /// Where a finished selection is copied, and where a paste comes from.
     pub clipboard: Clipboard,
+    /// Whether the app asks the provider for its model list.
+    ///
+    /// On in the binary, where the answer fills the model picker; off in
+    /// [`AppOptions::new`], so a test that pins its own backend makes no
+    /// request of its own and the catalogue is the only source.
+    pub discover_models: bool,
 }
 
 impl AppOptions {
     /// Options with no stored credentials and no persistence — handy in tests.
     ///
     /// The factory pinned here always returns `backend`, so a test drives the
-    /// backend it handed in whatever the wizard does to the credentials.
+    /// backend it handed in whatever the wizard does to the credentials. Model
+    /// discovery is left off for the same reason: whatever backend it was handed
+    /// is the only thing this app should talk to.
     pub fn new(
         backend: Arc<dyn AgentBackend>,
         config: Config,
@@ -138,6 +149,7 @@ impl AppOptions {
             overlay_flag,
             selection: Selection::handle(),
             clipboard: Clipboard::system(),
+            discover_models: false,
         }
     }
 }
@@ -218,6 +230,14 @@ pub struct App {
     inline: Option<Inline>,
     /// Events from the background device-auth task.
     device_rx: Option<UnboundedReceiver<DeviceAuthEvent>>,
+    /// Models the active provider reported, once it has reported any. Empty
+    /// until then, which is what makes the catalogue the fallback rather than
+    /// the only answer.
+    discovered: Vec<String>,
+    /// Answer from the background model-discovery task, while one is in flight.
+    models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
+    /// Whether asking the provider for its models is allowed at all.
+    discover_models: bool,
 }
 
 impl App {
@@ -240,6 +260,7 @@ impl App {
             overlay_flag,
             selection,
             clipboard,
+            discover_models,
         } = options;
 
         let mut config = config;
@@ -257,7 +278,7 @@ impl App {
         editor.set_hints(commands::hints());
         editor.set_styles(editor_styles(&theme));
 
-        Self {
+        let mut app = Self {
             backend,
             backend_factory,
             provider_id,
@@ -294,7 +315,13 @@ impl App {
             quit_press: None,
             inline: None,
             device_rx: None,
-        }
+            discovered: Vec::new(),
+            models_rx: None,
+            discover_models,
+        };
+
+        app.refresh_models();
+        app
     }
 
     /// The active provider, once one has been connected.
@@ -876,6 +903,95 @@ impl App {
         );
     }
 
+    /// Ask the backend which models the provider offers, in the background.
+    ///
+    /// Discovery never blocks the UI: until an answer lands the picker falls
+    /// back to the catalogue, and if none ever does it keeps doing that. A
+    /// second call replaces the first, so a stale answer cannot arrive after a
+    /// newer one.
+    fn refresh_models(&mut self) {
+        if !self.discover_models {
+            return;
+        }
+
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = unbounded_channel();
+        self.models_rx = Some(rx);
+        self.discovered.clear();
+
+        tokio::spawn(async move {
+            let answer = backend.models().await.map_err(|error| error.to_string());
+            let _ = tx.send(answer);
+        });
+    }
+
+    /// Adopt the model list the provider reported.
+    fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
+        match answer {
+            Ok(models) if !models.is_empty() => {
+                // The provider's own list is the one that knows which models
+                // this credential can actually reach, so an unnamed model takes
+                // the first of them — the same substitution the catalogue gets.
+                let adopt = self.config.model.is_empty();
+                self.discovered = models;
+
+                if adopt {
+                    if let Some(first) = self.discovered.first().cloned() {
+                        self.config.model = first;
+                        self.rebuild_backend();
+                    }
+                }
+                self.notifications.info(format!(
+                    "{} model(s) available — /model to choose",
+                    self.discovered.len()
+                ));
+            }
+            Ok(_) => {}
+            Err(message) => {
+                // Only worth saying when there was no catalogue to fall back on;
+                // otherwise a provider that will not answer is not the user's
+                // problem to solve.
+                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                    self.notifications.warning(format!(
+                        "could not list models: {message} — use /model <name>"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The models the picker should offer.
+    ///
+    /// What the provider reported comes first and is annotated from the
+    /// catalogue where the model is known, which keeps descriptions, prices and
+    /// context windows for the models we ship while leaving a gateway's own
+    /// list intact. With nothing reported, the catalogue is the whole answer.
+    fn model_choices(&self) -> Vec<SelectItem> {
+        let catalogue = self.provider_id.and_then(solaris_provider::provider);
+
+        if self.discovered.is_empty() {
+            return catalogue
+                .map(|spec| {
+                    spec.models
+                        .iter()
+                        .map(|model| {
+                            SelectItem::new(model.id, model.id).description(model.description)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+
+        self.discovered
+            .iter()
+            .map(|id| {
+                let description =
+                    solaris_provider::model_spec(id).map_or("", |spec| spec.description);
+                SelectItem::new(id.as_str(), id.as_str()).description(description)
+            })
+            .collect()
+    }
+
     /// Open the model picker in the prompt region — the `/connect` look rather
     /// than a modal — with the active model highlighted.
     ///
@@ -883,20 +999,11 @@ impl App {
     /// provider's models can be asked for. With nothing connected there is
     /// nothing to choose between, so the user is told what to do instead.
     fn open_model_picker(&mut self) {
-        let models = self
-            .provider_id
-            .and_then(solaris_core::provider)
-            .map(|spec| {
-                spec.models
-                    .iter()
-                    .map(|model| SelectItem::new(model.id, model.id).description(model.description))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let models = self.model_choices();
 
         if models.is_empty() {
             self.notifications
-                .warning("no provider is connected — run /connect to choose a model");
+                .warning("no models to choose from — run /connect, or name one with /model <name>");
             return;
         }
 
@@ -977,7 +1084,7 @@ impl App {
 
     /// Route a picked provider to the step its auth kind needs.
     fn begin_provider_setup(&mut self, provider_id: &str, name: &str) {
-        let Some(spec) = solaris_core::provider(provider_id) else {
+        let Some(spec) = solaris_provider::provider(provider_id) else {
             self.notifications
                 .error(format!("unknown provider {provider_id}"));
             self.close_inline();
@@ -1061,7 +1168,7 @@ impl App {
         self.persist_auth();
 
         // Connecting is what resolves a real client, so the backend is rebuilt
-        // before the model step.
+        // before the model step — and the new provider is asked what it offers.
         match self.rebuild_backend() {
             CredentialSource::NotImplemented => self.notifications.warning(
                 "subscription sign-in is not implemented yet — connect an API key instead",
@@ -1069,13 +1176,17 @@ impl App {
             CredentialSource::Missing => self
                 .notifications
                 .warning("no usable credential — turns will say so until /connect succeeds"),
+            CredentialSource::NoModel => self.notifications.info(format!(
+                "connected to {provider_name} — no model named yet, use /model <name>"
+            )),
             _ => self
                 .notifications
                 .info(format!("connected to {provider_name}")),
         }
+        self.refresh_models();
 
         // Continue into the model picker, the way claurst's wizard does.
-        let models: Vec<SelectItem> = solaris_core::provider(&provider_id)
+        let models: Vec<SelectItem> = solaris_provider::provider(&provider_id)
             .map(|spec| {
                 spec.models
                     .iter()
@@ -1472,6 +1583,29 @@ impl Component for App {
             }
         }
 
+        // Models the provider reported to the background discovery task.
+        let mut discovered = Vec::new();
+        let mut discovery_done = false;
+        if let Some(rx) = self.models_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(answer) => discovered.push(answer),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        discovery_done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if discovery_done {
+            self.models_rx = None;
+        }
+        for answer in discovered {
+            dirty = true;
+            self.on_models_discovered(answer);
+        }
+
         if self.notifications.tick() {
             dirty = true;
         }
@@ -1751,14 +1885,18 @@ mod tests {
     use super::*;
     use crate::connect::DeviceAuthStatus;
     use crossterm::event::MouseButton;
-    use solaris_backend::{AgentEventStream, BackendOptions};
+    use solaris_backend::AgentEventStream;
     use solaris_core::{BackendError, Usage};
+    use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
 
     /// A backend that answers with a prompt-echoing markdown reply, so the app's
     /// own behaviour can be driven without a provider and without a network.
-    struct FakeBackend;
+    struct FakeBackend {
+        /// What `models()` reports. `Err` stands for a provider that will not say.
+        models: Result<Vec<String>, String>,
+    }
 
     #[async_trait::async_trait]
     impl AgentBackend for FakeBackend {
@@ -1782,11 +1920,25 @@ mod tests {
         fn label(&self) -> &str {
             "fake"
         }
+
+        async fn models(&self) -> Result<Vec<String>, BackendError> {
+            self.models.clone().map_err(BackendError::new)
+        }
     }
 
-    /// The fake, type-erased the way `AppOptions` wants it.
+    /// The fake, type-erased the way `AppOptions` wants it. It lists no models,
+    /// which is what a backend with nothing to say looks like.
     fn fake_backend() -> Arc<dyn AgentBackend> {
-        Arc::new(FakeBackend)
+        Arc::new(FakeBackend {
+            models: Err("this backend cannot list models".to_string()),
+        })
+    }
+
+    /// The same, reporting `models` when asked.
+    fn fake_backend_reporting(models: &[&str]) -> Arc<dyn AgentBackend> {
+        Arc::new(FakeBackend {
+            models: Ok(models.iter().map(|id| (*id).to_string()).collect()),
+        })
     }
 
     fn app() -> App {
@@ -1801,6 +1953,46 @@ mod tests {
             queue,
             flag,
         ))
+    }
+
+    /// An app pinned to `backend` that is allowed to ask it for its models.
+    fn app_with_backend(backend: Arc<dyn AgentBackend>) -> App {
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.discover_models = true;
+        App::new(options)
+    }
+
+    /// An app that looks connected to `provider` while answering from the fake,
+    /// so the catalogue has a provider to fall back to.
+    fn app_connected_to_but_faked(provider: &'static str) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.discover_models = true;
+        options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            backend: fake_backend(),
+            provider_id: Some(provider),
+            base_url: None,
+            model: model.to_string(),
+            source: CredentialSource::None,
+        });
+        App::new(options)
+    }
+
+    /// Tick until the background model discovery has finished, or give up.
+    async fn settle_discovery(app: &mut App) {
+        for _ in 0..500 {
+            app.tick();
+            if app.models_rx.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     /// An app that persists credentials to `path`.
@@ -1845,11 +2037,11 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.auth = auth;
         options.backend_factory = Arc::new(|auth: &AuthStore, model: &str| {
-            solaris_backend::choose_backend(
+            solaris_provider::choose_backend(
                 auth,
                 model,
                 BackendOptions {
-                    environment: solaris_backend::empty_environment(),
+                    environment: solaris_provider::empty_environment(),
                 },
             )
         });
@@ -2129,6 +2321,76 @@ mod tests {
         assert_eq!(app.overlay_queue.borrow().len(), 2);
     }
 
+    #[tokio::test]
+    async fn the_providers_own_model_list_fills_the_picker() {
+        // A gateway's catalogue is empty, so what the provider reports is the
+        // only model list there is.
+        let mut app = app_with_backend(fake_backend_reporting(&["glm-5.3", "kimi-k3"]));
+        assert_eq!(app.model(), "", "nothing is named until the list lands");
+
+        settle_discovery(&mut app).await;
+
+        // The first of them takes the empty slot, so a turn can be sent without
+        // the user naming a model first.
+        assert_eq!(app.model(), "glm-5.3");
+
+        app.submit("/model".to_string());
+        let text = rendered_text(&mut app, 90, 24);
+        assert!(text.contains("Select a model:"), "{text}");
+        assert!(text.contains("glm-5.3"), "{text}");
+        assert!(text.contains("kimi-k3"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_reported_model_is_annotated_from_the_catalogue() {
+        let mut app = app_with_backend(fake_backend_reporting(&[
+            "claude-sonnet-4-5",
+            "acme-internal-1",
+        ]));
+        settle_discovery(&mut app).await;
+        app.submit("/model".to_string());
+
+        let text = rendered_text(&mut app, 100, 24);
+        // The catalogue knows this one, so its description comes along.
+        assert!(text.contains("claude-sonnet-4-5 · balanced"), "{text}");
+        // And one it has never heard of is offered all the same.
+        assert!(text.contains("acme-internal-1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_model_list_that_never_lands_leaves_the_catalogue_to_answer() {
+        let mut app = app_connected_to_but_faked("anthropic");
+        settle_discovery(&mut app).await;
+
+        // The provider would not say, and that is not the user's problem to
+        // solve while the catalogue can answer.
+        assert!(
+            app.notifications.current().is_none(),
+            "the failure was announced"
+        );
+
+        app.submit("/model".to_string());
+        let text = rendered_text(&mut app, 90, 24);
+        assert!(text.contains("claude-opus-4-1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_model_list_with_nothing_to_fall_back_on_says_so() {
+        let mut app = app_with_backend(fake_backend());
+        settle_discovery(&mut app).await;
+        assert_eq!(
+            app.model(),
+            "",
+            "nothing was reported, so nothing was adopted"
+        );
+
+        // No models and no catalogue: the notice has to say how to proceed.
+        app.submit("/model".to_string());
+        let (kind, text) = app.notifications.current().expect("a notice was shown");
+        assert_eq!(kind, NoticeKind::Warning);
+        assert!(text.contains("/model <name>"), "{text}");
+    }
+
     #[test]
     fn the_model_command_opens_the_inline_picker() {
         let mut app = app_connected_to("anthropic");
@@ -2171,7 +2433,7 @@ mod tests {
     #[test]
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
-        let names: Vec<&str> = solaris_core::provider("anthropic")
+        let names: Vec<&str> = solaris_provider::provider("anthropic")
             .expect("a known provider")
             .models
             .iter()
@@ -2562,7 +2824,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("solaris-auth-{nanos}.json"));
+        let path = std::env::temp_dir().join(format!("solaris-provider-{nanos}.json"));
         let _ = std::fs::remove_file(&path);
 
         let mut app = app_with_auth_path(path.clone());

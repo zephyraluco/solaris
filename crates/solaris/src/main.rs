@@ -11,10 +11,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use solaris::{App, AppOptions, BackendFactory, Clipboard};
-use solaris_backend::{BackendOptions, CredentialSource, choose_backend};
-use solaris_core::{
-    AuthStore, Companion, Config, Mode, RecentActivity, Soul, context_window_for, provider, tips,
-};
+use solaris_core::{Companion, Config, Mode, RecentActivity, Soul, tips};
+use solaris_provider::{AuthStore, context_window_for, provider};
+use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
 
 /// A terminal AI assistant.
@@ -175,6 +174,9 @@ fn main() -> Result<()> {
         overlay_flag: tui.overlay_flag(),
         selection: tui.selection(),
         clipboard: Clipboard::system(),
+        // The binary wants the provider's own model list in the picker; the
+        // catalogue is what it falls back to.
+        discover_models: true,
     });
     tui.set_root(Box::new(app));
 
@@ -189,7 +191,7 @@ fn main() -> Result<()> {
 
 /// Every provider id the catalogue knows, for the `--provider` error message.
 fn provider_ids() -> String {
-    solaris_core::PROVIDERS
+    solaris_provider::PROVIDERS
         .iter()
         .map(|spec| spec.id)
         .collect::<Vec<_>>()
@@ -216,6 +218,7 @@ fn describe_source(source: CredentialSource) -> String {
         CredentialSource::NotImplemented => {
             "sign-in is not implemented yet — connect an API key".to_string()
         }
+        CredentialSource::NoModel => "present — no model named for it yet".to_string(),
     }
 }
 

@@ -2,7 +2,8 @@
 //!
 //! A tiny record of the prompts a session has started, persisted next to the
 //! credentials so the box can show what you were doing last time. Kept pure:
-//! reading and writing the file is the binary's job, exactly like [`crate::auth`].
+//! reading and writing the file is the binary's job, exactly like the credential
+//! store in `solaris-provider`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

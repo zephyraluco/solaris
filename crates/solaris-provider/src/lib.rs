@@ -1,9 +1,29 @@
-//! Credentials collected by `/connect`.
+//! Credentials and the platform catalogue.
 //!
-//! [`AuthStore`] is the domain half: it holds the credentials and remembers
+//! [`AuthStore`] holds the credentials collected by `/connect` and remembers
 //! which provider is active. Reading and writing the file is deliberately left
-//! to the application layer, so this module stays pure and testable — the
-//! store serializes to and from JSON, and `solaris` decides where that JSON lives.
+//! to the application, so this crate stays pure and testable — the store
+//! serializes to and from JSON, and `solaris` decides where that JSON lives.
+//!
+//! [`providers`] is the platform table: which providers exist, how each
+//! authenticates, where its endpoint lives, which models it offers and what they
+//! cost. [`choose_backend`] turns a credential plus a model name into a backend,
+//! so nothing above this crate has to know the difference between one platform
+//! and another.
+
+pub mod choose;
+pub mod providers;
+
+pub use choose::{
+    BackendChoice, BackendOptions, CredentialSource, Environment, build_backend, choose_backend,
+    empty_environment, process_environment,
+};
+pub use solaris_backend::Wire;
+
+pub use providers::{
+    AuthKind, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelSpec, PROVIDERS, ProviderSpec,
+    context_window_for, max_output_for, model_spec, models, price_for, provider,
+};
 
 use std::collections::BTreeMap;
 

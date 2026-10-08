@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 solaris-core = { workspace = true }
+solaris-provider = { workspace = true }
 solaris-backend = { workspace = true }
 solaris-tui = { workspace = true }
 ratatui = { workspace = true }

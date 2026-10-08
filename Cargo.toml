@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+	"crates/solaris-provider",
 	"crates/solaris-core",
 	"crates/solaris-backend",
 	"crates/solaris-tui",
@@ -15,6 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
+solaris-provider = { path = "crates/solaris-provider", version = "0.1.0" }
 solaris-core = { path = "crates/solaris-core", version = "0.1.0" }
 solaris-backend = { path = "crates/solaris-backend", version = "0.1.0" }
 solaris-tui = { path = "crates/solaris-tui", version = "0.1.0" }

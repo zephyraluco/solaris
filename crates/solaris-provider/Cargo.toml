@@ -1,0 +1,19 @@
+[package]
+name = "solaris-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider catalogue, credentials and platform resolution for solaris"
+
+[dependencies]
+solaris-backend = { workspace = true }
+solaris-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The resolution tests drive the async entry point.
+tokio = { workspace = true }

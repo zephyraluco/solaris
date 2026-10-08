@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use solaris::{App, AppOptions, Clipboard};
-use solaris_backend::{AgentBackend, AgentEventStream, BackendOptions};
-use solaris_core::{AgentEvent, BackendError, Config, TurnRequest, Usage};
-use solaris_tui::{Theme, Tui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use solaris::{App, AppOptions, Clipboard};
+use solaris_backend::{AgentBackend, AgentEventStream};
+use solaris_core::{AgentEvent, BackendError, Config, TurnRequest, Usage};
+use solaris_provider::BackendOptions;
+use solaris_tui::{Theme, Tui};
 
 const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
@@ -100,11 +101,11 @@ impl Harness {
         // the network is off limits, so an unresolved choice is filled in with
         // the fake — the UI path under test is the same either way.
         options.backend_factory = Arc::new(|auth, model| {
-            let mut choice = solaris_backend::choose_backend(
+            let mut choice = solaris_provider::choose_backend(
                 auth,
                 model,
                 BackendOptions {
-                    environment: solaris_backend::empty_environment(),
+                    environment: solaris_provider::empty_environment(),
                 },
             );
             if choice.provider_id.is_none() {

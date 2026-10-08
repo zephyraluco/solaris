@@ -14,14 +14,15 @@
 //! [`ConnectOutcome`] is the single funnel out of this module.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use solaris_core::{PROVIDERS, ProviderSpec, mask_secret};
-use solaris_tui::components::inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};
-use solaris_tui::components::select_list::SelectItem;
-use solaris_tui::theme::Theme;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use solaris_provider::mask_secret;
+use solaris_provider::{PROVIDERS, ProviderSpec};
+use solaris_tui::components::inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};
+use solaris_tui::components::select_list::SelectItem;
+use solaris_tui::theme::Theme;
 
 /// Rows reserved for the pinned hint line.
 const FOOTER_ROWS: u16 = 1;
@@ -770,7 +771,7 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 
 /// Look up the catalogue entry a provider id belongs to.
 pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
-    solaris_core::provider(id)
+    solaris_provider::provider(id)
 }
 
 #[cfg(test)]

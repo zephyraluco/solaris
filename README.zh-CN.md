@@ -17,7 +17,7 @@
 
 ---
 
-solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个纯逻辑的领域 crate、一个后端抽象层，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
+solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个凭据 crate、一个纯逻辑的领域 crate、一个后端抽象层，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
 
 界面是完整的，接上 provider 之后真的会去调用它。接一个 provider（或者干脆只导出一个 API key），每一轮都会通过 SSE 从真实模型流式取回：首个 token 之前会重试，每一轮都会结算 token 与费用。
 
@@ -140,7 +140,7 @@ solaris --print-config
 
 ## Provider
 
-`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、Claude 订阅、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，模型名由你指定。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
+`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、Claude 订阅、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
 
 三条 wire 协议就覆盖了整个目录。Anthropic Messages API 承载两个 Claude 条目；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 自己则使用更新的 Responses API。谁走哪条协议是目录表里的一列，不靠猜。
 
@@ -164,7 +164,7 @@ solaris --print-config
 - **prompt 缓存**。solaris 是**主动请求**缓存的：Anthropic 走 `cache_control` 断点（打在最后一条消息上），OpenAI 只在端点是 OpenAI 自家时发 `prompt_cache_key`。`/stats` 里那两行缓存数字之所以会有值就是因为这个；也是长对话每轮越来越便宜的原因 —— 不变的前缀会以缓存读的价格回来。
 - **上下文**。`/stats` 分别给出 `session tokens`（本会话累计花掉的）和 `context used`。只有后者说明窗口有多满：它等于最后一轮上报的用量，加上其后新提交内容的估算量。把整个会话的轮次相加会无限增长，对「单次请求的窗口」毫无意义。
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
-- **模型名。** 不指定时使用所连 provider 提供的第一个模型（空模型名 provider 不会接受），页脚会立刻显示出来；`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕目录里没有它。
+- **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。不指定模型名就用其中的第一个，因为空模型名 provider 不会接受。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
 - **错误。** key 被拒、模型不存在、触发限流，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
 
 唯一的缺口是 `claude-subscription`：通过 OAuth 登录尚未实现，因此向导会直接说明这一点并要求你改用 API key。provider 条目、模型列表与凭据接缝都已就位，等这个流程落地即可接上。

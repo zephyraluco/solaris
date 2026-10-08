@@ -1,4 +1,4 @@
-//! A backend that talks to a real provider over HTTP.
+//! The HTTP client every platform is reached through.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -9,32 +9,30 @@ use futures::stream::BoxStream;
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
-use solaris_core::{
-    AgentEvent, BackendError, Credential, Price, TurnRequest, Usage, Wire, max_output_for,
-    price_for,
-};
+use solaris_core::{AgentEvent, BackendError, Price, TurnRequest, Usage};
 
 use crate::http;
 use crate::protocols::anthropic;
 use crate::protocols::openai::{self, Repair};
 use crate::sse::{SseDecoder, SseEvent};
-use crate::wire::{self, WireStream};
+use crate::wire::{self, Wire, WireStream};
 use crate::{AgentBackend, AgentEventStream};
 
-/// Everything one request needs: where it goes, how it authenticates, and which
-/// protocol it speaks.
+/// Where one turn goes, how it authenticates, and which protocol to speak.
+///
+/// Fixed at the moment the backend is built: nothing here is looked up later.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
-    /// Provider id, shown in the status bar.
-    pub provider_id: &'static str,
-    /// Display name, used in error messages.
-    pub provider_name: &'static str,
     /// Protocol to speak.
     pub wire: Wire,
     /// Base URL, without a trailing slash.
     pub base_url: String,
     /// The key or token to send, or `None` for a runtime that wants none.
     pub secret: Option<String>,
+    /// Display name, used in error messages.
+    pub name: &'static str,
+    /// Short label shown in the status bar — the platform id.
+    pub label: &'static str,
     /// Environment variables that could carry a key, for the error message.
     pub env_keys: &'static [&'static str],
 }
@@ -49,27 +47,43 @@ impl Endpoint {
             Wire::OpenAiResponses => format!("{base}/responses"),
         }
     }
+
+    /// The URL the model list is fetched from.
+    ///
+    /// Both protocols expose the same `{"data": [{"id": …}]}` shape. The
+    /// Messages API pages its list at twenty by default, so the largest page it
+    /// allows is asked for; a list longer than that still shows its first page.
+    pub fn models_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        match self.wire {
+            Wire::AnthropicMessages => format!("{base}/v1/models?limit=1000"),
+            Wire::OpenAiChat | Wire::OpenAiResponses => format!("{base}/models"),
+        }
+    }
 }
 
-/// Cache-routing key sent to OpenAI, which caches prompt prefixes without being
-/// asked. The key groups a client's requests onto one cache shard, and a single
-/// user wants every turn of a session on the same one.
-const PROMPT_CACHE_KEY: &str = "solaris";
-
-/// Whether `base_url` is OpenAI's own endpoint.
+/// One turn, already resolved by the caller.
 ///
-/// The cache key is only sent there. OpenAI's cache is automatic, so the field
-/// buys routing and nothing else, while a compatible gateway that does not
-/// implement it may reject the whole request — not worth the risk.
-fn is_openai_endpoint(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| host == "api.openai.com")
+/// Everything platform-specific has been decided before this point: which
+/// endpoint, which model, how large a reply to ask for, what that model costs,
+/// and whether a prompt-cache key should ride along.
+#[derive(Debug, Clone)]
+pub struct TurnPlan {
+    /// Where the turn goes and how it authenticates.
+    pub endpoint: Endpoint,
+    /// Model id to send, exactly as the caller wants it.
+    pub model: String,
+    /// Largest reply to ask for.
+    pub max_tokens: u32,
+    /// List price for the model, when the caller knows one. The backend only
+    /// multiplies; it has no idea what any model costs by itself.
+    pub price: Option<Price>,
+    /// Prompt-cache routing key, for the platforms that want one.
+    pub prompt_cache_key: Option<&'static str>,
 }
 
-/// A backend that streams one turn from a real provider.
-pub struct ProviderBackend {
+/// Streams one turn from an HTTP endpoint, over whichever wire it speaks.
+pub struct HttpBackend {
     client: reqwest::Client,
     endpoint: Endpoint,
     model: String,
@@ -78,18 +92,16 @@ pub struct ProviderBackend {
     prompt_cache_key: Option<&'static str>,
 }
 
-impl ProviderBackend {
-    /// A backend that posts to `endpoint` using `model`.
-    pub fn new(endpoint: Endpoint, model: &str) -> Result<Self, BackendError> {
-        let prompt_cache_key = is_openai_endpoint(&endpoint.base_url).then_some(PROMPT_CACHE_KEY);
-
+impl HttpBackend {
+    /// A backend for `plan`.
+    pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
         Ok(Self {
             client: http::client()?,
-            endpoint,
-            model: model.to_string(),
-            max_tokens: max_output_for(model),
-            price: price_for(model),
-            prompt_cache_key,
+            endpoint: plan.endpoint,
+            model: plan.model,
+            max_tokens: plan.max_tokens,
+            price: plan.price,
+            prompt_cache_key: plan.prompt_cache_key,
         })
     }
 
@@ -103,35 +115,36 @@ impl ProviderBackend {
         &self.model
     }
 
-    /// Post one request, authenticating the way `wire` wants.
-    async fn send(&self, url: &str, body: &Value) -> Result<Response, reqwest::Error> {
-        let mut request = self.client.post(url).json(body);
-
+    /// Attach the credential and the headers the wire wants.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.endpoint.wire {
             Wire::AnthropicMessages => {
-                request = request
-                    .header("anthropic-version", anthropic::API_VERSION)
-                    .header("accept", "text/event-stream");
-                if let Some(secret) = &self.endpoint.secret {
-                    request = request.header(anthropic::API_KEY_HEADER, secret);
+                let request = request.header("anthropic-version", anthropic::API_VERSION);
+                match &self.endpoint.secret {
+                    Some(secret) => request.header(anthropic::API_KEY_HEADER, secret),
+                    None => request,
                 }
             }
-            Wire::OpenAiChat | Wire::OpenAiResponses => {
-                request = request.header("accept", "text/event-stream");
-                if let Some(secret) = &self.endpoint.secret {
-                    request = request.bearer_auth(secret);
-                }
-            }
+            Wire::OpenAiChat | Wire::OpenAiResponses => match &self.endpoint.secret {
+                Some(secret) => request.bearer_auth(secret),
+                None => request,
+            },
         }
+    }
 
-        request.send().await
+    /// Post one request, authenticating the way `wire` wants.
+    async fn send(&self, url: &str, body: &Value) -> Result<Response, reqwest::Error> {
+        self.authorize(self.client.post(url).json(body))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
     }
 
     /// A status line for an attempt that is about to be retried.
     fn retrying(&self, wait: Duration) -> AgentEvent {
         AgentEvent::Status(format!(
             "{} is busy — retrying in {:.1}s",
-            self.endpoint.provider_name,
+            self.endpoint.name,
             wait.as_secs_f32()
         ))
     }
@@ -140,14 +153,14 @@ impl ProviderBackend {
     fn unreachable(&self, error: &reqwest::Error) -> BackendError {
         BackendError::new(format!(
             "could not reach {}: {}",
-            self.endpoint.provider_name,
+            self.endpoint.name,
             http::describe_transport(error)
         ))
     }
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for ProviderBackend {
+impl AgentBackend for HttpBackend {
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let url = self.endpoint.url();
         let mut body = wire::request_body(
@@ -194,7 +207,7 @@ impl AgentBackend for ProviderBackend {
                     return Err(BackendError::new(http::describe(
                         status,
                         &text,
-                        self.endpoint.provider_name,
+                        self.endpoint.name,
                         self.endpoint.env_keys,
                     )));
                 }
@@ -226,8 +239,55 @@ impl AgentBackend for ProviderBackend {
     }
 
     fn label(&self) -> &str {
-        self.endpoint.provider_id
+        self.endpoint.label
     }
+
+    /// Ask the provider which models it offers.
+    ///
+    /// One attempt, no retries: this feeds a picker, so a slow or unreachable
+    /// provider should cost nothing more than falling back to the catalogue.
+    async fn models(&self) -> Result<Vec<String>, BackendError> {
+        let response = self
+            .authorize(self.client.get(self.endpoint.models_url()))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|error| self.unreachable(&error))?;
+
+        let status = response.status();
+        let body = describe_body(response).await;
+
+        if !status.is_success() {
+            return Err(BackendError::new(http::describe(
+                status,
+                &body,
+                self.endpoint.name,
+                self.endpoint.env_keys,
+            )));
+        }
+
+        Ok(parse_models(&body))
+    }
+}
+
+/// Model ids out of a `{"data": [{"id": …}]}` list.
+///
+/// Both wires answer with this shape. Anything else — an error body, a proxy's
+/// HTML — reads as "no models", which the caller treats as a fallback rather
+/// than an error worth reporting.
+fn parse_models(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(entries) = value["data"].as_array() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Read a failed response's body for the provider's own explanation.
@@ -357,70 +417,19 @@ impl StreamEngine {
     }
 }
 
-/// The secret a stored credential carries, or `None` when it carries none.
-///
-/// Kept here so the selection in [`crate::choose_backend`] stays about choosing
-/// rather than about credentials.
-pub fn secret_of(credential: &Credential) -> Option<String> {
-    credential
-        .secret()
-        .map(|secret| secret.trim().to_string())
-        .filter(|secret| !secret.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use solaris_core::{Message, Mode};
 
     #[test]
-    fn only_openais_own_host_gets_the_cache_key() {
-        assert!(is_openai_endpoint("https://api.openai.com/v1"));
-        assert!(!is_openai_endpoint("https://openrouter.ai/api/v1"));
-        assert!(!is_openai_endpoint(
-            "https://generativelanguage.googleapis.com/v1beta/openai"
-        ));
-        assert!(!is_openai_endpoint("http://localhost:11434/v1"));
-        // A lookalike host must not qualify — hence the host comparison rather
-        // than a substring search.
-        assert!(!is_openai_endpoint(
-            "https://api.openai.com.example.test/v1"
-        ));
-        assert!(!is_openai_endpoint("not a url"));
-    }
-
-    #[test]
-    fn a_backend_decides_the_cache_key_from_its_endpoint() {
-        let build = |base_url: &str| {
-            ProviderBackend::new(
-                Endpoint {
-                    provider_id: "openai",
-                    provider_name: "OpenAI",
-                    wire: Wire::OpenAiResponses,
-                    base_url: base_url.to_string(),
-                    secret: None,
-                    env_keys: &[],
-                },
-                "gpt-5",
-            )
-            .expect("client")
-        };
-
-        let keyed = build("https://api.openai.com/v1");
-        assert_eq!(keyed.prompt_cache_key, Some(PROMPT_CACHE_KEY));
-
-        let unkeyed = build("https://gateway.internal/v1");
-        assert_eq!(unkeyed.prompt_cache_key, None);
-    }
-
-    #[test]
     fn each_wire_has_its_own_path() {
         let endpoint = |wire| Endpoint {
-            provider_id: "test",
-            provider_name: "Test",
             wire,
             base_url: "https://example.test/".to_string(),
             secret: None,
+            name: "Test",
+            label: "Test",
             env_keys: &[],
         };
 
@@ -435,6 +444,51 @@ mod tests {
         assert_eq!(
             endpoint(Wire::OpenAiResponses).url(),
             "https://example.test/responses"
+        );
+
+        // The Messages API pages its list, so the largest page is asked for.
+        assert_eq!(
+            endpoint(Wire::AnthropicMessages).models_url(),
+            "https://example.test/v1/models?limit=1000"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiChat).models_url(),
+            "https://example.test/models"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiResponses).models_url(),
+            "https://example.test/models"
+        );
+    }
+
+    #[test]
+    fn model_ids_are_read_from_both_list_shapes() {
+        // An OpenAI-compatible server.
+        assert_eq!(
+            parse_models(r#"{"object":"list","data":[{"id":"glm-5.3"},{"id":"kimi-k3"}]}"#),
+            vec!["glm-5.3", "kimi-k3"]
+        );
+
+        // The Messages API answers with the same `data[].id`, surrounded by
+        // paging fields this does not care about.
+        assert_eq!(
+            parse_models(
+                r#"{"data":[{"id":"claude-sonnet-4-5","display_name":"Sonnet"}],"has_more":false}"#
+            ),
+            vec!["claude-sonnet-4-5"]
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_model_list_reads_as_none() {
+        assert!(parse_models("").is_empty());
+        assert!(parse_models("<html>a proxy said no</html>").is_empty());
+        assert!(parse_models(r#"{"error":{"message":"invalid api key"}}"#).is_empty());
+        assert!(parse_models(r#"{"data":"not a list"}"#).is_empty());
+        // An entry without an id is skipped rather than invented.
+        assert_eq!(
+            parse_models(r#"{"data":[{"object":"model"},{"id":"ok"}]}"#),
+            vec!["ok"]
         );
     }
 
@@ -572,30 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_stored_secret_is_used() {
-        assert_eq!(
-            secret_of(&Credential::ApiKey {
-                key: " sk-1 ".to_string()
-            }),
-            Some("sk-1".to_string())
-        );
-        assert_eq!(
-            secret_of(&Credential::Endpoint {
-                base_url: "http://localhost:8080/v1".to_string(),
-                api_key: "  ".to_string(),
-            }),
-            None,
-            "an endpoint with no key sends no auth header"
-        );
-        assert_eq!(
-            secret_of(&Credential::Token {
-                token: "oauth".to_string()
-            }),
-            Some("oauth".to_string())
-        );
-    }
-
-    #[test]
     fn the_request_length_is_counted_for_estimation() {
         let request = TurnRequest {
             history: vec![Message::system("12345"), Message::user("1234567890")],
@@ -606,25 +636,27 @@ mod tests {
     }
 
     #[test]
-    fn the_backend_is_labelled_with_its_provider_id() {
-        let backend = ProviderBackend::new(
-            Endpoint {
-                provider_id: "openrouter",
-                provider_name: "OpenRouter",
+    fn the_backend_repeats_what_it_was_handed() {
+        let backend = HttpBackend::new(TurnPlan {
+            endpoint: Endpoint {
                 wire: Wire::OpenAiChat,
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 secret: None,
+                name: "OpenRouter",
+                label: "openrouter",
                 env_keys: &["OPENROUTER_API_KEY"],
             },
-            "auto",
-        )
+            model: "auto".to_string(),
+            max_tokens: 8_192,
+            price: None,
+            prompt_cache_key: None,
+        })
         .expect("client");
 
+        // A transport crate decides none of this; it only carries it.
         assert_eq!(backend.label(), "openrouter");
         assert_eq!(backend.model(), "auto");
         assert_eq!(backend.max_tokens, 8_192);
-        // The routed model is billed at whichever upstream it picked, so there
-        // is no list price to report.
         assert!(backend.price.is_none());
     }
 }

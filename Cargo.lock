@@ -2327,6 +2327,7 @@ dependencies = [
  "ratatui",
  "solaris-backend",
  "solaris-core",
+ "solaris-provider",
  "solaris-tui",
  "tokio",
 ]
@@ -2353,6 +2354,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "solaris-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "solaris-backend",
+ "solaris-core",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

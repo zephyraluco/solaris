@@ -1,13 +1,15 @@
-//! The provider catalogue the `/connect` wizard offers.
+//! The provider catalogue: what each platform offers, and how to reach it.
 //!
 //! Mirrors claurst's `claurst-api` provider list in miniature: each entry says
 //! how it authenticates, which wire protocol it speaks, where its endpoint
 //! lives, which environment variables carry its credentials, and which models
-//! it offers. The wizard's steps, the model picker, the HTTP client and the
-//! price table are all driven from this one table.
+//! it offers. The wizard's steps, the model picker and the price table are all
+//! driven from this one table, and [`crate::choose_backend`] turns one of them
+//! into a backend.
 
-use crate::usage::Price;
 use serde::{Deserialize, Serialize};
+use solaris_backend::Wire;
+use solaris_core::Price;
 
 /// How a provider authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,39 +23,6 @@ pub enum AuthKind {
     ApiKeyWithUrl,
     /// Device-code / browser OAuth.
     DeviceCode,
-}
-
-/// The wire protocol a provider speaks.
-///
-/// Three protocols cover the whole catalogue, which is why the backend only has
-/// to implement three clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wire {
-    /// The Anthropic Messages API, streamed from `POST /v1/messages`.
-    AnthropicMessages,
-    /// The OpenAI Chat Completions API, streamed from `POST /chat/completions`.
-    ///
-    /// The compatibility floor: every OpenAI-compatible upstream speaks this —
-    /// New API, OpenRouter, a local Ollama or llama.cpp runtime, and Google's
-    /// compatibility endpoint.
-    OpenAiChat,
-    /// The OpenAI Responses API, streamed from `POST /responses`.
-    ///
-    /// OpenAI's current first choice for new work, and what its newer models
-    /// are documented against. Not as widely implemented by compatible
-    /// upstreams as [`Wire::OpenAiChat`], so it is chosen per provider rather
-    /// than assumed.
-    OpenAiResponses,
-}
-
-impl Wire {
-    /// Whether this is one of the OpenAI protocols.
-    ///
-    /// They share a host, a key and a caching story, which is what makes some
-    /// request fields worth sending to both or to neither.
-    pub fn is_openai(self) -> bool {
-        matches!(self, Wire::OpenAiChat | Wire::OpenAiResponses)
-    }
 }
 
 /// One model a provider offers.

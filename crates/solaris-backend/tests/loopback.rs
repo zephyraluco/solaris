@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{AgentBackend, Endpoint, ProviderBackend};
-use solaris_core::{AgentEvent, Message, Mode, TurnRequest, Usage, Wire};
+use solaris_backend::{AgentBackend, Endpoint, HttpBackend, TurnPlan, Wire};
+use solaris_core::{AgentEvent, Message, Mode, Price, TurnRequest, Usage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -92,23 +92,33 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
 }
 
 /// A backend pointing at `addr`, named the way the local runtime is.
-fn backend(addr: SocketAddr) -> ProviderBackend {
-    backend_with(addr, Wire::OpenAiChat, "llama3.2")
+fn backend(addr: SocketAddr) -> HttpBackend {
+    backend_with(addr, Wire::OpenAiChat, "llama3.2", 32_768, None)
 }
 
-/// The same, for any wire and model.
-fn backend_with(addr: SocketAddr, wire: Wire, model: &str) -> ProviderBackend {
-    ProviderBackend::new(
-        Endpoint {
-            provider_id: "local",
-            provider_name: "Local runtime",
+/// The same, for any wire and model, with the caller supplying what it would
+/// have got from its own catalogue.
+fn backend_with(
+    addr: SocketAddr,
+    wire: Wire,
+    model: &str,
+    max_tokens: u32,
+    price: Option<Price>,
+) -> HttpBackend {
+    HttpBackend::new(TurnPlan {
+        endpoint: Endpoint {
             wire,
             base_url: format!("http://{addr}/v1"),
             secret: Some("sk-loopback".to_string()),
+            name: "Local runtime",
+            label: "local",
             env_keys: &[],
         },
-        model,
-    )
+        model: model.to_string(),
+        max_tokens,
+        price,
+        prompt_cache_key: None,
+    })
     .expect("client")
 }
 
@@ -183,12 +193,19 @@ async fn a_responses_turn_streams_over_a_real_socket() {
                 event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}}\n\n";
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
 
-    let events: Vec<AgentEvent> = backend_with(addr, Wire::OpenAiResponses, "gpt-5")
-        .run_turn(turn())
-        .await
-        .expect("the turn started")
-        .collect()
-        .await;
+    let events: Vec<AgentEvent> = backend_with(
+        addr,
+        Wire::OpenAiResponses,
+        "gpt-5",
+        128_000,
+        // The rate the catalogue would have handed over.
+        Some(Price::per_million(1.25, 10.00, 0.125, 0.00)),
+    )
+    .run_turn(turn())
+    .await
+    .expect("the turn started")
+    .collect()
+    .await;
 
     assert_eq!(events[0], AgentEvent::TextDelta("Hel".to_string()));
     assert_eq!(events[1], AgentEvent::TextDelta("lo".to_string()));
@@ -227,6 +244,43 @@ async fn a_responses_turn_streams_over_a_real_socket() {
         !request.contains("\"messages\""),
         "the Responses API takes input items, not messages: {request}"
     );
+}
+
+#[tokio::test]
+async fn the_model_list_is_fetched_over_a_real_socket() {
+    let body = r#"{"object":"list","data":[{"id":"glm-5.3"},{"id":"kimi-k3"}]}"#;
+    let (addr, seen) = serve(response("200 OK", "application/json", body)).await;
+
+    let models = backend(addr).models().await.expect("the list came back");
+    assert_eq!(models, vec!["glm-5.3", "kimi-k3"]);
+
+    let request = tokio::time::timeout(PATIENCE, seen)
+        .await
+        .expect("the server saw a request in time")
+        .expect("the server reported its request")
+        .to_lowercase();
+
+    // A GET, to the list path, carrying the same credential a turn would.
+    assert!(request.starts_with("get /v1/models "), "{request}");
+    assert!(
+        request.contains("authorization: bearer sk-loopback"),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_model_list_is_an_error_the_caller_falls_back_on() {
+    let body = r#"{"error":{"message":"invalid api key provided"}}"#;
+    let (addr, _seen) = serve(response("401 Unauthorized", "application/json", body)).await;
+
+    let error = backend(addr)
+        .models()
+        .await
+        .expect_err("a 401 must not read as a model list");
+
+    let message = error.to_string();
+    assert!(message.contains("Local runtime returned 401"), "{message}");
+    assert!(message.contains("invalid api key provided"), "{message}");
 }
 
 #[tokio::test]
