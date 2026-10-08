@@ -39,10 +39,15 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// The URL one turn is posted to.
+    ///
+    /// The API version is part of the base URL, so a gateway that serves several
+    /// protocols under one root — opencode zen answers `/responses`, `/messages`
+    /// and `/chat/completions` beneath `/zen/v1` — needs no more than one entry
+    /// in this match per protocol it speaks.
     pub fn url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.wire {
-            Wire::AnthropicMessages => format!("{base}/v1/messages"),
+            Wire::AnthropicMessages => format!("{base}/messages"),
             Wire::OpenAiChat => format!("{base}/chat/completions"),
             Wire::OpenAiResponses => format!("{base}/responses"),
         }
@@ -56,7 +61,7 @@ impl Endpoint {
     pub fn models_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.wire {
-            Wire::AnthropicMessages => format!("{base}/v1/models?limit=1000"),
+            Wire::AnthropicMessages => format!("{base}/models?limit=1000"),
             Wire::OpenAiChat | Wire::OpenAiResponses => format!("{base}/models"),
         }
     }
@@ -455,9 +460,11 @@ mod tests {
 
     #[test]
     fn each_wire_has_its_own_path() {
+        // The base carries the API version, so a wire appends only what is its
+        // own.
         let endpoint = |wire| Endpoint {
             wire,
-            base_url: "https://example.test/".to_string(),
+            base_url: "https://example.test/v1/".to_string(),
             secret: None,
             name: "Test",
             label: "Test",
@@ -470,11 +477,11 @@ mod tests {
         );
         assert_eq!(
             endpoint(Wire::OpenAiChat).url(),
-            "https://example.test/chat/completions"
+            "https://example.test/v1/chat/completions"
         );
         assert_eq!(
             endpoint(Wire::OpenAiResponses).url(),
-            "https://example.test/responses"
+            "https://example.test/v1/responses"
         );
 
         // The Messages API pages its list, so the largest page is asked for.
@@ -484,11 +491,42 @@ mod tests {
         );
         assert_eq!(
             endpoint(Wire::OpenAiChat).models_url(),
-            "https://example.test/models"
+            "https://example.test/v1/models"
         );
         assert_eq!(
             endpoint(Wire::OpenAiResponses).models_url(),
-            "https://example.test/models"
+            "https://example.test/v1/models"
+        );
+    }
+
+    #[test]
+    fn one_gateway_root_serves_every_wire() {
+        // opencode zen answers all three protocols beneath `/zen/v1`, which is
+        // why the version lives in the base rather than in the match above.
+        let endpoint = |wire| Endpoint {
+            wire,
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            secret: None,
+            name: "opencode zen",
+            label: "opencode",
+            env_keys: &[],
+        };
+
+        assert_eq!(
+            endpoint(Wire::OpenAiChat).url(),
+            "https://opencode.ai/zen/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiResponses).url(),
+            "https://opencode.ai/zen/v1/responses"
+        );
+        assert_eq!(
+            endpoint(Wire::AnthropicMessages).url(),
+            "https://opencode.ai/zen/v1/messages"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiChat).models_url(),
+            "https://opencode.ai/zen/v1/models"
         );
     }
 

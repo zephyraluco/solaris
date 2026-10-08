@@ -21,8 +21,6 @@ pub enum AuthKind {
     ApiKey,
     /// An OpenAI-compatible endpoint: base URL plus an optional key.
     ApiKeyWithUrl,
-    /// Device-code / browser OAuth.
-    DeviceCode,
 }
 
 /// One model a provider offers.
@@ -38,6 +36,45 @@ pub struct ModelSpec {
     pub max_output: u32,
     /// List price, or `None` when it varies per request — a router's `auto`.
     pub price: Option<Price>,
+    /// Protocol this model is answered over, when the provider's is not it.
+    ///
+    /// The protocol belongs to the model, not to the subscription that carries
+    /// it: one gateway can answer GPT models on the Responses API and Claude
+    /// models on the Messages API under a single key.
+    pub wire: Option<Wire>,
+}
+
+impl ProviderSpec {
+    /// The protocol `model` is answered over.
+    ///
+    /// What this provider lists for the model decides; its own wire covers the
+    /// models it does not list, because `/model <name>` may name anything and
+    /// most platforms speak one protocol for all of it.
+    pub fn wire_for(&self, model: &str) -> Wire {
+        self.listed(model)
+            .and_then(|spec| spec.wire)
+            .unwrap_or(self.wire)
+    }
+
+    /// This provider's entry for `model`, when it lists one.
+    ///
+    /// Scoped to the provider on purpose: `claude-sonnet-4-5` is reachable both
+    /// from Anthropic itself and through a gateway, and the two need not answer
+    /// it the same way. Matching mirrors [`model_spec`] — an exact id, else the
+    /// longest listed id `model` starts with, so a date-suffixed name still
+    /// finds its entry.
+    fn listed(&self, model: &str) -> Option<&ModelSpec> {
+        self.models
+            .iter()
+            .find(|spec| spec.id.eq_ignore_ascii_case(model))
+            .or_else(|| {
+                let lowered = model.to_ascii_lowercase();
+                self.models
+                    .iter()
+                    .filter(|spec| lowered.starts_with(spec.id))
+                    .max_by_key(|spec| spec.id.len())
+            })
+    }
 }
 
 /// One selectable provider.
@@ -85,7 +122,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKey,
         badge: None,
         wire: Wire::AnthropicMessages,
-        base_url: Some("https://api.anthropic.com"),
+        base_url: Some("https://api.anthropic.com/v1"),
         env_keys: &["ANTHROPIC_API_KEY"],
         base_url_envs: &["ANTHROPIC_BASE_URL"],
         models: &[
@@ -95,6 +132,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 200_000,
                 max_output: 64_000,
                 price: Some(usd(3.00, 15.00, 0.30, 3.75)),
+                wire: None,
             },
             ModelSpec {
                 id: "claude-opus-4-1",
@@ -102,6 +140,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 200_000,
                 max_output: 32_000,
                 price: Some(usd(15.00, 75.00, 1.50, 18.75)),
+                wire: None,
             },
             ModelSpec {
                 id: "claude-haiku-4-5",
@@ -109,33 +148,58 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 200_000,
                 max_output: 64_000,
                 price: Some(usd(1.00, 5.00, 0.10, 1.25)),
+                wire: None,
             },
         ],
     },
     ProviderSpec {
-        id: "claude-subscription",
-        name: "Claude subscription",
-        description: "Sign in with a Pro or Max plan",
-        auth: AuthKind::DeviceCode,
+        id: "opencode",
+        name: "OpenCode Zen",
+        description: "Tested models — API key",
+        auth: AuthKind::ApiKey,
         badge: None,
-        wire: Wire::AnthropicMessages,
-        base_url: Some("https://api.anthropic.com"),
+        // The floor for a model the table below does not name: most of what zen
+        // serves is OpenAI-compatible.
+        wire: Wire::OpenAiChat,
+        base_url: Some("https://opencode.ai/zen/v1"),
+        // The key is collected in `/connect`; nothing looks for it in the
+        // environment.
         env_keys: &[],
         base_url_envs: &[],
         models: &[
+            ModelSpec {
+                id: "gpt-5.5",
+                description: "flagship",
+                context_window: 400_000,
+                max_output: 128_000,
+                price: Some(usd(5.00, 30.00, 0.50, 0.00)),
+                // Answered on the Responses API rather than the chat one.
+                wire: Some(Wire::OpenAiResponses),
+            },
+            ModelSpec {
+                id: "gpt-5.6-luna",
+                description: "cheap and fast",
+                context_window: 400_000,
+                max_output: 128_000,
+                price: Some(usd(0.20, 1.20, 0.02, 0.25)),
+                wire: Some(Wire::OpenAiResponses),
+            },
             ModelSpec {
                 id: "claude-sonnet-4-5",
                 description: "balanced",
                 context_window: 200_000,
                 max_output: 64_000,
                 price: Some(usd(3.00, 15.00, 0.30, 3.75)),
+                // Answered on the Messages API, under the same key.
+                wire: Some(Wire::AnthropicMessages),
             },
             ModelSpec {
-                id: "claude-opus-4-1",
+                id: "claude-opus-4-5",
                 description: "most capable",
                 context_window: 200_000,
                 max_output: 32_000,
-                price: Some(usd(15.00, 75.00, 1.50, 18.75)),
+                price: Some(usd(5.00, 25.00, 0.50, 6.25)),
+                wire: Some(Wire::AnthropicMessages),
             },
         ],
     },
@@ -156,6 +220,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 400_000,
                 max_output: 128_000,
                 price: Some(usd(1.25, 10.00, 0.125, 0.00)),
+                wire: None,
             },
             ModelSpec {
                 id: "gpt-5-mini",
@@ -163,6 +228,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 400_000,
                 max_output: 128_000,
                 price: Some(usd(0.25, 2.00, 0.025, 0.00)),
+                wire: None,
             },
         ],
     },
@@ -185,6 +251,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 1_048_576,
                 max_output: 65_536,
                 price: Some(usd(1.25, 10.00, 0.31, 0.00)),
+                wire: None,
             },
             ModelSpec {
                 id: "gemini-2.5-flash",
@@ -192,6 +259,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 1_048_576,
                 max_output: 65_536,
                 price: Some(usd(0.30, 2.50, 0.075, 0.00)),
+                wire: None,
             },
         ],
     },
@@ -230,6 +298,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             // Billed at whichever upstream the router chose, so there is no
             // list price to report.
             price: None,
+            wire: None,
         }],
     },
     ProviderSpec {
@@ -249,6 +318,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 131_072,
                 max_output: 8_192,
                 price: Some(Price::FREE),
+                wire: None,
             },
             ModelSpec {
                 id: "qwen2.5-coder",
@@ -256,6 +326,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_window: 131_072,
                 max_output: 8_192,
                 price: Some(Price::FREE),
+                wire: None,
             },
         ],
     },
@@ -363,12 +434,7 @@ mod tests {
     fn the_catalog_exercises_every_auth_kind() {
         // The wizard has a step per auth kind; the shipped table must reach all
         // of them or those steps would be dead code.
-        for kind in [
-            AuthKind::Local,
-            AuthKind::ApiKey,
-            AuthKind::ApiKeyWithUrl,
-            AuthKind::DeviceCode,
-        ] {
+        for kind in [AuthKind::Local, AuthKind::ApiKey, AuthKind::ApiKeyWithUrl] {
             assert!(
                 PROVIDERS.iter().any(|spec| spec.auth == kind),
                 "no provider uses {kind:?}"
@@ -413,13 +479,54 @@ mod tests {
 
         // `/responses` is not implemented as widely as chat completions, so
         // every other compatible upstream stays on the floor.
-        for id in ["new-api", "openrouter", "google", "local", "custom"] {
+        for id in [
+            "new-api",
+            "opencode",
+            "openrouter",
+            "google",
+            "local",
+            "custom",
+        ] {
             assert_eq!(
                 provider_spec(id).expect("a known provider").wire,
                 Wire::OpenAiChat,
                 "{id} should speak chat completions"
             );
         }
+    }
+
+    #[test]
+    fn a_gateway_answers_each_model_on_its_own_protocol() {
+        let zen = provider_spec("opencode").expect("a known provider");
+
+        // One key, three protocols: the model decides, not the subscription
+        // that carries it.
+        assert_eq!(zen.wire_for("gpt-5.5"), Wire::OpenAiResponses);
+        assert_eq!(zen.wire_for("claude-sonnet-4-5"), Wire::AnthropicMessages);
+        // A model the table does not name takes the platform's floor.
+        assert_eq!(zen.wire_for("qwen3.8-max"), Wire::OpenAiChat);
+        // A date-suffixed id still finds the entry it belongs to.
+        assert_eq!(
+            zen.wire_for("claude-sonnet-4-5-20250929"),
+            Wire::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn a_model_entry_belongs_to_the_provider_that_lists_it() {
+        // The same id is offered by Anthropic itself and through the gateway,
+        // and a lookup must not cross between them: one that searched the whole
+        // table would hand the gateway's answer to whichever came first in it.
+        let direct = provider_spec("anthropic").expect("a known provider");
+        assert_eq!(
+            direct.wire_for("claude-sonnet-4-5"),
+            Wire::AnthropicMessages
+        );
+        assert_eq!(
+            direct.wire_for("gpt-5.5"),
+            Wire::AnthropicMessages,
+            "a model this provider does not list keeps its own floor"
+        );
     }
 
     #[test]
@@ -445,14 +552,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_key_providers_read_the_environment() {
+    fn only_key_providers_read_the_environment() {
+        // A gateway's key arrives with its URL, so the environment cannot set
+        // one up. The other direction is not a rule: opencode zen needs nothing
+        // but a key, and that key is collected in `/connect` rather than read
+        // from a variable.
         for spec in PROVIDERS {
-            assert_eq!(
-                !spec.env_keys.is_empty(),
-                spec.auth == AuthKind::ApiKey,
-                "{} reads the environment unexpectedly",
-                spec.id
-            );
+            if !spec.env_keys.is_empty() {
+                assert_eq!(
+                    spec.auth,
+                    AuthKind::ApiKey,
+                    "{} reads the environment but is not a key provider",
+                    spec.id
+                );
+            }
         }
     }
 

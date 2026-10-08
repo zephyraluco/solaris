@@ -223,10 +223,7 @@ mod tests {
                 api_key: "k".into(),
             },
         );
-        store.store(
-            "claude-subscription",
-            Credential::Token { token: "t".into() },
-        );
+        store.store("oauth-provider", Credential::Token { token: "t".into() });
         store.activate("anthropic");
 
         let json = store.to_json().expect("encode");
@@ -234,7 +231,7 @@ mod tests {
         assert_eq!(restored, store);
         assert_eq!(
             restored.connected(),
-            vec!["anthropic", "claude-subscription", "custom"]
+            vec!["anthropic", "custom", "oauth-provider"]
         );
     }
 

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan, Wire};
+use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan};
 use solaris_core::{BackendError, TurnRequest};
 
 use crate::providers::{
@@ -99,9 +99,6 @@ pub enum CredentialSource {
     None,
     /// Nothing usable, so no provider can be asked and every turn says so.
     Missing,
-    /// The provider signs in over OAuth, which is not implemented yet, so no
-    /// provider can be asked and every turn says so.
-    NotImplemented,
     /// The credential is fine, but no model is named and the catalogue has none
     /// to offer — so there is nothing to ask the provider for.
     NoModel,
@@ -156,19 +153,6 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         );
     };
 
-    if spec.auth == AuthKind::DeviceCode && auth.credential(spec.id).is_none() {
-        // The flow that would mint a token is not built, so say so rather than
-        // send a request that can only fail with a 401 the user cannot act on.
-        return BackendChoice::unconnected(
-            CredentialSource::NotImplemented,
-            format!(
-                "{} signs in with OAuth, which is not implemented yet — connect an API key instead",
-                spec.name
-            ),
-            model,
-        );
-    }
-
     let Some((base_url, secret, source)) = resolve(spec, auth, lookup) else {
         return BackendChoice::unconnected(
             CredentialSource::Missing,
@@ -178,9 +162,11 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     };
 
     let model = real_model(spec, model);
+    // The protocol follows the model, so it is resolved once the model is.
+    let wire = spec.wire_for(&model);
 
     let endpoint = Endpoint {
-        wire: spec.wire,
+        wire,
         base_url,
         secret,
         name: spec.name,
@@ -290,11 +276,11 @@ fn is_openai_host(base_url: &str) -> bool {
         .is_some_and(|host| host == "api.openai.com")
 }
 
-/// The base URL `wire` should really be called at, given what was configured.
+/// The base URL a wire should really be called at, given what was configured.
 ///
-/// An OpenAI-compatible gateway serves its API under `/v1` — the paths appended
-/// to the base are `/models` and `/chat/completions`, so the prefix has to be
-/// part of it — while the URL a person types into `/connect` or exports as
+/// Every wire hangs its paths off the API version — `/messages`,
+/// `/chat/completions`, `/responses` — so the version has to be part of the
+/// base, while the URL a person types into `/connect` or exports as
 /// `OPENAI_BASE_URL` usually stops at the host. `GET …/models` then lands on the
 /// gateway's web front end, which answers 200 with a page that parses as "this
 /// provider has no models at all": an empty provider rather than a visible
@@ -302,12 +288,12 @@ fn is_openai_host(base_url: &str) -> bool {
 ///
 /// A URL with no path of its own therefore gets the prefix, and one that
 /// already carries a path is left exactly as written — only its owner knows
-/// where the API is mounted. The Messages API is never touched: its base *is*
-/// the host, and `/v1` is part of the path appended here.
-fn endpoint_base_url(wire: Wire, base_url: &str) -> String {
+/// where the API is mounted, and a gateway that answers several protocols
+/// beneath one root has to be taken at its word.
+fn endpoint_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
-    if wire == Wire::AnthropicMessages || trimmed.is_empty() {
-        return trimmed.to_string();
+    if trimmed.is_empty() {
+        return String::new();
     }
 
     // Everything after the scheme up to the first path, query or fragment: a
@@ -402,7 +388,7 @@ fn resolve(
             _ => return None,
         },
     };
-    let base_url = endpoint_base_url(spec.wire, &base_url);
+    let base_url = endpoint_base_url(&base_url);
 
     if let Some((name, key)) = lookup(spec.env_keys) {
         return Some((base_url, Some(key), CredentialSource::Env(name)));
@@ -420,6 +406,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_backend::Wire;
 
     /// Options with a fixed environment, so tests never touch the process's
     /// variables or the network.
@@ -490,7 +477,7 @@ mod tests {
         assert_eq!(choice.backend.label(), "anthropic");
         assert_eq!(
             choice.base_url.as_deref(),
-            Some("https://api.anthropic.com")
+            Some("https://api.anthropic.com/v1")
         );
     }
 
@@ -534,34 +521,38 @@ mod tests {
     }
 
     #[test]
-    fn a_gateway_url_without_a_path_gets_the_openai_prefix() {
-        // The paths appended to a base are `/models` and `/chat/completions`,
-        // so a gateway's `/v1` has to be part of the base. A URL that stops at
-        // the host is the one shape that is certainly missing it.
+    fn a_url_without_a_path_gets_the_api_prefix() {
+        // Every wire's paths hang off the API version, so a base has to carry
+        // it, and a URL that stops at the host is the one shape certainly
+        // missing it — the same host a person exports as `ANTHROPIC_BASE_URL`.
         assert_eq!(
-            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test"),
+            endpoint_base_url("http://one-api.test"),
             "http://one-api.test/v1"
         );
         assert_eq!(
-            endpoint_base_url(Wire::OpenAiChat, "  http://one-api.test/  "),
+            endpoint_base_url("  http://one-api.test/  "),
             "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1"
         );
         // A path is left exactly as written: only whoever deployed the gateway
-        // knows where its API is mounted.
+        // knows where its API is mounted, and one that answers several
+        // protocols beneath a single root has to be taken at its word.
         assert_eq!(
-            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test/v1"),
+            endpoint_base_url("http://one-api.test/v1"),
             "http://one-api.test/v1"
         );
         assert_eq!(
-            endpoint_base_url(Wire::OpenAiChat, "http://one-api.test/api/v1"),
+            endpoint_base_url("http://one-api.test/api/v1"),
             "http://one-api.test/api/v1"
         );
-        // The Messages API takes the host itself and appends `/v1` on its own.
         assert_eq!(
-            endpoint_base_url(Wire::AnthropicMessages, "https://api.anthropic.com"),
-            "https://api.anthropic.com"
+            endpoint_base_url("https://opencode.ai/zen/v1"),
+            "https://opencode.ai/zen/v1"
         );
-        assert_eq!(endpoint_base_url(Wire::OpenAiChat, "   "), "");
+        assert_eq!(endpoint_base_url("   "), "");
     }
 
     #[tokio::test]
@@ -824,25 +815,27 @@ mod tests {
     }
 
     #[test]
-    fn an_oauth_provider_says_it_is_not_implemented_yet() {
-        let mut auth = AuthStore::new();
-        auth.activate("claude-subscription");
-        let choice = choose_backend(&auth, "claude-sonnet-4-5", options());
-
-        assert_eq!(choice.source, CredentialSource::NotImplemented);
-        assert_eq!(choice.backend.label(), "unconnected");
-
-        // A token that really is there is used, so the seam is ready for the
-        // day the sign-in flow lands.
+    fn one_gateway_key_answers_every_family_it_offers() {
+        // The protocol changes per model, but the credential and the endpoint
+        // do not: whichever family is asked for, the same key reaches the same
+        // root.
         let auth = auth_with(
-            "claude-subscription",
-            Some(Credential::Token {
-                token: "oauth-token".to_string(),
+            "opencode",
+            Some(Credential::ApiKey {
+                key: "sk-zen".to_string(),
             }),
         );
-        let choice = choose_backend(&auth, "claude-sonnet-4-5", options());
-        assert_eq!(choice.source, CredentialSource::Stored);
-        assert_eq!(choice.backend.label(), "claude-subscription");
+
+        for model in ["gpt-5.5", "claude-sonnet-4-5", "qwen3.8-max"] {
+            let choice = choose_backend(&auth, model, options());
+            assert_eq!(choice.source, CredentialSource::Stored, "{model}");
+            assert_eq!(choice.provider_id, Some("opencode"), "{model}");
+            assert_eq!(
+                choice.base_url.as_deref(),
+                Some("https://opencode.ai/zen/v1"),
+                "{model}"
+            );
+        }
     }
 
     #[test]
