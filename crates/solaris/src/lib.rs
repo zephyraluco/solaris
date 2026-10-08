@@ -23,6 +23,10 @@ pub mod model;
 pub mod state;
 pub mod transcript;
 
+// `Inline` is an implementation detail of `App`, so it stays off the crate's
+// surface.
+mod inline;
+
 pub use app::{App, AppOptions, BackendFactory};
 pub use clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
 pub use connect::{
