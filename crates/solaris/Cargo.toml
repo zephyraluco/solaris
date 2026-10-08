@@ -14,6 +14,7 @@ path = "src/main.rs"
 solaris-core = { workspace = true }
 solaris-provider = { workspace = true }
 solaris-backend = { workspace = true }
+solaris-tools = { workspace = true }
 solaris-tui = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
@@ -28,3 +29,5 @@ arboard = { version = "3", default-features = false }
 [dev-dependencies]
 # The test suites implement `AgentBackend` for their own local fake backend.
 async-trait = { workspace = true }
+# A tool call carries JSON arguments, so the tests build them.
+serde_json = { workspace = true }

@@ -127,6 +127,7 @@ fn turn() -> TurnRequest {
         history: vec![Message::system("You are solaris."), Message::user("hi")],
         prompt: "hello".to_string(),
         mode: Mode::Build,
+        tools: Vec::new(),
     }
 }
 

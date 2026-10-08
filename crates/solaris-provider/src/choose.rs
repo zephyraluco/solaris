@@ -454,6 +454,7 @@ mod tests {
             history: Vec::new(),
             prompt: "hello".to_string(),
             mode: solaris_core::Mode::Build,
+            tools: Vec::new(),
         }
     }
 

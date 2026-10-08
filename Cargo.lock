@@ -2325,9 +2325,11 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde_json",
  "solaris-backend",
  "solaris-core",
  "solaris-provider",
+ "solaris-tools",
  "solaris-tui",
  "tokio",
 ]
@@ -2361,6 +2363,20 @@ name = "solaris-provider"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
+ "serde_json",
+ "solaris-backend",
+ "solaris-core",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "solaris-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "solaris-backend",
@@ -2661,6 +2677,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

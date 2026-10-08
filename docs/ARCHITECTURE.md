@@ -6,28 +6,31 @@
 
 ## 1. 总览
 
-solaris 是一个用 Rust 编写的终端 AI 助手：一个全屏 TUI 聊天客户端，外带一套可复用的终端 UI 框架。仓库是一个 Cargo workspace（edition 2024，Rust 1.85+），由五个 crate 组成，依赖严格单向：
+solaris 是一个用 Rust 编写的终端 AI 助手：一个全屏 TUI 聊天客户端，外带一套可复用的终端 UI 框架。仓库是一个 Cargo workspace（edition 2024，Rust 1.85+），由六个 crate 组成，依赖严格单向：
 
 ```text
 solaris              应用：根组件、对话框、/connect 向导、转录渲染、按键映射、CLI 入口
 ├── solaris-tui      可复用终端 UI 框架（不依赖工作区其他 crate）
 ├── solaris-provider 平台层：provider 目录、鉴权与模型信息，把凭据解析成一个后端
+├── solaris-tools    工具层与 agent loop：八个内建工具、注册表、审批钩子、多轮循环
 ├── solaris-backend  传输层：一个客户端讲三条 wire，不认识平台、也不认识模型
 └── solaris-core     领域类型与纯逻辑（不依赖工作区其他 crate）
 ```
 
-两条硬性约束：
+三条硬性约束：
 
-1. **依赖只能向下**。`solaris-core` 与 `solaris-tui` 互不依赖；`solaris-provider` 建在 `solaris-backend` 之上——平台层必须知道「谁讲哪种协议」，而传输层反过来什么平台都不需要知道。应用层只向上组合它们。
+1. **依赖只能向下**。`solaris-core` 与 `solaris-tui` 互不依赖；`solaris-provider` 与 `solaris-tools` 都建在 `solaris-backend` 之上——平台层必须知道「谁讲哪种协议」，工具层必须能发请求，而传输层反过来什么都不需要知道。应用层只向上组合它们。
 2. **UI 不认识任何 provider**。界面把一次请求交给 `AgentBackend`，只消费它回流的 `AgentEvent` 流；换成真实模型服务只需实现这个 trait。
+3. **工具对 UI 透明**。`ToolLoop` 包在 `AgentBackend` 外面，多轮循环因此不进入应用层：UI 只是多消费两种事件，别无改动。
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
 | `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`solaris-core`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
-| `solaris-core` | [`crates/solaris-core`](../crates/solaris-core) | `serde`、`serde_json`、`thiserror` | 领域类型与纯逻辑：斜杠命令解析、配置、provider 目录、消息与事件、token 计费、伙伴、提示轮换。不涉及终端、渲染、凭据存储与网络。 |
+| `solaris-tools` | [`crates/solaris-tools`](../crates/solaris-tools) | `solaris-backend`、`solaris-core`、`async-trait`、`futures`、`tokio`（`process`/`io-util`/`fs`）、`serde`、`serde_json`、`thiserror` | 工具层与 agent loop：八个内建工具（`read`/`write`/`edit`/`ls`/`grep`/`find` 与所在平台的 shell）、按模式选择工具的注册表、审批钩子、截断与文件写入串行化，以及实现 `AgentBackend` 的 `ToolLoop`。 |
+| `solaris-core` | [`crates/solaris-core`](../crates/solaris-core) | `serde`、`serde_json`、`thiserror` | 领域类型与纯逻辑：斜杠命令解析、配置、消息与事件、工具声明/调用/结果、token 计费、伙伴、提示轮换。不涉及终端、渲染、凭据存储与网络。 |
 | `solaris-tui` | [`crates/solaris-tui`](../crates/solaris-tui) | `ratatui`、`crossterm`、`unicode-width`、`unicode-segmentation` | 终端 UI 框架：组件模型、类 flex 布局、浮层、主题、按键匹配、组件集、终端生命周期。 |
 | `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `solaris-core`、`async-trait`、`futures`、`tokio`、`reqwest`（rustls）、`bytes`、`serde`、`serde_json`、`thiserror` | 传输层：`AgentBackend` 统一接口、`HttpBackend`（三条协议的请求体与流解析）、SSE 解码、重试与计费。它只接收一个已经解析好的请求，因此既不认识平台也不认识模型。 |
-| `solaris` | [`crates/solaris`](../crates/solaris) | 上述四个 + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio` | 应用本体，同时产出库与 `solaris` 二进制。 |
+| `solaris` | [`crates/solaris`](../crates/solaris) | 上述五个 + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio` | 应用本体，同时产出库与 `solaris` 二进制。 |
 
 ---
 
@@ -39,8 +42,9 @@ solaris              应用：根组件、对话框、/connect 向导、转录�
 | --- | --- |
 | `config` | `Mode`（`Build` / `Plan`，`label()` 给出状态栏徽章，`next()` 用于 Tab 切换）、`Config`（模型、主题、模式、上下文窗口大小）。 |
 | `event` | `AgentEvent`、`TurnRequest`、`BackendError` —— 后端与 UI 之间的唯一契约。 |
-| `usage` | `Usage` / `Price`：四个互不重叠的 token 桶（普通输入、输出、缓存读、缓存写）外加「这是估算」标记；`Price` 是 USD / 百万 token 的单价。 |
-| `message` | `Message` / `Role`，供转录与历史构造使用。 |
+| `usage` | `Usage` / `Price`：四个互不重叠的 token 桶（普通输入、输出、缓存读、缓存写）外加「这是估算」标记；`Price` 是 USD / 百万 token 的单价。`Usage::merge` 把一轮里的多次模型调用加起来（工具往返就是这种情况）。 |
+| `message` | `Message` / `Role` / `Content`：一条消息是**内容块列表**——`Text`、`ToolUse`、`ToolResult`。工具结果放在 user 的 `Content::ToolResult` 里，正是 Messages API 要求的位置；纯文本消息只有一个 `Text` 块，所以不碰工具的路径与从前一样。 |
+| `tool` | `ToolSpec`（下发给模型的声明）、`ToolCall`（模型的请求）、`ToolResult`（执行结果）。纯数据，执行在 `solaris-tools`。 |
 | `command` | `SlashCommandSpec` 与 `PROMPT_SLASH_COMMANDS` 命令表；`parse_slash_command`、`matching_slash_commands` 是纯函数，供编辑器补全、命令面板与帮助对话框共用。 |
 | `provider` / `auth` | 已迁至 [`solaris-provider`](../crates/solaris-provider)：`ProviderSpec` / `ModelSpec` / `PROVIDERS` / `AuthKind` 在它的 `providers`，`Credential` / `AuthStore` / `mask_secret` 在它的 `choose`。核心层不再认识任何平台。 |
 | `buddy` | `Companion` / `Bones` / `Soul` / `Species` / `Rarity` / `Hat`：由用户 id 经 FNV-1a 播种，用 Mulberry32 掷出「骨架」，因此稳定且不可手工篡改。 |
@@ -54,12 +58,16 @@ enum AgentEvent {
     ThinkingDelta(String),                    // 思考轨迹分片
     TextDelta(String),                        // 可见回复分片
     Status(String),                           // 瞬时状态行
+    ToolCall(ToolCall),                       // 模型请求一次工具调用（非终态）
+    ToolResult { result: ToolResult, duration_ms: u64 }, // 这次调用的结果（非终态）
     TurnComplete { usage: Usage, cost_usd: f64 }, // 终态：成功
     Error(String),                            // 终态：失败
 }
 ```
 
-`TurnRequest { history, prompt, mode }` 是输入侧：历史（含一条描述当前模式的 system 消息）、本轮提示词、当前模式。
+`TurnRequest { history, prompt, mode, tools }` 是输入侧：历史（含一条描述当前模式的 system 消息）、本轮提示词、当前模式、本轮声明的工具。
+
+**`prompt` 为空时协议层不追加 user 消息**：这是给工具往返用的——第 2 轮起，用户的提示词已经在 `history` 里了，接着往下写的是「助手请求调用 → 工具结果」这一串，而不是把同一句话再问一遍。
 
 ---
 
@@ -85,6 +93,8 @@ pub trait AgentBackend: Send + Sync {
   - [`sse`](../crates/solaris-backend/src/sse.rs) —— 跨 chunk 的 SSE 帧解码，**按字节**缓冲，所以帧切在多字节字符中间也不会损坏。
   - [`http`](../crates/solaris-backend/src/http.rs) —— 共享的 `reqwest` 客户端（10s 连接超时，无整请求超时，因为一轮本来就要流几分钟）、状态码 → 可操作的错误文案、退避重试。
   - [`wire`](../crates/solaris-backend/src/wire.rs) —— 按 `Wire` 分发请求体构造与流解析。跨协议但**只有 OpenAI 需要**的字段在这里补上：`prompt_cache_key` 只在 `Wire::is_openai()` 且端点主机就是 `api.openai.com` 时发送（OpenAI 的缓存本来就是自动的，这个键只影响路由，而兼容网关可能因为不认识它而拒掉整个请求，不值得冒险）。
+  - **工具调用**：请求体里的 `tools` 只在调用方声明过工具时出现——空列表连字段都不写，所以不用工具的那条路径逐字节不变。三条协议各写各的形状（Anthropic 是 `input_schema`，Chat Completions 在 `function` 里包一层，Responses 是扁平的 `name`/`parameters`）。**调用一律在流结束时一次性交付**：三条 wire 都把一次调用拆成片段（名字先到，参数作为 JSON 文本分片随后抵达），解析器因此各自按索引或条目累积，只在流末 `flush` 出去，被执行的总是一个完整调用；流中途报错则不交付。历史里的 `ToolUse`/`ToolResult` 也按对方形状转换：Chat Completions 拆成 `tool_calls` 与 `role:"tool"` 消息，Responses 拆成 `function_call`/`function_call_output` 条目，Messages API 把结果并进紧随其后的 **user** 消息，并在合并同角色消息时把 `tool_result` 排在最前——那边的 API 两件事都不允许：角色不能重复，结果必须领起它所在的那条消息。
+  - 参数文本解析不出 JSON 时进 `null`，工具层会把它当作「参数不是对象」回给模型，而不是静默地当成空参数——一个能自我纠正的模型需要知道它写错了什么。
 - **模型发现**：`AgentBackend::models()` 是可选能力（默认实现直接报「本后端不会列模型」），`ProviderBackend` 用 `Endpoint::models_url()`（Messages API 走 `/v1/models?limit=1000`，OpenAI 兼容走 `/models`）发一次 GET，复用同一套认证；`parse_models` 从 `{"data":[{"id":…}]}` 里取 id——两条 wire 的清单形状相同。**不重试**：它只喂选择器，慢或不可达的代价应当是退回目录，而不是让用户等。**网关的 `/v1` 在解析层补齐**：OpenAI 兼容网关的 API 挂在 `/v1` 下，而 `/connect` 收集来的 URL 常常只写到主机，于是请求打到的是网关的网页前端——它用 200 + HTML 回答，`parse_models` 读不出任何 id，于是「没有模型」而不是一个看得见的错误。所以 `resolve()` 会给没有路径的 base URL 补上 `/v1`（带路径的一律按原样使用：只有部署者知道 API 挂在哪），Messages API 不在其列——它的 base 就是主机本身。**200 但不成清单的回复是一种要报出来的失败**：`parse_models` 返回 `Option`，`None` 表示这压根不是清单（代理的 HTML 页、被包进 200 的错误），此时错误信息指名 URL 并转述网关自己的说法，而不是当成一个没有模型的 provider。真正空的清单（`{"data":[]}`）则是答案——网关在说这个凭据够不到任何模型；没有目录可退时这一条也会告知用户。这两者必须分得开，否则「URL 打错地方」和「网关不给模型」看起来一模一样。
 - **重试只在第一个事件发出之前**（429 / 5xx / 传输错误；指数退避并尊重 `Retry-After`，最多 3 次）。已经吐过字就绝不再试，否则会重复输出。中断靠丢掉接收端：app 放弃 `rx` 后 `send` 失败、任务结束、`reqwest` 的流随之被 drop，请求被取消。
 - **计费**：`Usage` 把各家的报告归一成四个互不重叠的桶（两家 OpenAI 协议都把缓存读计入 `input_tokens` / `prompt_tokens`，会被减掉）；提供商什么都没报时退回按字符估算并置位 `estimated`，`/stats` 会据此显示 `≈`。价格来自 `provider` 表的内置快照，未知模型不收费。生成的 token 还是 0 的 `usage` 块不算「报告过」。
@@ -95,9 +105,106 @@ pub trait AgentBackend: Send + Sync {
 
 ---
 
-## 4. solaris-tui：终端 UI 框架
+## 4. solaris-tools：工具层与 agent loop
 
-### 4.1 组件模型
+模型只能「请求」，真正动手的是这一层。它由四部分组成：工具本身、决定一轮声明哪些工具的注册表、可以拒绝一次调用的审批钩子，以及把一次请求变成若干次模型调用的多轮循环。
+
+与参考实现 pi 的逐项差异、以及已知缺口，见 [`PI-COMPARISON.md`](./PI-COMPARISON.md)。
+
+### 4.1 工具契约
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> Value;                                  // JSON Schema
+    async fn run(&self, input: Value, ctx: &ToolContext) -> ToolOutput;
+}
+```
+
+两条约定决定了这一层的形状：
+
+- **工具不会让一轮失败**。文件不存在、命令退出码非零、模型给的参数不合规，全部变成 `ToolOutput::error` 回到模型手里——能处置它的是模型，不是 UI。
+- **工具不认 provider**。声明是 JSON Schema，执行在本地；把声明翻成某条 wire 的请求形状是 `solaris-backend` 的事。
+
+`ToolContext` 带三样东西：`cwd`（相对路径的解析基准）、`temp_dir`（被截断的命令输出落在这里）与 `Cancel`（应用取消一轮时，正在跑的命令要被杀掉，而不是留给一个已经没人听的模型）。
+
+八个内建工具：
+
+| 工具 | 说明 |
+| --- | --- |
+| `read` | 读文本文件，`offset`/`limit` 支持分段续读 |
+| `write` | 新建或整体覆盖，自动建父目录 |
+| `edit` | 精确文本替换，一次调用可改多处；`oldText` 必须唯一匹配**原始**文本 |
+| `ls` | 列目录，目录带 `/` 后缀，含 dotfiles |
+| `grep` | shell out 到 ripgrep，输出 `path:line: text` |
+| `find` | shell out 到 fd，按 glob 找路径 |
+| `bash` / `powershell` | 合并 stdout+stderr，超时可杀，输出尾部截断 |
+
+两个 shell 是同一份实现的两套配置（`ShellConfig`），注册表按平台只放其中一个：Windows 放 `powershell`，其余放 `bash`——给 Windows 声明 `bash` 是在声明一个跑不起来的东西。`edit` 与 `write` 共用一张按路径的锁（`FileMutationQueue`）：一轮里模型完全可能同时要求改同一个文件的两处，两次「读—改—写」重叠就会丢掉一次改动。
+
+### 4.2 可测的缝
+
+需要外部程序的三个工具都通过 trait 拿起子进程：
+
+```rust
+pub trait CommandRunner { async fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<CommandOutput, String>; }
+pub trait ShellRunner { async fn run(&self, config: ShellConfig, command: &str, ctx: &ToolContext, timeout: Option<Duration>) -> Result<ShellOutcome, String>; }
+```
+
+默认实现是真的子进程（`LocalRunner`/`LocalShell`），测试注入的是罐头输出。于是整套测试既不需要机器上装了 ripgrep 与 fd，也不会真的执行命令——只有两个测试例外，它们各起一次真进程，用来证明「接线是对的」。`read`/`write`/`edit`/`ls` 则直接在系统临时目录里建自己的夹具目录。
+
+### 4.3 注册表与选择
+
+`ToolRegistry` 持有本平台的全部工具；一轮声明哪些，由「模式默认集合 + 用户选择」决定，所以切到 plan 模式时，写类工具是在模型看到之前就被撤下的。
+
+```text
+Mode::Build  →  read + shell + edit + write
+Mode::Plan   →  read + grep + find + ls
+ToolSelection{ only, add, remove }     // --tools / --exclude-tools
+```
+
+`--tools` 是白名单；若整份列表只由 `+name`/`-name` 组成，则改为在模式默认集合上增删。条目可以是 `*` 模式。`unmatched()` 会报出匹配不到任何工具的名字，所以打错的名字会被指出来，而不是静默地什么都没声明。
+
+### 4.4 agent loop
+
+`ToolLoop` **实现 `AgentBackend`**，包住真实后端：
+
+```rust
+pub struct ToolLoop { inner: Arc<dyn AgentBackend>, registry: Arc<ToolRegistry>, options: ToolLoopOptions, cancel: Cancel }
+```
+
+一轮的流程：
+
+1. 按 `request.mode` 取当前工具集，构造本轮的 `TurnRequest.tools`。
+2. 调内层后端，转发 `ThinkingDelta`/`TextDelta`/`Status`/`ToolCall`，拦下 `TurnComplete` 以累计用量与费用。
+3. 本轮没有工具调用 → 发出自己的 `TurnComplete`（累计后的数字），结束。
+4. 有调用 → 逐个「审批 → 执行 → 发 `ToolResult`」，把 `assistant(tool_use…)` 与 `user(tool_result…)` 追加进 history，回到第 1 步。
+5. 单轮最多 `DEFAULT_MAX_ROUNDS`（24）次工具往返，超出即以终态错误停下：模型可能卡在同一个请求上，没有上限的一轮既不会结束也不会停止花钱。
+
+因为它是 `AgentBackend`，应用侧几乎不必为此改动：`App` 的 turn 流程、channel 与事件循环照旧，只是多消费两种事件。循环在独立任务里跑，返回的流被丢弃（用户取消）就等于取消这一轮——任务发现发送端已关闭便不再继续。
+
+历史在循环内累积，第二轮起 `prompt` 为空，协议层因而不追加新的 user 消息：这正是「继续同一段对话」与「重新问一遍」的区别。
+
+### 4.5 审批
+
+```rust
+pub enum Approval { Approved, Denied }
+pub trait Approver { fn approve(&self, call: &ToolCall) -> Approval; }
+```
+
+默认是 `AlwaysApprove`：终端 agent 本来就在替用户做事，为每一次读取弹一个确认只会变成噪音。钩子存在的意义是让「有人在看」与「没人在看」的会话用同一套工具；交互式确认（对话框）还没做，被拒绝的调用会作为错误结果回到模型，而不是中断这一轮。
+
+### 4.6 截断
+
+读类取头部（文件开头才说明它是什么），命令类取尾部（失败信息在那里打印），上限 2000 行或 50KB，先到者为准。被截断的命令会把完整输出写进 `temp_dir` 下的文件并把路径写进结果；读取类则给出 `offset` 续读的提示。截断说明本身就是写给模型的，所以它总是跟在内容后面。
+
+---
+
+## 5. solaris-tui：终端 UI 框架
+
+### 5.1 组件模型
 
 ```rust
 pub trait Component {
@@ -116,7 +223,7 @@ pub trait Component {
 - `desired_height` 让内容自报高度：编辑器与内联向导据此决定输入区高度，`ScrollView` 据此决定离屏画布大小。
 - `version` 是渲染缓存的失效键，`0` 表示「未知」——强制每帧重建。
 
-### 4.2 布局
+### 5.2 布局
 
 [`layout`](../crates/solaris-tui/src/layout.rs) 是一组纯几何函数，语义对齐 flex（对应 pi-tui 的 `VStack` / `HStack`）：
 
@@ -127,20 +234,20 @@ pub trait Component {
 
 框架与应用共用同一套布局，不存在两套排版逻辑。
 
-### 4.3 浮层
+### 5.3 浮层
 
 [`overlay`](../crates/solaris-tui/src/overlay.rs) 负责几何：`Anchor`（默认居中，另有八向锚点）、`SizeValue::Cells | Percent`、`OverlayOptions`（宽高、`min_width`、最大宽高、锚点、偏移、外边距；默认宽 70%、`min_width` 30、最大宽 90%、最大高 80%、外边距 1），`resolve(area, options) -> Rect` 给出最终矩形。
 
 绘制时浮层是**不透明**的：先 `Clear` 掉矩形区域，再绘制组件 —— 因此不存在半透明叠加的排版问题。
 
-### 4.4 事件循环与输入路由
+### 5.4 事件循环与输入路由
 
 [`Tui`](../crates/solaris-tui/src/tui.rs) 持有根组件、浮层栈与两个句柄：
 
 - `OverlayQueue = Rc<RefCell<Vec<(Box<dyn Component>, OverlayOptions)>>>` —— 根组件用它**请求**打开浮层，不在渲染中途直接改动栈。
 - `QuitFlag = Rc<Cell<bool>>` —— 根组件用它请求退出。
 - `overlay_flag: Rc<Cell<bool>>` —— 报告「当前有浮层」，根组件据此让编辑器失焦（即便浮层是被点击外部关闭的）。
-- `SelectionHandle = Rc<RefCell<Selection>>` —— 全屏拖选状态，见 §4.5。
+- `SelectionHandle = Rc<RefCell<Selection>>` —— 全屏拖选状态，见 §5.5。
 
 主循环（`poll_interval` 16 ms）：
 
@@ -168,9 +275,9 @@ while !quit {
 - **松手不会取消选区**：释放后高亮留在原地，直到下一次按下另起一个选区、尺寸变化，或应用层主动清掉（例如 `/clear` 清空对话记录时）。框架也不会自动复制任何东西。
 - `render` 的最后一步在**画完的帧**上重刷选中单元格的颜色，并记下每一行此刻显示的文字，供双击取词、三击取段使用。因为跑在最后，浮层里的单元格同样可选。
 - 选区范围按行主序归一化并夹到帧内，拖到屏幕外会延伸到边缘而不是取消。
-- 抽文本由应用层发起：`Selection::selected_text()` 给出当前选区的文字（按行去掉尾随空白；整块都是空白的选区则原样保留，所以缩进也能复制）。solaris 把它绑在 `Ctrl+C` 上，而且**只要有选区就复制** —— 空白选区不会掉进「清空输入框 / 退出」那一档（§5.4）。
+- 抽文本由应用层发起：`Selection::selected_text()` 给出当前选区的文字（按行去掉尾随空白；整块都是空白的选区则原样保留，所以缩进也能复制）。solaris 把它绑在 `Ctrl+C` 上，而且**只要有选区就复制** —— 空白选区不会掉进「清空输入框 / 退出」那一档（§6.4）。
 
-### 4.5 组件集、主题与终端
+### 5.5 组件集、主题与终端
 
 - 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
 - 拖选（[`selection`](../crates/solaris-tui/src/selection.rs)）：`Selection` 记锚点 / 焦点、按 `selection_bg` / `selection_fg` 给单元格上色、抽取文本；`Tui::selection()` 把句柄交给应用层。
@@ -180,29 +287,30 @@ while !quit {
 
 ---
 
-## 5. solaris：应用层
+## 6. solaris：应用层
 
-### 5.1 形态
+### 6.1 形态
 
 同一个 crate 同时提供**库**与**二进制**：库（`lib.rs`）承载全部 UI 与状态逻辑，`main.rs` 只做参数解析与装配。这样集成测试可以 `use solaris::{App, AppOptions}` 直接驱动真实技术栈。
 
 模块划分：`app`（根组件）、`state`（会话与通知）、`dialogs`（浮层对话框）、`connect`（内联向导，以及复用它渲染的 `/model` 选择器）、`transcript`（转录渲染与缓存）、`commands`（命令注册表）、`keymap`（全局按键与页脚提示）、`clipboard`（平台剪贴板，藏在可注入的 `Clipboard` 后面）。
 
-### 5.2 启动装配（`main.rs`）
+### 6.2 启动装配（`main.rs`）
 
-1. `clap` 解析参数；构造 `Config`（`--plan` 映射到 `Mode::Plan`，`--model` 未给时模型名留空，由 provider 决定）。
+1. `clap` 解析参数；构造 `Config`（`--plan` 映射到 `Mode::Plan`，`--model` 未给时模型名留空，由 provider 决定）。`--tools` / `--exclude-tools` 解析成 `ToolSelection`：白名单与 `+name`/`-name` 两种写法不能混用（混用直接报错，而不是猜），匹配不到任何工具的名字在启动时被指出来。
 2. `config_dir()` 解析状态目录，优先级：`$SOLARIS_CONFIG_DIR` → Windows 的 `%APPDATA%\solaris` → `$XDG_CONFIG_HOME/solaris`，回退 `~/.config/solaris`。
 3. 读取 `auth.json`、`companion.json`、`recent.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。
 4. `--provider`（可选）覆盖本次运行的 provider，只改内存里的 `auth`，不重写 `auth.json`；未知 id 直接报错并列出可选值。
-5. 用 `choose_backend(&auth, &model, BackendOptions::default())` 解析出初始后端；显式给了 `--provider` 却解析不出凭据时，向 stderr 说明「先运行 /connect 或设置环境变量」，以免静默降级。
+5. 用 `choose_backend(&auth, &model, BackendOptions::default())` 解析出初始后端；显式给了 `--provider` 却解析不出凭据时，向 stderr 说明「先运行 /connect 或设置环境变量」，以免静默降级。解析出的后端随即由 `with_tools` 包上一层 `ToolLoop`，注册表与工具选择在 `App` 里只建一次——`edit` 与 `write` 的按路径锁因此整个会话共用一张。
 6. 若给了 `--print-config`，打印解析结果（含 backend / endpoint / 凭据来源）后直接返回，不进入界面。
 7. 否则：建 tokio runtime 并 `enter()`，安装 panic hook，`setup_terminal()`，建 `Tui` 与 `App`。`AppOptions.backend_factory` 是一个闭包（生产环境就是 `choose_backend`），四个句柄 —— `quit`、`overlay_queue`、`overlay_flag`、`selection` —— 都取自 `Tui`，外加 `system_writer()` 作剪贴板；`tui.set_root(app)`、`tui.run(&mut terminal)`，最后无论如何都 `restore_terminal()`。
 
-### 5.3 App 的状态组成
+### 6.3 App 的状态组成
 
 | 分组 | 字段 |
 | --- | --- |
 | 依赖与配置 | `backend: Arc<dyn AgentBackend>`、`backend_factory`（按凭据与模型重新解析后端）、`provider_id`（解析到的 provider，`/model` 据此列模型）、`config`、`theme` |
+| 工具 | `tools: ToolSelection`（`--tools`/`--exclude-tools` 的结果）、`registry: Arc<ToolRegistry>`（本平台的全部内建工具，整个会话一份）、`cwd`（相对路径的解析基准） |
 | 会话 | `session: SessionState`、`transcript: TranscriptView`、`notifications: NotificationQueue` |
 | 输入 | `editor: Editor`、`keybindings`、`inline: Option<ConnectFlow>` |
 | 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag`、`selection` |
@@ -211,7 +319,9 @@ while !quit {
 | 剪贴板 | `clipboard: Clipboard`（`write` / `read` 两个可注入的闭包，生产环境是 `arboard`） |
 | 展示与动画 | `version`、`greeting`、`tip`、`spinner_frame`、`buddy_step` / `buddy_started`、`queued_prompts` |
 
-`SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、`Usage`、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
+`SessionState` 持有 `turns: Vec<Turn>`（每轮含提示词、回复、思考轨迹、工具步骤 `steps: Vec<ToolStep>`、`Usage`、费用、是否结束）、瞬时 `status`、滚动偏移、`follow_end`（是否吸附到最新一行）与单调递增的 `version`（渲染缓存的失效键）。`ToolStep` 是一次调用及其结果与耗时：`ToolCall` 事件把它加成「进行中」，对应的 `ToolResult` 事件把它补完，所以转录里既能看到正在跑的调用，也能看到它花了多久。`NotificationQueue` 是带存活时间的临时通知队列（Info / Warning / Error）。
+
+**历史会把工具痕迹带上**：`SessionState::history()` 除 user/assistant 文本外，还按顺序补上每一轮的 `assistant(tool_use…)` 与 `user(tool_result…)`，让下一轮模型不必重复调查同一件事。结果没回来的调用（用户中途取消）会被略过——一条只有请求没有结果的调用，三条 wire 都会拒收。回复为空时也不再发一条空的 assistant 消息，Messages API 不接受空文本块。
 
 **后端在会话中途会被重新解析**：`/connect` 写入凭据、`/model` 改模型时都调 `App::rebuild_backend()` → `resolve_backend()`。它做三件事，而不只是换一个后端：把凭据与模型交给 `backend_factory`；**采纳真正会被询问的模型**（模型名为空时换成该 provider 提供的第一个模型，因为 provider 不会接受空模型名）；按模型目录更新 `config.context_window`，footer 的占比条据此才诚实。`AppOptions::new()` 会把传进来的那个后端**钉死**成一个固定工厂（并把模型原样回传），所以测试驱动的永远是它自己交给 app 的后端；生产环境则用真实的 `choose_backend`。
 
@@ -219,7 +329,7 @@ while !quit {
 
 复制发生在 `handle_key`：`Ctrl+C` 命中 `quit` 绑定时，先看共享的 `selection` 句柄里有没有文本 —— 有就交给 [`clipboard`](../crates/solaris/src/clipboard.rs) 并通知结果，没有才真的退出。
 
-### 5.4 输入优先级
+### 6.4 输入优先级
 
 根组件 `handle_key` 的分发顺序固定为：
 
@@ -243,7 +353,7 @@ while !quit {
 
 `Ctrl+V` 走反方向：从剪贴板取文本，插进当前接受输入的地方 —— 内联向导的字段在场就给它，否则给输入框；剪贴板为空时提示 `clipboard is empty`。claurst 就是在同一个键（它还接受 `Cmd+V`）上读剪贴板、并对空剪贴板报警的。
 
-### 5.5 渲染管线
+### 6.5 渲染管线
 
 `render_session` 用一次 `layout::split` 把整屏切成三段：
 
@@ -261,14 +371,15 @@ while !quit {
 
 转录本身由 [`TranscriptView`](../crates/solaris/src/transcript.rs) 负责，并做缓存：只有当**会话版本、区域尺寸、主题名、spinner 帧**变化时才重建行；唯一例外是转录为空时（欢迎框里的伙伴要做待机动画），此时每帧重建 —— 因为那也只有一个屏面。
 
-### 5.6 一次对话的完整数据流
+### 6.6 一次对话的完整数据流
 
 ```text
 编辑器提交
    │
    ▼
 App::start_turn
-   ├─ TurnRequest { history: session.history(mode), prompt, mode }
+   ├─ TurnRequest { history: session.history(mode), prompt, mode, tools: vec![] }
+   │     （工具由 ToolLoop 按模式填，应用层不必知道有哪些）
    ├─ 追加一个未完成的 Turn，follow_end = true，session.bump()
    ├─ 建 tokio unbounded channel，events_rx = Some(rx)
    └─ tokio::spawn：消费 backend 流，逐条 tx.send(event)
@@ -277,6 +388,7 @@ App::start_turn
    ▼  （后台任务，主线程不阻塞）
 每帧 App::tick
    ├─ try_recv 排空 events_rx → apply_event 写入当前 Turn / status
+   │     （ToolCall 追加一个进行中的 ToolStep，ToolResult 把它补完）
    ├─ 收到终态事件或通道断开 → 结束该轮、清 status、
    │                          取出 queued_prompts 中的下一条提示词开跑
    ├─ 排空 dialog_rx → on_dialog_message（主题/模型/命令/确认）
@@ -294,11 +406,12 @@ Tui::render
 要点：
 
 - **UI 侧永不阻塞**。后端跑在 tokio 任务上，主线程只用 `try_recv` 排空通道，因此流式输出、滚动与动画互不阻塞。
+- **一轮可能是多次模型调用**。工具往返发生在 `ToolLoop` 内部：它自己转发分片、自己累计用量，只在模型不再请求工具时发出一个 `TurnComplete`。所以 UI 看到的「一轮」始终是一次提问到一次回答，哪怕中间跑了十次命令。
 - **按需重绘**。渲染只由 `dirty` 触发；`ratatui` 的双缓冲差分只把变化的单元写进终端，所以空闲帧是零成本的。
 - **流式期间仍可输入**。此时提交的提示词进入 `queued_prompts`，在当前轮结束后按序执行。
 - **终态必达**。即使后端流意外结束且没有终态事件，`tick` 也会把该轮标记为完成并停掉 spinner。
 
-### 5.7 对话框与内联向导
+### 6.7 对话框与内联向导
 
 对话框（[`dialogs`](../crates/solaris/src/dialogs.rs)）有一条**唯一**的模态路径：每个对话框都是普通 `Component`，被压入框架的浮层栈，结果通过 `mpsc` 回传，而不是反向持有应用引用。
 
@@ -323,7 +436,7 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。文本步骤会从 `AuthStore` 回填该 provider 已存的 URL 与 key（key 照常掩码显示），所以重新 `/connect` 看到的是已保存的内容而不是空字段，直接回车即沿用；`ctrl+u` 清空当前字段，用来换成另一个 key。设备码授权的网络侧尚未实现，所以向导的这一步会直接报「not implemented」并让用户改用 API key —— 编一个占位 token 更糟：它会连上一个回答不了的 provider，然后第一轮以一个解释不了任何事的认证错误失败。
 
-### 5.8 持久化
+### 6.8 持久化
 
 三个 JSON 文件都写在同一个状态目录下，全部由应用层负责读写（领域层只负责序列化）：
 
@@ -337,10 +450,16 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ---
 
-## 6. 扩展点
+## 7. 扩展点
 
 | 想做的事 | 改哪里 |
 | --- | --- |
+| 新增一个工具 | 在 [`crates/solaris-tools/src/tools`](../crates/solaris-tools/src/tools) 实现 `Tool`（name / description / parameters / run），在 [`registry.rs`](../crates/solaris-tools/src/registry.rs) 的 `with_runners` 里 `add` 一次，必要时把名字加进 `BUILTIN_TOOLS` 与某个模式的默认集合。声明与执行是分开的，所以工具不需要认识任何 wire。 |
+| 改变默认工具集 | [`registry.rs`](../crates/solaris-tools/src/registry.rs) 的 `default_tool_names`（按模式给默认集合）。单次运行用 `--tools` / `--exclude-tools` 即可，不必改代码。 |
+| 让工具执行前需要确认 | 实现 `Approver` 并在构造 `ToolLoopOptions` 时用 `with_approver` 注入（[`crates/solaris/src/app.rs`](../crates/solaris/src/app.rs) 的 `with_tools`）。要做成交互式对话框，需要一条把「请确认」送回 UI 的通道，再让 `Approver` 等它。 |
+| 调整工具的输出上限 | [`truncate.rs`](../crates/solaris-tools/src/truncate.rs) 的 `DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`，或给单个工具 `with_limits`。 |
+| 限制一次工具往返的次数 | [`agent_loop.rs`](../crates/solaris-tools/src/agent_loop.rs) 的 `DEFAULT_MAX_ROUNDS`，或 `ToolLoopOptions::max_rounds`。 |
+| 换掉 ripgrep / fd | 实现 `CommandRunner` 并传给 `ToolRegistry::with_runners`（`grep` 与 `find` 都经它起子进程）。 |
 | 接入新的 wire 协议 | 在 [`solaris-core/src/provider.rs`](../crates/solaris-core/src/provider.rs) 的 `Wire` 加一个变体，在 [`wire.rs`](../crates/solaris-backend/src/wire.rs) 的 `request_body` / `WireStream` 各加一个分支，照 [`protocols/`](../crates/solaris-backend/src/protocols) 里既有的三个模块写一个只做「请求体 + 流解析」的模块，最后让 `PROVIDERS` 里对应的 provider 指向它。UI 与 `choose_backend` 都不用动。 |
 | 增删 provider 目录项 / 模型 | [`solaris-core/src/provider.rs`](../crates/solaris-core/src/provider.rs) 的 `PROVIDERS`（向导步骤、模型选择器、端点、环境变量与价格表都从这里读）。 |
 | 调整重试 / 超时策略 | [`solaris-backend/src/http.rs`](../crates/solaris-backend/src/http.rs)：`BACKOFF`、`IDLE_TIMEOUT`、`CONNECT_TIMEOUT`。 |
@@ -354,13 +473,15 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ---
 
-## 7. 测试策略
+## 8. 测试策略
 
-工作区共 **444 个测试**，分三层：
+工作区共 **616 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 40、`solaris-core` 31、`solaris-tui` 130、`solaris-backend` 67、`solaris` 库 142），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。
-- **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（7 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
-- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（27 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。它自带一个只回显提示词的 `FakeBackend` 顶替真实 provider，并把 `environment` 换成空表，所以既不会继承 shell 里的 key，也不会联网。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 44、`solaris-core` 41、`solaris-tui` 130、`solaris-backend` 88、`solaris-tools` 112、`solaris` 库 161），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`ToolLoop` 的多轮与轮数上限、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
+- **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
+- **工具往返的回路测试** [`crates/solaris-tools/tests/loopback.rs`](../crates/solaris-tools/tests/loopback.rs)（2 个）：同一套真 socket 手法，但服务端先回一个 `tool_call`、再回最终文本，于是「请求体带上了 `tools` → 调用被解析出来 → 真的 `read` 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。
+ead 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。
+- **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（28 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + 真实 `ToolLoop`），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。它自带一个只回显提示词的 `FakeBackend` 顶替真实 provider，并把 `environment` 换成空表，所以既不会继承 shell 里的 key，也不会联网；另有一个先请求一个不存在工具的后端，用来验证工具步骤确实进了转录，而不会真的碰文件或执行命令。
 
 ```bash
 cargo build --workspace --all-targets
@@ -369,9 +490,13 @@ cargo test --workspace
 
 ---
 
-## 8. 当前边界
+## 9. 当前边界
 
-- **没有工具调用**。`AgentEvent` 里没有工具调用/结果，也就没有多轮 agent loop、权限确认、MCP 与会话落盘；一轮就是一次请求。
+- **工具调用已经打通，但工具集是固定的八个**。`ToolLoop` 会跑「模型 → 工具 → 模型」直到模型不再请求，用量与费用按轮累计；但可声明的工具就是内建那八个，没有 MCP、没有第三方扩展工具。
+- **工具执行前没有交互式确认**。`Approver` 钩子在（默认全部批准），但对话框还没接上，所以 `bash` 与 `write` 目前是直接执行的。
+- **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
+- **`grep` 与 `find` 需要外部程序**。它们 shell out 到 ripgrep 与 fd；缺失时工具会明确报错并给出安装提示，而不是退化成另一个实现。
+- **工具输出是截断的**。读类保留前 2000 行或 50KB，命令类保留末尾并把完整输出写进临时文件；被截断的那部分只有通过报告出来的路径才读得到。
 - **设备码授权仍是替身**。`spawn_device_auth` 不联系任何授权服务器，只回报「尚未实现」，所以 `claude-subscription` 目前必须手工往 `auth.json` 里放 token 才会真的发请求。
 - **价格是内置快照**。`provider` 表里的单价是打表值，账单可能不同；未知模型按 0 计。
 - **报不了用量的服务端会被估算**。OpenAI 兼容服务里有一部分不实现 `stream_options.include_usage`，那一轮退回按字符估算，并在 `/stats` 里标注 `≈`。

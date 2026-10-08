@@ -29,6 +29,7 @@ use solaris_core::{
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
 };
+use solaris_tools::{ToolLoop, ToolLoopOptions, ToolRegistry, ToolSelection};
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
 use solaris_tui::components::select_list::SelectItem;
@@ -53,7 +54,7 @@ use crate::dialogs::{
 };
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, Turn};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -110,6 +111,8 @@ pub struct AppOptions {
     /// [`AppOptions::new`], so a test that pins its own backend makes no
     /// request of its own and the catalogue is the only source.
     pub discover_models: bool,
+    /// Which tools a turn declares, on top of what the mode offers by default.
+    pub tools: ToolSelection,
 }
 
 impl AppOptions {
@@ -150,6 +153,7 @@ impl AppOptions {
             selection: Selection::handle(),
             clipboard: Clipboard::system(),
             discover_models: false,
+            tools: ToolSelection::none(),
         }
     }
 }
@@ -162,6 +166,7 @@ impl AppOptions {
 /// the app takes that on so the footer and `/stats` report what is really being
 /// asked for. The context window follows the model, because the footer gauge is
 /// only honest if it measures against the window the model really has.
+/// The backend the current credentials call for, and why it was chosen.
 fn resolve_backend(
     factory: &BackendFactory,
     auth: &AuthStore,
@@ -173,6 +178,29 @@ fn resolve_backend(
     }
     config.context_window = u64::from(context_window_for(&config.model));
     choice
+}
+
+/// Wrap a resolved backend in the tool loop.
+///
+/// Every backend goes through it — including the one that refuses turns when
+/// nothing is connected — because the loop is transparent until the model asks
+/// for a tool: with none declared it is exactly one model call, forwarded
+/// unchanged.
+fn with_tools(
+    choice: BackendChoice,
+    registry: Arc<ToolRegistry>,
+    selection: &ToolSelection,
+    cwd: &Path,
+) -> BackendChoice {
+    let options = ToolLoopOptions::in_directory(cwd).with_selection(selection.clone());
+    BackendChoice {
+        backend: Arc::new(ToolLoop::new(
+            Arc::clone(&choice.backend),
+            registry,
+            options,
+        )),
+        ..choice
+    }
 }
 
 /// The solaris application root component.
@@ -238,6 +266,15 @@ pub struct App {
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
     /// Whether asking the provider for its models is allowed at all.
     discover_models: bool,
+    /// Which tools a turn declares, on top of what the mode offers by default.
+    tools: ToolSelection,
+    /// Every built-in tool this platform has.
+    ///
+    /// Built once, so `edit` and `write` keep serialising against the same
+    /// per-file locks for the whole session.
+    registry: Arc<ToolRegistry>,
+    /// Directory relative tool paths resolve against.
+    cwd: PathBuf,
 }
 
 impl App {
@@ -261,10 +298,14 @@ impl App {
             selection,
             clipboard,
             discover_models,
+            tools,
         } = options;
 
         let mut config = config;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let registry = Arc::new(ToolRegistry::builtin());
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
+        let choice = with_tools(choice, Arc::clone(&registry), &tools, &cwd);
         let backend = choice.backend;
         let provider_id = choice.provider_id;
 
@@ -318,6 +359,9 @@ impl App {
             discovered: Vec::new(),
             models_rx: None,
             discover_models,
+            tools,
+            registry,
+            cwd,
         };
 
         app.refresh_models();
@@ -365,6 +409,12 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+        let choice = with_tools(
+            choice,
+            Arc::clone(&self.registry),
+            &self.tools,
+            &self.cwd,
+        );
         self.backend = choice.backend;
         self.provider_id = choice.provider_id;
         choice.source
@@ -668,10 +718,13 @@ impl App {
     }
 
     fn start_turn(&mut self, prompt: String) {
+        // No tools here: the loop that wraps the backend declares them, so the
+        // app never has to know which ones a turn offers.
         let request = TurnRequest {
             history: self.session.history(self.config.mode),
             prompt: prompt.clone(),
             mode: self.config.mode,
+            tools: Vec::new(),
         };
 
         self.session.turns.push(Turn {
@@ -716,6 +769,28 @@ impl App {
                 }
             }
             AgentEvent::Status(text) => self.session.status = Some(text),
+            AgentEvent::ToolCall(call) => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.steps.push(ToolStep::pending(call));
+                }
+            }
+            AgentEvent::ToolResult {
+                result,
+                duration_ms,
+            } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    // The newest call with this id that has not been answered
+                    // yet, since a model may call the same tool twice.
+                    let step = turn
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|step| step.call.id == result.id && !step.is_done());
+                    if let Some(step) = step {
+                        step.finish(result, duration_ms);
+                    }
+                }
+            }
             AgentEvent::TurnComplete { usage, cost_usd } => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -1976,7 +2051,7 @@ mod tests {
     use crate::connect::DeviceAuthStatus;
     use crossterm::event::MouseButton;
     use solaris_backend::AgentEventStream;
-    use solaris_core::{BackendError, Usage};
+    use solaris_core::{BackendError, ToolCall, ToolResult, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -2621,6 +2696,52 @@ mod tests {
             accepted: true,
         });
         assert!(app.session.turns.is_empty());
+    }
+
+    #[test]
+    fn tool_events_become_one_step_per_call() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.session.bump();
+
+        let first = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
+        let second = ToolCall::new("call-2", "bash", serde_json::json!({ "command": "ls" }));
+        app.apply_event(AgentEvent::ToolCall(first.clone()));
+        app.apply_event(AgentEvent::ToolCall(second.clone()));
+
+        assert_eq!(app.session.turns[0].steps.len(), 2);
+        assert!(!app.session.turns[0].steps[0].is_done(), "still running");
+
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::ok(&first, "hello"),
+            duration_ms: 7,
+        });
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::error(&second, "exit code 1"),
+            duration_ms: 3,
+        });
+
+        let steps = &app.session.turns[0].steps;
+        assert!(steps[0].is_done() && !steps[0].is_error());
+        assert_eq!(steps[0].duration_ms(), Some(7));
+        assert!(steps[1].is_error());
+        assert_eq!(steps[1].duration_ms(), Some(3));
+    }
+
+    #[test]
+    fn a_result_for_a_call_that_was_never_made_is_ignored() {
+        // A backend that lost a ToolCall event must not invent a step for it.
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.session.bump();
+
+        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::ok(&call, "hello"),
+            duration_ms: 1,
+        });
+
+        assert!(app.session.turns[0].steps.is_empty());
     }
 
     #[test]

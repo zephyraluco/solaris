@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::welcome::{WelcomeData, WelcomeStyles, render_welcome};
 use solaris_tui::theme::Theme;
-use solaris_tui::util::wrap_text;
+use solaris_tui::util::{truncate_to_width, wrap_text};
 
 use crate::state::{SessionState, Turn};
 
@@ -112,6 +112,7 @@ pub fn build(
             out.push(Line::default());
         }
         push_prompt(&mut out, &turn.prompt, width, theme);
+        push_steps(&mut out, turn, width, theme);
         push_thinking(&mut out, turn, width, theme);
 
         if !turn.reply.trim().is_empty() {
@@ -172,6 +173,53 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
     }
 }
 
+/// One line per tool call, so a turn says what it did rather than only what it
+/// concluded.
+///
+/// The line is the tool, its arguments and how long it took. A failed call also
+/// shows the first line of what it said, because that is the part a person
+/// needs; the full text went to the model either way.
+fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &Theme) {
+    for step in &turn.steps {
+        let (glyph, colour) = match step.result.as_ref() {
+            None => ("⋯", theme.muted),
+            Some(result) if result.is_error => ("✗", theme.error),
+            Some(_) => ("✓", theme.success),
+        };
+
+        // Arguments are what makes a call recognisable at a glance. Values are
+        // printed as compact JSON, so this is always one line.
+        let mut detail = format!("{}", step.call.input);
+        if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
+            detail.push_str(" — ");
+            detail.push_str(&summarize(&result.output));
+        }
+        if let Some(elapsed) = step.duration_ms() {
+            detail.push_str(&format!("  ·  {elapsed}ms"));
+        }
+
+        // Indent, glyph, space, the tool name, then two spaces before the detail.
+        let used = 6 + step.call.name.chars().count();
+        out.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{glyph} "), Style::default().fg(colour)),
+            Span::styled(
+                step.call.name.clone(),
+                Style::default()
+                    .fg(theme.assistant)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {}",
+                    truncate_to_width(&detail, width.saturating_sub(used).max(8), "…")
+                ),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+    }
+}
+
 /// First line of `text`, trimmed and shortened for the collapsed thinking label.
 pub fn summarize(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
@@ -186,6 +234,8 @@ pub fn summarize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ToolStep;
+    use solaris_core::{ToolCall, ToolResult};
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -225,6 +275,68 @@ mod tests {
         assert!(text.contains("/\\_/\\"), "the companion is missing: {text}");
         assert!(text.contains("Tips for getting started"), "{text}");
         assert!(text.contains("No recent activity"), "{text}");
+    }
+
+    #[test]
+    fn tool_steps_are_rendered_beside_the_turn() {
+        let call = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
+        let mut done = ToolStep::pending(call.clone());
+        done.finish(ToolResult::ok(&call, "hello"), 7);
+
+        let failing = ToolCall::new("call-2", "bash", serde_json::json!({ "command": "false" }));
+        let mut failed = ToolStep::pending(failing.clone());
+        failed.finish(ToolResult::error(&failing, "exit code 1"), 3);
+
+        let running = ToolStep::pending(ToolCall::new(
+            "call-3",
+            "grep",
+            serde_json::json!({ "pattern": "x" }),
+        ));
+
+        let session = session_with(Turn {
+            prompt: "do it".to_string(),
+            reply: "done".to_string(),
+            steps: vec![done, failed, running],
+            ..Default::default()
+        });
+
+        let lines = build(&session, area(80, 30), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("✓ read"), "{text}");
+        assert!(text.contains(r#"{"path":"a.txt"}"#), "arguments are shown: {text}");
+        assert!(text.contains("7ms"), "timing is shown: {text}");
+
+        assert!(text.contains("✗ bash"), "{text}");
+        assert!(
+            text.contains("exit code 1"),
+            "a failure says why, not just that it failed: {text}"
+        );
+
+        assert!(text.contains("⋯ grep"), "a call in flight: {text}");
+    }
+
+    #[test]
+    fn a_step_line_longer_than_the_screen_is_cut() {
+        let call = ToolCall::new(
+            "call-1",
+            "read",
+            serde_json::json!({ "path": "x".repeat(200) }),
+        );
+        let session = session_with(Turn {
+            prompt: "p".to_string(),
+            steps: vec![ToolStep::pending(call)],
+            ..Default::default()
+        });
+
+        let lines = build(&session, area(40, 20), &Theme::dark(), None, &welcome());
+        let step = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("read"))
+            .expect("a step line");
+        assert!(step.contains('…'), "{step}");
+        assert!(step.chars().count() <= 40, "{step}");
     }
 
     #[test]

@@ -130,6 +130,19 @@ impl WireStream {
             Self::Responses(stream) => stream.usage(),
         }
     }
+
+    /// Hand over the tool calls this stream assembled.
+    ///
+    /// A wire only knows a call is complete when the stream ends, so the caller
+    /// runs this at that point — before the terminal event, so the turn's
+    /// sequence reads as text, then calls, then completion.
+    pub fn flush(&mut self, out: &mut Vec<AgentEvent>) {
+        match self {
+            Self::Anthropic(stream) => stream.flush(out),
+            Self::OpenAi(stream) => stream.flush(out),
+            Self::Responses(stream) => stream.flush(out),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +155,7 @@ mod tests {
             history: vec![Message::system("You are solaris.")],
             prompt: "hello".to_string(),
             mode: Mode::Build,
+            tools: Vec::new(),
         }
     }
 

@@ -3,7 +3,55 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use solaris_core::{Mode, Usage, tokens_for_characters};
+use solaris_core::{Mode, ToolCall, ToolResult, Usage, tokens_for_characters};
+
+/// One tool call the model made, and what running it produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolStep {
+    /// What the model asked for.
+    pub call: ToolCall,
+    /// What running it produced, once it has run.
+    ///
+    /// `None` while the call is in flight, and also when the turn ended before
+    /// it could run — a cancelled turn leaves a step like that behind.
+    pub result: Option<ToolResult>,
+    /// How long the call took, once it has run.
+    pub duration_ms: Option<u64>,
+}
+
+impl ToolStep {
+    /// A step whose call has not run yet.
+    pub fn pending(call: ToolCall) -> Self {
+        Self {
+            call,
+            result: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Record what the call produced.
+    pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
+        self.result = Some(result);
+        self.duration_ms = Some(duration_ms);
+    }
+
+    /// Whether the call has run.
+    pub fn is_done(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Whether it ran and failed.
+    pub fn is_error(&self) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(|result| result.is_error)
+    }
+
+    /// How long it took, when it has run.
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.duration_ms
+    }
+}
 
 /// One prompt/response exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -16,6 +64,8 @@ pub struct Turn {
     pub thinking: String,
     /// Whether the thinking block is expanded.
     pub thinking_expanded: bool,
+    /// The tool calls this turn made, in the order they were made.
+    pub steps: Vec<ToolStep>,
     /// Tokens the turn consumed, as the backend reported or estimated them.
     pub usage: Usage,
     /// Cost reported for this turn.
@@ -143,14 +193,32 @@ impl SessionState {
     }
 
     /// Completed turns flattened into backend history.
+    ///
+    /// Tool calls ride along, so the next turn's model can see what it already
+    /// looked at instead of asking again. A call whose result never arrived —
+    /// the turn was cancelled while it ran — is left out rather than sent as a
+    /// call with no answer, which every wire rejects.
     pub fn history(&self, mode: Mode) -> Vec<solaris_core::Message> {
         let mut history = vec![solaris_core::Message::system(format!(
             "You are solaris, a terminal assistant running in {} mode.",
             mode.label().to_lowercase()
         ))];
+
         for turn in self.turns.iter().filter(|turn| turn.complete) {
             history.push(solaris_core::Message::user(turn.prompt.clone()));
-            history.push(solaris_core::Message::assistant(turn.reply.clone()));
+
+            for step in turn.steps.iter().filter(|step| step.result.is_some()) {
+                history.push(solaris_core::Message::tool_use(step.call.clone()));
+                if let Some(result) = &step.result {
+                    history.push(solaris_core::Message::tool_result(result.clone()));
+                }
+            }
+
+            // An empty reply adds nothing, and some wires reject a blank text
+            // block outright.
+            if !turn.reply.is_empty() {
+                history.push(solaris_core::Message::assistant(turn.reply.clone()));
+            }
         }
         history
     }
@@ -306,8 +374,68 @@ mod tests {
         let history = session.history(Mode::Build);
         // system + one user/assistant pair.
         assert_eq!(history.len(), 3);
-        assert_eq!(history[1].content, "one");
-        assert_eq!(history[2].content, "1");
+        assert_eq!(history[1].text(), "one");
+        assert_eq!(history[2].text(), "1");
+    }
+
+    #[test]
+    fn history_carries_what_a_turn_did_with_tools() {
+        let call = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
+        let result = ToolResult::ok(&call, "hello");
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "read it".into(),
+            reply: "it says hello".into(),
+            steps: vec![ToolStep {
+                call,
+                result: Some(result),
+                duration_ms: None,
+            }],
+            complete: true,
+            ..Default::default()
+        });
+
+        let history = session.history(Mode::Build);
+        assert_eq!(
+            history.len(),
+            5,
+            "system, prompt, the call, its result, and the reply"
+        );
+        assert_eq!(history[2].tool_calls().count(), 1);
+        assert_eq!(history[3].tool_results().count(), 1);
+        assert_eq!(history[3].tool_results().next().expect("a result").output, "hello");
+        assert_eq!(history[4].text(), "it says hello");
+    }
+
+    #[test]
+    fn a_call_whose_result_never_arrived_is_left_out_of_history() {
+        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "read it".into(),
+            reply: "hmm".into(),
+            steps: vec![ToolStep::pending(call)],
+            complete: true,
+            ..Default::default()
+        });
+
+        let history = session.history(Mode::Build);
+        assert_eq!(history.len(), 3, "a call with no answer is not sent");
+        assert_eq!(history[2].tool_calls().count(), 0);
+    }
+
+    #[test]
+    fn an_empty_reply_is_not_sent_as_a_blank_message() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "hi".into(),
+            reply: String::new(),
+            complete: true,
+            ..Default::default()
+        });
+
+        let history = session.history(Mode::Build);
+        assert_eq!(history.len(), 2, "system and the prompt");
     }
 
     #[test]

@@ -8,10 +8,13 @@
 //! so everything is a pure function of its inputs and can be tested from a
 //! fixture.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use solaris_core::{AgentEvent, Message, Role, TurnRequest, Usage};
 
+use crate::protocols::{PartialCall, arguments_json};
 use crate::sse::SseEvent;
 
 /// Marker a stream ends with, for servers that send one.
@@ -24,19 +27,27 @@ const DONE: &str = "[DONE]";
 ///
 /// The system prompt becomes `instructions`, which is where the API documents
 /// it. `store` is off: a terminal session has no business leaving its
-/// transcript lying on the provider's servers.
+/// transcript lying on the provider's servers. `tools` is written only when the
+/// caller declared some.
 pub fn request_body(request: &TurnRequest, model: &str, max_tokens: u32) -> Value {
-    let mut instructions: Vec<&str> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
     let mut input = Vec::with_capacity(request.history.len() + 1);
 
     for message in &request.history {
         if message.role == Role::System {
-            instructions.push(message.content.as_str());
+            let text = message.text();
+            if !text.is_empty() {
+                instructions.push(text);
+            }
         } else {
-            input.push(input_item(message));
+            push_input(&mut input, message);
         }
     }
-    input.push(json!({ "role": "user", "content": request.prompt }));
+    // An empty prompt means the caller already put it in the history — which is
+    // what a tool round trip does — so no further user message is appended.
+    if !request.prompt.is_empty() {
+        input.push(json!({ "role": "user", "content": request.prompt }));
+    }
 
     let mut body = json!({
         "model": model,
@@ -50,11 +61,53 @@ pub fn request_body(request: &TurnRequest, model: &str, max_tokens: u32) -> Valu
     if !instructions.is_empty() {
         body["instructions"] = Value::String(instructions.join("\n\n"));
     }
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "type": "function",
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    })
+                })
+                .collect(),
+        );
+    }
     body
 }
 
-fn input_item(message: &Message) -> Value {
-    json!({ "role": message.role.as_str(), "content": message.content })
+/// Append one history entry, as the input items this API is built from.
+///
+/// A call and its answer are items of their own rather than blocks inside a
+/// message, so one message in the shared transcript can become several items
+/// here. Calls come first, since that is the order they happened in. Text
+/// travels as a message item of its own, and an empty one is dropped: it would
+/// say nothing.
+fn push_input(out: &mut Vec<Value>, message: &Message) {
+    for call in message.tool_calls() {
+        out.push(json!({
+            "type": "function_call",
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": arguments_json(&call.input),
+        }));
+    }
+    for result in message.tool_results() {
+        out.push(json!({
+            "type": "function_call_output",
+            "call_id": result.id,
+            "output": result.output,
+        }));
+    }
+
+    let text = message.text();
+    if !text.is_empty() {
+        out.push(json!({ "role": message.role.as_str(), "content": text }));
+    }
 }
 
 /// State carried across one Responses stream.
@@ -63,6 +116,9 @@ pub struct ResponsesStream {
     usage: Usage,
     reported_usage: bool,
     finished: bool,
+    /// Tool calls by item id, which is what ties the announced item to the
+    /// argument fragments that follow it.
+    calls: BTreeMap<String, PartialCall>,
 }
 
 impl ResponsesStream {
@@ -109,7 +165,19 @@ impl ResponsesStream {
                 if data["item"]["type"] == "reasoning" {
                     out.push(AgentEvent::Status("thinking".to_string()));
                 }
+                self.read_item(&data["item"]);
             }
+            // The arguments of a call stream in after the item that announces it.
+            "response.function_call_arguments.delta" => {
+                let key = data["item_id"].as_str().unwrap_or_default();
+                if let Some(call) = self.calls.get_mut(key) {
+                    if let Some(delta) = data["delta"].as_str() {
+                        call.arguments.push_str(delta);
+                    }
+                }
+            }
+            // A server may send the finished item instead of the deltas.
+            "response.output_item.done" => self.read_item(&data["item"]),
             // `completed` is the ordinary ending. `incomplete` means the model
             // stopped early — a length cutoff — but its usage still counts.
             "response.completed" | "response.incomplete" => {
@@ -131,6 +199,42 @@ impl ResponsesStream {
     /// Whether the server signalled the end of its stream.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Hand over the calls this stream assembled.
+    ///
+    /// Run when the stream ends, so the model's whole message is in hand before
+    /// anything is executed.
+    pub fn flush(&mut self, out: &mut Vec<AgentEvent>) {
+        for (index, (_, call)) in std::mem::take(&mut self.calls).into_iter().enumerate() {
+            if let Some(call) = call.finish(format!("call_{index}")) {
+                out.push(AgentEvent::ToolCall(call));
+            }
+        }
+    }
+
+    /// Remember a `function_call` item, or refresh it with a finished version.
+    fn read_item(&mut self, item: &Value) {
+        if item["type"] != "function_call" {
+            return;
+        }
+        let key = item["id"].as_str().unwrap_or_default().to_string();
+        let entry = self.calls.entry(key).or_default();
+
+        // `call_id` is what the answer quotes back; the item id is only this
+        // stream's handle on it.
+        if let Some(id) = item["call_id"].as_str().filter(|id| !id.is_empty()) {
+            entry.id = id.to_string();
+        }
+        if let Some(name) = item["name"].as_str().filter(|name| !name.is_empty()) {
+            entry.name = name.to_string();
+        }
+        // `added` carries no arguments and `done` carries the finished ones, so
+        // only overwrite when there is something to overwrite with — otherwise
+        // the deltas would be lost.
+        if let Some(arguments) = item["arguments"].as_str().filter(|text| !text.is_empty()) {
+            entry.arguments = arguments.to_string();
+        }
     }
 
     /// The usage the server reported, once it has reported any.
@@ -195,7 +299,7 @@ fn error_message(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::Mode;
+    use solaris_core::{Mode, ToolCall, ToolResult, ToolSpec};
 
     fn request() -> TurnRequest {
         TurnRequest {
@@ -206,6 +310,7 @@ mod tests {
             ],
             prompt: "second question".to_string(),
             mode: Mode::Build,
+            tools: Vec::new(),
         }
     }
 
@@ -410,5 +515,133 @@ mod tests {
         assert!(events.is_empty(), "{events:?}");
         assert!(!stream.finished());
         assert_eq!(stream.usage(), None);
+    }
+
+    // ------------------------------------------------------------- tool calls
+
+    #[test]
+    fn declared_tools_are_flat_function_declarations() {
+        let body = request_body(&request(), "gpt-5", 4096);
+        assert!(
+            body.get("tools").is_none(),
+            "a request with no tools must carry no such field"
+        );
+
+        let mut request = request();
+        request.tools = vec![ToolSpec::new(
+            "read",
+            "Read file contents",
+            json!({ "type": "object" }),
+        )];
+        let body = request_body(&request, "gpt-5", 4096);
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["tools"][0]["description"], "Read file contents");
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn a_function_call_item_is_assembled_from_its_argument_deltas() {
+        let (mut events, mut stream) = replay(&[
+            frame(
+                "response.output_item.added",
+                r#"{"item":{"id":"item_1","type":"function_call","call_id":"call-1","name":"read","arguments":""}}"#,
+            ),
+            frame(
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"item_1","delta":"{\"path\":"}"#,
+            ),
+            frame(
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"item_1","delta":"\"a.txt\"}"}"#,
+            ),
+            frame(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_1","type":"function_call","call_id":"call-1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            ),
+            frame("response.completed", r#"{"response":{}}"#),
+        ]);
+        stream.flush(&mut events);
+
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].id, "call-1",
+            "the call_id is what the answer must quote back"
+        );
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].input["path"], "a.txt");
+    }
+
+    #[test]
+    fn a_finished_item_without_deltas_is_still_read() {
+        let (mut events, mut stream) = replay(&[
+            frame(
+                "response.output_item.added",
+                r#"{"item":{"id":"item_1","type":"function_call","call_id":"call-1","name":"ls"}}"#,
+            ),
+            frame(
+                "response.output_item.done",
+                r#"{"item":{"id":"item_1","type":"function_call","call_id":"call-1","name":"ls","arguments":"{\"path\":\".\"}"}}"#,
+            ),
+        ]);
+        stream.flush(&mut events);
+
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input["path"], ".");
+    }
+
+    #[test]
+    fn a_tool_exchange_becomes_a_call_item_and_an_output_item() {
+        let call = ToolCall::new("call-1", "read", json!({ "path": "a.txt" }));
+        let mut request = request();
+        request.history.push(Message::tool_use(call.clone()));
+        request
+            .history
+            .push(Message::tool_result(ToolResult::ok(&call, "file contents")));
+
+        let body = request_body(&request, "gpt-5", 4096);
+        let input = body["input"].as_array().expect("input");
+
+        // user, assistant, function_call, function_call_output, prompt.
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["name"], "read");
+        assert_eq!(
+            input[2]["arguments"], r#"{"path":"a.txt"}"#,
+            "arguments travel as JSON text on this wire"
+        );
+
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-1");
+        assert_eq!(input[3]["output"], "file contents");
+    }
+
+    #[test]
+    fn an_empty_prompt_appends_no_further_item() {
+        let mut request = request();
+        request.prompt = String::new();
+
+        let body = request_body(&request, "gpt-5", 4096);
+        assert_eq!(
+            body["input"].as_array().expect("input").len(),
+            2,
+            "the system prompt is instructions, and the prompt already lives in the history"
+        );
     }
 }

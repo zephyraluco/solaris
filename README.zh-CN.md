@@ -32,6 +32,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 目录所涵盖的三条 wire 协议都有真实客户端，按凭据自动选择
 > - 全屏 TUI：保留式组件树、类 flex 布局栈，以及模态 / 内联浮层
 > - 流式对话记录，支持 Markdown 渲染与可折叠的思考块
+> - 八个内建工具 —— `read`、`write`、`edit`、`ls`、`grep`、`find` 与所在平台的 shell —— 由多轮工具循环驱动
 > - 多行编辑器，支持按词移动、`/` 命令补全，以及命令面板
 > - 两套配色主题，运行时循环切换
 > - Build 与 Plan 两种模式，各有独立强调色与系统提示词
@@ -40,7 +41,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 会话统计 —— 轮次、分类 token、费用与上下文占用
 > - 凭据、伙伴与历史记录保存在平台配置目录下
 >
-> **尚未具备：** 工具调用、MCP、会话落盘，以及真实的设备码登录。
+> **尚未具备：** MCP、会话落盘、真实的设备码登录，以及工具执行前的交互式确认。
 
 ---
 
@@ -50,6 +51,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 
 - **Rust 1.85 或更高版本** —— 工作区使用 2024 edition。
 - 一个能渲染 24 位色的终端（Windows Terminal、iTerm2、Alacritty、Kitty 等）。
+- [ripgrep](https://github.com/BurntSushi/ripgrep) 与 [fd](https://github.com/sharkdp/fd)，供 `grep` 与 `find` 使用；没有它们，其余部分照常工作。
 
 ## 从源码构建
 
@@ -82,6 +84,8 @@ cargo run --release
 | `--provider <PROVIDER>` | 本次运行改用该 provider，但不改动已保存的选择 | 当前 provider |
 | `--theme <THEME>` | 启动时使用的配色主题（`dark`、`light`） | `dark` |
 | `--plan` | 以 plan 模式启动，而非 build 模式 | 关闭 |
+| `-t`, `--tools <LIST>` | 声明哪些工具，整体替换该模式的默认集合；若只由 `+name`/`-name` 组成，则改为在默认集合上增删 | 该模式的默认集合 |
+| `--exclude-tools <LIST>` | 在前述选择之后，再撤下这些工具 | 无 |
 | `--print-config` | 打印解析后的配置并退出，不启动界面 | — |
 | `-h`, `--help` | 打印帮助 | — |
 | `-V`, `--version` | 打印版本 | — |
@@ -132,7 +136,43 @@ solaris --print-config
 
 ## 模式
 
-**Build** 与 **Plan** 是同一次对话，只是强调色不同、系统提示词里的一句话不同。`Tab` 或 `/mode` 在两者之间切换，`--plan` 让你直接以 plan 模式启动。
+**Build** 与 **Plan** 是同一次对话，只是强调色不同、系统提示词里的一句话不同。`Tab` 或 `/mode` 在两者之间切换，`--plan` 让你直接以 plan 模式启动。两者声明的工具也不同：build 模式能执行命令、改动文件，plan 模式只能看。
+
+## 工具
+
+模型可以请 solaris 做事。一轮会执行它请求的调用、把结果回给它，再问一次，直到它不再需要工具为止 —— 从你这一侧看，这些都只是同一轮。
+
+| 工具 | 作用 | 默认在哪些模式下声明 |
+| --- | --- | --- |
+| `read` | 读取文本文件，大文件可用 `offset`/`limit` | build、plan |
+| `write` | 新建文件，或整体覆盖 | build |
+| `edit` | 对文件做精确文本替换，一次调用可改多处 | build |
+| `ls` | 列出目录内容 | plan |
+| `grep` | 搜索文件内容，遵守 `.gitignore` | plan |
+| `find` | 按 glob 查找路径，遵守 `.gitignore` | plan |
+| `bash` | 执行 shell 命令并返回它打印的内容 | build（非 Windows） |
+| `powershell` | 执行 PowerShell 命令并返回它打印的内容 | build（Windows） |
+
+plan 模式只声明那四个只读工具，所以计划不会失手改动任何东西。`--tools` 整体替换这套集合，`--exclude-tools` 在此基础上再撤下：
+
+```bash
+# 这一次运行只读，不论当前模式
+solaris --tools read,grep,find,ls --print "review this project"
+
+# 在模式默认集合上增加一个、并去掉另一个
+solaris --tools +grep,-write
+
+# 完全拿掉 shell
+solaris --exclude-tools 'bash'
+```
+
+条目是工具名或模式，其中 `*` 匹配任意长度字符。若整个列表只由 `+name` 与 `-name` 组成，它就是在模式默认集合上增删，而不是替换 —— 这正是「只加一个工具、不必把其余挨个写出来」的用法。`--print-config` 会打印你启动的那个模式最终解析出的工具列表。
+
+`grep` 与 `find` 是 shell out 到 [ripgrep](https://github.com/BurntSushi/ripgrep) 与 [fd](https://github.com/sharkdp/fd)，而不是另写一遍：它们本来就懂 `.gitignore`、遍历目录也快，重写一份只会逐渐走样。两者请自行安装，或者用 `--tools` 把它们排除掉；缺失时工具会告诉你该装什么，而不是让整轮失败。
+
+每个结果都会回给模型，失败也一样：文件不存在、命令退出码非零、调用参数不合规，都是模型可以处置的事，而不是这一轮的终点。输出会被截断以保证一轮的成本可控 —— 读取类保留前 2000 行或 50KB，命令类保留末尾（失败信息通常在那里）—— 被截断的命令会把完整输出写入一个文件并在结果里报出路径，模型可以分段读回去。
+
+每次调用都会在它发生时出现在对话记录里，带上参数、耗时，以及失败时输出内容的第一行。
 
 ## 伙伴
 

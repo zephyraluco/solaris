@@ -326,7 +326,7 @@ fn request_characters(request: &TurnRequest) -> usize {
         + request
             .history
             .iter()
-            .map(|message| message.content.chars().count())
+            .map(|message| message.characters())
             .sum::<usize>()
 }
 
@@ -425,6 +425,15 @@ impl StreamEngine {
             return;
         }
         self.done = true;
+
+        // A stream only knows a tool call is complete once it ends, so the
+        // calls go out here — before the terminal event, so the turn reads as
+        // text, then calls, then completion.
+        let mut calls = Vec::new();
+        self.parser.flush(&mut calls);
+        for event in calls {
+            self.push(event);
+        }
 
         // A provider that reports nothing at all still gets a token count, so
         // the footer gauge says something rather than nothing.
@@ -661,6 +670,7 @@ mod tests {
             history: vec![Message::system("12345"), Message::user("1234567890")],
             prompt: "123".to_string(),
             mode: Mode::Build,
+            tools: Vec::new(),
         };
         assert_eq!(request_characters(&request), 18);
     }

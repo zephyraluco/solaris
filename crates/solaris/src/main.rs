@@ -14,6 +14,7 @@ use solaris::{App, AppOptions, BackendFactory, Clipboard};
 use solaris_core::{Companion, Config, Mode, RecentActivity, Soul, tips};
 use solaris_provider::{AuthStore, context_window_for, provider};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
+use solaris_tools::{ToolRegistry, ToolSelection};
 use solaris_tui::Tui;
 
 /// A terminal AI assistant.
@@ -36,6 +37,16 @@ struct Args {
     #[arg(long)]
     provider: Option<String>,
 
+    /// Tools to declare, replacing the mode's default set. Entries are tool
+    /// names or patterns where `*` matches any characters; a list made only of
+    /// `+name` and `-name` entries edits the default set instead.
+    #[arg(short = 't', long, value_name = "LIST")]
+    tools: Option<String>,
+
+    /// Tools to withdraw, after everything else has selected them.
+    #[arg(long, value_name = "LIST")]
+    exclude_tools: Option<String>,
+
     /// Print the resolved configuration and exit without starting the UI.
     #[arg(long)]
     print_config: bool,
@@ -51,6 +62,20 @@ fn main() -> Result<()> {
     };
     if let Some(model) = &args.model {
         config.model = model.clone();
+    }
+
+    let tools = match ToolSelection::parse(args.tools.as_deref(), args.exclude_tools.as_deref()) {
+        Ok(selection) => selection,
+        Err(message) => anyhow::bail!("{message}"),
+    };
+    // A name that matches nothing is almost always a typo, and silently
+    // declaring nothing would look like the tool simply refused to run.
+    let registry = ToolRegistry::builtin();
+    for entry in registry.unmatched(&tools) {
+        eprintln!(
+            "solaris: no tool named `{entry}` on this platform — available: {}",
+            registry.names().join(", ")
+        );
     }
 
     let state_dir = config_dir();
@@ -88,6 +113,12 @@ fn main() -> Result<()> {
         println!("model: {}", describe_model(&choice.model));
         println!("theme: {}", config.theme);
         println!("mode: {}", config.mode.label());
+        println!(
+            "tools: {}",
+            registry
+                .selected_names(config.mode, &tools)
+                .join(", ")
+        );
         println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {
             Some(path) => println!("credentials: {}", path.display()),
@@ -177,6 +208,7 @@ fn main() -> Result<()> {
         // The binary wants the provider's own model list in the picker; the
         // catalogue is what it falls back to.
         discover_models: true,
+        tools,
     });
     tui.set_root(Box::new(app));
 

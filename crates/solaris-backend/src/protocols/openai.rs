@@ -8,8 +8,9 @@
 
 use serde_json::{Value, json};
 
-use solaris_core::{AgentEvent, TurnRequest, Usage};
+use solaris_core::{AgentEvent, Message, TurnRequest, Usage};
 
+use crate::protocols::{PartialCall, arguments_json};
 use crate::sse::SseEvent;
 
 /// Marker a stream ends with.
@@ -21,7 +22,9 @@ const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 /// Build the request body for one turn.
 ///
 /// Unlike the Anthropic wire this one keeps system messages inline: it is the
-/// shape every compatible server understands.
+/// shape every compatible server understands. `tools` is written only when the
+/// caller declared some, so a request that wants no tools carries no such field
+/// for an upstream to reject.
 pub fn request_body(
     request: &TurnRequest,
     model: &str,
@@ -30,12 +33,13 @@ pub fn request_body(
 ) -> Value {
     let mut messages = Vec::with_capacity(request.history.len() + 1);
     for message in &request.history {
-        messages.push(json!({
-            "role": message.role.as_str(),
-            "content": message.content,
-        }));
+        push_message(&mut messages, message);
     }
-    messages.push(json!({ "role": "user", "content": request.prompt }));
+    // An empty prompt means the caller already put it in the history — which is
+    // what a tool round trip does — so no further user message is appended.
+    if !request.prompt.is_empty() {
+        messages.push(json!({ "role": "user", "content": request.prompt }));
+    }
 
     let mut body = json!({
         "model": model,
@@ -48,7 +52,75 @@ pub fn request_body(
         // compatible servers implement, but not all — see [`repair_for`].
         body["stream_options"] = json!({ "include_usage": true });
     }
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": spec.parameters,
+                        },
+                    })
+                })
+                .collect(),
+        );
+    }
     body
+}
+
+/// One history entry, in Chat Completions' shape.
+///
+/// A tool result is not a user message on this wire: each one is a `tool`
+/// message naming the call it answers, which is why one message in the shared
+/// transcript can become several here. Arguments travel as JSON *text*, not as
+/// an object, so they are serialised back.
+fn push_message(out: &mut Vec<Value>, message: &Message) {
+    for result in message.tool_results() {
+        out.push(json!({
+            "role": "tool",
+            "tool_call_id": result.id,
+            "content": result.output,
+        }));
+    }
+
+    let text = message.text();
+    let calls: Vec<Value> = message
+        .tool_calls()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": arguments_json(&call.input),
+                },
+            })
+        })
+        .collect();
+
+    // A message that was nothing but tool results has already been sent above.
+    if calls.is_empty() && text.is_empty() && message.is_tool_results() {
+        return;
+    }
+
+    let mut entry = json!({
+        "role": message.role.as_str(),
+        "content": text,
+    });
+    if !calls.is_empty() {
+        entry["tool_calls"] = Value::Array(calls);
+        // The canonical shape for a pure tool-call assistant turn is a null
+        // `content`, not an empty string.
+        if entry["content"].as_str().is_some_and(str::is_empty) {
+            entry["content"] = Value::Null;
+        }
+    }
+    out.push(entry);
 }
 
 /// A change to the request that a server asked for by rejecting it.
@@ -103,6 +175,9 @@ pub struct OpenAiStream {
     usage: Usage,
     reported_usage: bool,
     finished: bool,
+    /// Tool calls by the index the server assigns, which is what ties the
+    /// fragments of one call together.
+    calls: Vec<PartialCall>,
 }
 
 impl OpenAiStream {
@@ -152,11 +227,55 @@ impl OpenAiStream {
                 break;
             }
         }
+
+        self.read_tool_calls(&delta["tool_calls"]);
     }
 
     /// Whether the server signalled the end of its stream.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Hand over the calls this stream assembled.
+    ///
+    /// The caller runs this when the stream ends, so the model's whole message
+    /// is in hand before anything is executed.
+    pub fn flush(&mut self, out: &mut Vec<AgentEvent>) {
+        for (index, call) in std::mem::take(&mut self.calls).into_iter().enumerate() {
+            if let Some(call) = call.finish(format!("call_{index}")) {
+                out.push(AgentEvent::ToolCall(call));
+            }
+        }
+    }
+
+    /// Read the `tool_calls` fragments of one delta.
+    ///
+    /// A call arrives as its id and name once, then its arguments as JSON text
+    /// split at arbitrary boundaries, so only the arguments are appended.
+    fn read_tool_calls(&mut self, calls: &Value) {
+        let Some(entries) = calls.as_array() else {
+            return;
+        };
+        for entry in entries {
+            let index = entry["index"].as_u64().unwrap_or(0) as usize;
+            while self.calls.len() <= index {
+                self.calls.push(PartialCall::default());
+            }
+            let call = &mut self.calls[index];
+
+            if let Some(id) = entry["id"].as_str().filter(|id| !id.is_empty()) {
+                call.id = id.to_string();
+            }
+            if let Some(name) = entry["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+            {
+                call.name = name.to_string();
+            }
+            if let Some(arguments) = entry["function"]["arguments"].as_str() {
+                call.arguments.push_str(arguments);
+            }
+        }
     }
 
     /// The usage the server reported, once it has reported any.
@@ -231,7 +350,7 @@ fn error_text(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Message, Mode};
+    use solaris_core::{Message, Mode, ToolCall, ToolResult, ToolSpec};
 
     fn request() -> TurnRequest {
         TurnRequest {
@@ -241,6 +360,7 @@ mod tests {
             ],
             prompt: "second question".to_string(),
             mode: Mode::Build,
+            tools: Vec::new(),
         }
     }
 
@@ -409,5 +529,131 @@ mod tests {
         // Some servers send the message as a bare string.
         let (events, _) = replay(&[r#"{"error":"bad model"}"#]);
         assert_eq!(events, vec![AgentEvent::Error("bad model".to_string())]);
+    }
+
+    // ------------------------------------------------------------- tool calls
+
+    #[test]
+    fn declared_tools_reach_the_body_and_are_absent_when_there_are_none() {
+        let body = request_body(&request(), "gpt-5", 100, false);
+        assert!(
+            body.get("tools").is_none(),
+            "a request with no tools must carry no such field"
+        );
+
+        let mut request = request();
+        request.tools = vec![ToolSpec::new(
+            "read",
+            "Read file contents",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        )];
+        let body = request_body(&request, "gpt-5", 100, false);
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert_eq!(body["tools"][0]["function"]["description"], "Read file contents");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_assembled_from_their_fragments() {
+        let (mut events, mut stream) = replay(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.txt\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            DONE,
+        ]);
+        stream.flush(&mut events);
+
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].input["path"], "a.txt");
+    }
+
+    #[test]
+    fn two_tool_calls_keep_the_order_the_server_indexed_them_in() {
+        let (mut events, mut stream) = replay(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"ls","arguments":"{}"}},{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+            DONE,
+        ]);
+        stream.flush(&mut events);
+
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall(call) => Some(call.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["read", "ls"]);
+    }
+
+    #[test]
+    fn a_tool_call_with_no_name_is_not_reported() {
+        let (mut events, mut stream) = replay(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"arguments":"{}"}}]}}]}"#,
+            DONE,
+        ]);
+        stream.flush(&mut events);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_tool_exchange_becomes_a_call_and_a_tool_message() {
+        let call = ToolCall::new("call-1", "read", json!({ "path": "a.txt" }));
+        let mut request = request();
+        request
+            .history
+            .push(Message::tool_use(call.clone()));
+        request
+            .history
+            .push(Message::tool_result(ToolResult::ok(&call, "file contents")));
+
+        let body = request_body(&request, "gpt-5", 100, false);
+        let messages = body["messages"].as_array().expect("messages");
+
+        // system, user, assistant(call), tool(result), then the new prompt.
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"], r#"{"path":"a.txt"}"#,
+            "arguments travel as JSON text on this wire"
+        );
+        assert_eq!(
+            messages[2]["content"],
+            Value::Null,
+            "a pure tool-call turn has a null content, not an empty string"
+        );
+
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-1");
+        assert_eq!(messages[3]["content"], "file contents");
+    }
+
+    #[test]
+    fn an_empty_prompt_appends_no_further_message() {
+        let mut request = request();
+        request.prompt = String::new();
+
+        let body = request_body(&request, "gpt-5", 100, false);
+        assert_eq!(
+            body["messages"].as_array().expect("messages").len(),
+            2,
+            "the prompt already lives in the history"
+        );
     }
 }
