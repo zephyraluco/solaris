@@ -537,22 +537,36 @@ impl App {
         }
     }
 
-    /// Ctrl+C: copy a selection, stop a turn that is streaming, or start the
+    /// Copy the selection when a range was drawn, reporting whether there was one.
+    ///
+    /// This is the first rung of the ctrl+C ladder the reference terminals use:
+    /// pi-tui binds `ctrl+c` to a copy action, Claude Code and claurst interrupt
+    /// first, and only a key with nothing left to do asks about quitting. Copy
+    /// sits on top of all of them, so a range drawn over the transcript, over a
+    /// streaming turn or over the wizard is always what the key does.
+    ///
+    /// A range holding nothing but blanks still counts as answered: the user drew
+    /// it, so the key must not fall through to clearing the prompt or arming the
+    /// quit.
+    fn copy_selection_if_any(&mut self) -> bool {
+        let selected = {
+            let selection = self.selection.borrow();
+            if !selection.is_active() {
+                return false;
+            }
+            selection.selected_text()
+        };
+
+        self.copy_selection(&selected);
+        true
+    }
+
+    /// Ctrl+C with nothing drawn: stop a turn that is streaming, or start the
     /// two-press quit.
     ///
-    /// That ladder is the one the reference terminals use — pi-tui binds
-    /// `ctrl+c` to a copy action, Claude Code and claurst interrupt first, and
-    /// only a key with nothing left to do asks about quitting.
+    /// [`App::copy_selection_if_any`] settles the copy case before this is
+    /// reached, so a drawn range never cancels a turn or clears the prompt.
     fn interrupt(&mut self) {
-        // A drawn range copies even when it holds nothing but blanks, and it
-        // must never fall through to clearing the prompt or asking to quit.
-        let has_selection = self.selection.borrow().is_active();
-        if has_selection {
-            let selected = self.selection.borrow().selected_text();
-            self.copy_selection(&selected);
-            return;
-        }
-
         if self.session.is_streaming() {
             self.cancel_turn();
             return;
@@ -1588,8 +1602,15 @@ impl Component for App {
             return KeyResult::Handled;
         }
 
+        // Ctrl+C copies first, wherever the range was drawn — over the wizard's
+        // own text too — so "copy" outranks the "cancel" and "interrupt" below.
+        if self.keybindings.matches("quit", &key) && self.copy_selection_if_any() {
+            return KeyResult::Handled;
+        }
+
         // The inline wizard owns the keyboard while it is up — including
-        // Ctrl+C, which cancels the wizard rather than the application.
+        // Ctrl+C, which cancels the wizard rather than the application. It only
+        // sees that key when there is nothing to copy.
         if self.inline.is_some() {
             self.handle_inline_key(key);
             return KeyResult::Handled;
@@ -3432,6 +3453,39 @@ mod tests {
                 (MouseEventKind::Up(MouseButton::Left), to),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_copies_instead_of_cancelling_a_streaming_turn() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("hello".to_string());
+        assert!(app.session.is_streaming());
+
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().as_slice(), ["› hello".to_string()]);
+        assert!(
+            app.session.is_streaming(),
+            "a copy must not stop the turn that is running"
+        );
+        assert!(!app.quit.get(), "copying a selection must not quit");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_copies_over_the_wizard_instead_of_cancelling_it() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("/connect".to_string());
+        assert!(app.connect_open());
+
+        // The transcript is still on screen behind the wizard, and the range can
+        // be drawn over either.
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (5, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().len(), 1, "the range was not copied");
+        assert!(app.connect_open(), "the wizard was cancelled instead");
+        assert!(!app.quit.get(), "copying a selection must not quit");
     }
 
     #[tokio::test]
