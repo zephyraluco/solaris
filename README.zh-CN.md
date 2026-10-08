@@ -41,7 +41,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 会话统计 —— 轮次、分类 token、费用与上下文占用
 > - 凭据、伙伴与历史记录保存在平台配置目录下
 >
-> **尚未具备：** MCP、会话落盘、真实的设备码登录，以及工具执行前的交互式确认。
+> **尚未具备：** MCP、会话落盘，以及工具执行前的交互式确认。
 
 ---
 
@@ -180,9 +180,9 @@ solaris --exclude-tools 'bash'
 
 ## Provider
 
-`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、Claude 订阅、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
+`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、OpenCode Zen、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
 
-三条 wire 协议就覆盖了整个目录。Anthropic Messages API 承载两个 Claude 条目；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 自己则使用更新的 Responses API。谁走哪条协议是目录表里的一列，不靠猜。
+三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Zen 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。
 
 ### 环境变量
 
@@ -206,8 +206,6 @@ solaris --exclude-tools 'bash'
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
 - **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。不指定模型名就用其中的第一个，因为空模型名 provider 不会接受。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
 - **错误。** key 被拒、模型不存在、触发限流，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
-
-唯一的缺口是 `claude-subscription`：通过 OAuth 登录尚未实现，因此向导会直接说明这一点并要求你改用 API key。provider 条目、模型列表与凭据接缝都已就位，等这个流程落地即可接上。
 
 ---
 

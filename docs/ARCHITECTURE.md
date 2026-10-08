@@ -19,7 +19,7 @@ solaris              应用：根组件、对话框、/connect 向导、转录�
 
 三条硬性约束：
 
-1. **依赖只能向下**。`solaris-core` 与 `solaris-tui` 互不依赖；`solaris-provider` 与 `solaris-tools` 都建在 `solaris-backend` 之上——平台层必须知道「谁讲哪种协议」，工具层必须能发请求，而传输层反过来什么都不需要知道。应用层只向上组合它们。
+1. **依赖只能向下**。`solaris-core` 与 `solaris-tui` 互不依赖；`solaris-provider` 与 `solaris-tools` 都建在 `solaris-backend` 之上——平台层必须知道「哪个模型讲哪种协议」，工具层必须能发请求，而传输层反过来什么都不需要知道。应用层只向上组合它们。
 2. **UI 不认识任何 provider**。界面把一次请求交给 `AgentBackend`，只消费它回流的 `AgentEvent` 流；换成真实模型服务只需实现这个 trait。
 3. **工具对 UI 透明**。`ToolLoop` 包在 `AgentBackend` 外面，多轮循环因此不进入应用层：UI 只是多消费两种事件，别无改动。
 
@@ -100,7 +100,7 @@ pub trait AgentBackend: Send + Sync {
 - **计费**：`Usage` 把各家的报告归一成四个互不重叠的桶（两家 OpenAI 协议都把缓存读计入 `input_tokens` / `prompt_tokens`，会被减掉）；提供商什么都没报时退回按字符估算并置位 `estimated`，`/stats` 会据此显示 `≈`。价格来自 `provider` 表的内置快照，未知模型不收费。生成的 token 还是 0 的 `usage` 块不算「报告过」。
 - **上下文 vs 会话总量**：`SessionState::total_tokens()` 是全会话累计（帧脚把它和累计费用并排显示），`SessionState::context_tokens()` 才是「窗口有多满」——取最后一轮有上报的 usage，加上其后新提交内容的估算；没有任何上报时退化为对提示词取估算。把累计量拿去比窗口是错的，因为窗口是每请求的，而累计会无限增长。
 - **没有可用凭据时**，`lib.rs` 里的 `UnconnectedBackend` 接管：它不发任何请求，而是把每一轮直接变成一条可操作的错误（「run /connect」，或指名该 provider 的环境变量），页脚也会写 `unconnected`。这样既不会假装有回复，也不会发一个必然 401 的请求。
-- [`lib.rs`](../crates/solaris-backend/src/lib.rs) 的 `choose_backend(auth, model, options)` 是应用唯一需要知道的入口：按「环境变量 > `auth.json` > 本机运行时无需凭据」解析出一个 `BackendChoice`（后端 + provider id + 端点 + 凭据来源）。解析不出可用凭据就交给 `UnconnectedBackend`（`CredentialSource::Missing`）；OAuth 类 provider 在签名流程落地前明确报告 `NotImplemented`，同样不发请求。模型名为空时（用户还没选过模型）换成该 provider 提供的第一个模型；用户明确给过的名字则原样送出。**目录里也没有名字时**（网关与自定义端点就是这样）凭据一样解析出端点，只是包成 `NamelessBackend`：turn 照旧拒绝——空模型名只会换来 400——但 `models()` 直通真正的客户端，因为那份清单正是名字的唯一来源，否则 `/model` 会永远空着（`CredentialSource::NoModel`，provider id 仍然给出来）。`BackendOptions` 里的 `environment` 可注入，测试因此既不继承 shell 里的 key、也碰不到网络。
+- [`lib.rs`](../crates/solaris-backend/src/lib.rs) 的 `choose_backend(auth, model, options)` 是应用唯一需要知道的入口：按「环境变量 > `auth.json` > 本机运行时无需凭据」解析出一个 `BackendChoice`（后端 + provider id + 端点 + 凭据来源）。解析不出可用凭据就交给 `UnconnectedBackend`（`CredentialSource::Missing`）。模型名为空时（用户还没选过模型）换成该 provider 提供的第一个模型；用户明确给过的名字则原样送出。**目录里也没有名字时**（网关与自定义端点就是这样）凭据一样解析出端点，只是包成 `NamelessBackend`：turn 照旧拒绝——空模型名只会换来 400——但 `models()` 直通真正的客户端，因为那份清单正是名字的唯一来源，否则 `/model` 会永远空着（`CredentialSource::NoModel`，provider id 仍然给出来）。`BackendOptions` 里的 `environment` 可注入，测试因此既不继承 shell 里的 key、也碰不到网络。
 - `AgentBackend` 是唯一扩展点：再实现一个即可接入新协议，UI 零改动。
 
 ---
@@ -314,7 +314,7 @@ while !quit {
 | 会话 | `session: SessionState`、`transcript: TranscriptView`、`notifications: NotificationQueue` |
 | 输入 | `editor: Editor`、`keybindings`、`inline: Option<ConnectFlow>` |
 | 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag`、`selection` |
-| 跨线程通道 | `events_rx`（后端事件）、`dialog_rx` / `dialog_tx`（对话框结果）、`device_rx`（设备码授权进度） |
+| 跨线程通道 | `events_rx`（后端事件）、`dialog_rx` / `dialog_tx`（对话框结果） |
 | 持久化 | `auth` / `auth_path`、`buddy` / `buddy_path`、`recent` / `recent_path` |
 | 剪贴板 | `clipboard: Clipboard`（`write` / `read` 两个可注入的闭包，生产环境是 `arboard`） |
 | 展示与动画 | `version`、`greeting`、`tip`、`spinner_frame`、`buddy_step` / `buddy_started`、`queued_prompts` |
@@ -392,7 +392,7 @@ App::start_turn
    ├─ 收到终态事件或通道断开 → 结束该轮、清 status、
    │                          取出 queued_prompts 中的下一条提示词开跑
    ├─ 排空 dialog_rx → on_dialog_message（主题/模型/命令/确认）
-   ├─ 排空 device_rx → 驱动内联向导的设备码步骤
+   ├─ 排空 events_rx
    ├─ notifications.tick()、spinner 前进、伙伴动画步进
    └─ 任一变化则返回 dirty = true
    │
@@ -425,16 +425,15 @@ enum DialogMessage { Cancelled, Theme(String), Command(String),
 **列表类选择器走内联**：`/connect` 与 `/model` 都不弹浮层，而是接管输入区（与 Claude Code 的 `/login` 视觉一致）。[`ConnectFlow`](../crates/solaris/src/connect.rs) 是一个状态机：
 
 ```text
-ConnectStep:   Provider → ApiKey | CustomProvider | DeviceAuth → Model
+ConnectStep:   Provider → ApiKey | CustomProvider → Model
 ConnectOutcome: Handled | Closed | ProviderPicked | Submit | ModelPicked
-DeviceAuthStatus / DeviceAuthEvent: 设备码授权进度回传
 ```
 
 `/model` 由 [`model.rs`](../crates/solaris/src/model.rs) 实现：它只写下这个命令的策略（列表说什么、选中意味着什么），列表本身是框架组件 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs) —— 标题、说明、问题行、`❯` 行、底部提示、按键、滚轮与命中测试都在那里，`/connect` 的 provider / model 两步用的也是它，所以两者样式不会漂移。`App` 用一个 `Inline` 枚举持有两者并转发事件。
 
 Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/solaris/src/connect.rs) 接受空列表（此时给选择器加一行「正在问 provider」的说明），provider 的答案到达后同一个方法再调一次，把列表填上并把当前模型设为高亮行，回车即沿用——所以网关用户看到的第三步和内置目录的 provider 完全一样，只是晚半秒。
 
-流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。文本步骤会从 `AuthStore` 回填该 provider 已存的 URL 与 key（key 照常掩码显示），所以重新 `/connect` 看到的是已保存的内容而不是空字段，直接回车即沿用；`ctrl+u` 清空当前字段，用来换成另一个 key。设备码授权的网络侧尚未实现，所以向导的这一步会直接报「not implemented」并让用户改用 API key —— 编一个占位 token 更糟：它会连上一个回答不了的 provider，然后第一轮以一个解释不了任何事的认证错误失败。
+流程状态（第几步、输入框内容）归 `ConnectFlow`；副作用（写凭据、激活 provider、重新解析后端）归 `App`，因为那是应用状态而非流程状态。文本步骤会从 `AuthStore` 回填该 provider 已存的 URL 与 key（key 照常掩码显示），所以重新 `/connect` 看到的是已保存的内容而不是空字段，直接回车即沿用；`ctrl+u` 清空当前字段，用来换成另一个 key。
 
 ### 6.8 持久化
 
@@ -460,8 +459,8 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 | 调整工具的输出上限 | [`truncate.rs`](../crates/solaris-tools/src/truncate.rs) 的 `DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`，或给单个工具 `with_limits`。 |
 | 限制一次工具往返的次数 | [`agent_loop.rs`](../crates/solaris-tools/src/agent_loop.rs) 的 `DEFAULT_MAX_ROUNDS`，或 `ToolLoopOptions::max_rounds`。 |
 | 换掉 ripgrep / fd | 实现 `CommandRunner` 并传给 `ToolRegistry::with_runners`（`grep` 与 `find` 都经它起子进程）。 |
-| 接入新的 wire 协议 | 在 [`solaris-core/src/provider.rs`](../crates/solaris-core/src/provider.rs) 的 `Wire` 加一个变体，在 [`wire.rs`](../crates/solaris-backend/src/wire.rs) 的 `request_body` / `WireStream` 各加一个分支，照 [`protocols/`](../crates/solaris-backend/src/protocols) 里既有的三个模块写一个只做「请求体 + 流解析」的模块，最后让 `PROVIDERS` 里对应的 provider 指向它。UI 与 `choose_backend` 都不用动。 |
-| 增删 provider 目录项 / 模型 | [`solaris-core/src/provider.rs`](../crates/solaris-core/src/provider.rs) 的 `PROVIDERS`（向导步骤、模型选择器、端点、环境变量与价格表都从这里读）。 |
+| 接入新的 wire 协议 | 在 [`wire.rs`](../crates/solaris-backend/src/wire.rs) 的 `Wire` 加一个变体，在同一个 `wire.rs` 的 `request_body` / `WireStream` 各加一个分支，照 [`protocols/`](../crates/solaris-backend/src/protocols) 里既有的三个模块写一个只做「请求体 + 流解析」的模块，最后让 `PROVIDERS` 里对应的条目指向它——provider 自己的 `wire` 管它没列出的模型，模型的 `wire` 管它自己。UI 与 `choose_backend` 的调用方都不用动。 |
+| 增删 provider 目录项 / 模型 | [`solaris-provider/src/providers.rs`](../crates/solaris-provider/src/providers.rs) 的 `PROVIDERS`（向导步骤、模型选择器、端点、环境变量、价格表，以及每个模型自己的 wire 都从这里读）。 |
 | 调整重试 / 超时策略 | [`solaris-backend/src/http.rs`](../crates/solaris-backend/src/http.rs)：`BACKOFF`、`IDLE_TIMEOUT`、`CONNECT_TIMEOUT`。 |
 | 新增斜杠命令 | [`solaris-core/src/command.rs`](../crates/solaris-core/src/command.rs) 的命令表 + `App::execute_command` 加一个分支；补全、面板、帮助会自动跟随。 |
 | 新增浮层对话框 | 在 [`dialogs.rs`](../crates/solaris/src/dialogs.rs) 实现 `Component`，经 `DialogMessage` 回传结果，再用 `push_overlay` 打开。 |
@@ -475,9 +474,9 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ## 8. 测试策略
 
-工作区共 **616 个测试**，分三层：
+工作区共 **619 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 44、`solaris-core` 41、`solaris-tui` 130、`solaris-backend` 88、`solaris-tools` 112、`solaris` 库 161），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`ToolLoop` 的多轮与轮数上限、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 46、`solaris-core` 41、`solaris-tui` 130、`solaris-backend` 89、`solaris-tools` 114、`solaris` 库 159），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`ToolLoop` 的多轮与轮数上限、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
 - **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
 - **工具往返的回路测试** [`crates/solaris-tools/tests/loopback.rs`](../crates/solaris-tools/tests/loopback.rs)（2 个）：同一套真 socket 手法，但服务端先回一个 `tool_call`、再回最终文本，于是「请求体带上了 `tools` → 调用被解析出来 → 真的 `read` 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。
 ead 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证。仍然不碰外网。
@@ -497,7 +496,6 @@ cargo test --workspace
 - **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
 - **`grep` 与 `find` 需要外部程序**。它们 shell out 到 ripgrep 与 fd；缺失时工具会明确报错并给出安装提示，而不是退化成另一个实现。
 - **工具输出是截断的**。读类保留前 2000 行或 50KB，命令类保留末尾并把完整输出写进临时文件；被截断的那部分只有通过报告出来的路径才读得到。
-- **设备码授权仍是替身**。`spawn_device_auth` 不联系任何授权服务器，只回报「尚未实现」，所以 `claude-subscription` 目前必须手工往 `auth.json` 里放 token 才会真的发请求。
 - **价格是内置快照**。`provider` 表里的单价是打表值，账单可能不同；未知模型按 0 计。
 - **报不了用量的服务端会被估算**。OpenAI 兼容服务里有一部分不实现 `stream_options.include_usage`，那一轮退回按字符估算，并在 `/stats` 里标注 `≈`。
 - **Windows 上不启用 bracketed paste**，粘贴内容以按键事件到达（`Component::handle_paste` 不会被调用）。

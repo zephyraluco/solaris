@@ -180,9 +180,9 @@ Every user gets a terminal companion, shown in the welcome box and animated betw
 
 ## Providers
 
-`/connect` opens an inline wizard that takes over the prompt region instead of opening an overlay. It walks through picking a provider and supplying whatever that provider authenticates with: an API key, an OpenAI-compatible base URL plus key, or nothing at all for a runtime on your machine. The catalogue covers Anthropic, a Claude subscription, OpenAI, Google, OpenRouter, a self-hosted New API gateway and a local Ollama/llama.cpp runtime. Most entries list the models they offer; a gateway and a custom endpoint collect their own URL and key instead, and are then asked what they have. Credentials are stored in `auth.json` and masked wherever they are displayed.
+`/connect` opens an inline wizard that takes over the prompt region instead of opening an overlay. It walks through picking a provider and supplying whatever that provider authenticates with: an API key, an OpenAI-compatible base URL plus key, or nothing at all for a runtime on your machine. The catalogue covers Anthropic, OpenCode Zen, OpenAI, Google, OpenRouter, a self-hosted New API gateway and a local Ollama/llama.cpp runtime. Most entries list the models they offer; a gateway and a custom endpoint collect their own URL and key instead, and are then asked what they have. Credentials are stored in `auth.json` and masked wherever they are displayed.
 
-Three wire protocols cover the whole catalogue. The Anthropic Messages API carries both Claude entries; the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak; and OpenAI itself uses the newer Responses API. Which wire a provider speaks is a column in the catalogue, not a guess.
+Three wire protocols cover the whole catalogue, and the *model* decides which one carries it: the Anthropic Messages API reaches the Claude models, the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak, and OpenAI's models use the newer Responses API. A provider's own wire is the floor for whatever its table does not list, which is what lets a single OpenCode Zen key answer GPT models on the Responses API, Claude models on the Messages API and everything else on the compatibility floor.
 
 ### Environment variables
 
@@ -206,8 +206,6 @@ Keys found in the environment win over `auth.json`, and a key in the environment
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
 - **Model names.** Already connected once, solaris asks the provider which models it offers (`GET /models`, the one list endpoint both wires answer) and offers those in `/model`, annotated with the description and price from the bundled catalogue where the model is known. Name none and the first of them is used, because an empty model name is not something a provider will accept. If the provider will not answer, the bundled catalogue is what the picker shows; if there is nothing there either, `/model` says so rather than sending an empty name and collecting a 400. A name you passed with `--model` or `/model <name>` is kept exactly as written, even when nothing lists it.
 - **Errors.** A rejected key, an unknown model or a rate limit is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
-
-`claude-subscription` is the one gap: signing in over OAuth is not implemented, so the wizard says so and asks you to connect an API key instead. The provider entry, the model list and the credential seam are all in place for when the flow lands.
 
 ---
 
