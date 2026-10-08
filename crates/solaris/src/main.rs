@@ -115,9 +115,7 @@ fn main() -> Result<()> {
         println!("mode: {}", config.mode.label());
         println!(
             "tools: {}",
-            registry
-                .selected_names(config.mode, &tools)
-                .join(", ")
+            registry.selected_names(config.mode, &tools).join(", ")
         );
         println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {

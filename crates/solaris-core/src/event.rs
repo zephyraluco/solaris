@@ -21,7 +21,10 @@ pub enum AgentEvent {
     /// turn only ends when the model stops asking.
     ToolCall(ToolCall),
     /// What running a requested tool produced, and how long it took.
-    ToolResult { result: ToolResult, duration_ms: u64 },
+    ToolResult {
+        result: ToolResult,
+        duration_ms: u64,
+    },
     /// Terminal event: the turn finished successfully.
     TurnComplete {
         /// What the turn consumed, measured by the provider or estimated when

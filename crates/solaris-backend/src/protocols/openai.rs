@@ -551,7 +551,10 @@ mod tests {
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
-        assert_eq!(body["tools"][0]["function"]["description"], "Read file contents");
+        assert_eq!(
+            body["tools"][0]["function"]["description"],
+            "Read file contents"
+        );
         assert_eq!(
             body["tools"][0]["function"]["parameters"]["properties"]["path"]["type"],
             "string"
@@ -613,9 +616,7 @@ mod tests {
     fn a_tool_exchange_becomes_a_call_and_a_tool_message() {
         let call = ToolCall::new("call-1", "read", json!({ "path": "a.txt" }));
         let mut request = request();
-        request
-            .history
-            .push(Message::tool_use(call.clone()));
+        request.history.push(Message::tool_use(call.clone()));
         request
             .history
             .push(Message::tool_result(ToolResult::ok(&call, "file contents")));

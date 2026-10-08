@@ -307,8 +307,8 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::tests::StubRunner;
     use crate::runner::CommandOutput;
+    use crate::runner::tests::StubRunner;
     use crate::tools::shell::{ShellConfig, ShellOutcome};
 
     struct StubShell;
@@ -341,7 +341,11 @@ mod tests {
     fn the_registry_holds_one_shell_for_this_platform() {
         let registry = registry();
         assert!(registry.get(SHELL_TOOL).is_some());
-        let other = if SHELL_TOOL == "bash" { "powershell" } else { "bash" };
+        let other = if SHELL_TOOL == "bash" {
+            "powershell"
+        } else {
+            "bash"
+        };
         assert!(registry.get(other).is_none(), "only one shell can run here");
         assert_eq!(registry.get("read").expect("read").name(), "read");
     }
@@ -355,7 +359,10 @@ mod tests {
         assert!(build.contains(&SHELL_TOOL.to_string()));
         assert!(build.contains(&"edit".to_string()));
         assert!(build.contains(&"write".to_string()));
-        assert!(!build.contains(&"grep".to_string()), "not in the default set");
+        assert!(
+            !build.contains(&"grep".to_string()),
+            "not in the default set"
+        );
 
         let plan = names(&registry.select(Mode::Plan, &ToolSelection::none()));
         assert_eq!(plan, vec!["find", "grep", "ls", "read"]);
@@ -449,7 +456,11 @@ mod tests {
         assert_eq!(selection.add, vec!["codemode"]);
 
         assert!(ToolSelection::parse(Some("read,+grep"), None).is_err());
-        assert!(ToolSelection::parse(Some("   "), None).expect("blank").is_default());
+        assert!(
+            ToolSelection::parse(Some("   "), None)
+                .expect("blank")
+                .is_default()
+        );
     }
 
     #[test]

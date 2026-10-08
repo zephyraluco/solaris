@@ -109,7 +109,9 @@ impl Tool for EditTool {
                 let edit_count = edits.len();
                 let updated = match apply_edits(&normalized, &edits) {
                     Ok(updated) => updated,
-                    Err(error) => return ToolOutput::error(format!("could not edit {path}: {error}")),
+                    Err(error) => {
+                        return ToolOutput::error(format!("could not edit {path}: {error}"));
+                    }
                 };
 
                 if ctx.is_cancelled() {
@@ -178,13 +180,17 @@ mod tests {
     }
 
     async fn read(dir: &Path, name: &str) -> String {
-        tokio::fs::read_to_string(dir.join(name)).await.expect("read")
+        tokio::fs::read_to_string(dir.join(name))
+            .await
+            .expect("read")
     }
 
     #[tokio::test]
     async fn a_replacement_is_written_back() {
         let dir = test_dir("edit-simple");
-        tokio::fs::write(dir.join("a.txt"), "fn main() {}\n").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "fn main() {}\n")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(
@@ -201,7 +207,9 @@ mod tests {
     #[tokio::test]
     async fn several_edits_land_in_one_pass() {
         let dir = test_dir("edit-many");
-        tokio::fs::write(dir.join("a.txt"), "one two three").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "one two three")
+            .await
+            .expect("fixture");
 
         tool()
             .run(
@@ -222,7 +230,9 @@ mod tests {
     #[tokio::test]
     async fn a_crlf_file_keeps_its_line_endings() {
         let dir = test_dir("edit-crlf");
-        tokio::fs::write(dir.join("a.txt"), "one\r\ntwo\r\n").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "one\r\ntwo\r\n")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(
@@ -238,7 +248,9 @@ mod tests {
     #[tokio::test]
     async fn a_byte_order_mark_survives_and_is_not_part_of_the_match() {
         let dir = test_dir("edit-bom");
-        tokio::fs::write(dir.join("a.txt"), "\u{feff}hello").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "\u{feff}hello")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(
@@ -254,7 +266,9 @@ mod tests {
     #[tokio::test]
     async fn an_ambiguous_edit_is_refused_with_an_explanation() {
         let dir = test_dir("edit-ambiguous");
-        tokio::fs::write(dir.join("a.txt"), "x\nx\n").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "x\nx\n")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(
@@ -271,7 +285,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_edits_are_reported_per_entry() {
         let dir = test_dir("edit-malformed");
-        tokio::fs::write(dir.join("a.txt"), "hello").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "hello")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(

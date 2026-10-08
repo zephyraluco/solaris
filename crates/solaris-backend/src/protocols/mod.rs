@@ -44,7 +44,11 @@ impl PartialCall {
         } else {
             self.id
         };
-        Some(ToolCall::new(id, self.name, parse_arguments(&self.arguments)))
+        Some(ToolCall::new(
+            id,
+            self.name,
+            parse_arguments(&self.arguments),
+        ))
     }
 }
 

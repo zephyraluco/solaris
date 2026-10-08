@@ -64,7 +64,11 @@ impl Truncation {
     /// `None` when nothing was dropped: a notice that always appears spends the
     /// model's attention on saying nothing.
     pub fn notice(&self, limits: Limits) -> Option<String> {
-        let budget = format!("{} lines / {}", limits.max_lines, format_size(limits.max_bytes));
+        let budget = format!(
+            "{} lines / {}",
+            limits.max_lines,
+            format_size(limits.max_bytes)
+        );
         match self.removed {
             Removed::None => None,
             Removed::Back => Some(format!(

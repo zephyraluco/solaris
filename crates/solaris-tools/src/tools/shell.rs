@@ -310,7 +310,9 @@ impl Tool for ShellTool {
         if outcome.timed_out {
             notices.push(format!(
                 "the command was still running after {}s and was killed",
-                timeout.map(|duration| duration.as_secs()).unwrap_or_default()
+                timeout
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default()
             ));
         }
         if outcome.cancelled {
@@ -336,9 +338,10 @@ async fn write_full_output(output: &str, ctx: &ToolContext) -> Result<std::path:
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = ctx
-        .temp_dir
-        .join(format!("solaris-output-{}-{unique}.log", std::process::id()));
+    let path = ctx.temp_dir.join(format!(
+        "solaris-output-{}-{unique}.log",
+        std::process::id()
+    ));
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -442,7 +445,10 @@ mod tests {
         });
 
         let output = ShellTool::bash(runner.clone())
-            .run(json!({ "command": "sleep 99", "timeout": 2 }), &context(&dir))
+            .run(
+                json!({ "command": "sleep 99", "timeout": 2 }),
+                &context(&dir),
+            )
             .await;
 
         assert!(output.text.contains("killed"), "{}", output.text);
@@ -501,7 +507,11 @@ mod tests {
             .run(json!({ "command": "noisy" }), &context(&dir))
             .await;
 
-        assert!(output.text.starts_with("line 98\nline 99\nline 100"), "{}", output.text);
+        assert!(
+            output.text.starts_with("line 98\nline 99\nline 100"),
+            "{}",
+            output.text
+        );
         let notice = output.text.split('[').nth(1).expect("a notice");
         assert!(notice.contains("full output at"), "{notice}");
 
@@ -554,7 +564,11 @@ mod tests {
         // The only test that spawns a shell: it proves the local runner wires a
         // process up correctly, which a stub cannot.
         let dir = test_dir("shell-real");
-        let command = if cfg!(windows) { "Write-Output hello" } else { "echo hello" };
+        let command = if cfg!(windows) {
+            "Write-Output hello"
+        } else {
+            "echo hello"
+        };
 
         let output = ShellTool::new(
             if cfg!(windows) {
@@ -568,6 +582,10 @@ mod tests {
         .await;
 
         assert!(!output.is_error, "{}", output.text);
-        assert!(output.text.to_lowercase().contains("hello"), "{}", output.text);
+        assert!(
+            output.text.to_lowercase().contains("hello"),
+            "{}",
+            output.text
+        );
     }
 }

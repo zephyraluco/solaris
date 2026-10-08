@@ -145,10 +145,7 @@ fn registry() -> Arc<ToolRegistry> {
 
 /// A directory that lasts for one test.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "solaris-tools-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("solaris-tools-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -200,10 +197,7 @@ async fn a_tool_call_round_trips_through_a_real_socket() {
         })
         .collect();
     assert_eq!(text, "it says hello");
-    assert_eq!(
-        events.iter().filter(|event| event.is_terminal()).count(),
-        1
-    );
+    assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
 
     // Both requests went out: the first declared the tool, the second carried
     // the answer back.

@@ -48,7 +48,12 @@ impl CommandOutput {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run `program` with `args` in `cwd`.
-    async fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<CommandOutput, String>;
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<CommandOutput, String>;
 }
 
 /// The real runner: a child process with piped output.
@@ -57,7 +62,12 @@ pub struct LocalRunner;
 
 #[async_trait]
 impl CommandRunner for LocalRunner {
-    async fn run(&self, program: &str, args: &[String], cwd: &Path) -> Result<CommandOutput, String> {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<CommandOutput, String> {
         let mut command = Command::new(program);
         command
             .args(args)

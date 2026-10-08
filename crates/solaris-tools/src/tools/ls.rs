@@ -140,9 +140,15 @@ mod tests {
     #[tokio::test]
     async fn entries_are_sorted_and_directories_are_marked() {
         let dir = test_dir("ls-sorted");
-        tokio::fs::create_dir_all(dir.join("src")).await.expect("fixture");
-        tokio::fs::write(dir.join("README.md"), "hi").await.expect("fixture");
-        tokio::fs::write(dir.join(".env"), "x").await.expect("fixture");
+        tokio::fs::create_dir_all(dir.join("src"))
+            .await
+            .expect("fixture");
+        tokio::fs::write(dir.join("README.md"), "hi")
+            .await
+            .expect("fixture");
+        tokio::fs::write(dir.join(".env"), "x")
+            .await
+            .expect("fixture");
 
         let output = LsTool::new().run(json!({}), &context(&dir)).await;
         assert!(!output.is_error, "{}", output.text);
@@ -171,7 +177,10 @@ mod tests {
             .run(json!({ "limit": 2 }), &context(&dir))
             .await;
 
-        assert_eq!(output.text.lines().filter(|l| l.starts_with('f')).count(), 2);
+        assert_eq!(
+            output.text.lines().filter(|l| l.starts_with('f')).count(),
+            2
+        );
         assert!(output.text.contains("use limit=4"), "{}", output.text);
     }
 
@@ -189,7 +198,9 @@ mod tests {
     #[tokio::test]
     async fn a_file_is_not_a_directory() {
         let dir = test_dir("ls-file");
-        tokio::fs::write(dir.join("a.txt"), "x").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "x")
+            .await
+            .expect("fixture");
 
         let output = LsTool::new()
             .run(json!({ "path": "a.txt" }), &context(&dir))

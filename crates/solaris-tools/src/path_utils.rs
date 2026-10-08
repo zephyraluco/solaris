@@ -36,14 +36,21 @@ mod tests {
     #[test]
     fn a_relative_path_resolves_against_the_session_directory() {
         let cwd = Path::new("/work");
-        assert_eq!(resolve(cwd, "src/main.rs"), PathBuf::from("/work/src/main.rs"));
+        assert_eq!(
+            resolve(cwd, "src/main.rs"),
+            PathBuf::from("/work/src/main.rs")
+        );
         assert_eq!(resolve(cwd, "."), PathBuf::from("/work"));
     }
 
     #[test]
     fn an_absolute_path_is_left_alone() {
         let cwd = Path::new("/work");
-        let absolute = if cfg!(windows) { r"C:\tmp\a.txt" } else { "/tmp/a.txt" };
+        let absolute = if cfg!(windows) {
+            r"C:\tmp\a.txt"
+        } else {
+            "/tmp/a.txt"
+        };
         assert_eq!(resolve(cwd, absolute), PathBuf::from(absolute));
     }
 

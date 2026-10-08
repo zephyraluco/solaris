@@ -410,12 +410,7 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-        let choice = with_tools(
-            choice,
-            Arc::clone(&self.registry),
-            &self.tools,
-            &self.cwd,
-        );
+        let choice = with_tools(choice, Arc::clone(&self.registry), &self.tools, &self.cwd);
         self.backend = choice.backend;
         self.provider_id = choice.provider_id;
         choice.source

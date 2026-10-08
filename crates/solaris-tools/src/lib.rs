@@ -23,16 +23,16 @@ mod path_utils;
 mod registry;
 mod runner;
 mod tool;
-mod truncate;
 pub mod tools;
+mod truncate;
 
 pub use agent_loop::{DEFAULT_MAX_ROUNDS, ToolLoop, ToolLoopOptions};
 pub use approver::{AlwaysApprove, Approval, Approver, DenyAll, FnApprover};
 pub use diff::{Edit, EditError};
 pub use mutation_queue::FileMutationQueue;
-pub use registry::{
-    BUILTIN_TOOLS, SHELL_TOOL, ToolRegistry, ToolSelection, default_tool_names,
-};
+pub use registry::{BUILTIN_TOOLS, SHELL_TOOL, ToolRegistry, ToolSelection, default_tool_names};
 pub use runner::{CommandOutput, CommandRunner, LocalRunner};
 pub use tool::{Cancel, Tool, ToolContext, ToolOutput};
-pub use truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size};
+pub use truncate::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size,
+};

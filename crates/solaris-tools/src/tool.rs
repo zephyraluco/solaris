@@ -222,7 +222,10 @@ mod tests {
 
     #[test]
     fn an_optional_string_treats_empty_as_absent() {
-        assert_eq!(optional_string_arg(&json!({}), "glob").expect("absent"), None);
+        assert_eq!(
+            optional_string_arg(&json!({}), "glob").expect("absent"),
+            None
+        );
         assert_eq!(
             optional_string_arg(&json!({ "glob": "  " }), "glob").expect("blank"),
             None
@@ -236,7 +239,10 @@ mod tests {
 
     #[test]
     fn an_optional_count_must_be_positive() {
-        assert_eq!(optional_count_arg(&json!({}), "limit").expect("absent"), None);
+        assert_eq!(
+            optional_count_arg(&json!({}), "limit").expect("absent"),
+            None
+        );
         assert_eq!(
             optional_count_arg(&json!({ "limit": 5 }), "limit").expect("set"),
             Some(5)
@@ -248,7 +254,10 @@ mod tests {
 
     #[test]
     fn an_optional_flag_must_be_a_flag() {
-        assert_eq!(optional_bool_arg(&json!({}), "literal").expect("absent"), None);
+        assert_eq!(
+            optional_bool_arg(&json!({}), "literal").expect("absent"),
+            None
+        );
         assert_eq!(
             optional_bool_arg(&json!({ "literal": true }), "literal").expect("set"),
             Some(true)

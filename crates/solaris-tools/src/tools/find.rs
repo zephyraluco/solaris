@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use crate::path_utils;
 use crate::runner::CommandRunner;
-use crate::tool::{Tool, ToolContext, ToolOutput, optional_count_arg, optional_string_arg, string_arg};
+use crate::tool::{
+    Tool, ToolContext, ToolOutput, optional_count_arg, optional_string_arg, string_arg,
+};
 use crate::truncate::{Limits, head};
 
 /// Most paths one search returns.
@@ -114,9 +116,7 @@ impl Tool for FindTool {
 
         let mut notices = Vec::new();
         if paths.len() > limit {
-            notices.push(format!(
-                "stopped at {limit} paths; raise `limit` for more"
-            ));
+            notices.push(format!("stopped at {limit} paths; raise `limit` for more"));
             paths.truncate(limit);
         }
 
@@ -158,8 +158,8 @@ fn fd_args(pattern: &str, search_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::tests::StubRunner;
     use crate::runner::CommandOutput;
+    use crate::runner::tests::StubRunner;
     use crate::tools::test_dir;
     use std::path::Path;
 
@@ -240,9 +240,7 @@ mod tests {
             ..Default::default()
         })));
 
-        let result = tool
-            .run(json!({ "pattern": "[" }), &context(&dir))
-            .await;
+        let result = tool.run(json!({ "pattern": "[" }), &context(&dir)).await;
 
         assert!(result.is_error);
         assert!(result.text.contains("invalid glob"), "{}", result.text);

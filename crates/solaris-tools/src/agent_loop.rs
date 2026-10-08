@@ -213,7 +213,10 @@ impl Runner {
             cost_usd += reply.cost_usd;
 
             if reply.calls.is_empty() {
-                let _ = tx.send(AgentEvent::TurnComplete { usage: total, cost_usd });
+                let _ = tx.send(AgentEvent::TurnComplete {
+                    usage: total,
+                    cost_usd,
+                });
                 return;
             }
 
@@ -290,7 +293,10 @@ impl Runner {
                     }
                     calls.push(call);
                 }
-                AgentEvent::TurnComplete { usage, cost_usd: cost } => {
+                AgentEvent::TurnComplete {
+                    usage,
+                    cost_usd: cost,
+                } => {
                     *total = total.merge(usage);
                     cost_usd = cost;
                 }
@@ -362,12 +368,7 @@ fn assistant_blocks(text: String, calls: &[ToolCall]) -> Vec<Content> {
     if !text.is_empty() {
         blocks.push(Content::text(text));
     }
-    blocks.extend(
-        calls
-            .iter()
-            .cloned()
-            .map(|call| Content::ToolUse { call }),
-    );
+    blocks.extend(calls.iter().cloned().map(|call| Content::ToolUse { call }));
     blocks
 }
 
@@ -400,8 +401,8 @@ mod tests {
 
     use crate::approver::DenyAll;
     use crate::registry::ToolRegistry;
-    use crate::runner::tests::StubRunner;
     use crate::runner::CommandOutput;
+    use crate::runner::tests::StubRunner;
     use crate::tool::ToolOutput;
     use crate::tools::shell::{ShellConfig, ShellOutcome, ShellRunner};
 
@@ -535,7 +536,11 @@ mod tests {
     }
 
     fn request() -> TurnRequest {
-        TurnRequest::new(vec![Message::system("You are solaris.")], "do it", Mode::Build)
+        TurnRequest::new(
+            vec![Message::system("You are solaris.")],
+            "do it",
+            Mode::Build,
+        )
     }
 
     fn text(events: &[AgentEvent]) -> String {
@@ -550,7 +555,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_turn_with_no_tool_call_ends_after_one_round() {
-        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta("hello".to_string())])]);
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
         let tool = Arc::new(Recording::default());
         let backend = loop_with(
             inner.clone(),
@@ -606,20 +613,19 @@ mod tests {
 
         // The prompt moved into the history, so the second round does not repeat it.
         assert!(second.prompt.is_empty());
-        assert!(second.history.iter().any(|message| message.text() == "do it"));
+        assert!(
+            second
+                .history
+                .iter()
+                .any(|message| message.text() == "do it")
+        );
 
         // The caller saw the result, and one terminal event for the whole turn.
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { result, .. } if result.output == "done"
         )));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.is_terminal())
-                .count(),
-            1
-        );
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
         assert_eq!(text(&events), "all done");
     }
 
@@ -648,7 +654,9 @@ mod tests {
     async fn a_failing_tool_is_reported_to_the_model_without_ending_the_turn() {
         let inner = Scripted::new(vec![
             round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
-            round(vec![AgentEvent::TextDelta("I will try something else".to_string())]),
+            round(vec![AgentEvent::TextDelta(
+                "I will try something else".to_string(),
+            )]),
         ]);
         let backend = loop_with(
             inner.clone(),
@@ -662,10 +670,17 @@ mod tests {
         let events = drain(backend, request()).await;
 
         let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1].history.iter().flat_map(Message::tool_results).collect();
+        let results: Vec<&ToolResult> = seen[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .collect();
         assert!(results[0].is_error);
         assert_eq!(results[0].output, "it went wrong");
-        assert!(matches!(events.last(), Some(AgentEvent::TurnComplete { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
     }
 
     #[tokio::test]
@@ -688,9 +703,17 @@ mod tests {
             "a declined call does not run"
         );
         let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1].history.iter().flat_map(Message::tool_results).collect();
+        let results: Vec<&ToolResult> = seen[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .collect();
         assert!(results[0].is_error);
-        assert!(results[0].output.contains("declined"), "{}", results[0].output);
+        assert!(
+            results[0].output.contains("declined"),
+            "{}",
+            results[0].output
+        );
     }
 
     #[tokio::test]
@@ -708,15 +731,28 @@ mod tests {
         drain(backend, request()).await;
 
         let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1].history.iter().flat_map(Message::tool_results).collect();
+        let results: Vec<&ToolResult> = seen[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .collect();
         assert!(results[0].is_error);
-        assert!(results[0].output.contains("no tool called"), "{}", results[0].output);
+        assert!(
+            results[0].output.contains("no tool called"),
+            "{}",
+            results[0].output
+        );
     }
 
     #[tokio::test]
     async fn the_loop_stops_a_model_that_never_stops_asking() {
         let rounds: Vec<Vec<AgentEvent>> = (0..10)
-            .map(|index| round(vec![AgentEvent::ToolCall(call(&format!("call-{index}"), "record"))]))
+            .map(|index| {
+                round(vec![AgentEvent::ToolCall(call(
+                    &format!("call-{index}"),
+                    "record",
+                ))])
+            })
             .collect();
         let inner = Scripted::new(rounds);
         let backend = loop_with(
@@ -734,12 +770,18 @@ mod tests {
             panic!("the loop should have given up: {events:?}");
         };
         assert!(message.contains("3 rounds"), "{message}");
-        assert_eq!(inner.requests().len(), 4, "three rounds plus the one that tripped it");
+        assert_eq!(
+            inner.requests().len(),
+            4,
+            "three rounds plus the one that tripped it"
+        );
     }
 
     #[tokio::test]
     async fn an_error_from_the_backend_ends_the_turn() {
-        let inner = Scripted::new(vec![vec![AgentEvent::Error("the model exploded".to_string())]]);
+        let inner = Scripted::new(vec![vec![AgentEvent::Error(
+            "the model exploded".to_string(),
+        )]]);
         let backend = loop_with(
             inner,
             registry_with(Arc::new(Recording::default())),
@@ -763,7 +805,10 @@ mod tests {
         );
 
         assert_eq!(backend.label(), "scripted");
-        assert!(backend.models().await.is_err(), "the scripted backend lists nothing");
+        assert!(
+            backend.models().await.is_err(),
+            "the scripted backend lists nothing"
+        );
         assert_eq!(
             backend.tool_names(Mode::Build),
             vec!["record"],
@@ -783,14 +828,14 @@ mod tests {
             ToolLoopOptions::default(),
         );
 
-        drain(
-            backend,
-            TurnRequest::new(Vec::new(), "hi", Mode::Plan),
-        )
-        .await;
+        drain(backend, TurnRequest::new(Vec::new(), "hi", Mode::Plan)).await;
 
         let seen = inner.requests();
-        let mut names: Vec<&str> = seen[0].tools.iter().map(|spec| spec.name.as_str()).collect();
+        let mut names: Vec<&str> = seen[0]
+            .tools
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
         names.sort();
         assert_eq!(names, vec!["find", "grep", "ls", "read"]);
     }
@@ -803,7 +848,10 @@ mod tests {
 
         #[async_trait]
         impl AgentBackend for Endless {
-            async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            async fn run_turn(
+                &self,
+                _request: TurnRequest,
+            ) -> Result<AgentEventStream, BackendError> {
                 Ok(Box::pin(futures::stream::iter(vec![
                     AgentEvent::ToolCall(ToolCall::new("call-1", "record", json!({}))),
                     AgentEvent::TurnComplete {

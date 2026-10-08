@@ -80,7 +80,9 @@ impl Usage {
         Self {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
-            cache_read_tokens: self.cache_read_tokens.saturating_add(other.cache_read_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
             cache_write_tokens: self
                 .cache_write_tokens
                 .saturating_add(other.cache_write_tokens),
@@ -170,7 +172,8 @@ mod tests {
     }
 
     #[test]
-    fn cost_charges_each_bucket_at_its_own_rate() {        // Sonnet-shaped rates: a million plain input tokens, a million output
+    fn cost_charges_each_bucket_at_its_own_rate() {
+        // Sonnet-shaped rates: a million plain input tokens, a million output
         // tokens, and a million cached reads.
         let price = Price::per_million(3.0, 15.0, 0.3, 3.75);
         let usage = Usage::new(1_000_000, 1_000_000).with_cache(1_000_000, 1_000_000);

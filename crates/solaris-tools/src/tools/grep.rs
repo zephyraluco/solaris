@@ -126,7 +126,14 @@ impl Tool for GrepTool {
             return ToolOutput::error(format!("{search_path} does not exist"));
         }
 
-        let args = ripgrep_args(&pattern, &search_path, glob.as_deref(), ignore_case, literal, context);
+        let args = ripgrep_args(
+            &pattern,
+            &search_path,
+            glob.as_deref(),
+            ignore_case,
+            literal,
+            context,
+        );
         let output = match self.runner.run("rg", &args, &ctx.cwd).await {
             Ok(output) => output,
             Err(error) => return ToolOutput::error(error),
@@ -148,7 +155,9 @@ impl Tool for GrepTool {
 
         let mut notices = Vec::new();
         if capped {
-            notices.push(format!("stopped at {limit} matches; raise `limit` for more"));
+            notices.push(format!(
+                "stopped at {limit} matches; raise `limit` for more"
+            ));
         }
         if let Some(notice) = truncation.notice(self.limits) {
             notices.push(notice);
@@ -244,8 +253,8 @@ fn parse_ripgrep(stdout: &str, limit: usize) -> (Vec<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::tests::StubRunner;
     use crate::runner::CommandOutput;
+    use crate::runner::tests::StubRunner;
     use crate::tools::test_dir;
     use std::path::Path;
 
@@ -417,7 +426,9 @@ mod tests {
                 _args: &[String],
                 _cwd: &Path,
             ) -> Result<CommandOutput, String> {
-                Err(format!("`{program}` was not found on PATH — install it and try again"))
+                Err(format!(
+                    "`{program}` was not found on PATH — install it and try again"
+                ))
             }
         }
 

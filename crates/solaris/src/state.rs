@@ -42,9 +42,7 @@ impl ToolStep {
 
     /// Whether it ran and failed.
     pub fn is_error(&self) -> bool {
-        self.result
-            .as_ref()
-            .is_some_and(|result| result.is_error)
+        self.result.as_ref().is_some_and(|result| result.is_error)
     }
 
     /// How long it took, when it has run.
@@ -403,7 +401,10 @@ mod tests {
         );
         assert_eq!(history[2].tool_calls().count(), 1);
         assert_eq!(history[3].tool_results().count(), 1);
-        assert_eq!(history[3].tool_results().next().expect("a result").output, "hello");
+        assert_eq!(
+            history[3].tool_results().next().expect("a result").output,
+            "hello"
+        );
         assert_eq!(history[4].text(), "it says hello");
     }
 

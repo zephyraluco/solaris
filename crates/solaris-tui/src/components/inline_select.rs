@@ -134,7 +134,9 @@ impl InlineSelect {
 
     /// The value of the highlighted row.
     pub fn selected_value(&self) -> Option<&str> {
-        self.items.get(self.selected).map(|item| item.value.as_str())
+        self.items
+            .get(self.selected)
+            .map(|item| item.value.as_str())
     }
 
     /// Highlight the row carrying `value`; the first row when it is absent.
@@ -259,7 +261,8 @@ impl InlineSelect {
         if self.items.is_empty() {
             return InlineSelectOutcome::Handled;
         }
-        self.selected = (self.selected as isize + delta).rem_euclid(self.items.len() as isize) as usize;
+        self.selected =
+            (self.selected as isize + delta).rem_euclid(self.items.len() as isize) as usize;
         InlineSelectOutcome::Handled
     }
 
@@ -426,13 +429,12 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn items() -> Vec<SelectItem> {
         vec![
@@ -479,7 +481,10 @@ mod tests {
     #[test]
     fn arrows_wrap_and_enter_picks() {
         let mut selector = selector();
-        assert_eq!(selector.on_key(key(KeyCode::Up)), InlineSelectOutcome::Handled);
+        assert_eq!(
+            selector.on_key(key(KeyCode::Up)),
+            InlineSelectOutcome::Handled
+        );
         assert_eq!(selector.selected_value(), Some("three"));
 
         selector.on_key(key(KeyCode::Down));

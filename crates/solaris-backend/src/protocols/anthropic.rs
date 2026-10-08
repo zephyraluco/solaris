@@ -101,7 +101,10 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
 
     let last = out.last_mut().expect("a last message was just found");
     let mut existing = last["content"].take();
-    let mut existing = existing.as_array_mut().map(std::mem::take).unwrap_or_default();
+    let mut existing = existing
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
 
     let mut results: Vec<Value> = Vec::new();
     let mut rest: Vec<Value> = Vec::new();
@@ -676,7 +679,10 @@ mod tests {
     fn a_failed_tool_result_is_marked_and_carries_the_breakpoint_when_last() {
         let call = ToolCall::new("toolu_1", "read", json!({}));
         let request = TurnRequest {
-            history: vec![Message::tool_result(ToolResult::error(&call, "no such file"))],
+            history: vec![Message::tool_result(ToolResult::error(
+                &call,
+                "no such file",
+            ))],
             prompt: String::new(),
             mode: Mode::Build,
             tools: Vec::new(),

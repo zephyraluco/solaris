@@ -174,7 +174,10 @@ mod tests {
         write(&dir, "a.txt", "one\ntwo\nthree\nfour").await;
 
         let output = ReadTool::new()
-            .run(json!({ "path": "a.txt", "offset": 2, "limit": 2 }), &context(&dir))
+            .run(
+                json!({ "path": "a.txt", "offset": 2, "limit": 2 }),
+                &context(&dir),
+            )
             .await;
         assert_eq!(output.text, "two\nthree");
     }
@@ -189,12 +192,18 @@ mod tests {
             max_lines: 3,
             max_bytes: 4096,
         });
-        let output = tool
-            .run(json!({ "path": "a.txt" }), &context(&dir))
-            .await;
+        let output = tool.run(json!({ "path": "a.txt" }), &context(&dir)).await;
 
-        assert!(output.text.starts_with("line 1\nline 2\nline 3\n"), "{}", output.text);
-        assert!(output.text.contains("continue with offset=4"), "{}", output.text);
+        assert!(
+            output.text.starts_with("line 1\nline 2\nline 3\n"),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.contains("continue with offset=4"),
+            "{}",
+            output.text
+        );
     }
 
     #[tokio::test]
@@ -211,7 +220,9 @@ mod tests {
     #[tokio::test]
     async fn a_directory_is_pointed_at_ls() {
         let dir = test_dir("read-dir");
-        let output = ReadTool::new().run(json!({ "path": "." }), &context(&dir)).await;
+        let output = ReadTool::new()
+            .run(json!({ "path": "." }), &context(&dir))
+            .await;
         assert!(output.is_error);
         assert!(output.text.contains("ls"), "{}", output.text);
     }

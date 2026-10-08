@@ -74,7 +74,10 @@ impl Tool for WriteTool {
 
         self.queue
             .with_lock(&absolute, || async {
-                if let Some(parent) = absolute.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                if let Some(parent) = absolute
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
                     if let Err(error) = tokio::fs::create_dir_all(parent).await {
                         return ToolOutput::error(format!(
                             "could not create {}: {error}",
@@ -140,7 +143,9 @@ mod tests {
     #[tokio::test]
     async fn an_existing_file_is_replaced_and_says_so() {
         let dir = test_dir("write-replace");
-        tokio::fs::write(dir.join("a.txt"), "old").await.expect("fixture");
+        tokio::fs::write(dir.join("a.txt"), "old")
+            .await
+            .expect("fixture");
 
         let output = tool()
             .run(json!({ "path": "a.txt", "content": "new" }), &context(&dir))
@@ -148,7 +153,9 @@ mod tests {
 
         assert!(output.text.starts_with("Replaced"), "{}", output.text);
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("a.txt")).await.expect("read"),
+            tokio::fs::read_to_string(dir.join("a.txt"))
+                .await
+                .expect("read"),
             "new"
         );
     }

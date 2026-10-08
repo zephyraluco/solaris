@@ -165,8 +165,8 @@ mod tests {
     fn several_edits_all_match_the_original() {
         // The second edit's `oldText` is unaffected by the first edit having
         // changed the length of the file.
-        let updated = apply_edits("aa bb cc", &[edit("aa", "aaaa"), edit("cc", "c")])
-            .expect("applied");
+        let updated =
+            apply_edits("aa bb cc", &[edit("aa", "aaaa"), edit("cc", "c")]).expect("applied");
         assert_eq!(updated, "aaaa bb c");
     }
 
@@ -202,14 +202,15 @@ mod tests {
 
     #[test]
     fn overlapping_edits_are_refused() {
-        let error = apply_edits("abcdef", &[edit("abc", "1"), edit("cde", "2")])
-            .expect_err("overlap");
+        let error =
+            apply_edits("abcdef", &[edit("abc", "1"), edit("cde", "2")]).expect_err("overlap");
         assert_eq!(error, EditError::Overlap);
     }
 
     #[test]
     fn adjacent_edits_are_fine() {
-        let updated = apply_edits("abcdef", &[edit("abc", "1"), edit("def", "2")]).expect("applied");
+        let updated =
+            apply_edits("abcdef", &[edit("abc", "1"), edit("def", "2")]).expect("applied");
         assert_eq!(updated, "12");
     }
 
@@ -220,7 +221,11 @@ mod tests {
         let EditError::NotFound { snippet } = error else {
             panic!("expected NotFound");
         };
-        assert_eq!(snippet.chars().count(), 61, "60 characters plus an ellipsis");
+        assert_eq!(
+            snippet.chars().count(),
+            61,
+            "60 characters plus an ellipsis"
+        );
     }
 
     #[test]

@@ -304,7 +304,10 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
         assert!(text.contains("✓ read"), "{text}");
-        assert!(text.contains(r#"{"path":"a.txt"}"#), "arguments are shown: {text}");
+        assert!(
+            text.contains(r#"{"path":"a.txt"}"#),
+            "arguments are shown: {text}"
+        );
         assert!(text.contains("7ms"), "timing is shown: {text}");
 
         assert!(text.contains("✗ bash"), "{text}");
