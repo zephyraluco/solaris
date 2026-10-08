@@ -122,6 +122,7 @@ fn backend(addr: SocketAddr) -> HttpBackend {
     HttpBackend::new(TurnPlan {
         endpoint: Endpoint {
             wire: Wire::OpenAiChat,
+            key_auth: solaris_backend::KeyAuth::Wire,
             base_url: format!("http://{addr}/v1"),
             secret: Some("sk-loopback".to_string()),
             name: "Local runtime",

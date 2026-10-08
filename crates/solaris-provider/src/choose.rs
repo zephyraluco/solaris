@@ -167,6 +167,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     let endpoint = Endpoint {
         wire,
+        key_auth: spec.key_auth,
         base_url,
         secret,
         name: spec.name,
@@ -406,7 +407,6 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_backend::Wire;
 
     /// Options with a fixed environment, so tests never touch the process's
     /// variables or the network.

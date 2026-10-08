@@ -15,7 +15,7 @@ use crate::http;
 use crate::protocols::anthropic;
 use crate::protocols::openai::{self, Repair};
 use crate::sse::{SseDecoder, SseEvent};
-use crate::wire::{self, Wire, WireStream};
+use crate::wire::{self, KeyAuth, Wire, WireStream};
 use crate::{AgentBackend, AgentEventStream};
 
 /// Where one turn goes, how it authenticates, and which protocol to speak.
@@ -25,6 +25,8 @@ use crate::{AgentBackend, AgentEventStream};
 pub struct Endpoint {
     /// Protocol to speak.
     pub wire: Wire,
+    /// How the platform that issued the key wants it presented.
+    pub key_auth: KeyAuth,
     /// Base URL, without a trailing slash.
     pub base_url: String,
     /// The key or token to send, or `None` for a runtime that wants none.
@@ -121,19 +123,24 @@ impl HttpBackend {
     }
 
     /// Attach the credential and the headers the wire wants.
+    ///
+    /// The key goes where its own platform asks for it, which is not always
+    /// where the wire's protocol would put it: a gateway answers the Messages
+    /// API with a bearer token of its own.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.endpoint.wire {
-            Wire::AnthropicMessages => {
-                let request = request.header("anthropic-version", anthropic::API_VERSION);
-                match &self.endpoint.secret {
-                    Some(secret) => request.header(anthropic::API_KEY_HEADER, secret),
-                    None => request,
-                }
-            }
-            Wire::OpenAiChat | Wire::OpenAiResponses => match &self.endpoint.secret {
-                Some(secret) => request.bearer_auth(secret),
-                None => request,
-            },
+        let request = match self.endpoint.wire {
+            Wire::AnthropicMessages => request.header("anthropic-version", anthropic::API_VERSION),
+            Wire::OpenAiChat | Wire::OpenAiResponses => request,
+        };
+
+        let bearer = match self.endpoint.key_auth {
+            KeyAuth::Bearer => true,
+            KeyAuth::Wire => self.endpoint.wire.is_openai(),
+        };
+        match (&self.endpoint.secret, bearer) {
+            (Some(secret), true) => request.bearer_auth(secret),
+            (Some(secret), false) => request.header(anthropic::API_KEY_HEADER, secret),
+            (None, _) => request,
         }
     }
 
@@ -464,6 +471,7 @@ mod tests {
         // own.
         let endpoint = |wire| Endpoint {
             wire,
+            key_auth: KeyAuth::Wire,
             base_url: "https://example.test/v1/".to_string(),
             secret: None,
             name: "Test",
@@ -505,6 +513,8 @@ mod tests {
         // why the version lives in the base rather than in the match above.
         let endpoint = |wire| Endpoint {
             wire,
+            // The gateway presents its own key as a bearer token.
+            key_auth: KeyAuth::Bearer,
             base_url: "https://opencode.ai/zen/v1".to_string(),
             secret: None,
             name: "opencode zen",
@@ -528,6 +538,52 @@ mod tests {
             endpoint(Wire::OpenAiChat).models_url(),
             "https://opencode.ai/zen/v1/models"
         );
+    }
+
+    #[test]
+    fn a_key_travels_the_way_its_own_platform_asks_for_it() {
+        let headers = |wire, key_auth| {
+            let backend = HttpBackend::new(TurnPlan {
+                endpoint: Endpoint {
+                    wire,
+                    key_auth,
+                    base_url: "https://example.test/v1".to_string(),
+                    secret: Some("sk-1".to_string()),
+                    name: "Test",
+                    label: "Test",
+                    env_keys: &[],
+                },
+                model: "m".to_string(),
+                max_tokens: 1,
+                price: None,
+                prompt_cache_key: None,
+            })
+            .expect("a client");
+
+            backend
+                .authorize(backend.client.post("https://example.test/x"))
+                .build()
+                .expect("a request")
+                .headers()
+                .clone()
+        };
+
+        // Anthropic's own key, in Anthropic's own header.
+        let anthropic = headers(Wire::AnthropicMessages, KeyAuth::Wire);
+        assert_eq!(anthropic.get("x-api-key").expect("a key"), "sk-1");
+        assert!(anthropic.get("authorization").is_none());
+
+        // The OpenAI wires present a key as a bearer token either way.
+        let openai = headers(Wire::OpenAiChat, KeyAuth::Wire);
+        assert_eq!(openai.get("authorization").expect("a key"), "Bearer sk-1");
+
+        // A gateway's key is its own even on the Messages API, which is how
+        // opencode zen answers its Claude models.
+        let gateway = headers(Wire::AnthropicMessages, KeyAuth::Bearer);
+        assert_eq!(gateway.get("authorization").expect("a key"), "Bearer sk-1");
+        assert!(gateway.get("x-api-key").is_none());
+        // The version header still rides along: the wire is still Anthropic's.
+        assert!(gateway.get("anthropic-version").is_some());
     }
 
     #[test]
@@ -718,6 +774,7 @@ mod tests {
         let backend = HttpBackend::new(TurnPlan {
             endpoint: Endpoint {
                 wire: Wire::OpenAiChat,
+                key_auth: KeyAuth::Wire,
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 secret: None,
                 name: "OpenRouter",

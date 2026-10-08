@@ -8,7 +8,7 @@
 //! into a backend.
 
 use serde::{Deserialize, Serialize};
-use solaris_backend::Wire;
+use solaris_backend::{KeyAuth, Wire};
 use solaris_core::Price;
 
 /// How a provider authenticates.
@@ -100,6 +100,8 @@ pub struct ProviderSpec {
     pub base_url_envs: &'static [&'static str],
     /// Models offered once the provider is connected.
     pub models: &'static [ModelSpec],
+    /// How this platform wants its key presented.
+    pub key_auth: KeyAuth,
 }
 
 /// Context window assumed for a model the catalogue does not list.
@@ -122,6 +124,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKey,
         badge: None,
         wire: Wire::AnthropicMessages,
+        key_auth: KeyAuth::Wire,
         base_url: Some("https://api.anthropic.com/v1"),
         env_keys: &["ANTHROPIC_API_KEY"],
         base_url_envs: &["ANTHROPIC_BASE_URL"],
@@ -161,6 +164,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // The floor for a model the table below does not name: most of what zen
         // serves is OpenAI-compatible.
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Bearer,
         base_url: Some("https://opencode.ai/zen/v1"),
         // The key is collected in `/connect`; nothing looks for it in the
         // environment.
@@ -210,6 +214,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKey,
         badge: None,
         wire: Wire::OpenAiResponses,
+        key_auth: KeyAuth::Wire,
         base_url: Some("https://api.openai.com/v1"),
         env_keys: &["OPENAI_API_KEY"],
         base_url_envs: &["OPENAI_BASE_URL"],
@@ -241,6 +246,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // Gemini's own protocol is not worth a third client: Google publishes
         // an OpenAI-compatible endpoint that speaks this one.
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Wire,
         base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         env_keys: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         base_url_envs: &[],
@@ -270,6 +276,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKeyWithUrl,
         badge: None,
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Wire,
         // A gateway lives wherever it was deployed, so the endpoint comes from
         // `/connect` rather than from this table.
         base_url: None,
@@ -287,6 +294,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKey,
         badge: None,
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Wire,
         base_url: Some("https://openrouter.ai/api/v1"),
         env_keys: &["OPENROUTER_API_KEY"],
         base_url_envs: &["OPENROUTER_BASE_URL"],
@@ -308,6 +316,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::Local,
         badge: Some("LOCAL"),
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Wire,
         base_url: Some("http://localhost:11434/v1"),
         env_keys: &[],
         base_url_envs: &["SOLARIS_LOCAL_BASE_URL"],
@@ -337,6 +346,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         auth: AuthKind::ApiKeyWithUrl,
         badge: None,
         wire: Wire::OpenAiChat,
+        key_auth: KeyAuth::Wire,
         // The endpoint is whatever `/connect` collected.
         base_url: None,
         env_keys: &[],
