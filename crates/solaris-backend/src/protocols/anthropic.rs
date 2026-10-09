@@ -200,6 +200,8 @@ pub struct AnthropicStream {
     usage: Usage,
     reported_usage: bool,
     finished: bool,
+    /// The model stopped on `max_tokens`, so its message was cut off.
+    truncated: bool,
     /// Tool calls by content-block index, which is what ties the block opened by
     /// `content_block_start` to the argument fragments that follow it.
     calls: BTreeMap<u64, PartialCall>,
@@ -260,6 +262,12 @@ impl AnthropicStream {
                 // The closing usage block carries the output count; the cache
                 // counts only ever appear in `message_start`.
                 self.merge_output(&data["usage"]);
+                // `max_tokens` is the one reason that means the message was cut
+                // off mid-sentence, which is what a truncated tool call looks
+                // like.
+                if data["delta"]["stop_reason"] == "max_tokens" {
+                    self.truncated = true;
+                }
             }
             "message_stop" => self.finished = true,
             "error" => out.push(AgentEvent::Error(error_message(&data))),
@@ -272,6 +280,11 @@ impl AnthropicStream {
     /// Whether the server signalled the end of its stream.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether the model stopped because it hit its output limit.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Hand over the calls this stream assembled.

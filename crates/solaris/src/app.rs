@@ -23,13 +23,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_backend::AgentBackend;
 use solaris_core::{
-    AgentEvent, Companion, Config, Mode, Preferences, RecentActivity, SlashCommand, Soul,
+    AgentEvent, Companion, Config, Mode, Preferences, RecentActivity, SlashCommand, Soul, ToolCall,
     TurnRequest, buddy, parse_slash_command, recent,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
 };
-use solaris_tools::{ToolLoop, ToolLoopOptions, ToolRegistry, ToolSelection};
+use solaris_tools::{
+    AlwaysApprove, Approval, ApprovalRequest, Approver, Cancel, ChannelApprover, ToolLoop,
+    ToolLoopOptions, ToolRegistry, ToolSelection, default_tool_names,
+};
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
 use solaris_tui::components::select_list::SelectItem;
@@ -44,6 +47,7 @@ use solaris_tui::util::{display_width, pad_to_width, rect_contains, truncate_to_
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
+use tokio::sync::oneshot;
 
 use crate::clipboard::Clipboard;
 use crate::commands;
@@ -119,6 +123,11 @@ pub struct AppOptions {
     pub discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     pub tools: ToolSelection,
+    /// Whether a call that changes something is confirmed before it runs.
+    ///
+    /// Off in tests, which drive the loop themselves and have nobody to ask; on
+    /// in the binary, where a prompt is the point.
+    pub ask_approval: bool,
 }
 
 impl AppOptions {
@@ -162,6 +171,7 @@ impl AppOptions {
             clipboard: Clipboard::system(),
             discover_models: false,
             tools: ToolSelection::none(),
+            ask_approval: false,
         }
     }
 }
@@ -193,22 +203,26 @@ fn resolve_backend(
 /// Every backend goes through it — including the one that refuses turns when
 /// nothing is connected — because the loop is transparent until the model asks
 /// for a tool: with none declared it is exactly one model call, forwarded
-/// unchanged.
+/// unchanged. The returned handle stops whichever turn the loop is running.
 fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
     selection: &ToolSelection,
     cwd: &Path,
-) -> BackendChoice {
-    let options = ToolLoopOptions::in_directory(cwd).with_selection(selection.clone());
-    BackendChoice {
-        backend: Arc::new(ToolLoop::new(
-            Arc::clone(&choice.backend),
-            registry,
-            options,
-        )),
-        ..choice
-    }
+    approver: Arc<dyn Approver>,
+) -> (BackendChoice, Cancel) {
+    let options = ToolLoopOptions::in_directory(cwd)
+        .with_selection(selection.clone())
+        .with_approver(approver);
+    let loop_ = ToolLoop::new(Arc::clone(&choice.backend), registry, options);
+    let cancel = loop_.cancel_handle();
+    (
+        BackendChoice {
+            backend: Arc::new(loop_),
+            ..choice
+        },
+        cancel,
+    )
 }
 
 /// The solaris application root component.
@@ -285,6 +299,15 @@ pub struct App {
     registry: Arc<ToolRegistry>,
     /// Directory relative tool paths resolve against.
     cwd: PathBuf,
+    /// The approver every rebuilt loop is wired with.
+    approver: Arc<dyn Approver>,
+    /// Stops the turn in flight, tools included.
+    tool_cancel: Cancel,
+    /// Calls waiting for the user's answer; `None` when the session approves
+    /// everything without asking.
+    approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
+    /// Answers the loop is still waiting for, oldest first.
+    pending_approvals: VecDeque<oneshot::Sender<Approval>>,
 }
 
 impl App {
@@ -311,13 +334,30 @@ impl App {
             clipboard,
             discover_models,
             tools,
+            ask_approval,
         } = options;
 
         let mut config = config;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let registry = Arc::new(ToolRegistry::builtin());
+
+        // A session that asks before acting gets a channel the UI drains; one
+        // that does not approves everything, which is what a test wants.
+        let (approver, approval_rx): (Arc<dyn Approver>, _) = if ask_approval {
+            let (tx, rx) = unbounded_channel();
+            (Arc::new(ChannelApprover::new(tx)), Some(rx))
+        } else {
+            (Arc::new(AlwaysApprove), None)
+        };
+
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
-        let choice = with_tools(choice, Arc::clone(&registry), &tools, &cwd);
+        let (choice, tool_cancel) = with_tools(
+            choice,
+            Arc::clone(&registry),
+            &tools,
+            &cwd,
+            Arc::clone(&approver),
+        );
         let backend = choice.backend;
         let provider_id = choice.provider_id;
 
@@ -375,6 +415,10 @@ impl App {
             tools,
             registry,
             cwd,
+            approver,
+            tool_cancel,
+            approval_rx,
+            pending_approvals: VecDeque::new(),
         };
 
         app.refresh_models();
@@ -422,8 +466,15 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-        let choice = with_tools(choice, Arc::clone(&self.registry), &self.tools, &self.cwd);
+        let (choice, cancel) = with_tools(
+            choice,
+            Arc::clone(&self.registry),
+            &self.tools,
+            &self.cwd,
+            Arc::clone(&self.approver),
+        );
         self.backend = choice.backend;
+        self.tool_cancel = cancel;
         self.provider_id = choice.provider_id;
         choice.source
     }
@@ -616,6 +667,10 @@ impl App {
     /// send fails. Claude Code answers an interrupt by sending anything queued
     /// next, so the queue keeps running in order instead of stalling.
     fn cancel_turn(&mut self) {
+        // Stop the tool the loop is running as well. Dropping the receiver only
+        // ends the stream the UI draws from; a command already in flight would
+        // otherwise keep running for a model that is no longer listening.
+        self.tool_cancel.cancel();
         self.events_rx = None;
         if let Some(turn) = self.session.active_turn_mut() {
             turn.complete = true;
@@ -830,6 +885,13 @@ impl App {
                 }
                 self.session.status = None;
             }
+            // The model ran out of room, so anything it asked for in the same
+            // message was refused. Saying so explains why the next thing it does
+            // may look like a repetition.
+            AgentEvent::OutputTruncated => {
+                self.notifications
+                    .warning("the reply hit the output limit; its tool calls were refused");
+            }
             AgentEvent::Error(message) => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -849,6 +911,21 @@ impl App {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
             DialogMessage::Command(text) => self.submit(text),
+            DialogMessage::Confirm {
+                action: ConfirmAction::RunTool,
+                accepted,
+            } => {
+                // The loop is still waiting on this answer, so it is sent even
+                // when the prompt was dismissed: a denial is a real answer.
+                if let Some(reply) = self.pending_approvals.pop_front() {
+                    let answer = if accepted {
+                        Approval::Approved
+                    } else {
+                        Approval::Denied
+                    };
+                    let _ = reply.send(answer);
+                }
+            }
             DialogMessage::Confirm {
                 action: ConfirmAction::ClearTranscript,
                 accepted: true,
@@ -871,6 +948,32 @@ impl App {
 
     fn push_overlay(&mut self, component: Box<dyn Component>, options: OverlayOptions) {
         self.overlay_queue.borrow_mut().push((component, options));
+    }
+
+    /// Answer a call the loop is waiting on.
+    ///
+    /// Reading the session changes nothing, so it is approved silently; anything
+    /// else is put to the user, and the loop waits for their answer.
+    fn request_approval(&mut self, request: ApprovalRequest) {
+        let ApprovalRequest { call, reply } = request;
+
+        if read_only(&call.name) {
+            let _ = reply.send(Approval::Approved);
+            return;
+        }
+
+        self.pending_approvals.push_back(reply);
+        let dialog = ConfirmDialog::new(
+            format!("Run {}?", call.name),
+            describe_call(&call),
+            ConfirmAction::RunTool,
+            &self.theme,
+            self.dialog_tx.clone(),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered().width(SizeValue::Percent(64)),
+        );
     }
 
     fn open_help(&mut self) {
@@ -1748,6 +1851,19 @@ impl Component for App {
             self.on_dialog_message(message);
         }
 
+        // Calls the loop is waiting on: answer each one, asking the user where a
+        // prompt is warranted.
+        let mut requests = Vec::new();
+        if let Some(rx) = self.approval_rx.as_mut() {
+            while let Ok(request) = rx.try_recv() {
+                requests.push(request);
+            }
+        }
+        for request in requests {
+            dirty = true;
+            self.request_approval(request);
+        }
+
         // Models the provider reported to the background discovery task.
         let mut discovered = Vec::new();
         let mut discovery_done = false;
@@ -1793,6 +1909,23 @@ impl Component for App {
 
         dirty
     }
+}
+
+/// Whether calling `name` only looks at the session.
+///
+/// This is the set Plan mode declares, which is exactly the set that cannot
+/// change anything — prompting for a read would be noise.
+fn read_only(name: &str) -> bool {
+    default_tool_names(Mode::Plan)
+        .iter()
+        .any(|known| known == name)
+}
+
+/// The arguments of a call, as the confirmation prompt shows them.
+fn describe_call(call: &ToolCall) -> String {
+    // `Value`'s own display is the compact JSON the model sent, which is what
+    // the user needs to judge the call by.
+    truncate_to_width(&call.input.to_string(), 400, "…")
 }
 
 /// Write `json` to `path`, creating the directory when needed.
@@ -2584,6 +2717,65 @@ mod tests {
             accepted: true,
         });
         assert!(app.session.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_call_is_approved_without_asking() {
+        let mut app = app();
+        let (reply, answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" })),
+            reply,
+        });
+
+        assert!(app.pending_approvals.is_empty(), "nothing to ask about");
+        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+    }
+
+    #[tokio::test]
+    async fn a_mutating_call_waits_for_the_users_answer() {
+        let mut app = app();
+        let (reply, mut answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new(
+                "call-1",
+                "write",
+                serde_json::json!({ "path": "a.txt", "content": "hi" }),
+            ),
+            reply,
+        });
+
+        // The loop is parked until the prompt is answered.
+        assert_eq!(app.pending_approvals.len(), 1);
+        assert!(
+            answer.try_recv().is_err(),
+            "the call must not be answered before the user is"
+        );
+
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::RunTool,
+            accepted: true,
+        });
+
+        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+        assert!(app.pending_approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_declined_prompt_denies_the_call() {
+        let mut app = app();
+        let (reply, answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new("call-1", "bash", serde_json::json!({ "command": "ls" })),
+            reply,
+        });
+
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::RunTool,
+            accepted: false,
+        });
+
+        assert_eq!(answer.await.expect("an answer"), Approval::Denied);
     }
 
     #[test]

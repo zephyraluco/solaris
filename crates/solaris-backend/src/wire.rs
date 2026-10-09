@@ -122,6 +122,18 @@ impl WireStream {
         }
     }
 
+    /// Whether the model stopped because it hit its output limit.
+    ///
+    /// A truncated message may carry tool calls whose arguments were cut
+    /// mid-JSON, so whoever runs them has to be told before it acts.
+    pub fn truncated(&self) -> bool {
+        match self {
+            Self::Anthropic(stream) => stream.truncated(),
+            Self::OpenAi(stream) => stream.truncated(),
+            Self::Responses(stream) => stream.truncated(),
+        }
+    }
+
     /// The usage the server reported, once it has reported any.
     pub fn usage(&self) -> Option<Usage> {
         match self {

@@ -86,6 +86,7 @@ cargo run --release
 | `--plan` | 以 plan 模式启动，而非 build 模式 | 关闭 |
 | `-t`, `--tools <LIST>` | 声明哪些工具，整体替换该模式的默认集合；若只由 `+name`/`-name` 组成，则改为在默认集合上增删 | 该模式的默认集合 |
 | `--exclude-tools <LIST>` | 在前述选择之后，再撤下这些工具 | 无 |
+| `--confirm-tools` | 会改动东西的调用（`write`、`edit`、shell）执行前先问一次 | 关 |
 | `--print-config` | 打印解析后的配置并退出，不启动界面 | — |
 | `-h`, `--help` | 打印帮助 | — |
 | `-V`, `--version` | 打印版本 | — |

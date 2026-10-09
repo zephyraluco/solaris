@@ -459,6 +459,13 @@ impl StreamEngine {
         }
         self.done = true;
 
+        // A message the model stopped writing because it ran out of room may
+        // carry tool calls with half-written arguments, so the readers are told
+        // before the calls themselves go out.
+        if self.parser.truncated() {
+            self.pending.push_back(AgentEvent::OutputTruncated);
+        }
+
         // A stream only knows a tool call is complete once it ends, so the
         // calls go out here — before the terminal event, so the turn reads as
         // text, then calls, then completion.

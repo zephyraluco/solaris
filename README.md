@@ -86,6 +86,7 @@ cargo run --release
 | `--plan` | Start in plan mode instead of build mode | off |
 | `-t`, `--tools <LIST>` | Tools to declare, replacing the mode's default set; a list of `+name`/`-name` entries adjusts it instead | the mode's set |
 | `--exclude-tools <LIST>` | Tools to withdraw after everything else has selected them | none |
+| `--confirm-tools` | Ask before a call that changes something (`write`, `edit`, the shell) runs | off |
 | `--print-config` | Print the resolved configuration and exit without starting the UI | — |
 | `-h`, `--help` | Print help | — |
 | `-V`, `--version` | Print version | — |

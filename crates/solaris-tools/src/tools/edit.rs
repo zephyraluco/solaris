@@ -10,7 +10,7 @@ use crate::diff::{
 };
 use crate::mutation_queue::FileMutationQueue;
 use crate::path_utils;
-use crate::tool::{Tool, ToolContext, ToolOutput, string_arg};
+use crate::tool::{ExecutionMode, Tool, ToolContext, ToolOutput, string_arg};
 
 /// Replaces exact text in one file.
 #[derive(Debug, Clone)]
@@ -29,6 +29,12 @@ impl EditTool {
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "edit"
+    }
+
+    /// An edit changes what a later call in the same round might read, so it
+    /// runs alone rather than beside them.
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
     }
 
     fn description(&self) -> &str {

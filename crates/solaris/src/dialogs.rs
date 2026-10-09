@@ -37,6 +37,8 @@ pub enum DialogMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmAction {
     ClearTranscript,
+    /// A tool call the loop is waiting on.
+    RunTool,
 }
 
 /// Hint shown at the bottom of a picker dialog.

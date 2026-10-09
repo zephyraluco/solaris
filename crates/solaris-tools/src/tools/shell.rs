@@ -10,12 +10,25 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::runner::describe_spawn_failure;
-use crate::tool::{Tool, ToolContext, ToolOutput, optional_count_arg, string_arg};
+use crate::tool::{ExecutionMode, Tool, ToolContext, ToolOutput, optional_count_arg, string_arg};
 use crate::truncate::{Limits, format_size, tail};
+
+/// Most seconds a `timeout` argument may ask for.
+///
+/// The runner arms a millisecond timer with it, so this is the largest value
+/// that reaches the timer without wrapping — a longer wait would end early
+/// rather than late.
+const MAX_TIMEOUT_SECONDS: u64 = 2_147_483;
+
+/// Keeps a program spawned from a windowed parent from opening a console of its
+/// own, which flashes on screen for every command.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Which shell a tool runs commands with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,18 +116,30 @@ impl ShellRunner for LocalShell {
         let mut last_missing = String::new();
 
         for program in config.programs {
-            // `2>&1` inside the command string is what merges the two streams in
-            // the order they happened; piping them separately would need a loop
-            // that still got the interleaving wrong.
-            let mut child = match Command::new(program)
+            let mut builder = Command::new(program);
+            builder
                 .arg(config.command_flag)
-                .arg(format!("{command} 2>&1"))
+                // The command is handed over untouched: appending to it — a
+                // `2>&1`, say — rewrites what the model asked for and breaks
+                // anything ending in a comment or a continuation.
+                .arg(command)
                 .current_dir(&ctx.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            {
+                // Both streams are piped and merged here instead. What the shell
+                // itself reports about the command only ever reaches its stderr,
+                // so a redirect written into the command cannot carry it.
+                .stderr(Stdio::piped());
+
+            #[cfg(windows)]
+            builder.creation_flags(CREATE_NO_WINDOW);
+
+            // A process group of its own is what lets a timeout or a cancel
+            // reach the grandchildren, not just the shell.
+            #[cfg(unix)]
+            builder.process_group(0);
+
+            let mut child = match builder.spawn() {
                 Ok(child) => child,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     last_missing = describe_spawn_failure(program, &error);
@@ -123,13 +148,25 @@ impl ShellRunner for LocalShell {
                 Err(error) => return Err(format!("could not run {program}: {error}")),
             };
 
-            let mut pipe = child
-                .stdout
-                .take()
-                .ok_or_else(|| format!("{program} produced no output pipe"))?;
+            // One reader per pipe, both feeding one channel, so what is reported
+            // keeps the order the bytes arrived in rather than every line of
+            // stdout followed by every line of stderr.
+            let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+            let mut readers = Vec::new();
+            if let Some(pipe) = child.stdout.take() {
+                readers.push(spawn_reader(pipe, chunk_tx.clone()));
+            }
+            if let Some(pipe) = child.stderr.take() {
+                readers.push(spawn_reader(pipe, chunk_tx.clone()));
+            }
+            drop(chunk_tx);
+
             let mut buffer = Vec::new();
             let mut timed_out = false;
             let mut cancelled = false;
+            let mut status = None;
+            let mut wait_error = None;
+            let mut pipes_open = true;
 
             let deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
                 match timeout {
@@ -145,10 +182,21 @@ impl ShellRunner for LocalShell {
 
             loop {
                 tokio::select! {
-                    read = pipe.read_buf(&mut buffer) => match read {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                    chunk = chunk_rx.recv(), if pipes_open => match chunk {
+                        // Both pipes are closed, so no more output can arrive.
+                        None => pipes_open = false,
+                        Some(bytes) => buffer.extend_from_slice(&bytes),
                     },
+                    // Waiting on the process rather than on its pipes is what
+                    // keeps a descendant that inherited them from holding the
+                    // tool open: the command is over either way.
+                    waited = child.wait() => {
+                        match waited {
+                            Ok(exit) => status = Some(exit),
+                            Err(error) => wait_error = Some(error),
+                        }
+                        break;
+                    }
                     _ = &mut deadline => {
                         timed_out = true;
                         break;
@@ -162,22 +210,32 @@ impl ShellRunner for LocalShell {
                 }
             }
 
-            let code = if timed_out || cancelled {
-                kill(child.id()).await;
+            if timed_out || cancelled {
+                kill_tree(child.id()).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                None
-            } else {
-                child
-                    .wait()
-                    .await
-                    .map_err(|error| format!("could not wait for {program}: {error}"))?
-                    .code()
-            };
+            }
+
+            // Take what the readers already hold, then let them go: the last
+            // words of a command that has ended are worth having, but a pipe an
+            // escaped grandchild still holds must not keep the turn running.
+            collect_pending(&mut chunk_rx, &mut buffer).await;
+            for reader in readers {
+                reader.abort();
+            }
+
+            if let Some(error) = wait_error {
+                // What the process is doing is unknown, so stop it rather than
+                // leave it running behind a failed call.
+                kill_tree(child.id()).await;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(format!("could not wait for {program}: {error}"));
+            }
 
             return Ok(ShellOutcome {
-                output: String::from_utf8_lossy(&buffer).into_owned(),
-                code,
+                output: sanitize(&String::from_utf8_lossy(&buffer)),
+                code: exit_code(status),
                 timed_out,
                 cancelled,
             });
@@ -187,23 +245,176 @@ impl ShellRunner for LocalShell {
     }
 }
 
-/// Kill a whole process tree, which on Windows is the only way to stop the
-/// grandchildren a shell started.
+/// Read one of a command's pipes to its end, forwarding what it yields.
+fn spawn_reader(
+    mut pipe: impl AsyncRead + Unpin + Send + 'static,
+    chunks: mpsc::UnboundedSender<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut block = [0u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut block).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if chunks.send(block[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Take whatever the readers have already handed over, briefly.
+///
+/// Called once the command has ended. Both pipes close with it, so this usually
+/// returns straight away; the wait is capped so that a descendant which
+/// inherited them cannot hold the turn open.
+async fn collect_pending(chunks: &mut mpsc::UnboundedReceiver<Vec<u8>>, buffer: &mut Vec<u8>) {
+    let drain = async {
+        while let Some(bytes) = chunks.recv().await {
+            buffer.extend_from_slice(&bytes);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(50), drain).await;
+}
+
+/// Kill a command and everything it started.
 ///
 /// `child.kill()` reaches the shell itself; a command that spawned something
 /// would leave it running.
-async fn kill(pid: Option<u32>) {
+async fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+
     #[cfg(windows)]
-    if let Some(pid) = pid {
-        let _ = Command::new("taskkill")
+    {
+        // `taskkill.exe` by full path out of System32: stopping a runaway
+        // command should not depend on what PATH happens to point at.
+        let taskkill = std::env::var_os("SystemRoot")
+            .map_or_else(
+                || std::path::PathBuf::from(r"C:\Windows"),
+                std::path::PathBuf::from,
+            )
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = Command::new(taskkill)
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .await;
     }
-    #[cfg(not(windows))]
-    let _ = pid;
+
+    #[cfg(unix)]
+    {
+        // The command leads its own process group (see the spawn above), so the
+        // negated pid reaches every process it started.
+        // SAFETY: the pid belongs to a child this process started, and the
+        // outcome of the kill is deliberately ignored.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+}
+
+/// The exit code to report, using the shell convention for a signalled process.
+///
+/// A process killed by a signal has no exit code of its own; `128 + signal` is
+/// what a shell reports, and it keeps a kill from reading as a success.
+fn exit_code(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    let status = status?;
+    if let Some(code) = status.code() {
+        return Some(code);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return Some(128 + signal);
+        }
+    }
+
+    None
+}
+
+/// Terminal output, with the parts that are not text taken out.
+///
+/// A command that colours its output, redraws a progress bar or dumps binary
+/// emits escape sequences and control characters. They mean something to a
+/// terminal and nothing to the model: left in, they misalign the transcript and
+/// spend the output budget on noise.
+fn sanitize(output: &str) -> String {
+    let mut clean = String::with_capacity(output.len());
+    let mut line_start = 0;
+    let mut returned = false;
+    let mut chars = output.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            // An escape sequence, in the shapes that turn up in command output.
+            '\u{1b}' => match chars.next() {
+                // A control sequence: `ESC [ … ` up to a byte in `@`..`~`.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // An operating system command: `ESC ] … ` to BEL or `ESC \`.
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is two characters long.
+                _ => {}
+            },
+            '\r' => {
+                // A carriage return sends the cursor back to the start of the
+                // line, so whatever is drawn next replaces what is there: a
+                // progress bar ends up saying what it last said instead of
+                // every frame of it. What follows decides whether anything is
+                // replaced at all, so the replacement waits for it — text a
+                // trailing return leaves on screen is still text.
+                if chars.peek() != Some(&'\n') {
+                    returned = true;
+                }
+            }
+            ch if is_control(ch) => {}
+            ch => {
+                if returned {
+                    clean.truncate(line_start);
+                    returned = false;
+                }
+                clean.push(ch);
+                if ch == '\n' {
+                    line_start = clean.len();
+                }
+            }
+        }
+    }
+
+    clean
+}
+
+/// Whether `ch` is a control character that carries nothing to read.
+///
+/// Tab and newline are not: they are how text is laid out. U+FFF9..FFFB go too,
+/// because they break the width measurement the display uses.
+fn is_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0}'..='\u{8}' | '\u{b}'..='\u{c}' | '\u{e}'..='\u{1f}' | '\u{fff9}'..='\u{fffb}'
+    )
 }
 
 /// Runs commands with a shell.
@@ -247,6 +458,12 @@ impl Tool for ShellTool {
         self.config.tool_name
     }
 
+    /// A command can change anything, and two of them racing over the same
+    /// directory is exactly the trouble this avoids, so it runs alone.
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
+
     fn description(&self) -> &str {
         self.config.description
     }
@@ -261,7 +478,10 @@ impl Tool for ShellTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Seconds to let the command run before killing it; omit for no limit",
+                    "description": format!(
+                        "Seconds to let the command run before killing it; omit for no limit, at \
+                         most {MAX_TIMEOUT_SECONDS}"
+                    ),
                 },
             },
             "required": ["command"],
@@ -274,6 +494,11 @@ impl Tool for ShellTool {
             Err(error) => return error,
         };
         let timeout = match optional_count_arg(&input, "timeout") {
+            Ok(Some(seconds)) if seconds as u64 > MAX_TIMEOUT_SECONDS => {
+                return ToolOutput::error(format!(
+                    "`timeout` must be at most {MAX_TIMEOUT_SECONDS} seconds"
+                ));
+            }
             Ok(timeout) => timeout.map(|seconds| Duration::from_secs(seconds as u64)),
             Err(error) => return error,
         };
@@ -587,5 +812,153 @@ mod tests {
             "{}",
             output.text
         );
+    }
+
+    #[test]
+    fn sanitize_keeps_the_text_and_drops_the_terminal_commands() {
+        // Colour, then an erase-line, both as control sequences.
+        assert_eq!(sanitize("\u{1b}[31mred\u{1b}[0m\u{1b}[K"), "red");
+        // A bar that redraws itself says what it last said.
+        assert_eq!(sanitize("50%\r100%\n"), "100%\n");
+        assert_eq!(sanitize("one\rtwo\rthree"), "three");
+        // But a return with nothing drawn over it is not an erasure.
+        assert_eq!(sanitize("progress\r"), "progress");
+        // `\r\n` is a line ending, not a cursor return.
+        assert_eq!(sanitize("a\r\nb\r\n"), "a\nb\n");
+        // Bell and NUL carry nothing; tab and newline are how text is laid out.
+        assert_eq!(sanitize("a\u{7}b\u{0}c\td\ne"), "abc\td\ne");
+        // A window title goes with its terminator.
+        assert_eq!(sanitize("\u{1b}]0;title\u{7}after"), "after");
+        // U+FFF9..FFFB break the width measurement the display uses.
+        assert_eq!(sanitize("a\u{fff9}b"), "ab");
+        // A lone escape at the end is dropped rather than read past.
+        assert_eq!(sanitize("x\u{1b}"), "x");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_past_the_ceiling_is_refused() {
+        let dir = test_dir("shell-timeout-ceiling");
+        let runner = StubShell::new(ShellOutcome::default());
+
+        let output = ShellTool::bash(runner.clone())
+            .run(
+                json!({ "command": "sleep 1", "timeout": MAX_TIMEOUT_SECONDS + 1 }),
+                &context(&dir),
+            )
+            .await;
+
+        assert!(output.is_error);
+        assert!(output.text.contains("at most"), "{}", output.text);
+        assert!(
+            runner.seen.lock().expect("lock").is_empty(),
+            "a refused timeout must not run the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_at_the_ceiling_is_accepted() {
+        let dir = test_dir("shell-timeout-max");
+        let runner = StubShell::new(ShellOutcome::default());
+
+        ShellTool::bash(runner.clone())
+            .run(
+                json!({ "command": "sleep 1", "timeout": MAX_TIMEOUT_SECONDS }),
+                &context(&dir),
+            )
+            .await;
+
+        let seen = runner.seen.lock().expect("lock");
+        assert_eq!(seen[0].1, Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)));
+    }
+
+    #[test]
+    fn a_process_that_never_ran_has_no_exit_code() {
+        assert_eq!(exit_code(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_killed_by_a_signal_reports_the_shell_convention() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Raw status 9 is "terminated by SIGKILL", which a shell calls 137.
+        let status = std::process::ExitStatus::from_raw(9);
+        assert_eq!(exit_code(Some(status)), Some(137));
+    }
+
+    #[tokio::test]
+    async fn stderr_is_reported_even_when_the_command_ends_with_a_comment() {
+        // Merging the streams by appending `2>&1` to the command would put the
+        // redirect inside the comment, and what the shell itself said about the
+        // command would be lost with it.
+        let dir = test_dir("shell-stderr");
+        let (config, command) = if cfg!(windows) {
+            (
+                ShellConfig::POWERSHELL,
+                "Write-Output hello; Write-Error boom # why",
+            )
+        } else {
+            (ShellConfig::BASH, "echo hello; echo boom 1>&2 # why")
+        };
+
+        let output = ShellTool::new(config, Arc::new(LocalShell))
+            .run(json!({ "command": command }), &context(&dir))
+            .await;
+
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("hello"), "{}", output.text);
+        assert!(output.text.contains("boom"), "{}", output.text);
+    }
+
+    /// The command a real-shell test runs when it must outlive its waiting.
+    fn a_command_that_never_finishes() -> (ShellConfig, &'static str) {
+        if cfg!(windows) {
+            (ShellConfig::POWERSHELL, "Start-Sleep -Seconds 30")
+        } else {
+            (ShellConfig::BASH, "sleep 30")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_command_that_outlives_its_timeout_is_killed_and_returns() {
+        let dir = test_dir("shell-real-timeout");
+        let (config, command) = a_command_that_never_finishes();
+        let started = std::time::Instant::now();
+
+        let output = ShellTool::new(config, Arc::new(LocalShell))
+            .run(json!({ "command": command, "timeout": 1 }), &context(&dir))
+            .await;
+
+        assert!(output.text.contains("killed"), "{}", output.text);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the command was killed rather than waited out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_command_is_killed_when_the_turn_is_cancelled() {
+        let dir = test_dir("shell-real-cancel");
+        let (config, command) = a_command_that_never_finishes();
+        let ctx = context(&dir);
+
+        let tool = ShellTool::new(config, Arc::new(LocalShell));
+        let running = tool.run(json!({ "command": command }), &ctx);
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let output = run_with_deadline(running).await;
+        assert!(output.text.contains("cancelled"), "{}", output.text);
+    }
+
+    /// Poll `work` to its end, giving up on it rather than hanging a test run.
+    async fn run_with_deadline(work: impl std::future::Future<Output = ToolOutput>) -> ToolOutput {
+        tokio::time::timeout(Duration::from_secs(15), work)
+            .await
+            .expect("the command was killed rather than waited out")
     }
 }

@@ -20,6 +20,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Signalling a command's whole process group needs the call itself on Unix; the
+# child is put in a group of its own so the negated pid reaches its descendants.
+libc = { workspace = true }
+
 [dev-dependencies]
 # The loopback test binds a real socket and drives the real HTTP client.
 tokio = { workspace = true, features = ["net"] }

@@ -116,6 +116,8 @@ pub struct ResponsesStream {
     usage: Usage,
     reported_usage: bool,
     finished: bool,
+    /// The response came back `incomplete`, so its message was cut off.
+    truncated: bool,
     /// Tool calls by item id, which is what ties the announced item to the
     /// argument fragments that follow it.
     calls: BTreeMap<String, PartialCall>,
@@ -180,8 +182,13 @@ impl ResponsesStream {
             "response.output_item.done" => self.read_item(&data["item"]),
             // `completed` is the ordinary ending. `incomplete` means the model
             // stopped early — a length cutoff — but its usage still counts.
-            "response.completed" | "response.incomplete" => {
+            "response.completed" => {
                 self.read_usage(&data["response"]["usage"]);
+                self.finished = true;
+            }
+            "response.incomplete" => {
+                self.read_usage(&data["response"]["usage"]);
+                self.truncated = true;
                 self.finished = true;
             }
             "response.failed" => {
@@ -199,6 +206,11 @@ impl ResponsesStream {
     /// Whether the server signalled the end of its stream.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether the model stopped because it hit its output limit.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Hand over the calls this stream assembled.

@@ -25,6 +25,14 @@ pub enum AgentEvent {
         result: ToolResult,
         duration_ms: u64,
     },
+    /// The model hit its output limit, so the message it produced is cut off.
+    ///
+    /// Not terminal: the message still arrives in full as far as the provider
+    /// sent it, and it may carry tool calls whose arguments were cut mid-JSON.
+    /// A reader that runs calls has to refuse them rather than act on a
+    /// half-written request, which is why the signal is its own event rather
+    /// than a detail of the completion.
+    OutputTruncated,
     /// Terminal event: the turn finished successfully.
     TurnComplete {
         /// What the turn consumed, measured by the provider or estimated when
@@ -105,6 +113,10 @@ mod tests {
             .is_terminal()
         );
         assert!(!AgentEvent::TextDelta("hi".to_string()).is_terminal());
+        assert!(
+            !AgentEvent::OutputTruncated.is_terminal(),
+            "a cut-off message still has a completion after it"
+        );
         assert!(AgentEvent::Error("boom".to_string()).is_terminal());
     }
 

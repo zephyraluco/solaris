@@ -50,6 +50,13 @@ struct Args {
     /// Print the resolved configuration and exit without starting the UI.
     #[arg(long)]
     print_config: bool,
+
+    /// Confirm a call that changes something before it runs.
+    ///
+    /// Off by default: a terminal agent is already acting on your behalf. Turn
+    /// it on to be asked before a write, an edit or a command runs.
+    #[arg(long)]
+    confirm_tools: bool,
 }
 
 fn main() -> Result<()> {
@@ -237,6 +244,7 @@ fn main() -> Result<()> {
         // catalogue is what it falls back to.
         discover_models: true,
         tools,
+        ask_approval: args.confirm_tools,
     });
     tui.set_root(Box::new(app));
 

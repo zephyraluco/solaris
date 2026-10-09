@@ -175,6 +175,8 @@ pub struct OpenAiStream {
     usage: Usage,
     reported_usage: bool,
     finished: bool,
+    /// The model stopped on `length`, so its message was cut off.
+    truncated: bool,
     /// Tool calls by the index the server assigns, which is what ties the
     /// fragments of one call together.
     calls: Vec<PartialCall>,
@@ -217,6 +219,12 @@ impl OpenAiStream {
         };
         let delta = &choice["delta"];
 
+        // `length` is the one reason that means the output limit was reached, so
+        // a tool call in this chunk may carry half-written arguments.
+        if choice["finish_reason"] == "length" {
+            self.truncated = true;
+        }
+
         let text = content_text(&delta["content"]);
         if !text.is_empty() {
             out.push(AgentEvent::TextDelta(text));
@@ -234,6 +242,11 @@ impl OpenAiStream {
     /// Whether the server signalled the end of its stream.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether the model stopped because it hit its output limit.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Hand over the calls this stream assembled.

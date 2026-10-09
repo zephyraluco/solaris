@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::mutation_queue::FileMutationQueue;
 use crate::path_utils;
-use crate::tool::{Tool, ToolContext, ToolOutput, string_arg};
+use crate::tool::{ExecutionMode, Tool, ToolContext, ToolOutput, string_arg};
 
 /// Writes whole files.
 #[derive(Debug, Clone)]
@@ -29,6 +29,12 @@ impl WriteTool {
 impl Tool for WriteTool {
     fn name(&self) -> &str {
         "write"
+    }
+
+    /// A write changes what a later call in the same round might read, so it
+    /// runs alone rather than beside them.
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
     }
 
     fn description(&self) -> &str {
@@ -69,11 +75,20 @@ impl Tool for WriteTool {
             return ToolOutput::error(format!("{path} is a directory"));
         }
 
-        let existed = path_utils::exists(&absolute).await;
         let bytes = content.len();
 
         self.queue
             .with_lock(&absolute, || async {
+                // A cancelled call must not touch the filesystem at all, and the
+                // checks sit inside the lock because what they read — whether
+                // the file is there, whether a stop has arrived — is only
+                // settled while nobody else can change it.
+                if ctx.is_cancelled() {
+                    return ToolOutput::error("the write was cancelled before it started");
+                }
+
+                let existed = path_utils::exists(&absolute).await;
+
                 if let Some(parent) = absolute
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
@@ -86,7 +101,7 @@ impl Tool for WriteTool {
                     }
                 }
                 if ctx.is_cancelled() {
-                    return ToolOutput::error("the write was cancelled before it started");
+                    return ToolOutput::error("the write was cancelled before it was written");
                 }
                 match tokio::fs::write(&absolute, content.as_bytes()).await {
                     Ok(()) => ToolOutput::ok(describe(&path, bytes, existed)),
@@ -178,6 +193,24 @@ mod tests {
 
         assert!(output.is_error);
         assert!(output.text.contains("content"), "{}", output.text);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_leaves_nothing_behind() {
+        let dir = test_dir("write-cancelled");
+        let ctx = context(&dir);
+        ctx.cancel.cancel();
+
+        let output = tool()
+            .run(json!({ "path": "nested/deep/a.txt", "content": "x" }), &ctx)
+            .await;
+
+        assert!(output.is_error);
+        assert!(output.text.contains("cancelled"), "{}", output.text);
+        assert!(
+            !dir.join("nested").exists(),
+            "a cancelled write must not create its directories"
+        );
     }
 
     #[test]

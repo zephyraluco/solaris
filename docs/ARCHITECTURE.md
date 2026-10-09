@@ -128,7 +128,7 @@ pub trait Tool: Send + Sync {
 - **工具不会让一轮失败**。文件不存在、命令退出码非零、模型给的参数不合规，全部变成 `ToolOutput::error` 回到模型手里——能处置它的是模型，不是 UI。
 - **工具不认 provider**。声明是 JSON Schema，执行在本地；把声明翻成某条 wire 的请求形状是 `solaris-backend` 的事。
 
-`ToolContext` 带三样东西：`cwd`（相对路径的解析基准）、`temp_dir`（被截断的命令输出落在这里）与 `Cancel`（应用取消一轮时，正在跑的命令要被杀掉，而不是留给一个已经没人听的模型）。
+`ToolContext` 带三样东西：`cwd`（相对路径的解析基准）、`temp_dir`（被截断的命令输出落在这里）与 `Cancel`（应用取消一轮时，正在跑的命令要被杀掉，而不是留给一个已经没人听的模型）。`Tool::execution_mode()` 决定它能否与同一批调用并行：默认 `Parallel`；`write`/`edit`/shell 声明 `Sequential`，因为它们改动的东西正是同批其他调用可能读到的。
 
 八个内建工具：
 
@@ -178,10 +178,17 @@ pub struct ToolLoop { inner: Arc<dyn AgentBackend>, registry: Arc<ToolRegistry>,
 一轮的流程：
 
 1. 按 `request.mode` 取当前工具集，构造本轮的 `TurnRequest.tools`。
-2. 调内层后端，转发 `ThinkingDelta`/`TextDelta`/`Status`/`ToolCall`，拦下 `TurnComplete` 以累计用量与费用。
-3. 本轮没有工具调用 → 发出自己的 `TurnComplete`（累计后的数字），结束。
-4. 有调用 → 逐个「审批 → 执行 → 发 `ToolResult`」，把 `assistant(tool_use…)` 与 `user(tool_result…)` 追加进 history，回到第 1 步。
-5. 单轮最多 `DEFAULT_MAX_ROUNDS`（24）次工具往返，超出即以终态错误停下：模型可能卡在同一个请求上，没有上限的一轮既不会结束也不会停止花钱。
+2. 调内层后端，转发 `ThinkingDelta`/`TextDelta`/`Status`/`ToolCall`/`OutputTruncated`，拦下 `TurnComplete` 以累计用量与费用。
+3. **流结束时必须已经收到 `TurnComplete`**：只收到一半事件就断流的回合算失败（终态错误），不会把半截回答当成完整回答报成功。
+4. 本轮没有工具调用 → 发出自己的 `TurnComplete`（累计后的数字），结束。
+5. 有调用 → 跑这一批调用（见下），把 `assistant(tool_use…)` 与 `user(tool_result…)` 追加进 history，回到第 1 步。
+6. 单轮最多 `DEFAULT_MAX_ROUNDS`（24）次工具往返，超出即以终态错误停下：模型可能卡在同一个请求上，没有上限的一轮既不会结束也不会停止花钱。
+
+**一轮内的调用默认并行**：上限是 `max_parallel`（`DEFAULT_MAX_PARALLEL = 4`），结果按模型请求的顺序回填给模型；只要该批里任一工具声明了 `execution_mode() == Sequential`（`write`、`edit` 与 shell 都是），整批退回逐个执行——写入类工具的按文件锁保证的是不互相踩，串行保证的是「同一批里能读到刚写下的东西」。
+
+**被输出上限截断的调用不执行**：协议层把 `stop_reason` 为 `length` / `max_tokens` / `incomplete` 变成 `AgentEvent::OutputTruncated`，循环据此拒绝这一批全部调用，并告诉模型「撞到输出上限、参数可能残缺，请重新完整给出」；残缺参数被解析成 `null` 时那句含糊的「参数不是 JSON 对象」不再是唯一线索。
+
+**取消按轮次隔离**：`Cancel` 在每次 `run_turn` 开始时 `reset()`，上一轮的取消不会波及下一轮；应用层持有 `ToolLoop::cancel_handle()`，`Ctrl+C` 因此能杀掉正在跑的命令，而不只是不再读事件。
 
 因为它是 `AgentBackend`，应用侧几乎不必为此改动：`App` 的 turn 流程、channel 与事件循环照旧，只是多消费两种事件。循环在独立任务里跑，返回的流被丢弃（用户取消）就等于取消这一轮——任务发现发送端已关闭便不再继续。
 
@@ -191,10 +198,12 @@ pub struct ToolLoop { inner: Arc<dyn AgentBackend>, registry: Arc<ToolRegistry>,
 
 ```rust
 pub enum Approval { Approved, Denied }
-pub trait Approver { fn approve(&self, call: &ToolCall) -> Approval; }
+#[async_trait] pub trait Approver { async fn approve(&self, call: &ToolCall) -> Approval; }
 ```
 
-默认是 `AlwaysApprove`：终端 agent 本来就在替用户做事，为每一次读取弹一个确认只会变成噪音。钩子存在的意义是让「有人在看」与「没人在看」的会话用同一套工具；交互式确认（对话框）还没做，被拒绝的调用会作为错误结果回到模型，而不是中断这一轮。
+异步是必须的：循环跑在后台任务里，提示要送到画屏幕的地方，答案要再送回来。`ChannelApprover` 就是这条通路——`approve()` 把 `ApprovalRequest { call, reply }` 交给 UI，然后等一个 `oneshot`；UI 已经不在了就按拒绝处理，失败方向要安全。
+
+`App` 侧只读四件套（`read`/`grep`/`find`/`ls`）直接放行，其余弹一个 `ConfirmDialog`，答案经 `dialog_rx` 回到等待中的调用。默认仍是 `AlwaysApprove`；`--confirm-tools` 打开后才换成 `ChannelApprover`。被拒绝的调用会作为错误结果回到模型，而不是中断这一轮。
 
 ### 4.6 截断
 

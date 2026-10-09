@@ -64,6 +64,14 @@ impl Cancel {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// Clear the stop request, so the handle can be used for a later turn.
+    ///
+    /// A session keeps one handle across turns; without this, a cancel that
+    /// ended one turn would end every turn after it.
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+
     /// Whether that has happened.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
@@ -97,6 +105,22 @@ impl ToolContext {
     }
 }
 
+/// Whether a tool may run beside the other calls in its round.
+///
+/// Most tools are independent — two reads, or a read and a search, do not care
+/// about each other — so they run together by default. A tool that changes
+/// something another call in the same round might read, or that must not overlap
+/// itself, declares itself [`ExecutionMode::Sequential`] instead, and the whole
+/// round then runs one call at a time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// May run at the same time as the round's other calls.
+    #[default]
+    Parallel,
+    /// Runs alone: the round's other calls wait for it.
+    Sequential,
+}
+
 /// One thing the model can ask for.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -114,6 +138,15 @@ pub trait Tool: Send + Sync {
     /// Never fails: a missing file, a rejected command and unusable arguments
     /// are all error outputs rather than a broken turn.
     async fn run(&self, input: Value, ctx: &ToolContext) -> ToolOutput;
+
+    /// How this tool may run in a round with other calls.
+    ///
+    /// Parallel by default, which is right for anything that only reads. A tool
+    /// that writes, or that runs a program whose effect another call could race,
+    /// answers [`ExecutionMode::Sequential`].
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Parallel
+    }
 
     /// The declaration this tool contributes to a request.
     fn spec(&self) -> ToolSpec {
@@ -170,7 +203,7 @@ pub fn optional_count_arg(input: &Value, field: &str) -> Result<Option<usize>, T
             Some(0) | None => Err(ToolOutput::error(format!(
                 "`{field}` must be a whole number greater than zero"
             ))),
-            Some(count) => Ok(Some(count as usize)),
+            Some(count) => Ok(Some(usize::try_from(count).unwrap_or(usize::MAX))),
         },
     }
 }

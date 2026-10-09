@@ -22,13 +22,19 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::approver::{AlwaysApprove, Approval, Approver};
 use crate::registry::{ToolRegistry, ToolSelection};
-use crate::tool::{Cancel, Tool, ToolContext};
+use crate::tool::{Cancel, ExecutionMode, Tool, ToolContext};
 
 /// Most tool round trips one turn may take before the loop gives up.
 ///
 /// A model can get stuck asking for the same thing; without a ceiling the turn
 /// would never end and never stop costing money.
 pub const DEFAULT_MAX_ROUNDS: usize = 24;
+
+/// Tool calls from one round that run at the same time.
+///
+/// Enough to overlap a round's reads without turning one model reply into a
+/// burst of processes. A round containing a tool that must run alone ignores it.
+pub const DEFAULT_MAX_PARALLEL: usize = 4;
 
 /// What the loop needs to know about the session.
 #[derive(Clone)]
@@ -43,6 +49,11 @@ pub struct ToolLoopOptions {
     pub temp_dir: PathBuf,
     /// Most tool round trips per turn.
     pub max_rounds: usize,
+    /// Most tool calls from one round that run at the same time.
+    ///
+    /// `1` runs every round one call at a time; a round holding a tool that
+    /// declared itself sequential does that whatever this says.
+    pub max_parallel: usize,
 }
 
 impl Default for ToolLoopOptions {
@@ -53,6 +64,7 @@ impl Default for ToolLoopOptions {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temp_dir: std::env::temp_dir(),
             max_rounds: DEFAULT_MAX_ROUNDS,
+            max_parallel: DEFAULT_MAX_PARALLEL,
         }
     }
 }
@@ -127,6 +139,10 @@ impl std::fmt::Debug for ToolLoop {
 #[async_trait::async_trait]
 impl AgentBackend for ToolLoop {
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        // A cancel belongs to one turn. Clearing it here is what keeps a stop
+        // that arrived after the last turn from stopping this one.
+        self.cancel.reset();
+
         let tools = self.registry.select(request.mode, &self.options.selection);
         let (tx, rx) = unbounded_channel();
 
@@ -139,6 +155,7 @@ impl AgentBackend for ToolLoop {
             temp_dir: self.options.temp_dir.clone(),
             cancel: self.cancel.clone(),
             max_rounds: self.options.max_rounds,
+            max_parallel: self.options.max_parallel,
         };
 
         // The loop runs in its own task so the caller can keep drawing while a
@@ -171,6 +188,7 @@ struct Runner {
     temp_dir: PathBuf,
     cancel: Cancel,
     max_rounds: usize,
+    max_parallel: usize,
 }
 
 impl Runner {
@@ -205,9 +223,9 @@ impl Runner {
             };
 
             let reply = match self.consume(stream, &tx, &mut total).await {
-                Some(reply) => reply,
+                RoundOutcome::Completed(reply) => reply,
                 // The round ended in an error, which has already been sent.
-                None => return,
+                RoundOutcome::Failed => return,
             };
 
             cost_usd += reply.cost_usd;
@@ -240,58 +258,71 @@ impl Runner {
                 assistant_blocks(reply.text, &reply.calls),
             ));
 
-            let mut results = Vec::with_capacity(reply.calls.len());
-            for call in &reply.calls {
-                let started = Instant::now();
-                let result = self.run_call(call).await;
-                let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                if tx
-                    .send(AgentEvent::ToolResult {
-                        result: result.clone(),
-                        duration_ms: elapsed,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                results.push(Content::ToolResult { result });
-            }
+            // A message the model stopped writing early may carry half-written
+            // calls, so none of them run: it is told to ask again with whole
+            // arguments rather than have a guess acted on.
+            let results = if reply.truncated {
+                self.refuse_calls(&reply.calls, &tx)
+            } else {
+                self.run_round(&reply.calls, &tx).await
+            };
+            let Some(results) = results else {
+                return;
+            };
 
             // Every result of one round rides in a single user message, which is
             // the shape the Messages API requires of a tool result.
             history.push(Message::with_content(Role::User, results));
+
+            // A stop during the round ends the turn here: asking the model again
+            // would only queue work for nobody.
+            if self.cancel.is_cancelled() {
+                let _ = tx.send(AgentEvent::Error("the turn was cancelled".to_string()));
+                return;
+            }
         }
     }
 
-    /// Read one model call to its end, forwarding what it produces.
+    /// Read one round to its end, forwarding what it produces.
     ///
-    /// `None` means the round failed and the error has been sent; `total` has
-    /// this round's usage added to it either way.
+    /// A failed round has already had its error sent by the time `Failed`
+    /// returns; `total` has this round's usage added to it either way.
     async fn consume(
         &self,
         mut stream: AgentEventStream,
         tx: &UnboundedSender<AgentEvent>,
         total: &mut Usage,
-    ) -> Option<RoundReply> {
+    ) -> RoundOutcome {
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut cost_usd = 0.0;
+        let mut truncated = false;
+        let mut completed = false;
 
         while let Some(event) = stream.next().await {
             match event {
                 AgentEvent::TextDelta(chunk) => {
                     text.push_str(&chunk);
                     if tx.send(AgentEvent::TextDelta(chunk)).is_err() {
-                        return None;
+                        return RoundOutcome::Failed;
                     }
                 }
                 // The call is forwarded so a caller can show it while it runs;
                 // the result follows once it is done.
                 AgentEvent::ToolCall(call) => {
                     if tx.send(AgentEvent::ToolCall(call.clone())).is_err() {
-                        return None;
+                        return RoundOutcome::Failed;
                     }
                     calls.push(call);
+                }
+                // A cut-off message: remembered so the calls it carries are
+                // refused rather than run, and passed on so the caller can say
+                // so on screen.
+                AgentEvent::OutputTruncated => {
+                    truncated = true;
+                    if tx.send(AgentEvent::OutputTruncated).is_err() {
+                        return RoundOutcome::Failed;
+                    }
                 }
                 AgentEvent::TurnComplete {
                     usage,
@@ -299,23 +330,35 @@ impl Runner {
                 } => {
                     *total = total.merge(usage);
                     cost_usd = cost;
+                    completed = true;
                 }
                 AgentEvent::Error(message) => {
                     let _ = tx.send(AgentEvent::Error(message));
-                    return None;
+                    return RoundOutcome::Failed;
                 }
                 other => {
                     if tx.send(other).is_err() {
-                        return None;
+                        return RoundOutcome::Failed;
                     }
                 }
             }
         }
 
-        Some(RoundReply {
+        // A stream that ends without a completion was cut short — the transport
+        // dropped, a proxy closed the connection — and reading that as a
+        // finished turn would report half an answer as the whole one.
+        if !completed {
+            let _ = tx.send(AgentEvent::Error(
+                "the model's response ended without completing".to_string(),
+            ));
+            return RoundOutcome::Failed;
+        }
+
+        RoundOutcome::Completed(RoundReply {
             text,
             calls,
             cost_usd,
+            truncated,
         })
     }
 
@@ -328,12 +371,17 @@ impl Runner {
             );
         };
 
-        if self.approver.approve(call) == Approval::Denied {
+        if self.approver.approve(call).await == Approval::Denied {
             return ToolResult::error(
                 call,
                 "the call was declined, so it did not run — ask instead of acting, or try \
                  something else",
             );
+        }
+
+        // Waiting for that answer is exactly when a cancel is likely to arrive.
+        if self.cancel.is_cancelled() {
+            return ToolResult::error(call, "the turn was cancelled before this call ran");
         }
 
         let ctx = ToolContext {
@@ -349,6 +397,113 @@ impl Runner {
             ToolResult::ok(call, output.text)
         }
     }
+
+    /// Run one round's calls and answer with the blocks the next round carries.
+    ///
+    /// Calls that may run together do, up to the parallel cap; results come back
+    /// in the order the model asked for them, which is what pairs each answer
+    /// with its call. `None` means the caller stopped listening.
+    async fn run_round(
+        &self,
+        calls: &[ToolCall],
+        tx: &UnboundedSender<AgentEvent>,
+    ) -> Option<Vec<Content>> {
+        if self.runs_one_at_a_time(calls) {
+            let mut results = Vec::with_capacity(calls.len());
+            for call in calls {
+                results.push(self.run_and_report(call, tx).await?);
+            }
+            return Some(results);
+        }
+
+        // Calls run in batches of the cap, so nothing waits on more than the
+        // batch it is in and no closure has to name the futures' lifetimes.
+        let mut results = Vec::with_capacity(calls.len());
+        for batch in calls.chunks(self.max_parallel) {
+            let mut pending = Vec::with_capacity(batch.len());
+            for call in batch {
+                pending.push(self.run_and_report(call, tx));
+            }
+            results.extend(futures::future::join_all(pending).await);
+        }
+        results.into_iter().collect()
+    }
+
+    /// Whether this round has to run one call at a time.
+    ///
+    /// True when the cap says so, or when any call in it is for a tool that
+    /// asked to run alone: one such call settles the whole round, because the
+    /// point of running alone is that nothing else overlaps it.
+    fn runs_one_at_a_time(&self, calls: &[ToolCall]) -> bool {
+        if self.max_parallel <= 1 {
+            return true;
+        }
+        calls.iter().any(|call| {
+            self.tools
+                .iter()
+                .find(|tool| tool.name() == call.name)
+                .is_some_and(|tool| tool.execution_mode() == ExecutionMode::Sequential)
+        })
+    }
+
+    /// Run one call and report it, answering with the block to send back.
+    async fn run_and_report(
+        &self,
+        call: &ToolCall,
+        tx: &UnboundedSender<AgentEvent>,
+    ) -> Option<Content> {
+        let started = Instant::now();
+        // A stop that arrived between calls means nothing more should start.
+        let result = if self.cancel.is_cancelled() {
+            ToolResult::error(call, "the turn was cancelled before this call ran")
+        } else {
+            self.run_call(call).await
+        };
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        tx.send(AgentEvent::ToolResult {
+            result: result.clone(),
+            duration_ms: elapsed,
+        })
+        .ok()?;
+
+        Some(Content::ToolResult { result })
+    }
+
+    /// Refuse every call in a message the model never finished writing.
+    ///
+    /// The arguments may be half a JSON object, so running them would mean
+    /// acting on a guess. The model is told instead, and can ask again with the
+    /// arguments written out in full.
+    fn refuse_calls(
+        &self,
+        calls: &[ToolCall],
+        tx: &UnboundedSender<AgentEvent>,
+    ) -> Option<Vec<Content>> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let result = ToolResult::error(
+                call,
+                "the reply hit the output limit before this call was complete, so it did not \
+                 run — ask again with the arguments written out in full",
+            );
+            tx.send(AgentEvent::ToolResult {
+                result: result.clone(),
+                duration_ms: 0,
+            })
+            .ok()?;
+            results.push(Content::ToolResult { result });
+        }
+        Some(results)
+    }
+}
+
+/// How one round ended.
+enum RoundOutcome {
+    /// The model finished its message, which may ask for calls.
+    Completed(RoundReply),
+    /// The round failed. The error has already been sent to the caller.
+    Failed,
 }
 
 /// What one model call produced.
@@ -360,6 +515,8 @@ struct RoundReply {
     calls: Vec<ToolCall>,
     /// What the call cost.
     cost_usd: f64,
+    /// Whether the output limit cut the message off.
+    truncated: bool,
 }
 
 /// The assistant message for a round: its text, then its calls.
@@ -394,6 +551,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde_json::{Value, json};
@@ -437,18 +595,28 @@ mod tests {
         }
     }
 
-    /// A registry with one recording tool in it.
-    fn registry_with(tool: Arc<Recording>) -> ToolRegistry {
-        ToolRegistry::with_tools(vec![tool as Arc<dyn Tool>])
+    /// A registry with one tool in it.
+    fn registry_of(tool: Arc<dyn Tool>) -> ToolRegistry {
+        ToolRegistry::with_tools(vec![tool])
     }
 
-    /// Options that declare exactly the recording tool, since the mode's default
-    /// set would name tools this registry does not have.
-    fn record_options() -> ToolLoopOptions {
+    /// A registry with one recording tool in it.
+    fn registry_with(tool: Arc<Recording>) -> ToolRegistry {
+        registry_of(tool as Arc<dyn Tool>)
+    }
+
+    /// Options that declare exactly `name`, since the mode's default set would
+    /// name tools this registry does not have.
+    fn only(name: &str) -> ToolLoopOptions {
         ToolLoopOptions::default().with_selection(ToolSelection {
-            only: vec!["record".to_string()],
+            only: vec![name.to_string()],
             ..Default::default()
         })
+    }
+
+    /// Options that declare exactly the recording tool.
+    fn record_options() -> ToolLoopOptions {
+        only("record")
     }
 
     struct StubShell;
@@ -892,10 +1060,297 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_options_are_rooted_somewhere_sensible() {
+    /// A tool that reports how many copies of itself ran at once.
+    #[derive(Default)]
+    struct Overlapping {
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        sequential: bool,
+    }
+
+    #[async_trait]
+    impl Tool for Overlapping {
+        fn name(&self) -> &str {
+            "overlap"
+        }
+
+        fn description(&self) -> &str {
+            "Sleep briefly"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn execution_mode(&self) -> ExecutionMode {
+            if self.sequential {
+                ExecutionMode::Sequential
+            } else {
+                ExecutionMode::Parallel
+            }
+        }
+
+        async fn run(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            ToolOutput::ok("done")
+        }
+    }
+
+    /// A tool that cancels the turn it runs in, so a later call must not start.
+    #[derive(Default)]
+    struct Cancelling {
+        cancel: Mutex<Option<Cancel>>,
+        runs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Tool for Cancelling {
+        fn name(&self) -> &str {
+            "cancel-now"
+        }
+
+        fn description(&self) -> &str {
+            "Cancel the turn"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn run(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            // Only the first call cancels; the second turn runs unimpeded.
+            if let Some(cancel) = self.cancel.lock().expect("lock").take() {
+                cancel.cancel();
+            }
+            ToolOutput::ok("done")
+        }
+    }
+
+    /// The ids of the results a turn produced, in the order they were sent.
+    fn result_ids(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { result, .. } => Some(result.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_completing_is_an_error() {
+        // No TurnComplete: the answer was cut short on the way.
+        let inner = Scripted::new(vec![vec![AgentEvent::TextDelta("half".to_string())]]);
+        let backend = loop_with(
+            inner,
+            registry_with(Arc::new(Recording::default())),
+            record_options(),
+        );
+
+        let events = drain(backend, request()).await;
+
+        assert_eq!(text(&events), "half", "what arrived is still shown");
+        let Some(AgentEvent::Error(message)) = events.last() else {
+            panic!("a cut-short stream must not read as a finished turn: {events:?}");
+        };
+        assert!(message.contains("without completing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_message_has_its_calls_refused_instead_of_run() {
+        let inner = Scripted::new(vec![
+            round(vec![
+                AgentEvent::OutputTruncated,
+                AgentEvent::ToolCall(call("call-1", "record")),
+            ]),
+            round(vec![AgentEvent::TextDelta("asking again".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+        let backend = loop_with(
+            inner.clone(),
+            registry_with(Arc::clone(&tool)),
+            record_options(),
+        );
+
+        let events = drain(backend, request()).await;
+
+        assert!(
+            tool.calls.lock().expect("lock").is_empty(),
+            "a half-written call must not run"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::OutputTruncated))
+        );
+
+        let seen = inner.requests();
+        let results: Vec<&ToolResult> = seen[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .collect();
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("output limit"),
+            "{}",
+            results[0].output
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn calls_in_one_round_run_together_and_keep_their_order() {
+        let calls: Vec<AgentEvent> = (0..4)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping::default());
+        let backend = loop_with(
+            inner.clone(),
+            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
+            only("overlap"),
+        );
+
+        let events = drain(backend, request()).await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            4,
+            "a round's independent calls should overlap"
+        );
+        // Results come back in the order the model asked for them, whatever
+        // order the calls happened to finish in.
+        assert_eq!(
+            result_ids(&events),
+            vec!["call-0", "call-1", "call-2", "call-3"]
+        );
+        let seen = inner.requests();
+        let results: Vec<&ToolResult> = seen[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .collect();
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|result| !result.is_error));
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_runs_the_round_one_call_at_a_time() {
+        let calls: Vec<AgentEvent> = (0..3)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping::default());
+        let backend = loop_with(
+            inner,
+            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
+            ToolLoopOptions {
+                max_parallel: 1,
+                ..only("overlap")
+            },
+        );
+
+        drain(backend, request()).await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            1,
+            "a cap of one must not overlap anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sequential_tool_settles_the_whole_round() {
+        let calls: Vec<AgentEvent> = (0..3)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping {
+            sequential: true,
+            ..Default::default()
+        });
+        let backend = loop_with(
+            inner,
+            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
+            only("overlap"),
+        );
+
+        drain(backend, request()).await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            1,
+            "a tool that asked to run alone takes the round with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_the_round_and_does_not_leak_into_the_next_turn() {
+        let inner = Scripted::new(vec![
+            round(vec![
+                AgentEvent::ToolCall(call("call-1", "cancel-now")),
+                AgentEvent::ToolCall(call("call-2", "cancel-now")),
+            ]),
+            round(vec![AgentEvent::ToolCall(call("call-3", "cancel-now"))]),
+            round(vec![AgentEvent::TextDelta("after".to_string())]),
+        ]);
+        let tool = Arc::new(Cancelling::default());
+        let backend = loop_with(
+            inner,
+            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
+            only("cancel-now"),
+        );
+        // The first call cancels the turn it runs in.
+        *tool.cancel.lock().expect("lock") = Some(backend.cancel_handle());
+
+        let shared: Arc<dyn AgentBackend> = backend.clone();
+        let cancelled = drain(shared, request()).await;
+
+        assert_eq!(
+            tool.runs.load(Ordering::SeqCst),
+            1,
+            "the second call must not run once the turn is cancelled"
+        );
+        let Some(AgentEvent::Error(message)) = cancelled.last() else {
+            panic!("a cancelled turn ends in an error: {cancelled:?}");
+        };
+        assert!(message.contains("cancelled"), "{message}");
+
+        // The next turn starts clean: the stop belonged to one turn only.
+        let fresh: Arc<dyn AgentBackend> = backend;
+        let next = drain(fresh, request()).await;
+        assert!(
+            matches!(next.last(), Some(AgentEvent::TurnComplete { .. })),
+            "a fresh turn must not inherit the last turn's cancel: {next:?}"
+        );
+        assert_eq!(text(&next), "after");
+    }
+
+    #[tokio::test]
+    async fn the_options_are_rooted_somewhere_sensible() {
         let options = ToolLoopOptions::default();
         assert!(options.cwd.is_absolute() || options.cwd == Path::new("."));
-        assert!(options.approver.approve(&call("call-1", "record")) == Approval::Approved);
+        assert!(options.max_parallel >= 1);
+        assert_eq!(
+            options.approver.approve(&call("call-1", "record")).await,
+            Approval::Approved
+        );
     }
 }
