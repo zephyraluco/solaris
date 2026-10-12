@@ -265,6 +265,5 @@ mod tests {
         let tool = ReadTool::new();
         assert_eq!(tool.name(), "read");
         assert_eq!(tool.parameters()["required"][0], "path");
-        assert_eq!(tool.spec().name, "read");
     }
 }

@@ -13,9 +13,10 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use solaris::{App, AppOptions, Clipboard};
-use solaris_backend::{AgentBackend, AgentEventStream};
-use solaris_core::{AgentEvent, BackendError, Config, ToolCall, TurnRequest, Usage};
+use solaris::{App, AppOptions, Clipboard, Config};
+use solaris_agent::{
+    AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
+};
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 

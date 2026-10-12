@@ -5,8 +5,8 @@
 //! recorded fixture. The transport lives in [`crate::http`], the retry loop in
 //! [`crate::provider`], and [`crate::wire`] decides which of these to call.
 
+use crate::ToolCall;
 use serde_json::Value;
-use solaris_core::ToolCall;
 
 pub(crate) mod anthropic;
 pub(crate) mod openai;

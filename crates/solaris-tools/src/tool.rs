@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde_json::Value;
-use solaris_core::ToolSpec;
 
 /// What running a tool produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,11 +145,6 @@ pub trait Tool: Send + Sync {
     /// answers [`ExecutionMode::Sequential`].
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Parallel
-    }
-
-    /// The declaration this tool contributes to a request.
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(self.name(), self.description(), self.parameters())
     }
 }
 

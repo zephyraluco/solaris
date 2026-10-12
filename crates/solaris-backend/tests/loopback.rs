@@ -11,8 +11,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{AgentBackend, Endpoint, HttpBackend, TurnPlan, Wire};
-use solaris_core::{AgentEvent, Message, Mode, Price, TurnRequest, Usage};
+use solaris_backend::{
+    AgentBackend, AgentEvent, Endpoint, HttpBackend, Message, Price, TurnPlan, TurnRequest, Usage,
+    Wire,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -127,7 +129,6 @@ fn turn() -> TurnRequest {
     TurnRequest {
         history: vec![Message::system("You are solaris."), Message::user("hi")],
         prompt: "hello".to_string(),
-        mode: Mode::Build,
         tools: Vec::new(),
     }
 }

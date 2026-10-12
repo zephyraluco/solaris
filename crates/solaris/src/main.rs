@@ -10,11 +10,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use solaris::{App, AppOptions, BackendFactory, Clipboard};
-use solaris_core::{Companion, Config, Mode, Preferences, RecentActivity, Soul, tips};
+use solaris::tips;
+use solaris::{
+    App, AppOptions, BackendFactory, Clipboard, Companion, Config, Mode, Preferences,
+    RecentActivity, Soul,
+};
+use solaris_agent::{ToolRegistry, ToolSelection, default_tool_names};
 use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
-use solaris_tools::{ToolRegistry, ToolSelection};
 use solaris_tui::Tui;
 
 /// A terminal AI assistant.
@@ -150,7 +153,9 @@ fn main() -> Result<()> {
         println!("mode: {}", config.mode.label());
         println!(
             "tools: {}",
-            registry.selected_names(config.mode, &tools).join(", ")
+            registry
+                .selected_names(default_tool_names(config.mode), &tools)
+                .join(", ")
         );
         println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {

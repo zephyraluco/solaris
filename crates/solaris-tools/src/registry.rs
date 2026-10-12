@@ -1,14 +1,13 @@
-//! Which tools a session has, and which of them it declares.
+//! Which tools a session has, and which of them a turn declares.
 //!
 //! The registry holds every built-in tool this platform can run. Which of them a
-//! turn actually offers is decided per request: the mode picks the default set
-//! and the selection edits it, so switching to Plan mode withdraws the tools
-//! that write before the model ever sees them.
+//! turn actually offers is decided per request: the caller names a default set
+//! and a selection edits it, so withdrawing the tools that write is a matter of
+//! handing over a different default set — which is how Plan mode keeps the model
+//! from writing before it ever sees a file.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-
-use solaris_core::Mode;
 
 use crate::mutation_queue::FileMutationQueue;
 use crate::runner::{CommandRunner, LocalRunner};
@@ -39,28 +38,6 @@ pub const BUILTIN_TOOLS: &[&str] = &[
 
 /// The shell tool this platform has.
 pub const SHELL_TOOL: &str = if cfg!(windows) { "powershell" } else { "bash" };
-
-/// The tools a mode declares when nothing else is configured.
-///
-/// Build mode runs commands and changes files. Plan mode only looks: the model
-/// cannot be talked into writing by a prompt, because the tools are not there to
-/// call.
-pub fn default_tool_names(mode: Mode) -> Vec<String> {
-    match mode {
-        Mode::Build => vec![
-            "read".to_string(),
-            SHELL_TOOL.to_string(),
-            "edit".to_string(),
-            "write".to_string(),
-        ],
-        Mode::Plan => vec![
-            "read".to_string(),
-            "grep".to_string(),
-            "find".to_string(),
-            "ls".to_string(),
-        ],
-    }
-}
 
 /// The tools a session can declare.
 pub struct ToolRegistry {
@@ -136,9 +113,13 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
-    /// The tools to declare for `mode` under `selection`, in a stable order.
-    pub fn select(&self, mode: Mode, selection: &ToolSelection) -> Vec<Arc<dyn Tool>> {
-        self.selected_names(mode, selection)
+    /// The tools to declare for `defaults` under `selection`, in a stable order.
+    ///
+    /// The default set is the caller's: this crate knows which tools it has, not
+    /// which of them a turn should offer. Names in `defaults` this platform does
+    /// not have are simply not declared.
+    pub fn select(&self, defaults: &[&str], selection: &ToolSelection) -> Vec<Arc<dyn Tool>> {
+        self.selected_names(defaults, selection)
             .into_iter()
             .filter_map(|name| self.get(&name))
             .collect()
@@ -146,9 +127,9 @@ impl ToolRegistry {
 
     /// The names [`ToolRegistry::select`] would resolve, for callers that want
     /// to show them before running anything.
-    pub fn selected_names(&self, mode: Mode, selection: &ToolSelection) -> Vec<String> {
+    pub fn selected_names(&self, defaults: &[&str], selection: &ToolSelection) -> Vec<String> {
         let mut names = if selection.only.is_empty() {
-            default_tool_names(mode)
+            defaults.iter().map(|name| (*name).to_string()).collect()
         } else {
             self.expand(&selection.only)
         };
@@ -192,7 +173,7 @@ impl ToolRegistry {
 /// Which tools a session declares.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolSelection {
-    /// An explicit allowlist, which replaces the mode's default set entirely.
+    /// An explicit allowlist, which replaces the default set entirely.
     pub only: Vec<String>,
     /// Names or `*` patterns added to the default set.
     pub add: Vec<String>,
@@ -201,7 +182,7 @@ pub struct ToolSelection {
 }
 
 impl ToolSelection {
-    /// The default selection: whatever the mode declares.
+    /// The default selection: whatever the caller's default set declares.
     pub fn none() -> Self {
         Self::default()
     }
@@ -209,9 +190,9 @@ impl ToolSelection {
     /// Read a `--tools` list and an `--exclude-tools` list.
     ///
     /// `--tools` is an allowlist, unless every entry is a `+name`/`-name`
-    /// adjustment — then it edits the mode's default set instead, which is how
-    /// one tool gets added without naming the rest. Mixing the two forms is
-    /// refused rather than guessed at.
+    /// adjustment — then it edits the default set instead, which is how one tool
+    /// gets added without naming the rest. Mixing the two forms is refused
+    /// rather than guessed at.
     pub fn parse(tools: Option<&str>, exclude: Option<&str>) -> Result<Self, String> {
         let mut selection = Self::default();
 
@@ -326,6 +307,9 @@ mod tests {
         }
     }
 
+    /// The default set the tests declare: the same shape a session starts from.
+    const DEFAULTS: &[&str] = &["read", SHELL_TOOL, "edit", "write"];
+
     fn registry() -> ToolRegistry {
         ToolRegistry::with_runners(
             Arc::new(StubRunner(CommandOutput::default())),
@@ -351,22 +335,23 @@ mod tests {
     }
 
     #[test]
-    fn build_mode_runs_and_edits_while_plan_mode_only_looks() {
+    fn the_default_set_is_what_a_plain_selection_declares() {
         let registry = registry();
 
-        let build: Vec<String> = names(&registry.select(Mode::Build, &ToolSelection::none()));
-        assert!(build.contains(&"read".to_string()));
-        assert!(build.contains(&SHELL_TOOL.to_string()));
-        assert!(build.contains(&"edit".to_string()));
-        assert!(build.contains(&"write".to_string()));
+        let declared = names(&registry.select(DEFAULTS, &ToolSelection::none()));
+        assert!(declared.contains(&"read".to_string()));
+        assert!(declared.contains(&SHELL_TOOL.to_string()));
+        assert!(declared.contains(&"edit".to_string()));
+        assert!(declared.contains(&"write".to_string()));
         assert!(
-            !build.contains(&"grep".to_string()),
+            !declared.contains(&"grep".to_string()),
             "not in the default set"
         );
 
-        let plan = names(&registry.select(Mode::Plan, &ToolSelection::none()));
-        assert_eq!(plan, vec!["find", "grep", "ls", "read"]);
-        assert!(!plan.iter().any(|name| name == "write" || name == "edit"));
+        // A name the default set mentions but this platform lacks is dropped
+        // rather than declared as something that could not run.
+        let declared = names(&registry.select(&["read", "teleport"], &ToolSelection::none()));
+        assert_eq!(declared, vec!["read"]);
     }
 
     #[test]
@@ -378,7 +363,7 @@ mod tests {
         };
 
         assert_eq!(
-            names(&registry.select(Mode::Build, &selection)),
+            names(&registry.select(DEFAULTS, &selection)),
             vec!["grep", "read"]
         );
     }
@@ -390,7 +375,7 @@ mod tests {
             add: vec!["grep".to_string()],
             ..Default::default()
         };
-        let selected = names(&registry.select(Mode::Build, &added));
+        let selected = names(&registry.select(DEFAULTS, &added));
         assert!(selected.contains(&"grep".to_string()));
         assert!(selected.contains(&"read".to_string()), "the rest is kept");
 
@@ -398,7 +383,7 @@ mod tests {
             remove: vec!["write".to_string()],
             ..Default::default()
         };
-        let selected = names(&registry.select(Mode::Build, &removed));
+        let selected = names(&registry.select(DEFAULTS, &removed));
         assert!(!selected.contains(&"write".to_string()));
         assert!(selected.contains(&"edit".to_string()));
     }
@@ -413,7 +398,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            names(&registry.select(Mode::Build, &selection)),
+            names(&registry.select(DEFAULTS, &selection)),
             vec!["find", "read"]
         );
 
@@ -421,10 +406,7 @@ mod tests {
             only: vec!["gr*".to_string()],
             ..Default::default()
         };
-        assert_eq!(
-            names(&registry.select(Mode::Build, &selection)),
-            vec!["grep"]
-        );
+        assert_eq!(names(&registry.select(DEFAULTS, &selection)), vec!["grep"]);
     }
 
     #[test]
@@ -474,11 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn every_declared_name_is_one_the_tool_answers_to() {
+    fn every_tool_describes_itself() {
         let registry = registry();
-        for tool in registry.select(Mode::Build, &ToolSelection::none()) {
-            let spec = tool.spec();
-            assert_eq!(spec.name, tool.name());
+        for tool in registry.select(DEFAULTS, &ToolSelection::none()) {
+            assert!(!tool.description().is_empty(), "{}", tool.name());
+            assert_eq!(
+                tool.parameters()["type"],
+                "object",
+                "{} takes an arguments object",
+                tool.name()
+            );
         }
         assert_eq!(
             registry.len(),

@@ -2,32 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Agent operating mode; drives the accent colour and backend behaviour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    #[default]
-    Build,
-    Plan,
-}
-
-impl Mode {
-    /// Uppercase badge label shown in the status bar.
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Build => "BUILD",
-            Mode::Plan => "PLAN",
-        }
-    }
-
-    /// Cycle to the other mode (Tab).
-    pub fn next(self) -> Self {
-        match self {
-            Mode::Build => Mode::Plan,
-            Mode::Plan => Mode::Build,
-        }
-    }
-}
+use solaris_agent::Mode;
 
 /// User-visible configuration.
 #[derive(Debug, Clone)]

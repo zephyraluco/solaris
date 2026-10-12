@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use solaris_core::{Mode, ToolCall, ToolResult, Usage, tokens_for_characters};
+use solaris_agent::{Mode, ToolCall, ToolResult, Usage, tokens_for_characters};
 
 /// One tool call the model made, and what running it produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -196,26 +196,26 @@ impl SessionState {
     /// looked at instead of asking again. A call whose result never arrived —
     /// the turn was cancelled while it ran — is left out rather than sent as a
     /// call with no answer, which every wire rejects.
-    pub fn history(&self, mode: Mode) -> Vec<solaris_core::Message> {
-        let mut history = vec![solaris_core::Message::system(format!(
+    pub fn history(&self, mode: Mode) -> Vec<solaris_agent::Message> {
+        let mut history = vec![solaris_agent::Message::system(format!(
             "You are solaris, a terminal assistant running in {} mode.",
             mode.label().to_lowercase()
         ))];
 
         for turn in self.turns.iter().filter(|turn| turn.complete) {
-            history.push(solaris_core::Message::user(turn.prompt.clone()));
+            history.push(solaris_agent::Message::user(turn.prompt.clone()));
 
             for step in turn.steps.iter().filter(|step| step.result.is_some()) {
-                history.push(solaris_core::Message::tool_use(step.call.clone()));
+                history.push(solaris_agent::Message::tool_use(step.call.clone()));
                 if let Some(result) = &step.result {
-                    history.push(solaris_core::Message::tool_result(result.clone()));
+                    history.push(solaris_agent::Message::tool_result(result.clone()));
                 }
             }
 
             // An empty reply adds nothing, and some wires reject a blank text
             // block outright.
             if !turn.reply.is_empty() {
-                history.push(solaris_core::Message::assistant(turn.reply.clone()));
+                history.push(solaris_agent::Message::assistant(turn.reply.clone()));
             }
         }
         history

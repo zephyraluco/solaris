@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use solaris_core::{AgentEvent, Message, Role, TurnRequest, Usage};
+use crate::{AgentEvent, Message, Role, TurnRequest, Usage};
 
 use crate::protocols::{PartialCall, arguments_json};
 use crate::sse::SseEvent;
@@ -311,7 +311,7 @@ fn error_message(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Mode, ToolCall, ToolResult, ToolSpec};
+    use crate::{ToolCall, ToolResult, ToolSpec};
 
     fn request() -> TurnRequest {
         TurnRequest {
@@ -321,7 +321,6 @@ mod tests {
                 Message::assistant("first answer"),
             ],
             prompt: "second question".to_string(),
-            mode: Mode::Build,
             tools: Vec::new(),
         }
     }

@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
-use solaris_core::{AgentEvent, BackendError, Price, TurnRequest, Usage};
+use crate::{AgentEvent, BackendError, Price, TurnRequest, Usage};
 
 use crate::http;
 use crate::protocols::anthropic;
@@ -491,7 +491,7 @@ impl StreamEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Message, Mode};
+    use crate::Message;
 
     #[test]
     fn each_wire_has_its_own_path() {
@@ -831,7 +831,6 @@ mod tests {
         let request = TurnRequest {
             history: vec![Message::system("12345"), Message::user("1234567890")],
             prompt: "123".to_string(),
-            mode: Mode::Build,
             tools: Vec::new(),
         };
         assert_eq!(request_characters(&request), 18);

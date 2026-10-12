@@ -21,17 +21,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use solaris_backend::AgentBackend;
-use solaris_core::{
-    AgentEvent, Companion, Config, Mode, Preferences, RecentActivity, SlashCommand, Soul, ToolCall,
-    TurnRequest, buddy, parse_slash_command, recent,
+use solaris_agent::{
+    Agent, AgentBackend, AgentEvent, AgentOptions, AgentRequest, AlwaysApprove, Approval,
+    ApprovalRequest, Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry,
+    ToolSelection, default_tool_names,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
-};
-use solaris_tools::{
-    AlwaysApprove, Approval, ApprovalRequest, Approver, Cancel, ChannelApprover, ToolLoop,
-    ToolLoopOptions, ToolRegistry, ToolSelection, default_tool_names,
 };
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
@@ -49,8 +45,10 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot;
 
+use crate::buddy::{self, Companion, Soul};
 use crate::clipboard::Clipboard;
-use crate::commands;
+use crate::commands::{self, SlashCommand, parse_slash_command};
+use crate::config::{Config, Preferences};
 use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 use crate::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
@@ -59,6 +57,7 @@ use crate::dialogs::{
 use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
+use crate::recent::{self, RecentActivity};
 use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
@@ -159,7 +158,7 @@ impl AppOptions {
             greeting: "Welcome back!".to_string(),
             buddy: Companion::new("solaris", None),
             buddy_path: None,
-            tip: solaris_core::tips::select(0).content.to_string(),
+            tip: crate::tips::select(0).content.to_string(),
             recent: RecentActivity::new(),
             recent_path: None,
             preferences: Preferences::default(),
@@ -198,42 +197,33 @@ fn resolve_backend(
     choice
 }
 
-/// Wrap a resolved backend in the tool loop.
+/// Wrap a resolved backend in the agent session.
 ///
 /// Every backend goes through it — including the one that refuses turns when
-/// nothing is connected — because the loop is transparent until the model asks
-/// for a tool: with none declared it is exactly one model call, forwarded
-/// unchanged. The returned handle stops whichever turn the loop is running.
+/// nothing is connected — because the session is transparent until the model
+/// asks for a tool: with none declared it is exactly one model call, forwarded
+/// unchanged. The returned handle stops whichever turn the session is running.
 fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
     selection: &ToolSelection,
     cwd: &Path,
     approver: Arc<dyn Approver>,
-) -> (BackendChoice, Cancel) {
-    let options = ToolLoopOptions::in_directory(cwd)
+) -> (Arc<Agent>, Cancel) {
+    let options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_approver(approver);
-    let loop_ = ToolLoop::new(Arc::clone(&choice.backend), registry, options);
-    let cancel = loop_.cancel_handle();
-    (
-        BackendChoice {
-            backend: Arc::new(loop_),
-            ..choice
-        },
-        cancel,
-    )
+    let agent = Arc::new(Agent::new(choice, registry, options));
+    let cancel = agent.cancel_handle();
+    (agent, cancel)
 }
 
 /// The solaris application root component.
 pub struct App {
-    pub(crate) backend: Arc<dyn AgentBackend>,
+    /// The session every turn goes through, and the backend behind it.
+    pub(crate) agent: Arc<Agent>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
-    /// Provider the current backend was resolved to, when one was. The model
-    /// picker lists this provider's models, so it needs the id rather than the
-    /// backend's display label.
-    provider_id: Option<&'static str>,
     pub(crate) config: Config,
     pub(crate) theme: Theme,
     pub(crate) session: SessionState,
@@ -351,15 +341,13 @@ impl App {
         };
 
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
-        let (choice, tool_cancel) = with_tools(
+        let (agent, tool_cancel) = with_tools(
             choice,
             Arc::clone(&registry),
             &tools,
             &cwd,
             Arc::clone(&approver),
         );
-        let backend = choice.backend;
-        let provider_id = choice.provider_id;
 
         let theme = Theme::by_name(&config.theme);
         selection
@@ -372,9 +360,8 @@ impl App {
         editor.set_styles(editor_styles(&theme));
 
         let mut app = Self {
-            backend,
+            agent,
             backend_factory,
-            provider_id,
             config,
             theme,
             session: SessionState::new(),
@@ -457,7 +444,15 @@ impl App {
 
     /// The label of the backend answering turns right now.
     pub fn backend_label(&self) -> &str {
-        self.backend.label()
+        self.agent.label()
+    }
+
+    /// Provider the current session was resolved to, when one was.
+    ///
+    /// The model picker lists this provider's models, so it needs the id rather
+    /// than the backend's display label.
+    fn provider_id(&self) -> Option<&'static str> {
+        self.agent.provider_id()
     }
 
     /// Resolve the backend again after the credentials or the model changed.
@@ -466,17 +461,16 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-        let (choice, cancel) = with_tools(
+        let (agent, cancel) = with_tools(
             choice,
             Arc::clone(&self.registry),
             &self.tools,
             &self.cwd,
             Arc::clone(&self.approver),
         );
-        self.backend = choice.backend;
+        self.agent = agent;
         self.tool_cancel = cancel;
-        self.provider_id = choice.provider_id;
-        choice.source
+        self.agent.source()
     }
 
     /// Whether an overlay is currently visible.
@@ -717,7 +711,7 @@ impl App {
         self.config.model = name.to_string();
         // A model belongs to the provider that offers it, so it is remembered
         // beside that provider rather than in the settings file.
-        if let Some(provider) = self.provider_id {
+        if let Some(provider) = self.provider_id() {
             self.auth.activate(provider);
         }
         self.auth.remember_model(name);
@@ -804,14 +798,13 @@ impl App {
     }
 
     fn start_turn(&mut self, prompt: String) {
-        // No tools here: the loop that wraps the backend declares them, so the
-        // app never has to know which ones a turn offers.
-        let request = TurnRequest {
-            history: self.session.history(self.config.mode),
-            prompt: prompt.clone(),
-            mode: self.config.mode,
-            tools: Vec::new(),
-        };
+        // The session declares the tools a turn may use, so the app never has to
+        // know which ones a mode offers.
+        let request = AgentRequest::new(
+            self.session.history(self.config.mode),
+            prompt.clone(),
+            self.config.mode,
+        );
 
         self.session.turns.push(Turn {
             prompt,
@@ -824,19 +817,13 @@ impl App {
         let (tx, rx) = unbounded_channel();
         self.events_rx = Some(rx);
 
-        let backend = Arc::clone(&self.backend);
+        let agent = Arc::clone(&self.agent);
         tokio::spawn(async move {
             use futures::StreamExt;
-            match backend.run_turn(request).await {
-                Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
-                        if tx.send(event).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(AgentEvent::Error(error.to_string()));
+            let mut stream = agent.run_turn(request);
+            while let Some(event) = stream.next().await {
+                if tx.send(event).is_err() {
+                    break;
                 }
             }
         });
@@ -977,7 +964,7 @@ impl App {
     }
 
     fn open_help(&mut self) {
-        let lines = help_lines(&self.theme, solaris_core::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&self.theme, crate::PROMPT_SLASH_COMMANDS);
         let dialog = TextDialog::new(
             "Help",
             "↑↓ scroll · enter or esc closes",
@@ -994,7 +981,7 @@ impl App {
     }
 
     fn open_stats(&mut self) {
-        let backend = self.backend.label().to_string();
+        let backend = self.agent.label().to_string();
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -1123,13 +1110,13 @@ impl App {
             return;
         }
 
-        let backend = Arc::clone(&self.backend);
+        let agent = Arc::clone(&self.agent);
         let (tx, rx) = unbounded_channel();
         self.models_rx = Some(rx);
         self.discovered.clear();
 
         tokio::spawn(async move {
-            let answer = backend.models().await.map_err(|error| error.to_string());
+            let answer = agent.models().await.map_err(|error| error.to_string());
             let _ = tx.send(answer);
         });
     }
@@ -1166,7 +1153,7 @@ impl App {
                 // provider says this credential reaches no models — but with no
                 // catalogue to fall back on (a gateway, a custom endpoint) the
                 // picker would come up empty with no explanation of why.
-                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                if self.model_choices().is_empty() && self.provider_id().is_some() {
                     self.notifications
                         .warning("the provider listed no models — name one with /model <name>");
                 }
@@ -1175,7 +1162,7 @@ impl App {
                 // Only worth saying when there was no catalogue to fall back on;
                 // otherwise a provider that will not answer is not the user's
                 // problem to solve.
-                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                if self.model_choices().is_empty() && self.provider_id().is_some() {
                     self.notifications.warning(format!(
                         "could not list models: {message} — use /model <name>"
                     ));
@@ -1226,7 +1213,7 @@ impl App {
     /// context windows for the models we ship while leaving a gateway's own
     /// list intact. With nothing reported, the catalogue is the whole answer.
     fn model_choices(&self) -> Vec<SelectItem> {
-        let catalogue = self.provider_id.and_then(solaris_provider::provider_spec);
+        let catalogue = self.provider_id().and_then(solaris_provider::provider_spec);
 
         if self.discovered.is_empty() {
             return catalogue
@@ -1690,7 +1677,7 @@ impl App {
 
         // The model slot disappears while no model is named, so the footer
         // never shows an empty gap between two separators.
-        let mut facts = vec![self.backend.label().to_string()];
+        let mut facts = vec![self.agent.label().to_string()];
         if !self.config.model.is_empty() {
             facts.push(self.config.model.clone());
         }
@@ -1916,9 +1903,7 @@ impl Component for App {
 /// This is the set Plan mode declares, which is exactly the set that cannot
 /// change anything — prompting for a read would be noise.
 fn read_only(name: &str) -> bool {
-    default_tool_names(Mode::Plan)
-        .iter()
-        .any(|known| known == name)
+    default_tool_names(Mode::Plan).contains(&name)
 }
 
 /// The arguments of a call, as the confirmation prompt shows them.
@@ -2031,8 +2016,8 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 mod tests {
     use super::*;
     use crossterm::event::MouseButton;
-    use solaris_backend::AgentEventStream;
-    use solaris_core::{BackendError, ToolCall, ToolResult, Usage};
+    use solaris_agent::AgentEventStream;
+    use solaris_agent::{BackendError, ToolCall, ToolResult, TurnRequest, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -2085,6 +2070,24 @@ mod tests {
         Arc::new(FakeBackend {
             models: Ok(models.iter().map(|id| (*id).to_string()).collect()),
         })
+    }
+
+    /// A session resolved as `provider` while answering from the fake backend.
+    ///
+    /// The provider id is what the model picker reads its catalogue with, so a
+    /// test that needs one has to resolve a backend that carries it.
+    fn fake_session(provider: &'static str) -> Arc<Agent> {
+        Arc::new(Agent::new(
+            BackendChoice {
+                backend: fake_backend(),
+                provider_id: Some(provider),
+                base_url: None,
+                model: String::new(),
+                source: CredentialSource::None,
+            },
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::default(),
+        ))
     }
 
     fn app() -> App {
@@ -2204,7 +2207,7 @@ mod tests {
 
         let mut app = app_with_settings_path(settings_path.clone());
         app.auth_path = Some(auth_path.clone());
-        app.provider_id = Some("opencode");
+        app.agent = fake_session("opencode");
         app.set_model("minimax-m3");
         app.toggle_mode();
         app.set_theme("light");

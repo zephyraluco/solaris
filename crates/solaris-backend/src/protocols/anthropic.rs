@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use solaris_core::{AgentEvent, Content, Message, Role, TurnRequest, Usage};
+use crate::{AgentEvent, Content, Message, Role, TurnRequest, Usage};
 
 use crate::protocols::PartialCall;
 use crate::sse::SseEvent;
@@ -350,7 +350,7 @@ fn error_message(data: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Mode, ToolCall, ToolResult, ToolSpec};
+    use crate::{ToolCall, ToolResult, ToolSpec};
 
     fn request(prompt: &str) -> TurnRequest {
         TurnRequest {
@@ -360,7 +360,6 @@ mod tests {
                 Message::assistant("first answer"),
             ],
             prompt: prompt.to_string(),
-            mode: Mode::Build,
             tools: Vec::new(),
         }
     }
@@ -434,7 +433,6 @@ mod tests {
             &TurnRequest {
                 history: Vec::new(),
                 prompt: "hello".to_string(),
-                mode: Mode::Build,
                 tools: Vec::new(),
             },
             "claude-haiku-4-5",
@@ -455,7 +453,6 @@ mod tests {
             &TurnRequest {
                 history: Vec::new(),
                 prompt: "hello".to_string(),
-                mode: Mode::Plan,
                 tools: Vec::new(),
             },
             "claude-haiku-4-5",
@@ -697,7 +694,6 @@ mod tests {
                 "no such file",
             ))],
             prompt: String::new(),
-            mode: Mode::Build,
             tools: Vec::new(),
         };
 

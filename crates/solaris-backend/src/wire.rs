@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use solaris_core::{AgentEvent, TurnRequest, Usage};
+use crate::{AgentEvent, TurnRequest, Usage};
 
 use crate::protocols::anthropic::AnthropicStream;
 use crate::protocols::openai::OpenAiStream;
@@ -160,13 +160,12 @@ impl WireStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Message, Mode};
+    use crate::Message;
 
     fn request() -> TurnRequest {
         TurnRequest {
             history: vec![Message::system("You are solaris.")],
             prompt: "hello".to_string(),
-            mode: Mode::Build,
             tools: Vec::new(),
         }
     }

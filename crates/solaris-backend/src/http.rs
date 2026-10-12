@@ -6,7 +6,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 
-use solaris_core::BackendError;
+use crate::BackendError;
 
 /// How long a connect may take before it counts as a failure.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

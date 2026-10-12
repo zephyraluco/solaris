@@ -2325,12 +2325,26 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde",
+ "serde_json",
+ "solaris-agent",
+ "solaris-provider",
+ "solaris-tui",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "solaris-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
  "serde_json",
  "solaris-backend",
- "solaris-core",
  "solaris-provider",
  "solaris-tools",
- "solaris-tui",
  "tokio",
 ]
 
@@ -2344,18 +2358,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "solaris-core",
  "thiserror 2.0.21",
  "tokio",
-]
-
-[[package]]
-name = "solaris-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2366,7 +2370,6 @@ dependencies = [
  "serde",
  "serde_json",
  "solaris-backend",
- "solaris-core",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -2378,10 +2381,7 @@ dependencies = [
  "async-trait",
  "futures",
  "libc",
- "serde",
  "serde_json",
- "solaris-backend",
- "solaris-core",
  "thiserror 2.0.21",
  "tokio",
 ]

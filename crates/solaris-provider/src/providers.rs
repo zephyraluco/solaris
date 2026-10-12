@@ -8,8 +8,7 @@
 //! into a backend.
 
 use serde::{Deserialize, Serialize};
-use solaris_backend::Wire;
-use solaris_core::Price;
+use solaris_backend::{Price, Wire};
 
 /// How a provider authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

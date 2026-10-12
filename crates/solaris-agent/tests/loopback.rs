@@ -1,22 +1,24 @@
 //! End-to-end test: a model asks for a tool over a real socket, the tool runs,
 //! and the answer goes back for a second call.
 //!
-//! The unit tests drive the loop with a scripted backend and the tools from
-//! canned outputs. This one puts the real pieces together — a real `TcpListener`,
-//! a real HTTP client, the real tools — so that the request bodies, the parsed
-//! tool call, the executed tool and the follow-up request are all exercised
-//! together. Nothing here reaches the network.
+//! The unit tests drive the loop with a scripted backend and hold the tools in
+//! hand. This one puts the real pieces together — a real `TcpListener`, a real
+//! HTTP client, a real tool, the real agent — so that the request bodies, the
+//! parsed tool call, the executed tool and the follow-up request are all
+//! exercised together. Nothing here reaches the network.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{AgentBackend, Endpoint, HttpBackend, TurnPlan, Wire};
-use solaris_core::{AgentEvent, Message, Mode, TurnRequest};
+use solaris_agent::{
+    Agent, AgentEvent, AgentOptions, AgentRequest, Message, Mode, Tool, ToolRegistry, ToolSelection,
+};
+use solaris_backend::{Endpoint, HttpBackend, TurnPlan, Wire};
+use solaris_provider::{BackendChoice, CredentialSource};
 use solaris_tools::tools::read::ReadTool;
-use solaris_tools::{Tool, ToolLoop, ToolLoopOptions, ToolRegistry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -144,9 +146,44 @@ fn registry() -> Arc<ToolRegistry> {
     ]))
 }
 
+/// The agent over `addr`, offering nothing but the read tool.
+///
+/// A gateway answers no catalogue, so the tool is named outright rather than
+/// left to a mode's default set.
+fn agent(addr: SocketAddr, dir: &Path) -> Agent {
+    let choice = BackendChoice {
+        backend: Arc::new(backend(addr)),
+        provider_id: None,
+        base_url: None,
+        model: "test-model".to_string(),
+        source: CredentialSource::None,
+    };
+    let selection = ToolSelection {
+        only: vec!["read".to_string()],
+        ..Default::default()
+    };
+    Agent::new(
+        choice,
+        registry(),
+        AgentOptions::in_directory(dir)
+            .with_selection(selection)
+            .with_approver(Arc::new(solaris_agent::AlwaysApprove)),
+    )
+}
+
+/// Read a turn's stream to its end.
+async fn drain(agent: &Agent, history: Vec<Message>, prompt: &str) -> Vec<AgentEvent> {
+    let mut stream = agent.run_turn(AgentRequest::new(history, prompt, Mode::Build));
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+    events
+}
+
 /// A directory that lasts for one test.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("solaris-tools-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("solaris-agent-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -157,23 +194,14 @@ async fn a_tool_call_round_trips_through_a_real_socket() {
     std::fs::write(dir.join("a.txt"), "hello from the file\n").expect("fixture");
 
     let (addr, requests) = serve(vec![tool_call_body(), text_body("it says hello")]).await;
-    let backend = ToolLoop::new(
-        Arc::new(backend(addr)),
-        registry(),
-        ToolLoopOptions::in_directory(PathBuf::from(&dir)),
-    );
+    let agent = agent(addr, &dir);
 
-    let request = TurnRequest::new(
+    let events = drain(
+        &agent,
         vec![Message::system("You are solaris.")],
         "read a.txt",
-        Mode::Build,
-    );
-    let mut stream = backend.run_turn(request).await.expect("started");
-
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event);
-    }
+    )
+    .await;
 
     // The tool ran, and its output came back to the caller.
     let results: Vec<&str> = events
@@ -228,20 +256,9 @@ async fn a_turn_with_no_tool_call_is_a_single_request() {
     let dir = temp_dir("plain");
 
     let (addr, requests) = serve(vec![text_body("no tools needed")]).await;
-    let backend = ToolLoop::new(
-        Arc::new(backend(addr)),
-        registry(),
-        ToolLoopOptions::in_directory(dir.clone()),
-    );
+    let agent = agent(addr, &dir);
 
-    let mut stream = backend
-        .run_turn(TurnRequest::new(Vec::new(), "hello", Mode::Build))
-        .await
-        .expect("started");
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        events.push(event);
-    }
+    let events = drain(&agent, Vec::new(), "hello").await;
 
     assert!(
         events.iter().all(|event| !matches!(

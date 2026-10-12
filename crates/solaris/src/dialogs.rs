@@ -593,10 +593,7 @@ pub const KEY_HELP: &[(&str, &str)] = &[
 ];
 
 /// Build the help dialog contents.
-pub fn help_lines(
-    theme: &Theme,
-    commands: &[solaris_core::SlashCommandSpec],
-) -> Vec<Line<'static>> {
+pub fn help_lines(theme: &Theme, commands: &[crate::SlashCommandSpec]) -> Vec<Line<'static>> {
     let heading = Style::default()
         .fg(theme.heading)
         .add_modifier(Modifier::BOLD);
@@ -653,7 +650,7 @@ pub fn stats_lines(
     session: &crate::state::SessionState,
     model: &str,
     backend: &str,
-    mode: solaris_core::Mode,
+    mode: solaris_agent::Mode,
     context_window: u64,
 ) -> Vec<Line<'static>> {
     let heading = Style::default()
@@ -997,13 +994,13 @@ mod tests {
     #[test]
     fn help_lines_mention_every_command() {
         let theme = Theme::dark();
-        let lines = help_lines(&theme, solaris_core::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&theme, crate::PROMPT_SLASH_COMMANDS);
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        for spec in solaris_core::PROMPT_SLASH_COMMANDS {
+        for spec in crate::PROMPT_SLASH_COMMANDS {
             assert!(
                 text.contains(&format!("/{}", spec.name)),
                 "missing {}",
@@ -1018,7 +1015,7 @@ mod tests {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
         session.turns.push(crate::state::Turn {
-            usage: solaris_core::Usage::new(120, 30),
+            usage: solaris_agent::Usage::new(120, 30),
             cost_usd: 0.01,
             complete: true,
             ..Default::default()
@@ -1029,7 +1026,7 @@ mod tests {
             &session,
             "claude-sonnet-4-5",
             "anthropic",
-            solaris_core::Mode::Build,
+            solaris_agent::Mode::Build,
             1000,
         );
         let text: String = lines
@@ -1063,7 +1060,7 @@ mod tests {
         for _ in 0..3 {
             session.turns.push(crate::state::Turn {
                 prompt: "hi".to_string(),
-                usage: solaris_core::Usage::new(100, 50),
+                usage: solaris_agent::Usage::new(100, 50),
                 complete: true,
                 ..Default::default()
             });
@@ -1074,7 +1071,7 @@ mod tests {
             &session,
             "claude-sonnet-4-5",
             "anthropic",
-            solaris_core::Mode::Build,
+            solaris_agent::Mode::Build,
             1000,
         ));
 
@@ -1090,7 +1087,7 @@ mod tests {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
         session.turns.push(crate::state::Turn {
-            usage: solaris_core::Usage::estimate(400, 400),
+            usage: solaris_agent::Usage::estimate(400, 400),
             ..Default::default()
         });
 
@@ -1099,7 +1096,7 @@ mod tests {
             &session,
             "llama3.2",
             "local",
-            solaris_core::Mode::Plan,
+            solaris_agent::Mode::Plan,
             1000,
         );
         let text: String = lines

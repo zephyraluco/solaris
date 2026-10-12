@@ -11,8 +11,9 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{AgentBackend, AgentEventStream, Endpoint, HttpBackend, TurnPlan};
-use solaris_core::{BackendError, TurnRequest};
+use solaris_backend::{
+    AgentBackend, AgentEventStream, BackendError, Endpoint, HttpBackend, TurnPlan, TurnRequest,
+};
 
 use crate::providers::{
     AuthKind, PROVIDERS, ProviderSpec, max_output_for, price_for, provider_spec,
@@ -442,7 +443,6 @@ mod tests {
         TurnRequest {
             history: Vec::new(),
             prompt: "hello".to_string(),
-            mode: solaris_core::Mode::Build,
             tools: Vec::new(),
         }
     }

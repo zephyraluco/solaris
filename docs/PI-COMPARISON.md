@@ -1,4 +1,4 @@
-# solaris-tools 与 pi 的差异
+# solaris-tools / solaris-agent 与 pi 的差异
 
 本文件对照 [earendil-works/pi](https://github.com/earendil-works/pi) 的**工具层与 agent loop**，逐项记录 solaris 的实现与它的区别。核对时间：2026-10-09，对照 pi 的 `main` 分支（逐文件读过 `tools/`、`packages/agent/src/agent-loop.ts` 与 `utils/shell.ts`，常量与文档记载一致）。
 
@@ -17,7 +17,6 @@
 | Windows 上的 shell | 找 Git Bash（`%ProgramFiles%\Git\bin\bash.exe` → PATH 上的 `bash.exe` → 否则报错），**默认工具集里就是 `bash`** | 没有 `bash` 工具；Windows 上注册的是 `powershell` | 不假设用户装了 Git for Windows。给 Windows 声明 `bash` 是在声明一个可能跑不起来的东西 |
 | `powershell` 参数 | `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` | 只有 `-Command` | 保持最小；需要时按需加回 |
 | `rg` / `fd` 缺失 | `ensureTool` **自动下载**二进制到 bin 目录 | 明确报错并给出安装提示 | 不引入网络下载与供应链成本 |
-| 工具往返的轮数 | 没有上限（`while (hasMoreToolCalls)`） | `DEFAULT_MAX_ROUNDS = 24` | 模型可能卡在同一个请求上；没有上限的一轮既不会结束也不会停止花钱 |
 | 工具执行的确认 | project trust + `tool_call` 处理器可拦截 | `Approver` 钩子（异步），默认全部批准，`--confirm-tools` 打开对话框确认 | 默认批准：终端 agent 本来就在替用户做事；有人在看时再打开提问 |
 
 ---
@@ -48,7 +47,7 @@ pi 的 `ToolDefinition` 比 solaris 的 `Tool` trait 厚一层。
 | 行为 | pi | solaris |
 | --- | --- | --- |
 | 执行顺序 | **默认并行**（`Promise.all`）；只有配置成 `sequential` 或该批里任一工具声明了 `executionMode: "sequential"` 才串行 | 同样默认并行（每批最多 `DEFAULT_MAX_PARALLEL = 4`），结果按请求顺序回填；批里有 `Sequential` 工具则整批串行 |
-| 轮数上限 | 无 | 24（`ToolLoopOptions::max_rounds`） |
+| 轮数上限 | 无（`while (hasMoreToolCalls)`） | 同样没有：循环跑到模型不再请求为止，取消是唯一上界 |
 | 流中断 | `stopReason` 直接来自助手消息 | 结束时没收到 `TurnComplete` 即视为失败（终态错误），不再把半截回答报成功 |
 | 输出被截断的调用 | 检查 `stopReason === "length"`，**拒绝执行**并告诉模型「响应撞到输出上限、参数可能残缺，请重新发起」 | 协议层把它变成 `AgentEvent::OutputTruncated`，循环据此拒绝该批全部调用并给出同样可操作的说明 |
 | 取消 | 每次运行独立的 `AbortSignal` | `Cancel` 每次 `run_turn` 开始时 `reset()`，按轮次隔离；应用层持句柄，取消会杀掉正在跑的命令 |
@@ -56,9 +55,9 @@ pi 的 `ToolDefinition` 比 solaris 的 `Tool` trait 厚一层。
 | 嵌套调用 | `ctx.executeTool()`（codemode 脚本内调工具），事件带 `parentToolCallId` | 无 |
 | 等待期间的用户输入 | steering / pending messages 可在循环内插入 | 应用层排队提示词（`queued_prompts`），在整轮结束后才跑 |
 | 上下文压缩 | 有 compaction | 无 |
-| 用量结算 | 每轮各自记账 | `ToolLoop` 拦下每轮的 `TurnComplete`，用 `Usage::merge` 累计后只发一个终态事件 |
+| 用量结算 | 每轮各自记账 | `Agent` 拦下每轮的 `TurnComplete`，用 `Usage::merge` 累计后只发一个终态事件 |
 
-solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部可能是多次模型调用；因为 `ToolLoop` 实现的是 `AgentBackend`，应用层不需要知道这件事。
+solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部可能是多次模型调用；因为多轮循环整个住在 `solaris-agent` 里、对应用只暴露一个 `Agent`，应用层不需要知道这件事。
 
 > pi 侧：`packages/agent/src/agent-loop.ts`（`executeToolCalls` / `executeToolCallsSequential` / `executeToolCallsParallel` / `runToolCall`）
 
@@ -149,7 +148,7 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 - **残缺调用不再执行**：协议层把停止原因带出来（`length` / `max_tokens` / `incomplete` → `AgentEvent::OutputTruncated`），循环拒绝该批全部调用并给出可操作的说明（§3）。
 - **一轮内并行**：每批最多 `DEFAULT_MAX_PARALLEL = 4`，结果按请求顺序回填；`write` / `edit` / shell 声明 `Sequential`，该批随之串行（§3）。
 - **回合不再误报成功**：流在收到 `TurnComplete` 之前结束即算失败，不会把半截回答当成完整回答。
-- **取消真正生效并按轮次隔离**：`Cancel` 每轮 `reset()`，应用层持有 `ToolLoop::cancel_handle()`，`Ctrl+C` 会杀掉正在跑的命令，而不只是停止读取事件。
+- **取消真正生效并按轮次隔离**：`Cancel` 每轮 `reset()`，应用层持有 `Agent::cancel_handle()`，`Ctrl+C` 会杀掉正在跑的命令，而不只是停止读取事件。
 - **审批可以等待 UI**：`Approver::approve` 改为 `async`，`ChannelApprover` 把 `ApprovalRequest` 交给 UI 并等 `oneshot`；`--confirm-tools` 打开后，非只读调用会弹确认对话框（§1）。
 - **命令输出被净化**：shell 的两条流合并后会剔除 ANSI 转义序列（CSI / OSC）、控制字符与 U+FFF9–FFFB；`\r` 按光标回退处理，进度条只留下最后一帧，CRLF 仍是一次换行（§4）。
 - **两条流都拿得到**：stdout 与 stderr 各自管道回来、按到达顺序合并，shell 自己关于命令的报错不再丢失；命令串也不再被追加 `2>&1` 改写，以注释或续行结尾的命令不会被打断（§4）。

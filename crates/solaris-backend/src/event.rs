@@ -1,6 +1,5 @@
 //! Events streamed from a backend during a turn.
 
-use crate::config::Mode;
 use crate::message::Message;
 use crate::tool::{ToolCall, ToolResult, ToolSpec};
 use crate::usage::Usage;
@@ -53,6 +52,10 @@ impl AgentEvent {
 }
 
 /// Everything a backend needs to answer one turn.
+///
+/// The mode a turn runs in is deliberately absent: which tools a turn may use is
+/// the agent's decision, and by the time a request reaches a backend its tool
+/// list is already settled.
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
     /// Prior conversation, oldest first, excluding the new prompt.
@@ -63,20 +66,17 @@ pub struct TurnRequest {
     /// is what a tool round trip does — and the request bodies then append no
     /// further user message.
     pub prompt: String,
-    /// Active agent mode.
-    pub mode: Mode,
     /// Tools declared to the model for this request. Empty means none, and the
     /// request bodies then carry no `tools` field at all.
     pub tools: Vec<ToolSpec>,
 }
 
 impl TurnRequest {
-    /// A request with no tools declared.
-    pub fn new(history: Vec<Message>, prompt: impl Into<String>, mode: Mode) -> Self {
+    /// A request that declares no tools.
+    pub fn new(history: Vec<Message>, prompt: impl Into<String>) -> Self {
         Self {
             history,
             prompt: prompt.into(),
-            mode,
             tools: Vec::new(),
         }
     }
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn a_new_request_declares_no_tools() {
-        let request = TurnRequest::new(Vec::new(), "hi", Mode::Build);
+        let request = TurnRequest::new(Vec::new(), "hi");
         assert!(request.tools.is_empty());
         assert_eq!(request.prompt, "hi");
     }

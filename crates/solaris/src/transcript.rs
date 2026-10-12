@@ -235,7 +235,7 @@ pub fn summarize(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::state::ToolStep;
-    use solaris_core::{ToolCall, ToolResult};
+    use solaris_agent::{ToolCall, ToolResult};
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

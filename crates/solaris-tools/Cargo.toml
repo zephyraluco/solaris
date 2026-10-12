@@ -4,19 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Built-in tools and the agent loop that runs them for solaris"
+description = "Built-in tools for solaris"
 
 [lints]
 workspace = true
 
 [dependencies]
-solaris-core = { workspace = true }
-solaris-backend = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 # `process` and `io-util` are for the shell tools, `fs` for the file tools.
 tokio = { workspace = true, features = ["process", "io-util", "fs"] }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
@@ -24,7 +21,3 @@ thiserror = { workspace = true }
 # Signalling a command's whole process group needs the call itself on Unix; the
 # child is put in a group of its own so the negated pid reaches its descendants.
 libc = { workspace = true }
-
-[dev-dependencies]
-# The loopback test binds a real socket and drives the real HTTP client.
-tokio = { workspace = true, features = ["net"] }

@@ -1,10 +1,11 @@
 //! The loop that runs the model's tool calls and asks it again.
 //!
-//! A model cannot run anything: it can only ask. This wraps a real backend and
-//! turns one request into as many model calls as the model needs — declaring the
-//! tools, running what comes back, feeding the results in, and repeating until
-//! the model stops asking. From the application's side it is just another
-//! [`AgentBackend`], so nothing above it had to learn about tools.
+//! A model cannot run anything: it can only ask. This drives a real backend
+//! through as many model calls as the model needs — declaring the tools it was
+//! handed, running what comes back, feeding the results in, and repeating until
+//! the model stops asking. Only [`crate::Agent`] calls it: working out which
+//! tools a turn may use is the agent's business, so by the time the loop starts
+//! the set is settled.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -13,22 +14,15 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use futures::{Stream, StreamExt};
-use solaris_backend::{AgentBackend, AgentEventStream};
-use solaris_core::{
-    AgentEvent, BackendError, Content, Message, Role, ToolCall, ToolResult, ToolSpec, TurnRequest,
-    Usage,
+use solaris_backend::{
+    AgentBackend, AgentEvent, AgentEventStream, Content, Message, Role, ToolCall, ToolResult,
+    ToolSpec, TurnRequest, Usage,
 };
+use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::approver::{AlwaysApprove, Approval, Approver};
-use crate::registry::{ToolRegistry, ToolSelection};
-use crate::tool::{Cancel, ExecutionMode, Tool, ToolContext};
-
-/// Most tool round trips one turn may take before the loop gives up.
-///
-/// A model can get stuck asking for the same thing; without a ceiling the turn
-/// would never end and never stop costing money.
-pub const DEFAULT_MAX_ROUNDS: usize = 24;
+use crate::agent::AgentOptions;
+use crate::approver::{Approval, Approver};
 
 /// Tool calls from one round that run at the same time.
 ///
@@ -36,149 +30,52 @@ pub const DEFAULT_MAX_ROUNDS: usize = 24;
 /// burst of processes. A round containing a tool that must run alone ignores it.
 pub const DEFAULT_MAX_PARALLEL: usize = 4;
 
-/// What the loop needs to know about the session.
-#[derive(Clone)]
-pub struct ToolLoopOptions {
-    /// Which tools the mode's default set is edited with.
-    pub selection: ToolSelection,
-    /// Who decides whether a call may run.
-    pub approver: Arc<dyn Approver>,
-    /// Directory relative paths resolve against.
-    pub cwd: PathBuf,
-    /// Where a truncated shell output is written.
-    pub temp_dir: PathBuf,
-    /// Most tool round trips per turn.
-    pub max_rounds: usize,
-    /// Most tool calls from one round that run at the same time.
-    ///
-    /// `1` runs every round one call at a time; a round holding a tool that
-    /// declared itself sequential does that whatever this says.
-    pub max_parallel: usize,
-}
-
-impl Default for ToolLoopOptions {
-    fn default() -> Self {
-        Self {
-            selection: ToolSelection::none(),
-            approver: Arc::new(AlwaysApprove),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            temp_dir: std::env::temp_dir(),
-            max_rounds: DEFAULT_MAX_ROUNDS,
-            max_parallel: DEFAULT_MAX_PARALLEL,
-        }
-    }
-}
-
-impl ToolLoopOptions {
-    /// Options rooted at `cwd`, with the default temp directory.
-    pub fn in_directory(cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            cwd: cwd.into(),
-            ..Default::default()
-        }
-    }
-
-    /// The same options with `approver` deciding about each call.
-    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
-        self.approver = approver;
-        self
-    }
-
-    /// The same options with `selection` choosing the tools.
-    pub fn with_selection(mut self, selection: ToolSelection) -> Self {
-        self.selection = selection;
-        self
-    }
-}
-
-/// A backend that runs the model's tool calls.
-pub struct ToolLoop {
+/// Start a turn over `tools`, streaming what it produces.
+///
+/// The loop runs in its own task so the caller can keep drawing while a command
+/// runs. Dropping the returned stream drops `tx`, which is how the loop learns
+/// the turn was abandoned.
+pub(crate) fn start(
     inner: Arc<dyn AgentBackend>,
-    registry: Arc<ToolRegistry>,
-    options: ToolLoopOptions,
+    tools: Vec<Arc<dyn Tool>>,
+    options: &AgentOptions,
     cancel: Cancel,
-}
+    history: Vec<Message>,
+    prompt: String,
+) -> AgentEventStream {
+    // A cancel belongs to one turn. Clearing it here is what keeps a stop that
+    // arrived after the last turn from stopping this one.
+    cancel.reset();
 
-impl ToolLoop {
-    /// A loop around `inner` that offers the registry's tools.
-    pub fn new(
-        inner: Arc<dyn AgentBackend>,
-        registry: Arc<ToolRegistry>,
-        options: ToolLoopOptions,
-    ) -> Self {
-        Self {
-            inner,
-            registry,
-            options,
-            cancel: Cancel::new(),
-        }
-    }
+    let (tx, rx) = unbounded_channel();
+    let runner = Runner {
+        inner,
+        specs: tools
+            .iter()
+            .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
+            .collect(),
+        tools,
+        approver: Arc::clone(&options.approver),
+        cwd: options.cwd.clone(),
+        temp_dir: options.temp_dir.clone(),
+        cancel,
+        max_parallel: options.max_parallel,
+    };
+    let request = TurnRequest {
+        history,
+        prompt,
+        tools: Vec::new(),
+    };
 
-    /// A handle that stops a turn in flight: a running command is killed and no
-    /// further model call is made.
-    pub fn cancel_handle(&self) -> Cancel {
-        self.cancel.clone()
-    }
+    tokio::spawn(async move {
+        runner.drive(request, tx).await;
+    });
 
-    /// The tools a request in `mode` would declare.
-    pub fn tool_names(&self, mode: solaris_core::Mode) -> Vec<String> {
-        self.registry.selected_names(mode, &self.options.selection)
-    }
-}
-
-impl std::fmt::Debug for ToolLoop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolLoop")
-            .field("inner", &self.inner.label())
-            .field("tools", &self.registry.len())
-            .field("max_rounds", &self.options.max_rounds)
-            .finish()
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentBackend for ToolLoop {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        // A cancel belongs to one turn. Clearing it here is what keeps a stop
-        // that arrived after the last turn from stopping this one.
-        self.cancel.reset();
-
-        let tools = self.registry.select(request.mode, &self.options.selection);
-        let (tx, rx) = unbounded_channel();
-
-        let runner = Runner {
-            inner: Arc::clone(&self.inner),
-            specs: tools.iter().map(|tool| tool.spec()).collect(),
-            tools,
-            approver: Arc::clone(&self.options.approver),
-            cwd: self.options.cwd.clone(),
-            temp_dir: self.options.temp_dir.clone(),
-            cancel: self.cancel.clone(),
-            max_rounds: self.options.max_rounds,
-            max_parallel: self.options.max_parallel,
-        };
-
-        // The loop runs in its own task so the caller can keep drawing while a
-        // command runs. Dropping the returned stream drops `tx`, which is how
-        // the loop learns the turn was abandoned.
-        tokio::spawn(async move {
-            runner.drive(request, tx).await;
-        });
-
-        Ok(Box::pin(EventStream { rx }))
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
-
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.inner.models().await
-    }
+    Box::pin(EventStream { rx })
 }
 
 /// The state one turn's loop runs with, owned outright so it can outlive the
-/// call to `run_turn`.
+/// call that started it.
 struct Runner {
     inner: Arc<dyn AgentBackend>,
     tools: Vec<Arc<dyn Tool>>,
@@ -187,19 +84,21 @@ struct Runner {
     cwd: PathBuf,
     temp_dir: PathBuf,
     cancel: Cancel,
-    max_rounds: usize,
     max_parallel: usize,
 }
 
 impl Runner {
     /// Ask the model, run what it asks for, and repeat until it stops asking.
+    ///
+    /// There is no round ceiling: the model keeps going until it asks for
+    /// nothing, fails, or the caller stops the turn. Cancelling is therefore the
+    /// only bound on how much a turn may spend, which is why it is checked
+    /// before every round and again after each round's calls have run.
     async fn drive(&self, request: TurnRequest, tx: UnboundedSender<AgentEvent>) {
-        let mode = request.mode;
         let mut history = request.history.clone();
         let mut prompt = request.prompt.clone();
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
-        let mut rounds = 0usize;
 
         loop {
             if self.cancel.is_cancelled() {
@@ -210,7 +109,6 @@ impl Runner {
             let round_request = TurnRequest {
                 history: history.clone(),
                 prompt: prompt.clone(),
-                mode,
                 tools: self.specs.clone(),
             };
 
@@ -235,15 +133,6 @@ impl Runner {
                     usage: total,
                     cost_usd,
                 });
-                return;
-            }
-
-            rounds += 1;
-            if rounds > self.max_rounds {
-                let _ = tx.send(AgentEvent::Error(format!(
-                    "stopped after {} rounds of tool calls — the model kept asking for more",
-                    self.max_rounds
-                )));
                 return;
             }
 
@@ -555,14 +444,10 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::{Value, json};
-    use solaris_core::{Mode, Usage};
 
-    use crate::approver::DenyAll;
-    use crate::registry::ToolRegistry;
-    use crate::runner::CommandOutput;
-    use crate::runner::tests::StubRunner;
-    use crate::tool::ToolOutput;
-    use crate::tools::shell::{ShellConfig, ShellOutcome, ShellRunner};
+    use crate::approver::{Approval, DenyAll};
+    use solaris_backend::{BackendError, Usage};
+    use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput};
 
     /// A tool that records every call it is handed.
     #[derive(Default)]
@@ -593,471 +478,6 @@ mod tests {
                 ToolOutput::ok("done")
             }
         }
-    }
-
-    /// A registry with one tool in it.
-    fn registry_of(tool: Arc<dyn Tool>) -> ToolRegistry {
-        ToolRegistry::with_tools(vec![tool])
-    }
-
-    /// A registry with one recording tool in it.
-    fn registry_with(tool: Arc<Recording>) -> ToolRegistry {
-        registry_of(tool as Arc<dyn Tool>)
-    }
-
-    /// Options that declare exactly `name`, since the mode's default set would
-    /// name tools this registry does not have.
-    fn only(name: &str) -> ToolLoopOptions {
-        ToolLoopOptions::default().with_selection(ToolSelection {
-            only: vec![name.to_string()],
-            ..Default::default()
-        })
-    }
-
-    /// Options that declare exactly the recording tool.
-    fn record_options() -> ToolLoopOptions {
-        only("record")
-    }
-
-    struct StubShell;
-
-    #[async_trait]
-    impl ShellRunner for StubShell {
-        async fn run(
-            &self,
-            _config: ShellConfig,
-            _command: &str,
-            _ctx: &ToolContext,
-            _timeout: Option<std::time::Duration>,
-        ) -> Result<ShellOutcome, String> {
-            Ok(ShellOutcome::default())
-        }
-    }
-
-    /// A backend that plays a scripted list of rounds and records what it was
-    /// asked.
-    struct Scripted {
-        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
-        seen: Mutex<Vec<TurnRequest>>,
-    }
-
-    impl Scripted {
-        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
-            Arc::new(Self {
-                rounds: Mutex::new(rounds.into()),
-                seen: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<TurnRequest> {
-            self.seen.lock().expect("lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl AgentBackend for Scripted {
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            self.seen.lock().expect("lock").push(request);
-            let events = self
-                .rounds
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
-        }
-    }
-
-    fn round(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
-        let mut round = events;
-        round.push(AgentEvent::TurnComplete {
-            usage: Usage::new(10, 5),
-            cost_usd: 0.001,
-        });
-        round
-    }
-
-    fn call(id: &str, name: &str) -> ToolCall {
-        ToolCall::new(id, name, json!({ "note": id }))
-    }
-
-    /// The events a loop produces for one request.
-    async fn drain(backend: Arc<dyn AgentBackend>, request: TurnRequest) -> Vec<AgentEvent> {
-        let mut stream = backend.run_turn(request).await.expect("started");
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            events.push(event);
-        }
-        events
-    }
-
-    fn loop_with(
-        inner: Arc<dyn AgentBackend>,
-        registry: ToolRegistry,
-        options: ToolLoopOptions,
-    ) -> Arc<ToolLoop> {
-        Arc::new(ToolLoop::new(inner, Arc::new(registry), options))
-    }
-
-    fn request() -> TurnRequest {
-        TurnRequest::new(
-            vec![Message::system("You are solaris.")],
-            "do it",
-            Mode::Build,
-        )
-    }
-
-    fn text(events: &[AgentEvent]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::TextDelta(chunk) => Some(chunk.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_turn_with_no_tool_call_ends_after_one_round() {
-        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
-            "hello".to_string(),
-        )])]);
-        let tool = Arc::new(Recording::default());
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::clone(&tool)),
-            record_options(),
-        );
-
-        let events = drain(backend, request()).await;
-
-        assert_eq!(text(&events), "hello");
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
-        assert!(tool.calls.lock().expect("lock").is_empty());
-        assert_eq!(inner.requests().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_tool_call_is_run_and_the_result_sent_back() {
-        let inner = Scripted::new(vec![
-            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
-            round(vec![AgentEvent::TextDelta("all done".to_string())]),
-        ]);
-        let tool = Arc::new(Recording::default());
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::clone(&tool)),
-            record_options(),
-        );
-
-        let events = drain(backend, request()).await;
-
-        // The call ran with the arguments the model sent.
-        assert_eq!(
-            tool.calls.lock().expect("lock").clone(),
-            vec![json!({ "note": "call-1" })]
-        );
-
-        // The model saw the result, and the turn ended once it stopped asking.
-        let seen = inner.requests();
-        assert_eq!(seen.len(), 2);
-        let second = &seen[1];
-        assert_eq!(second.tools.len(), 1, "tools are declared on every round");
-        let results: Vec<&ToolResult> = second
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].output, "done");
-        assert!(!results[0].is_error);
-
-        // The prompt moved into the history, so the second round does not repeat it.
-        assert!(second.prompt.is_empty());
-        assert!(
-            second
-                .history
-                .iter()
-                .any(|message| message.text() == "do it")
-        );
-
-        // The caller saw the result, and one terminal event for the whole turn.
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::ToolResult { result, .. } if result.output == "done"
-        )));
-        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
-        assert_eq!(text(&events), "all done");
-    }
-
-    #[tokio::test]
-    async fn usage_and_cost_are_summed_across_rounds() {
-        let inner = Scripted::new(vec![
-            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
-            round(vec![AgentEvent::TextDelta("done".to_string())]),
-        ]);
-        let backend = loop_with(
-            inner,
-            registry_with(Arc::new(Recording::default())),
-            record_options(),
-        );
-
-        let events = drain(backend, request()).await;
-        let Some(AgentEvent::TurnComplete { usage, cost_usd }) = events.last() else {
-            panic!("a completed turn: {events:?}");
-        };
-
-        assert_eq!(usage.total(), 30, "two rounds of 10 in and 5 out");
-        assert!((cost_usd - 0.002).abs() < 1e-9);
-    }
-
-    #[tokio::test]
-    async fn a_failing_tool_is_reported_to_the_model_without_ending_the_turn() {
-        let inner = Scripted::new(vec![
-            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
-            round(vec![AgentEvent::TextDelta(
-                "I will try something else".to_string(),
-            )]),
-        ]);
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::new(Recording {
-                calls: Mutex::new(Vec::new()),
-                fail: true,
-            })),
-            record_options(),
-        );
-
-        let events = drain(backend, request()).await;
-
-        let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1]
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
-        assert!(results[0].is_error);
-        assert_eq!(results[0].output, "it went wrong");
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_declined_call_becomes_an_error_result() {
-        let inner = Scripted::new(vec![
-            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
-            round(vec![AgentEvent::TextDelta("understood".to_string())]),
-        ]);
-        let tool = Arc::new(Recording::default());
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::clone(&tool)),
-            record_options().with_approver(Arc::new(DenyAll)),
-        );
-
-        drain(backend, request()).await;
-
-        assert!(
-            tool.calls.lock().expect("lock").is_empty(),
-            "a declined call does not run"
-        );
-        let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1]
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
-        assert!(results[0].is_error);
-        assert!(
-            results[0].output.contains("declined"),
-            "{}",
-            results[0].output
-        );
-    }
-
-    #[tokio::test]
-    async fn a_call_for_a_tool_that_is_not_declared_is_refused() {
-        let inner = Scripted::new(vec![
-            round(vec![AgentEvent::ToolCall(call("call-1", "teleport"))]),
-            round(vec![AgentEvent::TextDelta("sorry".to_string())]),
-        ]);
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::new(Recording::default())),
-            record_options(),
-        );
-
-        drain(backend, request()).await;
-
-        let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1]
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
-        assert!(results[0].is_error);
-        assert!(
-            results[0].output.contains("no tool called"),
-            "{}",
-            results[0].output
-        );
-    }
-
-    #[tokio::test]
-    async fn the_loop_stops_a_model_that_never_stops_asking() {
-        let rounds: Vec<Vec<AgentEvent>> = (0..10)
-            .map(|index| {
-                round(vec![AgentEvent::ToolCall(call(
-                    &format!("call-{index}"),
-                    "record",
-                ))])
-            })
-            .collect();
-        let inner = Scripted::new(rounds);
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::new(Recording::default())),
-            ToolLoopOptions {
-                max_rounds: 3,
-                ..record_options()
-            },
-        );
-
-        let events = drain(backend, request()).await;
-
-        let Some(AgentEvent::Error(message)) = events.last() else {
-            panic!("the loop should have given up: {events:?}");
-        };
-        assert!(message.contains("3 rounds"), "{message}");
-        assert_eq!(
-            inner.requests().len(),
-            4,
-            "three rounds plus the one that tripped it"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_error_from_the_backend_ends_the_turn() {
-        let inner = Scripted::new(vec![vec![AgentEvent::Error(
-            "the model exploded".to_string(),
-        )]]);
-        let backend = loop_with(
-            inner,
-            registry_with(Arc::new(Recording::default())),
-            record_options(),
-        );
-
-        let events = drain(backend, request()).await;
-        assert_eq!(
-            events,
-            vec![AgentEvent::Error("the model exploded".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_backends_label_and_models_pass_through() {
-        let inner = Scripted::new(vec![]);
-        let backend = ToolLoop::new(
-            inner,
-            Arc::new(registry_with(Arc::new(Recording::default()))),
-            record_options(),
-        );
-
-        assert_eq!(backend.label(), "scripted");
-        assert!(
-            backend.models().await.is_err(),
-            "the scripted backend lists nothing"
-        );
-        assert_eq!(
-            backend.tool_names(Mode::Build),
-            vec!["record"],
-            "the allowlist is the registry's own"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_turn_asks_for_the_tools_its_mode_declares() {
-        let inner = Scripted::new(vec![round(vec![])]);
-        let backend = loop_with(
-            inner.clone(),
-            ToolRegistry::with_runners(
-                Arc::new(StubRunner(CommandOutput::default())),
-                Arc::new(StubShell),
-            ),
-            ToolLoopOptions::default(),
-        );
-
-        drain(backend, TurnRequest::new(Vec::new(), "hi", Mode::Plan)).await;
-
-        let seen = inner.requests();
-        let mut names: Vec<&str> = seen[0]
-            .tools
-            .iter()
-            .map(|spec| spec.name.as_str())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["find", "grep", "ls", "read"]);
-    }
-
-    #[tokio::test]
-    async fn dropping_the_stream_stops_the_loop() {
-        /// A backend whose rounds all ask for another call, so the loop only
-        /// ends when nothing is listening.
-        struct Endless;
-
-        #[async_trait]
-        impl AgentBackend for Endless {
-            async fn run_turn(
-                &self,
-                _request: TurnRequest,
-            ) -> Result<AgentEventStream, BackendError> {
-                Ok(Box::pin(futures::stream::iter(vec![
-                    AgentEvent::ToolCall(ToolCall::new("call-1", "record", json!({}))),
-                    AgentEvent::TurnComplete {
-                        usage: Usage::new(1, 1),
-                        cost_usd: 0.0,
-                    },
-                ])))
-            }
-
-            fn label(&self) -> &str {
-                "endless"
-            }
-        }
-
-        let tool = Arc::new(Recording::default());
-        let backend = loop_with(
-            Arc::new(Endless),
-            registry_with(Arc::clone(&tool)),
-            record_options(),
-        );
-
-        let mut stream = backend.run_turn(request()).await.expect("started");
-        // Read one round's worth, then walk away.
-        while let Some(event) = stream.next().await {
-            if matches!(event, AgentEvent::ToolResult { .. }) {
-                break;
-            }
-        }
-        drop(stream);
-
-        // The tool ran at least once; the loop stops rather than running away.
-        let ran = tool.calls.lock().expect("lock").len();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            tool.calls.lock().expect("lock").len(),
-            ran,
-            "an abandoned turn runs nothing more"
-        );
     }
 
     /// A tool that reports how many copies of itself ran at once.
@@ -1130,6 +550,127 @@ mod tests {
         }
     }
 
+    /// A backend that plays a scripted list of rounds and records what it was
+    /// asked.
+    struct Scripted {
+        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
+        seen: Mutex<Vec<TurnRequest>>,
+    }
+
+    impl Scripted {
+        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                rounds: Mutex::new(rounds.into()),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<TurnRequest> {
+            self.seen.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for Scripted {
+        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            self.seen.lock().expect("lock").push(request);
+            let events = self
+                .rounds
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        fn label(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn round(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let mut round = events;
+        round.push(AgentEvent::TurnComplete {
+            usage: Usage::new(10, 5),
+            cost_usd: 0.001,
+        });
+        round
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall::new(id, name, json!({ "note": id }))
+    }
+
+    /// The conversation a turn here is asked with.
+    fn history() -> Vec<Message> {
+        vec![Message::system("You are solaris.")]
+    }
+
+    /// A turn to run: the backend behind the loop, the tools it may ask for, the
+    /// options, and the handle that stops it.
+    ///
+    /// The tools are handed in rather than selected, because choosing them from
+    /// a mode is [`crate::Agent`]'s job — the loop declares exactly what it is
+    /// given and can run exactly that.
+    struct Turn {
+        inner: Arc<dyn AgentBackend>,
+        tools: Vec<Arc<dyn Tool>>,
+        options: AgentOptions,
+        cancel: Cancel,
+    }
+
+    impl Turn {
+        /// A turn over one tool, with the default options.
+        fn of(inner: Arc<dyn AgentBackend>, tool: Arc<dyn Tool>) -> Self {
+            Self {
+                inner,
+                tools: vec![tool],
+                options: AgentOptions::default(),
+                cancel: Cancel::new(),
+            }
+        }
+
+        fn options(mut self, options: AgentOptions) -> Self {
+            self.options = options;
+            self
+        }
+
+        /// The same turn, stopped by `cancel` — so a test can hold the handle
+        /// the loop is running with.
+        fn cancel(mut self, cancel: Cancel) -> Self {
+            self.cancel = cancel;
+            self
+        }
+
+        /// Run the turn and collect everything it produced.
+        async fn run(self, prompt: &str) -> Vec<AgentEvent> {
+            let mut stream = start(
+                self.inner,
+                self.tools,
+                &self.options,
+                self.cancel,
+                history(),
+                prompt.to_string(),
+            );
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            events
+        }
+    }
+
+    /// The text a turn produced.
+    fn text(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(chunk) => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The ids of the results a turn produced, in the order they were sent.
     fn result_ids(events: &[AgentEvent]) -> Vec<String> {
         events
@@ -1141,17 +682,278 @@ mod tests {
             .collect()
     }
 
+    /// The results the model was handed in the round after the first.
+    fn results_seen(inner: &Scripted) -> Vec<ToolResult> {
+        inner.requests()[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_tool_call_ends_after_one_round() {
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
+        let tool = Arc::new(Recording::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        assert_eq!(text(&events), "hello");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        assert!(tool.calls.lock().expect("lock").is_empty());
+        assert_eq!(inner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_run_and_the_result_sent_back() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("all done".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        // The call ran with the arguments the model sent.
+        assert_eq!(
+            tool.calls.lock().expect("lock").clone(),
+            vec![json!({ "note": "call-1" })]
+        );
+
+        // The model saw the result, and the turn ended once it stopped asking.
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2);
+        let second = &seen[1];
+        assert_eq!(second.tools.len(), 1, "tools are declared on every round");
+        let results = results_seen(&inner);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output, "done");
+        assert!(!results[0].is_error);
+
+        // The prompt moved into the history, so the second round does not repeat it.
+        assert!(second.prompt.is_empty());
+        assert!(
+            second
+                .history
+                .iter()
+                .any(|message| message.text() == "do it")
+        );
+
+        // The caller saw the result, and one terminal event for the whole turn.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { result, .. } if result.output == "done"
+        )));
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+        assert_eq!(text(&events), "all done");
+    }
+
+    #[tokio::test]
+    async fn usage_and_cost_are_summed_across_rounds() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+        let Some(AgentEvent::TurnComplete { usage, cost_usd }) = events.last() else {
+            panic!("a completed turn: {events:?}");
+        };
+
+        assert_eq!(usage.total(), 30, "two rounds of 10 in and 5 out");
+        assert!((cost_usd - 0.002).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_is_reported_to_the_model_without_ending_the_turn() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta(
+                "I will try something else".to_string(),
+            )]),
+        ]);
+
+        let events = Turn::of(
+            inner.clone(),
+            Arc::new(Recording {
+                calls: Mutex::new(Vec::new()),
+                fail: true,
+            }),
+        )
+        .run("do it")
+        .await;
+
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert_eq!(results[0].output, "it went wrong");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_declined_call_becomes_an_error_result() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("understood".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+
+        let options = AgentOptions {
+            approver: Arc::new(DenyAll),
+            ..Default::default()
+        };
+        Turn::of(inner.clone(), tool.clone())
+            .options(options)
+            .run("do it")
+            .await;
+
+        assert!(
+            tool.calls.lock().expect("lock").is_empty(),
+            "a declined call does not run"
+        );
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("declined"),
+            "{}",
+            results[0].output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_for_a_tool_that_is_not_declared_is_refused() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "teleport"))]),
+            round(vec![AgentEvent::TextDelta("sorry".to_string())]),
+        ]);
+
+        Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("no tool called"),
+            "{}",
+            results[0].output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_asking_is_not_stopped_by_a_round_ceiling() {
+        // Well past the old 24-round cap: a long agentic turn has to be allowed
+        // to run to whatever end the model reaches. The last round asks for
+        // nothing, which is what ends the turn.
+        let mut rounds: Vec<Vec<AgentEvent>> = (0..40)
+            .map(|index| {
+                round(vec![AgentEvent::ToolCall(call(
+                    &format!("call-{index}"),
+                    "record",
+                ))])
+            })
+            .collect();
+        rounds.push(round(vec![AgentEvent::TextDelta("finally".to_string())]));
+        let inner = Scripted::new(rounds);
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "the turn ends because the model stopped asking: {events:?}"
+        );
+        assert_eq!(
+            inner.requests().len(),
+            41,
+            "forty rounds of calls plus the one that stopped asking"
+        );
+        assert_eq!(result_ids(&events).len(), 40, "every round's call ran");
+        assert_eq!(text(&events), "finally");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_a_model_that_would_otherwise_keep_asking() {
+        /// A backend that asks for another call forever, so only cancelling can
+        /// end the turn.
+        struct Endless;
+
+        #[async_trait]
+        impl AgentBackend for Endless {
+            async fn run_turn(
+                &self,
+                _request: TurnRequest,
+            ) -> Result<AgentEventStream, BackendError> {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    AgentEvent::ToolCall(ToolCall::new("call-1", "cancel-now", json!({}))),
+                    AgentEvent::TurnComplete {
+                        usage: Usage::new(1, 1),
+                        cost_usd: 0.0,
+                    },
+                ])))
+            }
+
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+
+        let tool = Arc::new(Cancelling::default());
+        let cancel = Cancel::new();
+        *tool.cancel.lock().expect("lock") = Some(cancel.clone());
+
+        // The tool stops the turn on its first call, which is now the only
+        // thing standing between an asking-forever model and a runaway bill.
+        let events = Turn::of(Arc::new(Endless), tool.clone())
+            .cancel(cancel)
+            .run("do it")
+            .await;
+
+        assert_eq!(
+            tool.runs.load(Ordering::SeqCst),
+            1,
+            "no further round may start once the turn is stopped"
+        );
+        let Some(AgentEvent::Error(message)) = events.last() else {
+            panic!("a cancelled turn ends in an error: {events:?}");
+        };
+        assert!(message.contains("cancelled"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_error_from_the_backend_ends_the_turn() {
+        let inner = Scripted::new(vec![vec![AgentEvent::Error(
+            "the model exploded".to_string(),
+        )]]);
+
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+        assert_eq!(
+            events,
+            vec![AgentEvent::Error("the model exploded".to_string())]
+        );
+    }
+
     #[tokio::test]
     async fn a_stream_that_ends_without_completing_is_an_error() {
         // No TurnComplete: the answer was cut short on the way.
         let inner = Scripted::new(vec![vec![AgentEvent::TextDelta("half".to_string())]]);
-        let backend = loop_with(
-            inner,
-            registry_with(Arc::new(Recording::default())),
-            record_options(),
-        );
 
-        let events = drain(backend, request()).await;
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
 
         assert_eq!(text(&events), "half", "what arrived is still shown");
         let Some(AgentEvent::Error(message)) = events.last() else {
@@ -1170,13 +972,8 @@ mod tests {
             round(vec![AgentEvent::TextDelta("asking again".to_string())]),
         ]);
         let tool = Arc::new(Recording::default());
-        let backend = loop_with(
-            inner.clone(),
-            registry_with(Arc::clone(&tool)),
-            record_options(),
-        );
 
-        let events = drain(backend, request()).await;
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
 
         assert!(
             tool.calls.lock().expect("lock").is_empty(),
@@ -1188,12 +985,7 @@ mod tests {
                 .any(|event| matches!(event, AgentEvent::OutputTruncated))
         );
 
-        let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1]
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
+        let results = results_seen(&inner);
         assert!(results[0].is_error);
         assert!(
             results[0].output.contains("output limit"),
@@ -1207,6 +999,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_the_stream_stops_the_loop() {
+        /// A backend whose rounds all ask for another call, so the loop only
+        /// ends when nothing is listening.
+        ///
+        /// It yields before answering: a real backend always awaits the network,
+        /// and without a yield point an always-ready round would starve the
+        /// single-threaded test runtime before the caller could drop the stream.
+        struct Endless;
+
+        #[async_trait]
+        impl AgentBackend for Endless {
+            async fn run_turn(
+                &self,
+                _request: TurnRequest,
+            ) -> Result<AgentEventStream, BackendError> {
+                tokio::task::yield_now().await;
+                Ok(Box::pin(futures::stream::iter(vec![
+                    AgentEvent::ToolCall(ToolCall::new("call-1", "record", json!({}))),
+                    AgentEvent::TurnComplete {
+                        usage: Usage::new(1, 1),
+                        cost_usd: 0.0,
+                    },
+                ])))
+            }
+
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+
+        let tool = Arc::new(Recording::default());
+        let mut stream = start(
+            Arc::new(Endless),
+            vec![tool.clone()],
+            &AgentOptions::default(),
+            Cancel::new(),
+            history(),
+            "do it".to_string(),
+        );
+        // Read one round's worth, then walk away.
+        while let Some(event) = stream.next().await {
+            if matches!(event, AgentEvent::ToolResult { .. }) {
+                break;
+            }
+        }
+        drop(stream);
+
+        // The tool ran at least once; the loop stops rather than running away.
+        let ran = tool.calls.lock().expect("lock").len();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            tool.calls.lock().expect("lock").len(),
+            ran,
+            "an abandoned turn runs nothing more"
+        );
+    }
+
+    #[tokio::test]
     async fn calls_in_one_round_run_together_and_keep_their_order() {
         let calls: Vec<AgentEvent> = (0..4)
             .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
@@ -1216,13 +1066,8 @@ mod tests {
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let tool = Arc::new(Overlapping::default());
-        let backend = loop_with(
-            inner.clone(),
-            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
-            only("overlap"),
-        );
 
-        let events = drain(backend, request()).await;
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
 
         assert_eq!(
             tool.peak.load(Ordering::SeqCst),
@@ -1235,12 +1080,7 @@ mod tests {
             result_ids(&events),
             vec!["call-0", "call-1", "call-2", "call-3"]
         );
-        let seen = inner.requests();
-        let results: Vec<&ToolResult> = seen[1]
-            .history
-            .iter()
-            .flat_map(Message::tool_results)
-            .collect();
+        let results = results_seen(&inner);
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|result| !result.is_error));
     }
@@ -1255,16 +1095,15 @@ mod tests {
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let tool = Arc::new(Overlapping::default());
-        let backend = loop_with(
-            inner,
-            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
-            ToolLoopOptions {
-                max_parallel: 1,
-                ..only("overlap")
-            },
-        );
 
-        drain(backend, request()).await;
+        let options = AgentOptions {
+            max_parallel: 1,
+            ..Default::default()
+        };
+        Turn::of(inner, tool.clone())
+            .options(options)
+            .run("do it")
+            .await;
 
         assert_eq!(
             tool.peak.load(Ordering::SeqCst),
@@ -1286,13 +1125,8 @@ mod tests {
             sequential: true,
             ..Default::default()
         });
-        let backend = loop_with(
-            inner,
-            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
-            only("overlap"),
-        );
 
-        drain(backend, request()).await;
+        Turn::of(inner, tool.clone()).run("do it").await;
 
         assert_eq!(
             tool.peak.load(Ordering::SeqCst),
@@ -1308,20 +1142,18 @@ mod tests {
                 AgentEvent::ToolCall(call("call-1", "cancel-now")),
                 AgentEvent::ToolCall(call("call-2", "cancel-now")),
             ]),
-            round(vec![AgentEvent::ToolCall(call("call-3", "cancel-now"))]),
             round(vec![AgentEvent::TextDelta("after".to_string())]),
         ]);
         let tool = Arc::new(Cancelling::default());
-        let backend = loop_with(
-            inner,
-            registry_of(Arc::clone(&tool) as Arc<dyn Tool>),
-            only("cancel-now"),
-        );
-        // The first call cancels the turn it runs in.
-        *tool.cancel.lock().expect("lock") = Some(backend.cancel_handle());
+        // The first call cancels the turn it runs in, through the same handle
+        // every turn of the session shares.
+        let cancel = Cancel::new();
+        *tool.cancel.lock().expect("lock") = Some(cancel.clone());
 
-        let shared: Arc<dyn AgentBackend> = backend.clone();
-        let cancelled = drain(shared, request()).await;
+        let cancelled = Turn::of(inner.clone(), tool.clone())
+            .cancel(cancel.clone())
+            .run("do it")
+            .await;
 
         assert_eq!(
             tool.runs.load(Ordering::SeqCst),
@@ -1334,8 +1166,7 @@ mod tests {
         assert!(message.contains("cancelled"), "{message}");
 
         // The next turn starts clean: the stop belonged to one turn only.
-        let fresh: Arc<dyn AgentBackend> = backend;
-        let next = drain(fresh, request()).await;
+        let next = Turn::of(inner, tool).cancel(cancel).run("do it").await;
         assert!(
             matches!(next.last(), Some(AgentEvent::TurnComplete { .. })),
             "a fresh turn must not inherit the last turn's cancel: {next:?}"
@@ -1345,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_options_are_rooted_somewhere_sensible() {
-        let options = ToolLoopOptions::default();
+        let options = AgentOptions::default();
         assert!(options.cwd.is_absolute() || options.cwd == Path::new("."));
         assert!(options.max_parallel >= 1);
         assert_eq!(
