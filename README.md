@@ -33,7 +33,8 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Full-screen TUI with a retained component tree, flex-like layout stacks and modal/inline overlays
 > - Streaming transcript with markdown rendering and collapsible thinking blocks
 > - Eight built-in tools — `read`, `write`, `edit`, `ls`, `grep`, `find` and your platform's shell — run by a multi-round tool loop
-> - A prompt system: identity, mode, each tool's own usage guidance, and a note from the platform when it needs one
+> - Skills: a `SKILL.md` under any of the usual directories is advertised to the model by name and description, and its instructions load only when a task calls for them — or when you ask for them with `/skill:<name>`
+> - A prompt system: identity, mode, each tool's own usage guidance, the skills on offer, and a note from the platform when it needs one
 > - Mid-turn steering: a message typed while a turn runs joins it; `/queue` lines one up for after it
 > - Context compaction: when the conversation nears the model's window, older messages are summarized into a structured checkpoint — updated rather than rewritten on later compactions — and a window that turns out to be full is summarized and retried
 > - Multi-line editor with word navigation, `/` command autocomplete, and a command palette
@@ -89,6 +90,7 @@ cargo run --release
 | `--plan` | Start in plan mode instead of build mode | off |
 | `-t`, `--tools <LIST>` | Tools to declare, replacing the mode's default set; a list of `+name`/`-name` entries adjusts it instead | the mode's set |
 | `--exclude-tools <LIST>` | Tools to withdraw after everything else has selected them | none |
+| `--skill <PATH>` | A skill directory, or a single `SKILL.md`, to load as well as the usual locations; repeat for more than one | none |
 | `--confirm-tools` | Ask before a call that changes something (`write`, `edit`, the shell) runs | off |
 | `--print-config` | Print the resolved configuration and exit without starting the UI | — |
 | `-h`, `--help` | Print help | — |
@@ -136,6 +138,8 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `/mode` | Toggle build / plan mode |
 | `/compact` | Summarize the conversation to free up context |
 | `/queue` | Run a prompt after the turn in flight |
+| `/skills` | List the skills available |
+| `/skill:<name> [request]` | Load a skill's instructions |
 | `/clear` | Clear the transcript |
 | `/stats` | Show token and cost statistics |
 | `/quit` | Exit solaris |
@@ -179,6 +183,50 @@ Entries are tool names or patterns where `*` matches any run of characters. A li
 Every result goes back to the model, failures included: a file that is not there, a command that exited non-zero and a call the model got wrong are all things it can react to, not the end of the turn. Output is cut to keep a turn affordable — the first 2000 lines or 50KB for a read, the last for a command, since that is where a failure prints — and a command whose output was cut has the whole of it written to a file whose path is reported, so the model can read it back in pieces.
 
 Each call appears in the transcript as it happens, with its arguments, how long it took and, when it failed, the first line of what it said.
+
+## Skills
+
+A skill is a directory holding a `SKILL.md`: frontmatter saying what it is and when it applies, then the instructions, usually with scripts and references beside it.
+
+```text
+pdf-tools/
+├── SKILL.md
+├── scripts/
+│   └── extract.sh
+└── references/
+    └── formats.md
+```
+
+```markdown
+---
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading, converting, or inspecting PDFs.
+---
+
+# PDF tools
+
+Read `references/formats.md` before converting a document, and resolve that path
+against this skill's directory.
+```
+
+solaris tells the model that each skill exists — its name, its description and the file — and nothing else, so the instructions cost no context until a task actually matches. The description is what routes the model to the skill, so it should say what the skill does *and* when it applies. `name` is optional: without one, a `SKILL.md` is named for the directory holding it. The block also takes `disable-model-invocation: true`, which keeps a skill out of the model's list so that only `/skill:<name>` reaches it.
+
+The format is the [Agent Skills](https://agentskills.io/specification) specification, so a skill written for another harness works here unchanged.
+
+Skills are looked for in these directories, in this order, and the first claim on a name keeps it:
+
+| Location | Scope |
+| --- | --- |
+| `<config dir>/skills` | user |
+| `~/.agents/skills` | user |
+| `.solaris/skills` in the working directory | project |
+| `.agents/skills` in the working directory | project |
+
+The user's own skills are read first, so a repository cannot shadow one of them by shipping a directory with the same name. `--skill <path>` adds a directory, or a single `SKILL.md`, after them.
+
+Directories are searched recursively for `SKILL.md`, and a directory holding one is a skill rather than a place to look for more. Anything that cannot be used — a skill with no description, a name that breaks the specification, a name already taken — is reported on stderr and skipped; a bad skill never stops a session.
+
+`/skills` lists what was found, with where each one came from. `/skill:<name> [request]` loads one now, which is how to reach a skill the model did not pick up on its own; whatever follows the name is appended to the instructions as the request. Type `/skill` and the editor offers every skill by name, badged with its source — `[u]` for a user skill, `[p]` for a project one, `[e]` for a path given with `--skill` — and when there are more than fit, the row underneath says which of them is highlighted. `/skill:` on its own is the same as `/skills`.
 
 ## Companion
 
@@ -226,6 +274,8 @@ solaris resolves a single state directory, in this order:
 3. `$XDG_CONFIG_HOME/solaris`, falling back to `~/.config/solaris`.
 
 `--print-config` prints the paths it actually resolved.
+
+Skills live in `skills/` inside that directory; see [Skills](#skills).
 
 ## Files
 

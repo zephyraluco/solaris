@@ -1010,7 +1010,12 @@ mod tests {
                 steering: self.steering,
                 follow_up: self.follow_up,
                 conversation: Arc::clone(&self.conversation),
-                system: crate::prompt::system_prompt(Mode::Build, &[], None),
+                system: crate::prompt::system_prompt(
+                    Mode::Build,
+                    &[],
+                    &crate::skills::Skills::empty(),
+                    None,
+                ),
                 prompt: prompt.to_string(),
                 context_window: self.context_window,
             });
@@ -1400,7 +1405,12 @@ mod tests {
             steering: Queue::new(),
             follow_up: Queue::new(),
             conversation: Arc::new(Conversation::new()),
-            system: crate::prompt::system_prompt(Mode::Build, &[], None),
+            system: crate::prompt::system_prompt(
+                Mode::Build,
+                &[],
+                &crate::skills::Skills::empty(),
+                None,
+            ),
             prompt: "do it".to_string(),
             context_window: 0,
         });

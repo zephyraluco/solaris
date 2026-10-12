@@ -142,20 +142,22 @@ impl Agent {
 
 ### 3.1 提示词系统
 
-系统提示词每轮现写一次，由三部分加上收尾组成（[`prompt.rs`](../crates/solaris-agent/src/prompt.rs)）：
+系统提示词每轮现写一次，由四部分加上收尾组成（[`prompt.rs`](../crates/solaris-agent/src/prompt.rs)）：
 
 ```text
 You are solaris, a terminal assistant. …
 # Working mode        ← Mode::instructions()：这一轮能做什么、不能做什么
 # Using the tools     ← 每个工具自己的 Tool::guideline()，只列这一轮声明的
+# Skills              ← 每个技能的名字、描述与 SKILL.md 路径，说明留在文件里
 # How to work         ← 调查先于修改、最小改动、不重排无关代码、失败要读原因
 # This endpoint       ← ProviderSpec::prompt，仅当平台确实需要不同措辞
 ```
 
-三个设计要点：
+四个设计要点：
 
 - **工具自带指南**。`Tool::guideline()` 返回 `Option<&'static str>`，默认 `None`。`description` 决定模型**要不要**用它，指南决定用得**好不好**。放在 trait 上而不是集中查表，是为了让 `ToolRegistry::with_tools` 注册的自定义工具也能自带指南。
 - **只写这一轮存在的工具**。Plan 模式撤掉 shell / `write` / `edit` 之后，提示词里也不提它们（§3.2）。
+- **技能只列清单，不列内容**。`Skills::prompt_section` 只写名字、描述与 `SKILL.md` 的绝对路径，说明本身留在文件里等模型去读 —— 把每个技能的说明都塞进提示词，就是在为可能永远不做的活儿预先付上下文。要读文件就得有读文件的工具，所以这一段只在**这一轮真的声明了 `read`** 时才点名它（[`skills.rs`](../crates/solaris-agent/src/skills.rs)）。
 - **平台的事实不重复**。端点、模型 id、工具 schema 都在请求体里，写进提示词就是第二个可能不一致的来源；只有**改变模型该被如何对待**的事才写（网关可能路由到任何模型家族、本机跑的是小模型、自建端点行为由部署者决定）。
 
 ### 3.2 模式与默认工具集
@@ -263,6 +265,24 @@ pub enum Approval { Approved, Denied }
 ### 3.8 对应用层的透明性
 
 `solaris` 从不 `use solaris_tools`，也从不 `use solaris_backend`：它需要的词汇（消息、事件、工具调用与结果、用量、注册表与选择）由 `solaris-agent` 再导出。应用侧因此几乎不必为工具改动：`App` 的 turn 流程、channel 与事件循环照旧，只是多消费两种事件。
+
+### 3.9 技能
+
+一段专门针对某类工作的说明，放在一个装有 `SKILL.md` 的目录里 —— 前面是 frontmatter（名字、描述），后面是说明本身，旁边通常还有脚本与参考资料。格式遵循 [Agent Skills](https://agentskills.io/specification) 规范，因此为其它 harness 写的技能无需改动即可使用（[`skills.rs`](../crates/solaris-agent/src/skills.rs)）。
+
+装载分两步，这也是「技能」值得存在的全部理由：
+
+1. **开机扫描，只把清单写进提示词**（§3.1 的 `# Skills` 段）：名字、描述、`SKILL.md` 的绝对路径。模型据此判断某个技能是否对得上手头这件事。
+2. **要用时才读**。模型自己用 `read` 打开那个文件；用户也可以用 `/skill:<name> [request]` 直接点名，此时说明会作为这一轮的提示词送出去，`request` 追加在后面，而转录里显示的仍是那行调用本身。
+
+几条边界：
+
+- **发现规则照规范来**：含 `SKILL.md` 的目录就是一个技能，不再往里找；只有被配置的顶层目录里散落的 `.md` 才可能自成技能，且必须有描述。隐藏目录与 `node_modules` 跳过。
+- **冲突与失格都不致命**：同名保留先发现的（目录顺序即优先级，用户先于项目），没有描述的不装载，其余问题（名字不合规范、描述过长）只报告不拒绝。全部经 `SkillWarning` 报出，由 [`main.rs`](../crates/solaris/src/main.rs) 打到 stderr。
+- **frontmatter 自己解析，不为它引一个 YAML 依赖**：顶层 `key: value`、`|` / `>` 块、引号、`#` 注释，以及续行拼接的普通标量。只读 `name` / `description` / `disable-model-invocation` 三个键，其余（包括 `metadata:` 这类嵌套结构）整体跳过。
+- **`disable-model-invocation: true` 把技能挡在模型清单之外**，只留给 `/skill:<name>`：给那些不该被自动挑中的技能用。
+
+`load_skills`（[`main.rs`](../crates/solaris/src/main.rs)）按「用户目录 → 项目目录 → `--skill`」装载，随 `AppOptions` 交给 `App`，再经 `AgentOptions::with_skills` 进入会话。之所以要一路传到这里：提示词是在 agent 里现写的，「模型知道存在哪些技能」和「能按名字点到哪个技能」必须是同一份列表。
 
 ---
 
@@ -420,6 +440,7 @@ while !quit {
 ### 5.5 组件集、主题与终端
 
 - 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
+- 列表滚动（[`util::window_start`](../crates/solaris-tui/src/util.rs)）：三处会滚动的列表 —— 编辑器的 `/` 补全弹窗、`/model` 与 `/connect` 用的 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs)、Ctrl+K 面板与 `/theme` 用的 [`SelectList`](../crates/solaris-tui/src/components/select_list.rs) —— 共用这一个窗口函数，所以高亮不可能走出任何一处。差别只在「要不要记住窗口起点」：前两者每次都从高亮重算（`offset = 0`，往上走时窗口立刻跟回），`SelectList` 把上一次的起点传回来，所以窗口在回调路上会先停住。
 - 拖选（[`selection`](../crates/solaris-tui/src/selection.rs)）：`Selection` 记锚点 / 焦点、按 `selection_bg` / `selection_fg` 给单元格上色、抽取文本；`Tui::selection()` 把句柄交给应用层。
 - 主题（[`theme`](../crates/solaris-tui/src/theme.rs)）：`Theme` 含约二十个颜色槽位（含 build / plan 两种强调色），`Theme::NAMES = ["dark", "light"]`，未知名称回退到 dark。
 - 按键（[`keys`](../crates/solaris-tui/src/keys.rs)）：`ctrl` / `alt` / `plain_char` / `is_submit` / `is_newline` 等匹配助手、`parse_key_spec`（支持 `ctrl+k`、`alt+enter`、`f1`…）、以及 action → 按键的 `Keybindings` 表。
@@ -439,7 +460,7 @@ while !quit {
 
 1. `clap` 解析参数；构造 `Config`（`--plan` 映射到 `Mode::Plan`，`--model` 未给时模型名留空，由 provider 决定）。`--tools` / `--exclude-tools` 解析成 `ToolSelection`：白名单与 `+name`/`-name` 两种写法不能混用（混用直接报错，而不是猜），匹配不到任何工具的名字在启动时被指出来。
 2. `config_dir()` 解析状态目录，优先级：`$SOLARIS_CONFIG_DIR` → Windows 的 `%APPDATA%\solaris` → `$XDG_CONFIG_HOME/solaris`，回退 `~/.config/solaris`。
-3. 读取 `auth.json`、`companion.json`、`recent.json`、`settings.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。
+3. 读取 `auth.json`、`companion.json`、`recent.json`、`settings.json`；**读取失败一律当作空**，绝不因为文件缺失而拒绝启动。随后 `load_skills` 扫描技能（用户目录 → 项目目录 → `--skill`），把每个用不上、以及每个名字撞车的地方打到 stderr —— 同样不阻止启动。
 4. `--provider`（可选）覆盖本次运行的 provider，只改内存里的 `auth`，不重写 `auth.json`；未知 id 直接报错并列出可选值。
 5. 用 `choose_backend(&auth, &model, BackendOptions::default())` 解析出初始后端；显式给了 `--provider` 却解析不出凭据时，向 stderr 说明「先运行 /connect 或设置环境变量」，以免静默降级。解析出的后端随即由 `with_tools` 交给 `solaris_agent::Agent`（连同注册表、工具选择与审批钩子），注册表与工具选择在 `App` 里只建一次——`edit` 与 `write` 的按路径锁因此整个会话共用一张。
 6. 若给了 `--print-config`，打印解析结果（含 backend / endpoint / 凭据来源）后直接返回，不进入界面。
@@ -450,7 +471,7 @@ while !quit {
 | 分组 | 字段 |
 | --- | --- |
 | 依赖与配置 | `agent: Arc<Agent>`（会话：后端 + 工具选择 + 审批 + 取消句柄，同时回答后端 label、provider id、真正会被询问的模型名与凭据来源）、`backend_factory`（按凭据与模型重新解析后端）、`config`、`theme` |
-| 工具 | `tools: ToolSelection`（`--tools`/`--exclude-tools` 的结果，交给 `Agent`）、`registry: Arc<ToolRegistry>`（本平台的全部内建工具，整个会话一份）、`cwd`（相对路径的解析基准）、`approver`（每个重建的会话都接同一个）、`tool_cancel`（`Agent` 交出的取消句柄） |
+| 工具 | `tools: ToolSelection`（`--tools`/`--exclude-tools` 的结果，交给 `Agent`）、`registry: Arc<ToolRegistry>`（本平台的全部内建工具，整个会话一份）、`skills: Skills`（扫描到的技能：交给 `Agent` 进提示词，也供 `/skills` 与 `/skill:<name>` 使用）、`cwd`（相对路径的解析基准）、`approver`（每个重建的会话都接同一个）、`tool_cancel`（`Agent` 交出的取消句柄） |
 | 会话 | `session: SessionState`、`transcript: TranscriptView`、`notifications: NotificationQueue` |
 | 输入 | `editor: Editor`、`keybindings`、`inline: Option<ConnectFlow>` |
 | 与框架的句柄 | `quit`、`overlay_queue`、`overlay_flag`、`selection` |
@@ -559,7 +580,7 @@ enum DialogMessage { Cancelled, Theme(String), Command(String),
                      Confirm { action: ConfirmAction, accepted: bool } }
 ```
 
-应用侧只暴露 `open_help` / `open_stats` / `open_buddy` / `open_palette` / `open_theme_dialog` / `open_clear_confirm`，内部统一走 `push_overlay`。
+应用侧只暴露 `open_help` / `open_stats` / `open_skills` / `open_buddy` / `open_palette` / `open_theme_dialog` / `open_clear_confirm`，内部统一走 `push_overlay`。技能的调用写作 `/skill:<name>`：冒号让名字留在同一个词里，编辑器因此能在 `/skill` 之后按名字把每个技能列出来（`commands::hints(skills)` 把固定的命令表与「每个技能一行」拼在一起），而 `/skill:` 单独出现时退化成 `/skills`。
 
 **列表类选择器走内联**：`/connect` 与 `/model` 都不弹浮层，而是接管输入区（与 Claude Code 的 `/login` 视觉一致）。[`ConnectFlow`](../crates/solaris/src/connect.rs) 是一个状态机：
 
@@ -596,6 +617,8 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 | 新增一个工具 | 在 [`crates/solaris-tools/src/tools`](../crates/solaris-tools/src/tools) 实现 `Tool`（name / description / parameters / guideline / run），在 [`registry.rs`](../crates/solaris-tools/src/registry.rs) 的 `with_runners` 里 `add` 一次，必要时把名字加进 `BUILTIN_TOOLS`，并在 [`solaris-agent/src/mode.rs`](../crates/solaris-agent/src/mode.rs) 的 `default_tool_names` 里把它列进某个模式。声明与执行是分开的，所以工具不需要认识任何 wire。 |
 | 改工具的用法指南 | 实现该工具的 `Tool::guideline()`（默认 `None`）。它会被汇编进系统提示词的那一段「Using the tools」，且只在这一轮真的声明了该工具时出现（§3.1）。 |
 | 调整系统提示词 | [`solaris-agent/src/prompt.rs`](../crates/solaris-agent/src/prompt.rs)：整体措辞与「How to work」在 `system_prompt`，模式那段在 [`mode.rs`](../crates/solaris-agent/src/mode.rs) 的 `Mode::instructions`。 |
+| 调整技能的查找位置或优先级 | [`crates/solaris/src/main.rs`](../crates/solaris/src/main.rs) 的 `load_skills`（用户目录 → 项目目录 → `--skill`，顺序即优先级，先认领名字的胜出）。 |
+| 调整技能清单段或 frontmatter 解析 | [`solaris-agent/src/skills.rs`](../crates/solaris-agent/src/skills.rs)：提示词里的清单在 `Skills::prompt_section`，`/skill:<name>` 送出的提示词在 `Skill::invocation_prompt`，frontmatter 在 `parse_frontmatter_fields`，发现规则在 `scan`。 |
 | 给某个平台加一句提示词 | [`solaris-provider/src/providers.rs`](../crates/solaris-provider/src/providers.rs) 里该条目的 `prompt` 字段；只有确实改变「模型该如何被对待」的事才值得写（网关、本机小模型、自建端点）。 |
 | 调整压缩的时机或保留量 | [`compaction.rs`](../crates/solaris-agent/src/compaction.rs) 的 `Compaction`（`reserve_tokens` 默认 16384、`keep_recent_tokens` 默认 20000）；整轮关掉用 `Compaction::OFF`。裁切点在同一个文件的 `cut_point`，摘要提示词在 [`prompt.rs`](../crates/solaris-agent/src/prompt.rs) 的 `COMPACT_PROMPT` / `UPDATE_COMPACT_PROMPT`。 |
 | 让消息在别处被读到 | 两个队列都由 agent 交出（`steering_handle()` / `follow_up_handle()`，§3.5）；非 UI 的调用方自己 `push()` 即可，记录由 `AgentEvent::Steered` / `FollowUp` 回报。 |
@@ -622,7 +645,7 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 工作区共 **700 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 49、`solaris-backend` 107、`solaris-tools` 108、`solaris-agent` 74、`solaris-tui` 130、`solaris` 库 192），覆盖纯逻辑、布局、按键、渲染、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`Agent` 的多轮与调用顺序、按模式选工具与选择增删、提示词的组装（身份 / 模式 / 只有本轮工具贡献指南 / 平台说明 / 无指南工具不加段）、steering 的入队与排空顺序、压缩的触发与安全裁切点（含摘要失败时原样发送）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 49、`solaris-backend` 107、`solaris-tools` 108、`solaris-agent` 102、`solaris-tui` 135、`solaris` 库 202），覆盖纯逻辑、布局、按键、渲染（含补全弹窗的列对齐与 `(n/总数)` 计数、三处列表共用的 `window_start` 及其顶 / 底 / 越界边界）、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`Agent` 的多轮与调用顺序、按模式选工具与选择增删、提示词的组装（身份 / 模式 / 只有本轮工具贡献指南 / 技能清单及其缺省 / 平台说明 / 无指南工具不加段）、技能的发现与递归边界（含「含 `SKILL.md` 的目录不再深入」）、frontmatter 的引号 / 注释 / 块标量 / 续行 / 嵌套结构跳过、描述缺失与名字撞车的处置、steering 的入队与排空顺序、压缩的触发与安全裁切点（含摘要失败时原样发送）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
 - **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
 - **工具往返的回路测试** [`crates/solaris-agent/tests/loopback.rs`](../crates/solaris-agent/tests/loopback.rs)（2 个）：同一套真 socket 手法，但服务端先回一个 `tool_call`、再回最终文本，于是「请求体带上了 `tools` → 调用被解析出来 → 真的 `read` 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证 —— 它住在 agent 里，因为只有那一层同时认识工具与 wire。仍然不碰外网。
 - **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（28 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + 真实 `Agent`），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。它自带一个只回显提示词的 `FakeBackend` 顶替真实 provider，并把 `environment` 换成空表，所以既不会继承 shell 里的 key，也不会联网；另有一个先请求一个不存在工具的后端，用来验证工具步骤确实进了转录，而不会真的碰文件或执行命令。
@@ -641,6 +664,7 @@ cargo test --workspace
 - **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
 - **插话在两轮之间生效**。steering 的消息由循环在「构造下一轮之前」读入，所以正在跑的那条命令不会被它打断；要立刻停下只有 `Ctrl+C`。
 - **follow-up 只能靠 `/queue`**。流式期间回车是 steering（默认、也最常用），想在当前这一轮之后另起一轮得打 `/queue <prompt>`——`alt+enter` 已被换行占用，而命令表顺带让 `/help` 与补全能发现它。
+- **技能只在启动时扫一次**。中途新建或改过的 `SKILL.md` 这一轮会话看不到，要重开才生效（pi 有 `/reload`，solaris 没有）；`--skill` 给的路径同理。
 - **对话不落盘**。`Conversation` 只在内存里，`/quit` 之后就没了；转录同样不落盘。
 - **压缩的触发靠真数，裁切靠估算**。是否超预算看 provider 上一轮报的 usage；**从哪里裁**只能按字符估算每个消息（`字符数 / 4`），与 provider 的分词器有出入——所以预留的 16384 token 同时是回复的空间和这个误差的余量。
 - **摘要是有损的**。被替换掉的那些消息只剩模型写的那段摘要，原文不再发给 provider；摘要本身是一次模型调用，因此压缩只在必要时发生（或用户 `/compact` 时）。转录里会留一行说明压掉了几条。

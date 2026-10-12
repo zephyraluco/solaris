@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 
 use crate::components::select_list::SelectItem;
 use crate::theme::Theme;
-use crate::util::{digit_count, display_width, truncate_to_width, wrap_text};
+use crate::util::{digit_count, display_width, truncate_to_width, window_start, wrap_text};
 
 /// Rows the list shows at once; longer lists scroll.
 const MAX_ROWS: u16 = 8;
@@ -73,7 +73,6 @@ pub struct InlineSelect {
     question: String,
     items: Vec<SelectItem>,
     selected: usize,
-    scroll: usize,
     styles: InlineStyles,
     /// Where the selector last drew, so mouse rows can be resolved.
     last_area: Rect,
@@ -94,7 +93,6 @@ impl InlineSelect {
             question: question.into(),
             items,
             selected: 0,
-            scroll: 0,
             styles,
             last_area: Rect::default(),
             item_rows: Vec::new(),
@@ -146,7 +144,6 @@ impl InlineSelect {
             .iter()
             .position(|item| item.value == value)
             .unwrap_or(0);
-        self.scroll = 0;
     }
 
     /// The area the selector last drew into.
@@ -321,13 +318,7 @@ impl InlineSelect {
         }
 
         let visible = list_rows.min(MAX_ROWS as usize).min(total);
-        let mut start = self.scroll.min(total.saturating_sub(visible));
-        if self.selected < start {
-            start = self.selected;
-        }
-        if self.selected >= start + visible {
-            start = self.selected + 1 - visible;
-        }
+        let start = window_start(total, visible, self.selected, 0);
 
         for index in start..start + visible {
             item_rows.push((lines.len(), index));

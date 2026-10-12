@@ -23,7 +23,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
     Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
-    Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry, ToolSelection,
+    Approver, Cancel, ChannelApprover, Mode, Skills, ToolCall, ToolRegistry, ToolSelection,
     default_tool_names,
 };
 use solaris_provider::{
@@ -47,12 +47,12 @@ use tokio::sync::oneshot;
 
 use crate::buddy::{self, Companion, Soul};
 use crate::clipboard::Clipboard;
-use crate::commands::{self, SlashCommand, parse_slash_command};
+use crate::commands::{self, SKILL_PREFIX, SlashCommand, parse_slash_command};
 use crate::config::{Config, Preferences};
 use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 use crate::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
-    stats_lines,
+    skills_lines, stats_lines,
 };
 use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
@@ -122,6 +122,11 @@ pub struct AppOptions {
     pub discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     pub tools: ToolSelection,
+    /// The skills this session found, which are listed in the system prompt and
+    /// loadable by name with `/skill:<name>`.
+    ///
+    /// Empty in tests, and in a session whose directories hold no skill.
+    pub skills: Skills,
     /// Whether a call that changes something is confirmed before it runs.
     ///
     /// Off in tests, which drive the loop themselves and have nobody to ask; on
@@ -170,6 +175,7 @@ impl AppOptions {
             clipboard: Clipboard::system(),
             discover_models: false,
             tools: ToolSelection::none(),
+            skills: Skills::empty(),
             ask_approval: false,
         }
     }
@@ -207,11 +213,13 @@ fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
     selection: &ToolSelection,
+    skills: &Skills,
     cwd: &Path,
     approver: Arc<dyn Approver>,
 ) -> (Arc<Agent>, Cancel) {
     let options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
+        .with_skills(skills.clone())
         .with_approver(approver);
     let agent = Arc::new(Agent::new(choice, registry, options));
     let cancel = agent.cancel_handle();
@@ -282,6 +290,8 @@ pub struct App {
     discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     tools: ToolSelection,
+    /// The skills this session may draw on, found before the app was built.
+    skills: Skills,
     /// Every built-in tool this platform has.
     ///
     /// Built once, so `edit` and `write` keep serialising against the same
@@ -324,6 +334,7 @@ impl App {
             clipboard,
             discover_models,
             tools,
+            skills,
             ask_approval,
         } = options;
 
@@ -345,6 +356,7 @@ impl App {
             choice,
             Arc::clone(&registry),
             &tools,
+            &skills,
             &cwd,
             Arc::clone(&approver),
         );
@@ -356,7 +368,7 @@ impl App {
         let (dialog_tx, dialog_rx) = unbounded_channel();
 
         let mut editor = Editor::with_placeholder("Ask anything…  /help for commands");
-        editor.set_hints(commands::hints());
+        editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
 
         let mut app = Self {
@@ -400,6 +412,7 @@ impl App {
             compact_rx: None,
             discover_models,
             tools,
+            skills,
             registry,
             cwd,
             approver,
@@ -442,6 +455,11 @@ impl App {
         &self.config.model
     }
 
+    /// The skills this session may draw on.
+    pub fn skills(&self) -> &Skills {
+        &self.skills
+    }
+
     /// The label of the backend answering turns right now.
     pub fn backend_label(&self) -> &str {
         self.agent.label()
@@ -465,6 +483,7 @@ impl App {
             choice,
             Arc::clone(&self.registry),
             &self.tools,
+            &self.skills,
             &self.cwd,
             Arc::clone(&self.approver),
         );
@@ -759,7 +778,7 @@ impl App {
             return;
         }
 
-        self.start_turn(trimmed);
+        self.start_turn(trimmed.clone(), trimmed);
     }
 
     /// Add `text` to the turn that is running.
@@ -779,6 +798,22 @@ impl App {
 
     fn execute_command(&mut self, command: SlashCommand) {
         let args = command.args.trim();
+
+        // A skill is invoked as `/skill:<name>`: the colon keeps the name part of
+        // the same word, which is what lets the editor offer every skill once
+        // `/skill` has been typed, and the parser hands that word back whole.
+        if let Some(name) = command.name.strip_prefix(SKILL_PREFIX) {
+            if name.is_empty() {
+                // `/skill:` on its own is the prefix a completion is built out
+                // of rather than a command; listing is what was about to be
+                // picked from anyway.
+                self.open_skills();
+            } else {
+                self.run_skill(name, args);
+            }
+            return;
+        }
+
         match command.name.as_str() {
             "help" => self.open_help(),
             "connect" => self.open_connect(),
@@ -800,6 +835,12 @@ impl App {
             "clear" => self.open_clear_confirm(),
             "compact" => self.compact_now(),
             "queue" => self.queue_follow_up(args),
+            "skills" => self.open_skills(),
+            // A skill's name is taken on the colon rather than after a space; a
+            // reminder that says so is worth more than "unknown command".
+            "skill" => self.notifications.error(format!(
+                "a skill is loaded as `{SKILL_PREFIX}<name>` — /skills lists them"
+            )),
             "stats" => self.open_stats(),
             "buddy" => self.open_buddy(args),
             "quit" | "exit" => self.quit.set(true),
@@ -807,6 +848,34 @@ impl App {
                 .notifications
                 .error(format!("unknown command /{other} — try /help")),
         }
+    }
+
+    /// Run a skill as the next turn's prompt.
+    ///
+    /// The instructions travel as the prompt because that is what the command
+    /// means: the user has decided the skill applies, and the model should not
+    /// have to spend a round working that out. The transcript shows the
+    /// invocation rather than the instructions it stands for.
+    fn run_skill(&mut self, name: &str, args: &str) {
+        let Some(skill) = self.skills.get(name) else {
+            self.notifications.error(format!(
+                "no skill named `{name}` — /skills lists what there is"
+            ));
+            return;
+        };
+
+        let invocation = if args.is_empty() {
+            format!("/skill:{name}")
+        } else {
+            format!("/skill:{name} {args}")
+        };
+        let prompt = skill.invocation_prompt(args);
+
+        if self.session.is_streaming() {
+            self.steer(prompt);
+            return;
+        }
+        self.start_turn(invocation, prompt);
     }
 
     /// Put `text` in line to run as the turn after the one in flight.
@@ -822,7 +891,8 @@ impl App {
         }
         if !self.session.is_streaming() {
             // Nothing to wait behind, so it is simply the next turn.
-            self.start_turn(text.to_string());
+            let prompt = text.to_string();
+            self.start_turn(prompt.clone(), prompt);
             return;
         }
         if self.agent.follow_up_handle().push(text) {
@@ -866,11 +936,11 @@ impl App {
         }
     }
 
-    fn start_turn(&mut self, prompt: String) {
+    fn start_turn(&mut self, submitted: String, prompt: String) {
         // The session owns the conversation and writes its own system prompt, so
         // the app hands over the new words and nothing else.
         self.session.turns.push(Turn {
-            prompt: prompt.clone(),
+            prompt: submitted,
             ..Default::default()
         });
         self.session.follow_end = true;
@@ -1073,6 +1143,30 @@ impl App {
         let lines = help_lines(&self.theme, crate::PROMPT_SLASH_COMMANDS);
         let dialog = TextDialog::new(
             "Help",
+            "↑↓ scroll · enter or esc closes",
+            lines,
+            &self.theme,
+            self.dialog_tx.clone(),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered()
+                .width(SizeValue::Percent(74))
+                .max_height(SizeValue::Percent(85)),
+        );
+    }
+
+    /// Show the skills this session found, and where each one lives.
+    fn open_skills(&mut self) {
+        if self.skills.is_empty() {
+            self.notifications
+                .info("no skills found — a skill is a directory holding a SKILL.md".to_string());
+            return;
+        }
+
+        let lines = skills_lines(&self.skills, &self.theme);
+        let dialog = TextDialog::new(
+            "Skills",
             "↑↓ scroll · enter or esc closes",
             lines,
             &self.theme,
@@ -2133,7 +2227,9 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{BackendError, Role, ToolCall, ToolResult, TurnRequest, Usage};
+    use solaris_agent::{
+        BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, TurnRequest, Usage,
+    };
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -3667,6 +3763,169 @@ mod tests {
         typing.handle_key(key(KeyCode::Char('a')));
         typing.handle_key(key(KeyCode::Char('?')));
         assert!(typing.overlay_queue.borrow().is_empty());
+    }
+
+    /// An app that found `skills` before it was built.
+    fn app_with_skills(skills: Skills) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.skills = skills;
+        App::new(options)
+    }
+
+    /// A skills directory holding one skill, found the way the binary finds it.
+    fn skills_holding(tag: &str, name: &str, description: &str, body: &str) -> Skills {
+        let dir = std::env::temp_dir().join(format!("solaris-skills-{tag}-{}", std::process::id()));
+        let path = dir.join(name).join("SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("a skill directory")).expect("skills dir");
+        std::fs::write(
+            &path,
+            format!("---\ndescription: {description}\n---\n{body}\n"),
+        )
+        .expect("the skill was written");
+        Skills::load(&[SkillRoot::new(&dir, SkillSource::Project)], &[])
+    }
+
+    /// Tick until the turn in flight has finished, or give up.
+    async fn settle_turn(app: &mut App) {
+        for _ in 0..500 {
+            app.tick();
+            if !app.session.is_streaming() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the turn never completed");
+    }
+
+    #[tokio::test]
+    async fn invoking_a_skill_asks_the_model_for_its_instructions() {
+        let skills = skills_holding(
+            "invoke",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Read the reference first.",
+        );
+        let mut app = app_with_skills(skills);
+
+        app.submit("/skill:pdf-tools extract report.pdf".to_string());
+
+        // The transcript shows what was typed, not the block it stood for.
+        assert_eq!(
+            app.session.turns[0].prompt,
+            "/skill:pdf-tools extract report.pdf"
+        );
+
+        settle_turn(&mut app).await;
+
+        let reply = &app.session.turns[0].reply;
+        assert!(reply.contains("Read the reference first."), "{reply}");
+        assert!(reply.contains("extract report.pdf"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn the_skill_prefix_offers_every_skill_by_name() {
+        let skills = skills_holding(
+            "offered",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Read the reference first.",
+        );
+        let mut app = app_with_skills(skills);
+
+        for character in "/skill".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(text.contains("› /skills"), "{text}");
+        assert!(
+            text.contains("  /skill:pdf-tools [p] Extract text from PDFs."),
+            "every skill is offered, with what it is for and where it came from: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.trim_end() == "› /skill"),
+            "the bare prefix is a prefix, not a row of its own: {text}"
+        );
+    }
+
+    #[test]
+    fn a_skill_named_after_a_space_is_a_reminder_rather_than_a_run() {
+        let mut app = app_with_skills(skills_holding(
+            "space",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill pdf-tools do it".to_string());
+
+        assert!(app.session.turns.is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Error);
+        assert!(text.contains("skill:<name>"), "{text}");
+    }
+
+    #[test]
+    fn the_skill_prefix_on_its_own_lists_what_there_is() {
+        let mut app = app_with_skills(skills_holding(
+            "prefix",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill:".to_string());
+
+        assert_eq!(app.overlay_queue.borrow().len(), 1);
+        assert!(app.session.turns.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_skill_is_reported_rather_than_run() {
+        let mut app = app_with_skills(skills_holding(
+            "unknown",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill:nope do it".to_string());
+
+        assert!(app.session.turns.is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Error);
+        assert!(text.contains("no skill named"), "{text}");
+    }
+
+    #[test]
+    fn listing_skills_without_any_says_none_were_found() {
+        let mut app = app();
+
+        app.submit("/skills".to_string());
+
+        assert!(app.overlay_queue.borrow().is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Info);
+        assert!(text.contains("no skills found"), "{text}");
+    }
+
+    #[test]
+    fn listing_skills_shows_the_ones_that_were_found() {
+        let mut app = app_with_skills(skills_holding(
+            "list",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skills".to_string());
+
+        assert_eq!(app.overlay_queue.borrow().len(), 1);
+        assert_eq!(app.skills().len(), 1);
     }
 
     #[tokio::test]

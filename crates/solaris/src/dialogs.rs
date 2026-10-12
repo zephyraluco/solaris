@@ -622,23 +622,80 @@ pub fn help_lines(theme: &Theme, commands: &[crate::SlashCommandSpec]) -> Vec<Li
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("Commands", heading)));
     lines.push(Line::default());
-    let name_width = commands
+    // Built first, so the column is measured from the text that is really drawn:
+    // a name ending in `:` runs on into its argument rather than being followed
+    // by a space, which is what makes `/skill:<name>` read as one word.
+    let invocations: Vec<String> = commands
         .iter()
-        .map(|spec| display_width(spec.name) + spec.args.len() + 2)
+        .map(
+            |spec| match (spec.args.is_empty(), spec.name.ends_with(':')) {
+                (true, _) => format!("/{}", spec.name),
+                (false, true) => format!("/{}{}", spec.name, spec.args),
+                (false, false) => format!("/{} {}", spec.name, spec.args),
+            },
+        )
+        .collect();
+    let name_width = invocations
+        .iter()
+        .map(|invocation| display_width(invocation))
         .max()
         .unwrap_or(0);
-    for spec in commands {
-        let invocation = if spec.args.is_empty() {
-            format!("/{}", spec.name)
-        } else {
-            format!("/{} {}", spec.name, spec.args)
-        };
-        let padding = " ".repeat(name_width.saturating_sub(display_width(&invocation)) + 2);
+
+    for (invocation, spec) in invocations.iter().zip(commands) {
+        let padding = " ".repeat(name_width.saturating_sub(display_width(invocation)) + 2);
         lines.push(Line::from(vec![
             Span::styled(format!("  {invocation}"), key_style),
             Span::styled(padding, muted),
             Span::styled(spec.description, text_style),
         ]));
+    }
+
+    lines
+}
+
+/// Width a skill's prose is wrapped to in the `/skills` dialog.
+///
+/// The dialog is a fraction of the terminal, so this is a guess that reads well
+/// at the usual sizes rather than a measurement; a narrower terminal clips the
+/// wrapped lines the way every other dialog's long lines are clipped.
+const SKILL_TEXT_WIDTH: usize = 72;
+
+/// Build the skills dialog contents.
+///
+/// A skill the model is not told about is marked, because that is the one thing
+/// about it a reader cannot tell from the list.
+pub fn skills_lines(skills: &solaris_agent::Skills, theme: &Theme) -> Vec<Line<'static>> {
+    let heading = Style::default()
+        .fg(theme.heading)
+        .add_modifier(Modifier::BOLD);
+    let name_style = Style::default().fg(theme.accent);
+    let text_style = Style::default().fg(theme.fg);
+    let muted = Style::default().fg(theme.muted);
+
+    let mut lines = vec![Line::from(Span::styled("Skills", heading)), Line::default()];
+
+    for skill in skills.iter() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}", skill.name()), name_style),
+            Span::styled(format!("  ({})", skill.source().as_str()), muted),
+        ]));
+
+        for segment in wrap_text(skill.description(), SKILL_TEXT_WIDTH) {
+            lines.push(Line::from(Span::styled(
+                format!("    {segment}"),
+                text_style,
+            )));
+        }
+
+        let mut location = skill.path().display().to_string();
+        if skill.disable_model_invocation() {
+            location.push_str("  ·  /skill:<name> only");
+        }
+        for segment in wrap_text(&location, SKILL_TEXT_WIDTH) {
+            lines.push(Line::from(Span::styled(format!("    {segment}"), muted)));
+        }
+
+        lines.push(Line::default());
     }
 
     lines
@@ -1008,6 +1065,62 @@ mod tests {
             );
         }
         assert!(text.contains("ctrl+k"));
+    }
+
+    #[test]
+    fn help_lines_write_a_skill_invocation_as_one_word() {
+        let lines = help_lines(&Theme::dark(), crate::PROMPT_SLASH_COMMANDS);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("/skill:<name> [request]"), "{text}");
+        assert!(!text.contains("/skill: <name>"), "{text}");
+    }
+
+    #[test]
+    fn skills_lines_name_each_skill_show_its_description_and_mark_the_hidden() {
+        let dir =
+            std::env::temp_dir().join(format!("solaris-dialogs-skills-{}", std::process::id()));
+        let path = dir.join("secret").join("SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("a skill directory")).expect("skills dir");
+        std::fs::write(
+            &path,
+            "---\ndescription: Only on request.\ndisable-model-invocation: true\n---\nBody.\n",
+        )
+        .expect("the skill was written");
+
+        let skills = solaris_agent::Skills::load(
+            &[solaris_agent::SkillRoot::new(
+                &dir,
+                solaris_agent::SkillSource::Project,
+            )],
+            &[],
+        );
+        let lines = skills_lines(&skills, &Theme::dark());
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("secret"), "{text}");
+        assert!(text.contains("Only on request."), "{text}");
+        assert!(text.contains("project"), "{text}");
+        assert!(text.contains("/skill:<name> only"), "{text}");
+
+        // The file is wrapped, so it is compared with the wrapping taken out.
+        let file = skills
+            .iter()
+            .next()
+            .expect("found")
+            .path()
+            .display()
+            .to_string();
+        let unbroken: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(unbroken.contains(&file), "{text}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod overflow;
 mod prompt;
 mod queue;
 mod session;
+mod skills;
 
 pub use agent::{Agent, AgentOptions};
 pub use approver::{
@@ -35,6 +36,7 @@ pub use compaction::Compaction;
 pub use mode::{Mode, default_tool_names};
 pub use queue::Queue;
 pub use session::DEFAULT_MAX_PARALLEL;
+pub use skills::{Skill, SkillRoot, SkillSource, SkillWarning, Skills};
 
 // The conversation: what a turn is written in and what it streams back.
 pub use solaris_backend::{

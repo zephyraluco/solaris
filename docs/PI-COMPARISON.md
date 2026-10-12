@@ -36,7 +36,7 @@ pi 的 `ToolDefinition` 比 solaris 的 `Tool` trait 厚一层。
 | 执行模式 | 每个工具可声明 `executionMode: "sequential"`，强制该批调用串行 | 同样有 `execution_mode()`；`write`/`edit`/shell 声明串行 |
 | 渲染 | `renderCall` / `renderResult`，`pi.registerToolRenderer` 可覆盖任意工具 | 应用层在 [`transcript.rs`](../crates/solaris/src/transcript.rs) 里硬编码成一行 |
 
-**系统提示词**：pi 把每个工具的 `promptSnippet`（一行说明）与 `promptGuidelines`（规则条目）注入系统提示词的 tools / rules 段，并列出可用的 skills；solaris 同样由**工具自己**贡献指南（`Tool::guideline()` 返回一行，由 agent 汇编进系统提示词），另外有身份、模式说明与一组通用工作准则，并按平台追加各自的说明（`ProviderSpec::prompt`）。差别只在 skills：pi 会把可用的 skill 列进提示词，solaris 没有这个概念。
+**系统提示词**：pi 把每个工具的 `promptSnippet`（一行说明）与 `promptGuidelines`（规则条目）注入系统提示词的 tools / rules 段，并列出可用的 skills；solaris 同样由**工具自己**贡献指南（`Tool::guideline()` 返回一行，由 agent 汇编进系统提示词），另外有身份、模式说明与一组通用工作准则，并按平台追加各自的说明（`ProviderSpec::prompt`）。技能也照同一套办法：只写名字、描述与 `SKILL.md` 路径，说明留在文件里等需要时再读（§6.2）。差别只在写法 —— pi 用 `<available_skills>` XML 块，solaris 用与其它段落一致的 Markdown 列表。
 
 > pi 侧：`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts`、`core/system-prompt.ts`
 
@@ -125,7 +125,6 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 | `codemode` | 模型写 JS，在 QuickJS 沙箱里通过 `tools.<name>()` 调其他工具，可并行 | 无 |
 | `tool_search` | 对未声明的工具做 BM25 检索并声明给下一次调用 | 无 |
 | 扩展注册工具 | `pi.registerTool()`，`prepareLoadout` / `setActiveTools` 动态启停 | 无（注册表在编译期固定为八个） |
-| skills | 扫描 SKILL.md，把名字与描述注入系统提示词，按需读取 | 无 |
 | 会话落盘 | 会话文件、`/tree`、resume、fork | 无（转录只在内存里） |
 | 权限 | project trust、`tool_call` 拦截、容器化 | `Approver` 钩子（异步，可等 UI）+ `--confirm-tools` 对话框；默认全批准 |
 
@@ -146,7 +145,7 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 
 - **上下文压缩**：超过「窗口 − 16384」时把较早的消息交给模型摘要，最近 20000 token 的对话按 token 保留；摘要写成固定六段（Goal / Constraints / Progress / Key Decisions / Next Steps / Critical Context），已有摘要时改为「保留旧的、追加新的」而不是重写；摘要失败就原样发送而不是丢掉对话（§3.6）。
 - **中途 steering 与 follow-up**：两个 `Queue`，前者并入正在跑的一轮（每轮开始前与「模型看似答完」时各排空一次），后者在这一轮之后另起一轮；应用直接回车 = steering，`/queue <prompt>` = follow-up（§3.5）。
-- **提示词系统**：系统提示词由身份 + 模式 + 每个工具自带的指南 + 一组工作准则组成，并按平台追加说明（`ProviderSpec::prompt`）（§3.1、§3.4）。
+- **提示词系统**：系统提示词由身份 + 模式 + 每个工具自带的指南 + 技能清单 + 一组工作准则组成，并按平台追加说明（`ProviderSpec::prompt`）（§3.1、§3.9）。
 - **残缺调用不再执行**：协议层把停止原因带出来（`length` / `max_tokens` / `incomplete` → `AgentEvent::OutputTruncated`），循环拒绝该批全部调用并给出可操作的说明（§3）。
 - **一轮内并行**：每批最多 `DEFAULT_MAX_PARALLEL = 4`，结果按请求顺序回填；`write` / `edit` / shell 声明 `Sequential`，该批随之串行（§3）。
 - **回合不再误报成功**：流在收到 `TurnComplete` 之前结束即算失败，不会把半截回答当成完整回答。
@@ -158,3 +157,21 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 - **timeout 有上限**：超过 `MAX_TIMEOUT_SECONDS = 2_147_483` 直接作为错误结果回给模型，而不是让毫秒计时器回绕（§4）。
 - **被信号杀死的命令不再像成功**：退出码按 `128 + signal` 约定上报（Unix）（§4）。
 - **`write` 的判定挪进锁内**：`Created` / `Replaced` 的判断与两次取消检查都在 `FileMutationQueue` 的锁内完成，取消的写入不再留下已建好的目录（§4）。
+- **技能**：启动时扫描 `SKILL.md`（用户目录 → 项目目录 → `--skill`），把名字、描述与文件路径写进系统提示词，说明只在需要时才读；`/skills` 列出、`/skill:<name> [request]` 直接载入，编辑器在 `/skill` 之后按名字列出每个技能。名字与描述的规范校验、名字撞车保留先发现的（用户先于项目）、缺描述不装载，都与 pi 一致（§6.2）。
+
+### 6.2 技能：与 pi 的实现差异
+
+同一个 Agent Skills 规范、同一套两步装载（清单进提示词、说明按需读取），差别在这几处：
+
+| 方面 | pi | solaris |
+| --- | --- | --- |
+| 提示词里的形状 | `<available_skills>` XML 块 | 与其它段落一致的 Markdown 列表，一份提示词只有一种标记风格 |
+| frontmatter 解析 | `yaml` 包，完整 YAML | 自己实现的子集（顶层标量、`\|` / `>` 块、引号、注释、续行），不为这件事引一个依赖 |
+| 忽略文件 | 读 `.gitignore` / `.ignore` / `.fdignore` | 不读；只跳过隐藏条目与 `node_modules` |
+| 散落 `.md` 的名字回退 | 父目录名（对散落文件几乎等于技能根目录的名字） | 文件自身的名字（`release.md` → `release`），父目录只用来放它 |
+| 说明的取得 | 模型用 `read`（或 `bash`）打开 | 同上；另外 `/skill:<name>` 会把说明直接作为这一轮的提示词送出 |
+| 技能命令参与补全 | 由 `enableSkillCommands` 设置决定，手敲的 `/skill:name` 仍可用 | 总是参与：`/skill` 一敲下去就把每个技能按名字列出来，带来源徽标与 `(n/总数)` |
+| 提示词里点名的读取工具 | 由调用方传 `"read"` / `"bash"` / `"indirect"` | 只在这一轮真的声明了 `read` 时才点名，否则不写机制 |
+| 重新扫描 | `/reload` | 没有；启动时扫一次，改过的技能要重开才生效 |
+
+> pi 侧：`packages/coding-agent/src/core/skills.ts`、`utils/frontmatter.ts`、`core/system-prompt.ts`

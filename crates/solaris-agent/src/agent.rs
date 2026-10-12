@@ -15,6 +15,7 @@ use crate::mode::{Mode, default_tool_names};
 use crate::prompt;
 use crate::queue::Queue;
 use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
+use crate::skills::Skills;
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -37,6 +38,12 @@ pub struct AgentOptions {
     pub max_parallel: usize,
     /// When the conversation is summarized to stay inside the context window.
     pub compaction: Compaction,
+    /// The skills this session may draw on.
+    ///
+    /// Held here rather than in the application because the system prompt is
+    /// written here: what the model is told exists and what it can be pointed at
+    /// by name have to be the same list.
+    pub skills: Skills,
 }
 
 impl Default for AgentOptions {
@@ -48,6 +55,7 @@ impl Default for AgentOptions {
             temp_dir: std::env::temp_dir(),
             max_parallel: DEFAULT_MAX_PARALLEL,
             compaction: Compaction::default(),
+            skills: Skills::empty(),
         }
     }
 }
@@ -76,6 +84,12 @@ impl AgentOptions {
     /// The same options with `compaction` deciding when to summarize.
     pub fn with_compaction(mut self, compaction: Compaction) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// The same options with `skills` as what this session may draw on.
+    pub fn with_skills(mut self, skills: Skills) -> Self {
+        self.skills = skills;
         self
     }
 }
@@ -224,6 +238,11 @@ impl Agent {
             .selected_names(default_tool_names(mode), &self.options.selection)
     }
 
+    /// The skills this session may draw on.
+    pub fn skills(&self) -> &Skills {
+        &self.options.skills
+    }
+
     /// Run one turn over `prompt`, streaming what it produces.
     ///
     /// The turn runs in its own task, so the caller can keep drawing while a
@@ -241,7 +260,8 @@ impl Agent {
         // The prompt is written per turn because every part of it can change:
         // the mode, which tools the mode leaves standing, and which platform the
         // credentials resolve to.
-        let system = prompt::system_prompt(mode, &tools, self.choice.provider_id);
+        let system =
+            prompt::system_prompt(mode, &tools, &self.options.skills, self.choice.provider_id);
 
         session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),

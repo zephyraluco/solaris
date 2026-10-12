@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 
 use crate::component::{Component, KeyResult, MouseResult};
 use crate::components::fuzzy::fuzzy_score;
-use crate::util::{digit_count, display_width, rect_contains, truncate_to_width};
+use crate::util::{digit_count, display_width, rect_contains, truncate_to_width, window_start};
 
 /// One selectable row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,17 +238,11 @@ impl SelectList {
         self.max_visible.min(self.last_area.height.max(1))
     }
 
+    /// Keep the window on the highlight, remembering where it was so the list
+    /// does not jump back to the top the moment the highlight steps up a line.
     fn sync_scroll(&mut self) {
         let visible = self.visible_rows() as usize;
-        if visible == 0 {
-            self.scroll = 0;
-            return;
-        }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
-        }
+        self.scroll = window_start(self.matches.len(), visible, self.selected, self.scroll);
     }
 }
 
