@@ -19,14 +19,21 @@
 
 mod agent;
 mod approver;
+mod compaction;
+mod conversation;
 mod mode;
+mod overflow;
+mod prompt;
+mod queue;
 mod session;
 
-pub use agent::{Agent, AgentOptions, AgentRequest};
+pub use agent::{Agent, AgentOptions};
 pub use approver::{
     AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, DenyAll, FnApprover,
 };
+pub use compaction::Compaction;
 pub use mode::{Mode, default_tool_names};
+pub use queue::Queue;
 pub use session::DEFAULT_MAX_PARALLEL;
 
 // The conversation: what a turn is written in and what it streams back.

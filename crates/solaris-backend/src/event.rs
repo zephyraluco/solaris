@@ -24,6 +24,15 @@ pub enum AgentEvent {
         result: ToolResult,
         duration_ms: u64,
     },
+    /// A message the user queued for after this turn is now being run as one.
+    ///
+    /// Not terminal: the turn it arrived during is over, and another has begun in
+    /// the same loop. It is reported so the caller can attribute what follows to
+    /// the right prompt rather than appending it to the turn that just finished.
+    FollowUp {
+        /// The prompt of the turn that is starting.
+        prompt: String,
+    },
     /// The model hit its output limit, so the message it produced is cut off.
     ///
     /// Not terminal: the message still arrives in full as far as the provider
@@ -32,6 +41,27 @@ pub enum AgentEvent {
     /// half-written request, which is why the signal is its own event rather
     /// than a detail of the completion.
     OutputTruncated,
+    /// Earlier messages were replaced by a summary of them.
+    ///
+    /// Not terminal, and not an error: the turn continues with less to read.
+    /// It is its own event because the caller is the only one that can say so —
+    /// a turn that suddenly remembers less is worth explaining to the user
+    /// rather than leaving as a mystery.
+    Compacted {
+        /// How many messages the summary replaced.
+        dropped: usize,
+    },
+    /// A message the user steered in has been folded into the conversation.
+    ///
+    /// Not terminal. The loop reports it rather than the caller assuming it,
+    /// because the loop is what decides *when* the message is read: one steered
+    /// in as a turn ends is read by the next turn instead, and a caller that had
+    /// written it down on the turn it was typed into would then have it in the
+    /// record twice.
+    Steered {
+        /// What the user typed.
+        text: String,
+    },
     /// Terminal event: the turn finished successfully.
     TurnComplete {
         /// What the turn consumed, measured by the provider or estimated when
@@ -116,6 +146,24 @@ mod tests {
         assert!(
             !AgentEvent::OutputTruncated.is_terminal(),
             "a cut-off message still has a completion after it"
+        );
+        assert!(
+            !AgentEvent::Compacted { dropped: 4 }.is_terminal(),
+            "a compacted conversation still has a completion after it"
+        );
+        assert!(
+            !AgentEvent::Steered {
+                text: "use the other file".to_string()
+            }
+            .is_terminal(),
+            "a steered message still has a completion after it"
+        );
+        assert!(
+            !AgentEvent::FollowUp {
+                prompt: "then run the tests".to_string()
+            }
+            .is_terminal(),
+            "a follow-up leaves the turn it interrupted finished"
         );
         assert!(AgentEvent::Error("boom".to_string()).is_terminal());
     }

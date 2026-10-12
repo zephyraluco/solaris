@@ -112,9 +112,9 @@ pub fn build(
             out.push(Line::default());
         }
         push_prompt(&mut out, &turn.prompt, width, theme);
+        push_compaction(&mut out, turn, theme);
         push_steps(&mut out, turn, width, theme);
         push_thinking(&mut out, turn, width, theme);
-
         if !turn.reply.trim().is_empty() {
             out.push(Line::default());
             out.extend(render_markdown(&turn.reply, width as u16, &markdown));
@@ -180,6 +180,15 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
 /// shows the first line of what it said, because that is the part a person
 /// needs; the full text went to the model either way.
 fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &Theme) {
+    // Messages the user steered in are drawn where they arrived, among the
+    // calls they followed: where the correction landed is why the model's next
+    // move changed, so collecting them at the end would lose the point of them.
+    let mut notes = turn.steering.iter().peekable();
+    while let Some(note) = notes.next_if(|note| note.after_steps == 0) {
+        push_steering(out, &note.text, width, theme);
+    }
+
+    let mut finished = 0usize;
     for step in &turn.steps {
         let (glyph, colour) = match step.result.as_ref() {
             None => ("⋯", theme.muted),
@@ -217,7 +226,66 @@ fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &T
                 Style::default().fg(theme.muted),
             ),
         ]));
+
+        // A note that followed this call is drawn after it, once the call is
+        // known to have finished.
+        if step.is_done() {
+            finished += 1;
+            while let Some(note) = notes.next_if(|note| note.after_steps <= finished) {
+                push_steering(out, &note.text, width, theme);
+            }
+        }
     }
+
+    // A note that arrived after the last call — while the answer streamed, say.
+    for note in notes {
+        push_steering(out, &note.text, width, theme);
+    }
+}
+
+/// A message the user added while the turn was running.
+fn push_steering(out: &mut Vec<Line<'static>>, text: &str, width: usize, theme: &Theme) {
+    let label = "steered";
+    let used = 6 + label.chars().count();
+    out.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled("↳ ", Style::default().fg(theme.accent)),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {}",
+                truncate_to_width(&summarize(text), width.saturating_sub(used).max(8), "…")
+            ),
+            Style::default().fg(theme.fg),
+        ),
+    ]));
+}
+
+/// A note that earlier messages were summarized away during this turn.
+///
+/// It is drawn before the calls because that is where it happened — the model
+/// read less from the first round onwards — and because a turn that forgot
+/// things has to say so somewhere it can be read back.
+fn push_compaction(out: &mut Vec<Line<'static>>, turn: &Turn, theme: &Theme) {
+    if turn.compacted == 0 {
+        return;
+    }
+    out.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled("⌁ ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format!(
+                "{} earlier messages summarized to make room",
+                turn.compacted
+            ),
+            Style::default().fg(theme.muted),
+        ),
+    ]));
 }
 
 /// First line of `text`, trimmed and shortened for the collapsed thinking label.

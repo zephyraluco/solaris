@@ -22,9 +22,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentOptions, AgentRequest, AlwaysApprove, Approval,
-    ApprovalRequest, Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry,
-    ToolSelection, default_tool_names,
+    Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
+    Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry, ToolSelection,
+    default_tool_names,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -58,7 +58,7 @@ use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
 use crate::recent::{self, RecentActivity};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -241,8 +241,6 @@ pub struct App {
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
-    /// Prompts typed while a turn was streaming; run in order afterwards.
-    queued_prompts: VecDeque<String>,
     spinner_frame: u16,
     frame: u64,
     last_transcript: Rect,
@@ -278,6 +276,8 @@ pub struct App {
     discovered: Vec<String>,
     /// Answer from the background model-discovery task, while one is in flight.
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
+    /// Answer from a `/compact` that is in flight.
+    compact_rx: Option<UnboundedReceiver<Option<usize>>>,
     /// Whether asking the provider for its models is allowed at all.
     discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
@@ -377,7 +377,6 @@ impl App {
             dialog_tx,
             dialog_rx,
             events_rx: None,
-            queued_prompts: VecDeque::new(),
             spinner_frame: 0,
             frame: 0,
             last_transcript: Rect::default(),
@@ -398,6 +397,7 @@ impl App {
             inline: None,
             discovered: Vec::new(),
             models_rx: None,
+            compact_rx: None,
             discover_models,
             tools,
             registry,
@@ -672,10 +672,6 @@ impl App {
             self.session.bump();
         }
         self.notifications.info("cancelled");
-
-        if let Some(next) = self.queued_prompts.pop_front() {
-            self.start_turn(next);
-        }
     }
 
     fn toggle_mode(&mut self) {
@@ -735,9 +731,12 @@ impl App {
 
     /// Submit prompt text: a slash command runs, anything else starts a turn.
     ///
-    /// Prompts submitted while a turn is streaming are queued and run in order
-    /// once it finishes; starting a second turn concurrently would attribute
-    /// the in-flight deltas to the wrong turn.
+    /// A prompt submitted while a turn is streaming joins that turn instead of
+    /// waiting behind it: starting a second turn concurrently would attribute
+    /// the in-flight deltas to the wrong turn, and waiting means the correction
+    /// arrives after the model has done the thing being corrected. The loop
+    /// folds it in before it asks again, so the message reaches the model as
+    /// soon as the current round finishes.
     pub(crate) fn submit(&mut self, text: String) {
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
@@ -756,15 +755,26 @@ impl App {
         self.record_activity(&trimmed);
 
         if self.session.is_streaming() {
-            self.queued_prompts.push_back(trimmed.clone());
-            self.notifications.info(format!(
-                "queued: {}",
-                crate::transcript::summarize(&trimmed)
-            ));
+            self.steer(trimmed);
             return;
         }
 
         self.start_turn(trimmed);
+    }
+
+    /// Add `text` to the turn that is running.
+    ///
+    /// The message goes into the agent's steering queue, and the agent reports
+    /// it back as a [`AgentEvent::Steered`] event once the loop has actually
+    /// folded it in — that is when the turn's record gets the note, so a
+    /// message that arrives just too late to be read by this turn is recorded
+    /// against the turn that does read it rather than the one it was typed into.
+    fn steer(&mut self, text: String) {
+        if !self.agent.steering_handle().push(text.clone()) {
+            return;
+        }
+        self.notifications
+            .info(format!("steered: {}", crate::transcript::summarize(&text)));
     }
 
     fn execute_command(&mut self, command: SlashCommand) {
@@ -788,6 +798,8 @@ impl App {
             }
             "mode" => self.toggle_mode(),
             "clear" => self.open_clear_confirm(),
+            "compact" => self.compact_now(),
+            "queue" => self.queue_follow_up(args),
             "stats" => self.open_stats(),
             "buddy" => self.open_buddy(args),
             "quit" | "exit" => self.quit.set(true),
@@ -797,17 +809,68 @@ impl App {
         }
     }
 
-    fn start_turn(&mut self, prompt: String) {
-        // The session declares the tools a turn may use, so the app never has to
-        // know which ones a mode offers.
-        let request = AgentRequest::new(
-            self.session.history(self.config.mode),
-            prompt.clone(),
-            self.config.mode,
-        );
+    /// Put `text` in line to run as the turn after the one in flight.
+    ///
+    /// This is what makes `steering` a choice rather than the only option: a
+    /// message typed while a turn runs is steered into it, and `/queue` is how to
+    /// say "this one after that one instead".
+    fn queue_follow_up(&mut self, text: &str) {
+        if text.is_empty() {
+            self.notifications
+                .error("usage: /queue <prompt>".to_string());
+            return;
+        }
+        if !self.session.is_streaming() {
+            // Nothing to wait behind, so it is simply the next turn.
+            self.start_turn(text.to_string());
+            return;
+        }
+        if self.agent.follow_up_handle().push(text) {
+            self.notifications.info(format!(
+                "after this turn: {}",
+                crate::transcript::summarize(text)
+            ));
+        }
+    }
 
+    /// Summarize the conversation now.
+    ///
+    /// It runs off the event loop because it is a model call of its own, and its
+    /// answer comes back the same way model discovery's does.
+    fn compact_now(&mut self) {
+        if self.compact_rx.is_some() {
+            self.notifications.info("already compacting".to_string());
+            return;
+        }
+        let agent = Arc::clone(&self.agent);
+        let (tx, rx) = unbounded_channel();
+        self.compact_rx = Some(rx);
+        self.notifications.clear();
+        self.notifications.info("compacting…".to_string());
+
+        tokio::spawn(async move {
+            let _ = tx.send(agent.compact().await);
+        });
+    }
+
+    /// Report what the manual compaction did.
+    fn on_compacted(&mut self, dropped: Option<usize>) {
+        match dropped {
+            Some(dropped) => self.notifications.info(format!(
+                "summarized {dropped} messages; {} left in context",
+                self.agent.conversation_len()
+            )),
+            None => self
+                .notifications
+                .warning("nothing to summarize, or the model would not produce a summary"),
+        }
+    }
+
+    fn start_turn(&mut self, prompt: String) {
+        // The session owns the conversation and writes its own system prompt, so
+        // the app hands over the new words and nothing else.
         self.session.turns.push(Turn {
-            prompt,
+            prompt: prompt.clone(),
             ..Default::default()
         });
         self.session.follow_end = true;
@@ -818,9 +881,10 @@ impl App {
         self.events_rx = Some(rx);
 
         let agent = Arc::clone(&self.agent);
+        let mode = self.config.mode;
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream = agent.run_turn(request);
+            let mut stream = agent.run_turn(prompt, mode);
             while let Some(event) = stream.next().await {
                 if tx.send(event).is_err() {
                     break;
@@ -879,6 +943,43 @@ impl App {
                 self.notifications
                     .warning("the reply hit the output limit; its tool calls were refused");
             }
+            // The conversation was summarized to make room. It is worth a
+            // banner because the model suddenly remembers less, and worth a line
+            // in the transcript because a session that forgot things should say
+            // so where it can be read back later.
+            AgentEvent::Compacted { dropped } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.compacted += dropped;
+                }
+                self.notifications.warning(format!(
+                    "summarized {dropped} earlier messages to make room in the context window"
+                ));
+            }
+            // A message the user steered in has been read. Recorded here rather
+            // than when it was typed, so it lands in the turn that read it.
+            AgentEvent::Steered { text } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    let after_steps = turn.steps.iter().filter(|step| step.is_done()).count();
+                    turn.steering.push(SteeringNote { text, after_steps });
+                }
+            }
+            // A queued prompt is now being run as a turn of its own. The turn it
+            // arrived during is over, so it is closed and a new one opened with
+            // this prompt: everything that streams from here belongs to it.
+            AgentEvent::FollowUp { prompt } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.complete = true;
+                    if turn.reply.is_empty() {
+                        turn.reply = "_(superseded by the queued prompt)_".to_string();
+                    }
+                }
+                self.session.turns.push(Turn {
+                    prompt,
+                    ..Default::default()
+                });
+                self.session.follow_end = true;
+                self.spinner_frame = 0;
+            }
             AgentEvent::Error(message) => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -923,6 +1024,11 @@ impl App {
                 self.session.bump();
                 // The highlight points at rows that no longer exist.
                 self.selection.borrow_mut().clear();
+                // The transcript and the conversation are not the same thing:
+                // clearing what is on screen must also forget what the model
+                // would be sent, or the next turn answers a conversation the
+                // user can no longer see.
+                self.agent.clear();
                 self.notifications.info("transcript cleared");
             }
             DialogMessage::Confirm {
@@ -1821,11 +1927,6 @@ impl Component for App {
                 self.session.bump();
             }
             dirty = true;
-
-            // Run the next queued prompt now that the turn is over.
-            if let Some(next) = self.queued_prompts.pop_front() {
-                self.start_turn(next);
-            }
         }
 
         // Dialog results.
@@ -1872,6 +1973,21 @@ impl Component for App {
         for answer in discovered {
             dirty = true;
             self.on_models_discovered(answer);
+        }
+
+        // Answer from a `/compact` that was running.
+        let mut compacted = None;
+        if let Some(rx) = self.compact_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(answer) => compacted = Some(answer),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => compacted = Some(None),
+            }
+        }
+        if let Some(answer) = compacted {
+            self.compact_rx = None;
+            dirty = true;
+            self.on_compacted(answer);
         }
 
         if self.notifications.tick() {
@@ -2017,10 +2133,28 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{BackendError, ToolCall, ToolResult, TurnRequest, Usage};
+    use solaris_agent::{BackendError, Role, ToolCall, ToolResult, TurnRequest, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// The prompt a request asks about, wherever the loop put it.
+    ///
+    /// The agent records the prompt in the conversation before it asks anything,
+    /// so a round's own `prompt` is empty and the words are the last user message
+    /// instead. The fake reads both so it answers the same way either way.
+    fn asked(request: &TurnRequest) -> String {
+        if !request.prompt.trim().is_empty() {
+            return request.prompt.trim().to_string();
+        }
+        request
+            .history
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User && !message.text().is_empty())
+            .map(|message| message.text())
+            .unwrap_or_default()
+    }
 
     /// A backend that answers with a prompt-echoing markdown reply, so the app's
     /// own behaviour can be driven without a provider and without a network.
@@ -2034,7 +2168,7 @@ mod tests {
         async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             let reply = format!(
                 "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-                request.prompt.trim()
+                asked(&request)
             );
             let events = vec![
                 AgentEvent::ThinkingDelta("thinking ".to_string()),
@@ -3448,19 +3582,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupting_still_runs_a_queued_prompt() {
+    async fn interrupting_a_turn_leaves_nothing_waiting_behind_it() {
         let mut app = app();
         app.submit("first".to_string());
+        // A second prompt joins the running turn rather than queueing behind it.
         app.submit("second".to_string());
-        assert_eq!(app.queued_prompts.len(), 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
-        // Claude Code sends what is queued after an interrupt, so the queue is
-        // never left waiting on a turn that no longer exists.
-        assert!(app.queued_prompts.is_empty());
-        assert_eq!(app.session.turns.len(), 2);
+        assert!(!app.session.is_streaming(), "the turn kept streaming");
+        assert_eq!(
+            app.session.turns.len(),
+            1,
+            "an interrupt must not start another turn"
+        );
+        assert!(app.session.turns.iter().all(|turn| turn.complete));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_submitted_while_streaming_steers_the_running_turn() {
+        let mut app = app();
+
+        app.submit("first".to_string());
         assert!(app.session.is_streaming());
+        app.submit("second".to_string());
+
+        // No concurrent turn, and the message is waiting for the loop that is
+        // running to read it rather than being run as a turn of its own.
+        assert_eq!(app.session.turns.len(), 1, "a concurrent turn was started");
+        assert!(
+            app.agent.steering_handle().has_pending(),
+            "the message never reached the running turn"
+        );
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("steered")),
+            "the user is told what happened to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steered_message_is_recorded_when_the_loop_says_it_was_read() {
+        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: "read it".into(),
+            steps: vec![
+                ToolStep {
+                    call: call.clone(),
+                    result: Some(ToolResult::ok(&call, "one")),
+                    duration_ms: None,
+                },
+                ToolStep::pending(call),
+            ],
+            ..Default::default()
+        });
+
+        app.apply_event(AgentEvent::Steered {
+            text: "also check the tests".into(),
+        });
+
+        // The note is recorded against the turn that read it, and remembers how
+        // much had already run — only the finished call counts.
+        let note = &app.session.turns[0].steering[0];
+        assert_eq!(note.text, "also check the tests");
+        assert_eq!(note.after_steps, 1);
     }
 
     #[test]
@@ -3514,42 +3701,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompts_submitted_while_streaming_are_queued_and_run_in_order() {
+    async fn a_queued_prompt_is_run_as_its_own_turn_when_the_loop_reports_it() {
         let mut app = app();
-
         app.submit("first".to_string());
-        assert!(app.session.is_streaming());
-        // A second prompt must not start a concurrent turn.
-        app.submit("second".to_string());
-        assert_eq!(app.session.turns.len(), 1, "concurrent turn started");
-        assert_eq!(app.queued_prompts.len(), 1);
 
-        for _ in 0..1000 {
+        // The loop reports that it has taken the queued prompt and is starting a
+        // turn with it: everything that streams from here belongs to that turn.
+        app.apply_event(AgentEvent::FollowUp {
+            prompt: "run the tests".into(),
+        });
+
+        assert_eq!(app.session.turns.len(), 2, "a turn was not opened for it");
+        assert!(app.session.turns[0].complete, "the old turn is finished");
+        assert_eq!(app.session.turns[1].prompt, "run the tests");
+        assert!(!app.session.turns[1].complete, "and the new one is running");
+    }
+
+    #[tokio::test]
+    async fn queueing_while_streaming_waits_for_the_turn_in_flight() {
+        let mut app = app();
+        app.submit("first".to_string());
+
+        app.submit("/queue run the tests".to_string());
+
+        // No second turn yet, and no steering either: this is the queue for after.
+        assert_eq!(app.session.turns.len(), 1);
+        assert!(app.agent.follow_up_handle().has_pending());
+        assert!(
+            app.agent.steering_handle().is_empty(),
+            "a queued prompt is not a correction"
+        );
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("after this turn")),
+            "the user is told when it will run"
+        );
+    }
+
+    #[tokio::test]
+    async fn queueing_with_nothing_in_flight_just_runs_it() {
+        let mut app = app();
+        app.submit("/queue do it now".to_string());
+
+        assert_eq!(app.session.turns.len(), 1, "it started straight away");
+        assert_eq!(app.session.turns[0].prompt, "do it now");
+        assert!(app.agent.follow_up_handle().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queueing_nothing_says_how_to_queue() {
+        let mut app = app();
+        app.submit("/queue".to_string());
+
+        assert!(app.session.turns.is_empty());
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("/queue <prompt>")),
+        );
+    }
+
+    #[tokio::test]
+    async fn compacting_an_empty_conversation_says_there_was_nothing_to_do() {
+        let mut app = app();
+        app.submit("/compact".to_string());
+
+        for _ in 0..200 {
             app.tick();
-            if app.queued_prompts.is_empty()
-                && !app.session.is_streaming()
-                && app.session.turns.len() == 2
-            {
+            if app.compact_rx.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        assert_eq!(
-            app.session
-                .turns
-                .iter()
-                .map(|turn| turn.prompt.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first", "second"]
-        );
+        assert!(app.compact_rx.is_none(), "the answer never came back");
         assert!(
-            app.session.turns.iter().all(|turn| turn.complete),
-            "a queued turn never completed"
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("nothing to summarize")),
+            "an empty conversation has nothing to summarize"
         );
-        // Deltas were attributed to the right turn.
-        assert!(app.session.turns[0].reply.contains("first"));
-        assert!(app.session.turns[1].reply.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_is_reported_and_recorded_on_the_turn() {
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: "long one".into(),
+            ..Default::default()
+        });
+
+        app.apply_event(AgentEvent::Compacted { dropped: 12 });
+
+        assert_eq!(app.session.turns[0].compacted, 12);
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("12")),
+            "the user is told the model now remembers less"
+        );
     }
 
     /// An app whose copies are recorded instead of written to the real

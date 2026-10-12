@@ -468,6 +468,14 @@ impl Tool for ShellTool {
         self.config.description
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "Commands run in the session's working directory and their output is returned to \
+             you. Prefer one command that prints everything you need over several small ones, \
+             and set `timeout` for anything that might hang.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

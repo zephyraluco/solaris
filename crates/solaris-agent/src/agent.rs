@@ -1,38 +1,20 @@
-//! The session: a resolved backend, the tools a turn may offer, and the handles
-//! the application holds on to.
+//! The session: a resolved backend, the conversation it extends, and the tools a
+//! turn may offer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use solaris_backend::{AgentEventStream, BackendError, Message};
-use solaris_provider::{BackendChoice, CredentialSource};
+use solaris_backend::{AgentEventStream, BackendError};
+use solaris_provider::{BackendChoice, CredentialSource, context_window_for};
 use solaris_tools::{Cancel, ToolRegistry, ToolSelection};
 
 use crate::approver::{AlwaysApprove, Approver};
+use crate::compaction::Compaction;
+use crate::conversation::Conversation;
 use crate::mode::{Mode, default_tool_names};
-use crate::session::{self, DEFAULT_MAX_PARALLEL};
-
-/// One turn, as the application asks for it.
-#[derive(Debug, Clone)]
-pub struct AgentRequest {
-    /// Prior conversation, oldest first, excluding `prompt`.
-    pub history: Vec<Message>,
-    /// The new user prompt.
-    pub prompt: String,
-    /// The mode the turn runs in, which decides the tools it may use.
-    pub mode: Mode,
-}
-
-impl AgentRequest {
-    /// A request in `mode`, with nothing said yet.
-    pub fn new(history: Vec<Message>, prompt: impl Into<String>, mode: Mode) -> Self {
-        Self {
-            history,
-            prompt: prompt.into(),
-            mode,
-        }
-    }
-}
+use crate::prompt;
+use crate::queue::Queue;
+use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -53,6 +35,8 @@ pub struct AgentOptions {
     /// There is no cap on how many rounds a turn may take: the loop runs until
     /// the model stops asking, fails, or the turn is cancelled.
     pub max_parallel: usize,
+    /// When the conversation is summarized to stay inside the context window.
+    pub compaction: Compaction,
 }
 
 impl Default for AgentOptions {
@@ -63,6 +47,7 @@ impl Default for AgentOptions {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temp_dir: std::env::temp_dir(),
             max_parallel: DEFAULT_MAX_PARALLEL,
+            compaction: Compaction::default(),
         }
     }
 }
@@ -87,6 +72,12 @@ impl AgentOptions {
         self.selection = selection;
         self
     }
+
+    /// The same options with `compaction` deciding when to summarize.
+    pub fn with_compaction(mut self, compaction: Compaction) -> Self {
+        self.compaction = compaction;
+        self
+    }
 }
 
 /// A session with a model behind it.
@@ -95,6 +86,11 @@ impl AgentOptions {
 /// which tools a turn declares, running them, feeding the results back, asking
 /// again — happens behind this type. So the app never learns which tools exist,
 /// how many model calls a turn took, or which platform answered.
+///
+/// The conversation lives here rather than in the application because it is the
+/// model's view, not the user's: a summary has to still stand on the next turn, a
+/// steered message has to still be where it landed, and neither is something the
+/// transcript can be asked to reconstruct. [`Agent::clear`] is what forgets it.
 pub struct Agent {
     /// The backend the credentials resolved to, and how it was chosen.
     choice: BackendChoice,
@@ -104,6 +100,12 @@ pub struct Agent {
     options: AgentOptions,
     /// Stops the turn in flight, tools included.
     cancel: Cancel,
+    /// The conversation every turn extends.
+    conversation: Arc<Conversation>,
+    /// Messages that correct the turn that is running.
+    steering: Queue,
+    /// Messages to run as the turn after this one.
+    follow_up: Queue,
 }
 
 impl Agent {
@@ -114,6 +116,9 @@ impl Agent {
             registry,
             options,
             cancel: Cancel::new(),
+            conversation: Arc::new(Conversation::new()),
+            steering: Queue::new(),
+            follow_up: Queue::new(),
         }
     }
 
@@ -124,6 +129,61 @@ impl Agent {
     /// is running.
     pub fn cancel_handle(&self) -> Cancel {
         self.cancel.clone()
+    }
+
+    /// A handle for messages that correct the turn that is running.
+    ///
+    /// Queued, not delivered: the loop folds a message into the conversation
+    /// before it asks the model again, so one sent while the model is answering
+    /// or while a command runs reaches it at the start of the next round rather
+    /// than in the middle of one. A message that arrives after the model's last
+    /// word still counts — the loop reads the queue once more before deciding the
+    /// turn is over, which is how "stop, do this instead" is heard.
+    pub fn steering_handle(&self) -> Queue {
+        self.steering.clone()
+    }
+
+    /// A handle for messages to run as the turn *after* the one that is running.
+    ///
+    /// The difference from [`steering_handle`](Agent::steering_handle) is when the
+    /// model reads it: a steered message joins the turn in flight, while a
+    /// follow-up becomes a turn of its own. Both reach the same conversation, so
+    /// the choice is about attribution and not about capability — "then run the
+    /// tests" wants its own turn and its own cost line.
+    pub fn follow_up_handle(&self) -> Queue {
+        self.follow_up.clone()
+    }
+
+    /// Forget the conversation, for `/clear`.
+    ///
+    /// The transcript is the application's to clear; what this clears is what the
+    /// model would be sent, which is the part that costs money to carry.
+    pub fn clear(&self) {
+        self.conversation.clear();
+    }
+
+    /// How many messages the model will be sent next turn.
+    ///
+    /// A count rather than a token total because it is the one number the
+    /// application has that the agent cannot state more honestly: what the
+    /// conversation costs is the provider's to say, and it says it per turn in
+    /// the usage.
+    pub fn conversation_len(&self) -> usize {
+        self.conversation.len()
+    }
+
+    /// Summarize the conversation now, at the user's request.
+    ///
+    /// Returns how many messages the summary replaced, or `None` when there was
+    /// nothing worth summarizing or the model would not produce one.
+    pub async fn compact(&self) -> Option<usize> {
+        session::compact_now(
+            &self.choice.backend,
+            &self.conversation,
+            self.options.compaction,
+            &self.cancel,
+        )
+        .await
     }
 
     /// Short human-readable label shown in the status bar.
@@ -153,31 +213,48 @@ impl Agent {
         self.choice.backend.models().await
     }
 
+    /// The context window of the model this session will ask.
+    fn context_window(&self) -> u32 {
+        context_window_for(&self.choice.model)
+    }
+
     /// The tools a turn in `mode` would declare.
     pub fn tool_names(&self, mode: Mode) -> Vec<String> {
         self.registry
             .selected_names(default_tool_names(mode), &self.options.selection)
     }
 
-    /// Run one turn, streaming what it produces.
+    /// Run one turn over `prompt`, streaming what it produces.
     ///
     /// The turn runs in its own task, so the caller can keep drawing while a
     /// command runs; dropping the stream abandons it. A failure to answer is an
     /// [`AgentEvent::Error`](crate::AgentEvent::Error) in the stream rather than
     /// a start-up error, because the loop is what finds out.
-    pub fn run_turn(&self, request: AgentRequest) -> AgentEventStream {
+    ///
+    /// The prompt is recorded in the conversation before anything is asked, so a
+    /// turn that is abandoned still leaves what the user said.
+    pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
         let tools = self
             .registry
-            .select(default_tool_names(request.mode), &self.options.selection);
+            .select(default_tool_names(mode), &self.options.selection);
 
-        session::start(
-            Arc::clone(&self.choice.backend),
+        // The prompt is written per turn because every part of it can change:
+        // the mode, which tools the mode leaves standing, and which platform the
+        // credentials resolve to.
+        let system = prompt::system_prompt(mode, &tools, self.choice.provider_id);
+
+        session::start(TurnInput {
+            inner: Arc::clone(&self.choice.backend),
             tools,
-            &self.options,
-            self.cancel.clone(),
-            request.history,
-            request.prompt,
-        )
+            options: self.options.clone(),
+            cancel: self.cancel.clone(),
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+            conversation: Arc::clone(&self.conversation),
+            system,
+            prompt: prompt.into(),
+            context_window: self.context_window(),
+        })
     }
 }
 
@@ -186,10 +263,11 @@ impl std::fmt::Debug for Agent {
         f.debug_struct("Agent")
             .field("backend", &self.label())
             .field("tools", &self.registry.len())
+            .field("messages", &self.conversation.len())
+            .field("compaction", &self.options.compaction)
             .finish()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,7 +443,7 @@ mod tests {
         let inner = Scripted::new(vec![Vec::new()]);
         let agent = agent(inner.clone());
 
-        drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Plan))).await;
+        drain(agent.run_turn("hi", Mode::Plan)).await;
 
         let mut names: Vec<String> = inner.requests()[0]
             .tools
@@ -386,7 +464,7 @@ mod tests {
             only("cancel-now"),
         );
 
-        drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Build))).await;
+        drain(agent.run_turn("hi", Mode::Build)).await;
 
         let spec = &inner.requests()[0].tools[0];
         assert_eq!(spec.name, tool.name());
@@ -448,7 +526,7 @@ mod tests {
         // the stop has to reach the loop that is running.
         *tool.cancel.lock().expect("lock") = Some(agent.cancel_handle());
 
-        let events = drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Build))).await;
+        let events = drain(agent.run_turn("hi", Mode::Build)).await;
 
         assert_eq!(tool.runs.load(Ordering::SeqCst), 1);
         let Some(AgentEvent::Error(message)) = events.last() else {

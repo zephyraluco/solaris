@@ -54,6 +54,13 @@ impl Tool for GrepTool {
          when the pattern contains regex characters that should be matched as they are."
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "Narrow the search with `glob` (which files) before widening `context`. Pass \
+             `literal: true` when the pattern is text rather than a regex.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

@@ -33,6 +33,9 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Full-screen TUI with a retained component tree, flex-like layout stacks and modal/inline overlays
 > - Streaming transcript with markdown rendering and collapsible thinking blocks
 > - Eight built-in tools — `read`, `write`, `edit`, `ls`, `grep`, `find` and your platform's shell — run by a multi-round tool loop
+> - A prompt system: identity, mode, each tool's own usage guidance, and a note from the platform when it needs one
+> - Mid-turn steering: a message typed while a turn runs joins it; `/queue` lines one up for after it
+> - Context compaction: when the conversation nears the model's window, older messages are summarized into a structured checkpoint — updated rather than rewritten on later compactions — and a window that turns out to be full is summarized and retried
 > - Multi-line editor with word navigation, `/` command autocomplete, and a command palette
 > - Two colour themes, cycled at runtime
 > - Build and plan modes, with distinct accents and system prompt
@@ -131,13 +134,15 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `/buddy [name <name>]` | Show your companion |
 | `/model [name]` | Switch the active model |
 | `/mode` | Toggle build / plan mode |
+| `/compact` | Summarize the conversation to free up context |
+| `/queue` | Run a prompt after the turn in flight |
 | `/clear` | Clear the transcript |
 | `/stats` | Show token and cost statistics |
 | `/quit` | Exit solaris |
 
 ## Modes
 
-**Build** and **plan** are the same conversation with a different accent colour and a different line in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode. They also declare different tools: build mode can run commands and change files, plan mode can only look.
+**Build** and **plan** are the same conversation with a different accent colour, a different set of declared tools and a different paragraph in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode. Build mode can run commands and change files; plan mode can only look, and is told so rather than left to discover the missing tools.
 
 ## Tools
 

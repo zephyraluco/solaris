@@ -48,6 +48,13 @@ impl Tool for ReadTool {
         DESCRIPTION
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "Read a file before you change it: `edit` matches the text that is really on disk. \
+             On a large file, `offset` and `limit` read it a part at a time.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

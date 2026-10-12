@@ -36,7 +36,7 @@ pi 的 `ToolDefinition` 比 solaris 的 `Tool` trait 厚一层。
 | 执行模式 | 每个工具可声明 `executionMode: "sequential"`，强制该批调用串行 | 同样有 `execution_mode()`；`write`/`edit`/shell 声明串行 |
 | 渲染 | `renderCall` / `renderResult`，`pi.registerToolRenderer` 可覆盖任意工具 | 应用层在 [`transcript.rs`](../crates/solaris/src/transcript.rs) 里硬编码成一行 |
 
-**系统提示词**：pi 把每个工具的 `promptSnippet`（一行说明）与 `promptGuidelines`（规则条目）注入系统提示词的 tools / rules 段，并列出可用的 skills；solaris 的系统提示词一个字没改，工具说明只出现在请求体的 `tools` 数组里。差别是模型少了一层「什么时候该用哪个工具」的引导。
+**系统提示词**：pi 把每个工具的 `promptSnippet`（一行说明）与 `promptGuidelines`（规则条目）注入系统提示词的 tools / rules 段，并列出可用的 skills；solaris 同样由**工具自己**贡献指南（`Tool::guideline()` 返回一行，由 agent 汇编进系统提示词），另外有身份、模式说明与一组通用工作准则，并按平台追加各自的说明（`ProviderSpec::prompt`）。差别只在 skills：pi 会把可用的 skill 列进提示词，solaris 没有这个概念。
 
 > pi 侧：`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts`、`core/system-prompt.ts`
 
@@ -53,8 +53,8 @@ pi 的 `ToolDefinition` 比 solaris 的 `Tool` trait 厚一层。
 | 取消 | 每次运行独立的 `AbortSignal` | `Cancel` 每次 `run_turn` 开始时 `reset()`，按轮次隔离；应用层持句柄，取消会杀掉正在跑的命令 |
 | 工具事件 | `tool_execution_start` / `tool_execution_update`（流式部分结果）/ `tool_execution_end` | 只有 `ToolCall` + `ToolResult`，没有中间过程 |
 | 嵌套调用 | `ctx.executeTool()`（codemode 脚本内调工具），事件带 `parentToolCallId` | 无 |
-| 等待期间的用户输入 | steering / pending messages 可在循环内插入 | 应用层排队提示词（`queued_prompts`），在整轮结束后才跑 |
-| 上下文压缩 | 有 compaction | 无 |
+| 等待期间的用户输入 | 两个入口：`getSteeringMessages`（并入跑着的一轮）与 `getFollowUpMessages`（这一轮之后再起一轮） | 同样两个：`Agent::steering_handle()` / `follow_up_handle()`，都是 `Queue`。steering 在每轮开始前与「模型看似答完」时各排空一次，follow-up 在这一轮真要结束时排空并让循环接着跑 |
+| 上下文压缩 | `core/compaction/`，约 1,660 行：固定 reserve 16384、按 token 保留尾部、结构化摘要、增量更新、overflow 后重试、`/compact`、可中止 | 同样五项都有（`compaction.rs` + `overflow.rs` + `session.rs` 的 `compact`，约 400 行）：`reserve_tokens` 默认 16384、`keep_recent_tokens` 默认 20000 按 token 裁、六段结构化摘要且已有摘要时改为增量更新、overflow（按 26 条措辞识别 + 用 usage 识别静默超限）强制压缩后重试一次、`/compact`。差别在规模：pi 还有分支会话摘要（`branch-summarization.ts`）与扩展拦截 |
 | 用量结算 | 每轮各自记账 | `Agent` 拦下每轮的 `TurnComplete`，用 `Usage::merge` 累计后只发一个终态事件 |
 
 solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部可能是多次模型调用；因为多轮循环整个住在 `solaris-agent` 里、对应用只暴露一个 `Agent`，应用层不需要知道这件事。
@@ -127,7 +127,6 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 | 扩展注册工具 | `pi.registerTool()`，`prepareLoadout` / `setActiveTools` 动态启停 | 无（注册表在编译期固定为八个） |
 | skills | 扫描 SKILL.md，把名字与描述注入系统提示词，按需读取 | 无 |
 | 会话落盘 | 会话文件、`/tree`、resume、fork | 无（转录只在内存里） |
-| 上下文压缩 | compaction | 无 |
 | 权限 | project trust、`tool_call` 拦截、容器化 | `Approver` 钩子（异步，可等 UI）+ `--confirm-tools` 对话框；默认全批准 |
 
 ---
@@ -145,6 +144,9 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 
 ### 6.1 已经补上的
 
+- **上下文压缩**：超过「窗口 − 16384」时把较早的消息交给模型摘要，最近 20000 token 的对话按 token 保留；摘要写成固定六段（Goal / Constraints / Progress / Key Decisions / Next Steps / Critical Context），已有摘要时改为「保留旧的、追加新的」而不是重写；摘要失败就原样发送而不是丢掉对话（§3.6）。
+- **中途 steering 与 follow-up**：两个 `Queue`，前者并入正在跑的一轮（每轮开始前与「模型看似答完」时各排空一次），后者在这一轮之后另起一轮；应用直接回车 = steering，`/queue <prompt>` = follow-up（§3.5）。
+- **提示词系统**：系统提示词由身份 + 模式 + 每个工具自带的指南 + 一组工作准则组成，并按平台追加说明（`ProviderSpec::prompt`）（§3.1、§3.4）。
 - **残缺调用不再执行**：协议层把停止原因带出来（`length` / `max_tokens` / `incomplete` → `AgentEvent::OutputTruncated`），循环拒绝该批全部调用并给出可操作的说明（§3）。
 - **一轮内并行**：每批最多 `DEFAULT_MAX_PARALLEL = 4`，结果按请求顺序回填；`write` / `edit` / shell 声明 `Sequential`，该批随之串行（§3）。
 - **回合不再误报成功**：流在收到 `TurnComplete` 之前结束即算失败，不会把半截回答当成完整回答。

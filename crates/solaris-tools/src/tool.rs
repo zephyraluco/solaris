@@ -132,6 +132,21 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the arguments object.
     fn parameters(&self) -> Value;
 
+    /// Guidance for the model about when and how to use this tool.
+    ///
+    /// The agent folds this into the system prompt. `description` decides
+    /// *whether* the model reaches for the tool; this decides whether it uses
+    /// the tool well, so a tool whose correct use is not obvious from its schema
+    /// alone should answer here. `None` — the default — leaves the description
+    /// as the only thing the model is told.
+    ///
+    /// It answers with a literal rather than a built string because it ends up
+    /// in a prompt that is assembled once per turn: allocating for it on every
+    /// call would buy nothing.
+    fn guideline(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Run one call.
     ///
     /// Never fails: a missing file, a rejected command and unusable arguments

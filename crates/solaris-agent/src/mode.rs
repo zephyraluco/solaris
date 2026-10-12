@@ -28,6 +28,25 @@ impl Mode {
             Mode::Plan => Mode::Build,
         }
     }
+
+    /// What the mode means for this turn, as the system prompt says it.
+    ///
+    /// It lives beside the mode because it is the same fact as the tool set: a
+    /// mode that withdraws `write` and `edit` has to *say* so, or the model reads
+    /// a missing tool as a broken one and starts describing the edit it cannot
+    /// make.
+    pub fn instructions(self) -> &'static str {
+        match self {
+            Mode::Build => {
+                "You are in build mode: you may read and search, run commands, and change files."
+            }
+            Mode::Plan => {
+                "You are in plan mode: you may only read, search and list. Withdrawn for this \
+                 turn are the tools that change files or run commands, so work out what you would \
+                 do and propose it in your reply instead of trying to make the change."
+            }
+        }
+    }
 }
 
 /// The tools Build mode declares: it runs commands and changes files.

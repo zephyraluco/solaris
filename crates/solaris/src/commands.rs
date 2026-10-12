@@ -60,6 +60,16 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         args: "",
     },
     SlashCommandSpec {
+        name: "compact",
+        description: "Summarize the conversation to free up context",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "queue",
+        description: "Run a prompt after the turn in flight",
+        args: "<prompt>",
+    },
+    SlashCommandSpec {
         name: "clear",
         description: "Clear the transcript",
         args: "",

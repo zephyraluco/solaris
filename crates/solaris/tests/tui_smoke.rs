@@ -15,10 +15,27 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
 use solaris_agent::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
+    AgentBackend, AgentEvent, AgentEventStream, BackendError, Role, ToolCall, TurnRequest, Usage,
 };
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
+
+/// The prompt a request asks about, wherever the loop put it.
+///
+/// The agent records the prompt in the conversation before it asks anything, so a
+/// round's own `prompt` is empty and the words are the last user message instead.
+fn asked(request: &TurnRequest) -> String {
+    if !request.prompt.trim().is_empty() {
+        return request.prompt.trim().to_string();
+    }
+    request
+        .history
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && !message.text().is_empty())
+        .map(|message| message.text())
+        .unwrap_or_default()
+}
 
 const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
@@ -36,7 +53,7 @@ impl AgentBackend for FakeBackend {
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-            request.prompt.trim()
+            asked(&request)
         );
         let events = vec![
             AgentEvent::ThinkingDelta("thinking ".to_string()),
@@ -225,6 +242,24 @@ impl Harness {
         }
         text
     }
+
+    /// Tick and redraw until `needle` appears *and* nothing is still streaming.
+    ///
+    /// A test that types its next prompt while a turn is running steers that
+    /// turn rather than starting a new one, so the next prompt has to wait for
+    /// this one to finish: the spinner is what says it has.
+    async fn settle_turn(&mut self, needle: &str) -> String {
+        let mut text = self.draw();
+        for _ in 0..500 {
+            self.tui.tick();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            text = self.draw();
+            if text.contains(needle) && !text.contains("generating") {
+                break;
+            }
+        }
+        text
+    }
 }
 
 fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -363,11 +398,16 @@ fn command_palette_renders_the_claude_picker_and_captures_input() {
     let text = harness.draw();
     assert!(text.contains("Commands"), "{text}");
     assert!(text.contains("Select a command:"), "{text}");
+    assert!(text.contains("Enter to select · Esc to cancel"), "{text}");
+
+    // The palette numbers its rows to fit however many commands there are, so
+    // only the row's own text is asserted here; that the first row is the
+    // selected one is the next test's business.
+    assert!(text.contains("❯"), "{text}");
     assert!(
-        text.contains("❯ 1. /help · Show keyboard shortcuts"),
+        text.contains("1. /help · Show keyboard shortcuts"),
         "{text}"
     );
-    assert!(text.contains("Enter to select · Esc to cancel"), "{text}");
 
     // While the overlay is modal, typing filters the palette, not the editor.
     harness.type_str("mode");
@@ -469,12 +509,18 @@ async fn a_tool_call_and_its_answer_are_shown_in_the_transcript() {
 async fn mouse_wheel_scrolls_a_transcript_that_overflows() {
     let mut harness = Harness::new();
 
-    // Three turns is more than the viewport can show.
-    for prompt in ["hello", "again", "third"] {
+    // Three turns is more than the viewport can show. Each one is waited out
+    // before the next is typed: a prompt sent mid-turn steers that turn rather
+    // than starting another, so submitting in a burst would leave one turn here.
+    for (prompt, reply) in [
+        ("hello", "You said: hello"),
+        ("again", "You said: again"),
+        ("third", "You said: third"),
+    ] {
         harness.type_str(prompt);
         harness.key(KeyCode::Enter);
+        let _ = harness.settle_turn(reply).await;
     }
-    let _ = harness.settle_on("You said: third").await;
     let at_bottom = harness.draw();
     assert!(at_bottom.contains("You said: third"), "{at_bottom}");
 

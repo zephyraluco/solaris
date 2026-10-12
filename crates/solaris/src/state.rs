@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use solaris_agent::{Mode, ToolCall, ToolResult, Usage, tokens_for_characters};
+use solaris_agent::{ToolCall, ToolResult, Usage, tokens_for_characters};
 
 /// One tool call the model made, and what running it produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,11 +51,27 @@ impl ToolStep {
     }
 }
 
+/// A message the user added while a turn was already running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeringNote {
+    /// What the user typed.
+    pub text: String,
+    /// How many of the turn's calls had finished when it arrived.
+    ///
+    /// It is recorded because where the message landed is the whole point of
+    /// steering: a correction that arrived after the third call is not the same
+    /// as one that arrived after the first, and the transcript has to show which
+    /// it was.
+    pub after_steps: usize,
+}
+
 /// One prompt/response exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
     /// The user's prompt.
     pub prompt: String,
+    /// Messages the user steered in while this turn was running.
+    pub steering: Vec<SteeringNote>,
     /// The assistant's visible reply.
     pub reply: String,
     /// The assistant's thinking trace.
@@ -64,6 +80,8 @@ pub struct Turn {
     pub thinking_expanded: bool,
     /// The tool calls this turn made, in the order they were made.
     pub steps: Vec<ToolStep>,
+    /// How many earlier messages were summarized away to make room, if any.
+    pub compacted: usize,
     /// Tokens the turn consumed, as the backend reported or estimated them.
     pub usage: Usage,
     /// Cost reported for this turn.
@@ -188,37 +206,6 @@ impl SessionState {
         // `Iterator::sum` seeds floats with `-0.0`, which would render as
         // `$-0.0000`; adding zero normalises the sign.
         self.turns.iter().map(|turn| turn.cost_usd).sum::<f64>() + 0.0
-    }
-
-    /// Completed turns flattened into backend history.
-    ///
-    /// Tool calls ride along, so the next turn's model can see what it already
-    /// looked at instead of asking again. A call whose result never arrived —
-    /// the turn was cancelled while it ran — is left out rather than sent as a
-    /// call with no answer, which every wire rejects.
-    pub fn history(&self, mode: Mode) -> Vec<solaris_agent::Message> {
-        let mut history = vec![solaris_agent::Message::system(format!(
-            "You are solaris, a terminal assistant running in {} mode.",
-            mode.label().to_lowercase()
-        ))];
-
-        for turn in self.turns.iter().filter(|turn| turn.complete) {
-            history.push(solaris_agent::Message::user(turn.prompt.clone()));
-
-            for step in turn.steps.iter().filter(|step| step.result.is_some()) {
-                history.push(solaris_agent::Message::tool_use(step.call.clone()));
-                if let Some(result) = &step.result {
-                    history.push(solaris_agent::Message::tool_result(result.clone()));
-                }
-            }
-
-            // An empty reply adds nothing, and some wires reject a blank text
-            // block outright.
-            if !turn.reply.is_empty() {
-                history.push(solaris_agent::Message::assistant(turn.reply.clone()));
-            }
-        }
-        history
     }
 }
 
@@ -351,92 +338,6 @@ mod tests {
         session.turns.last_mut().unwrap().complete = true;
         assert!(!session.is_streaming());
         assert!(session.active_turn().is_none());
-    }
-
-    #[test]
-    fn history_includes_only_completed_turns() {
-        let mut session = SessionState::new();
-        session.turns.push(Turn {
-            prompt: "one".into(),
-            reply: "1".into(),
-            complete: true,
-            ..Default::default()
-        });
-        session.turns.push(Turn {
-            prompt: "two".into(),
-            reply: "partial".into(),
-            complete: false,
-            ..Default::default()
-        });
-
-        let history = session.history(Mode::Build);
-        // system + one user/assistant pair.
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[1].text(), "one");
-        assert_eq!(history[2].text(), "1");
-    }
-
-    #[test]
-    fn history_carries_what_a_turn_did_with_tools() {
-        let call = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
-        let result = ToolResult::ok(&call, "hello");
-        let mut session = SessionState::new();
-        session.turns.push(Turn {
-            prompt: "read it".into(),
-            reply: "it says hello".into(),
-            steps: vec![ToolStep {
-                call,
-                result: Some(result),
-                duration_ms: None,
-            }],
-            complete: true,
-            ..Default::default()
-        });
-
-        let history = session.history(Mode::Build);
-        assert_eq!(
-            history.len(),
-            5,
-            "system, prompt, the call, its result, and the reply"
-        );
-        assert_eq!(history[2].tool_calls().count(), 1);
-        assert_eq!(history[3].tool_results().count(), 1);
-        assert_eq!(
-            history[3].tool_results().next().expect("a result").output,
-            "hello"
-        );
-        assert_eq!(history[4].text(), "it says hello");
-    }
-
-    #[test]
-    fn a_call_whose_result_never_arrived_is_left_out_of_history() {
-        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
-        let mut session = SessionState::new();
-        session.turns.push(Turn {
-            prompt: "read it".into(),
-            reply: "hmm".into(),
-            steps: vec![ToolStep::pending(call)],
-            complete: true,
-            ..Default::default()
-        });
-
-        let history = session.history(Mode::Build);
-        assert_eq!(history.len(), 3, "a call with no answer is not sent");
-        assert_eq!(history[2].tool_calls().count(), 0);
-    }
-
-    #[test]
-    fn an_empty_reply_is_not_sent_as_a_blank_message() {
-        let mut session = SessionState::new();
-        session.turns.push(Turn {
-            prompt: "hi".into(),
-            reply: String::new(),
-            complete: true,
-            ..Default::default()
-        });
-
-        let history = session.history(Mode::Build);
-        assert_eq!(history.len(), 2, "system and the prompt");
     }
 
     #[test]
