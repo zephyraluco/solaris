@@ -17,7 +17,7 @@
 
 ---
 
-solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个认识各种 provider 的平台 crate、一个只讲三条 wire 协议、别无所知的传输 crate、一个纯逻辑的领域 crate，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
+solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个只讲三条 wire 协议、别无所知的传输 crate，一个只会跑本地命令与文件的工具 crate，一个认识各种 provider 的平台 crate，一个把这三者接起来、也是应用唯一需要认识的 agent crate，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
 
 界面是完整的，接上 provider 之后真的会去调用它。接一个 provider（或者干脆只导出一个 API key），每一轮都会通过 SSE 从真实模型流式取回：首个 token 之前会重试，每一轮都会结算 token 与费用。
 
@@ -32,6 +32,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 目录所涵盖的三条 wire 协议都有真实客户端，按凭据自动选择
 > - 全屏 TUI：保留式组件树、类 flex 布局栈，以及模态 / 内联浮层
 > - 流式对话记录，支持 Markdown 渲染与可折叠的思考块
+> - 八个内建工具 —— `read`、`write`、`edit`、`ls`、`grep`、`find` 与所在平台的 shell —— 由多轮工具循环驱动
 > - 多行编辑器，支持按词移动、`/` 命令补全，以及命令面板
 > - 两套配色主题，运行时循环切换
 > - Build 与 Plan 两种模式，各有独立强调色与系统提示词
@@ -40,7 +41,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 会话统计 —— 轮次、分类 token、费用与上下文占用
 > - 凭据、伙伴与历史记录保存在平台配置目录下
 >
-> **尚未具备：** 工具调用、MCP、会话落盘，以及真实的设备码登录。
+> **尚未具备：** MCP、会话落盘，以及工具执行前的交互式确认。
 
 ---
 
@@ -50,6 +51,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 
 - **Rust 1.85 或更高版本** —— 工作区使用 2024 edition。
 - 一个能渲染 24 位色的终端（Windows Terminal、iTerm2、Alacritty、Kitty 等）。
+- [ripgrep](https://github.com/BurntSushi/ripgrep) 与 [fd](https://github.com/sharkdp/fd)，供 `grep` 与 `find` 使用；没有它们，其余部分照常工作。
 
 ## 从源码构建
 
@@ -82,6 +84,9 @@ cargo run --release
 | `--provider <PROVIDER>` | 本次运行改用该 provider，但不改动已保存的选择 | 当前 provider |
 | `--theme <THEME>` | 启动时使用的配色主题（`dark`、`light`） | `dark` |
 | `--plan` | 以 plan 模式启动，而非 build 模式 | 关闭 |
+| `-t`, `--tools <LIST>` | 声明哪些工具，整体替换该模式的默认集合；若只由 `+name`/`-name` 组成，则改为在默认集合上增删 | 该模式的默认集合 |
+| `--exclude-tools <LIST>` | 在前述选择之后，再撤下这些工具 | 无 |
+| `--confirm-tools` | 会改动东西的调用（`write`、`edit`、shell）执行前先问一次 | 关 |
 | `--print-config` | 打印解析后的配置并退出，不启动界面 | — |
 | `-h`, `--help` | 打印帮助 | — |
 | `-V`, `--version` | 打印版本 | — |
@@ -132,7 +137,43 @@ solaris --print-config
 
 ## 模式
 
-**Build** 与 **Plan** 是同一次对话，只是强调色不同、系统提示词里的一句话不同。`Tab` 或 `/mode` 在两者之间切换，`--plan` 让你直接以 plan 模式启动。
+**Build** 与 **Plan** 是同一次对话，只是强调色不同、系统提示词里的一句话不同。`Tab` 或 `/mode` 在两者之间切换，`--plan` 让你直接以 plan 模式启动。两者声明的工具也不同：build 模式能执行命令、改动文件，plan 模式只能看。
+
+## 工具
+
+模型可以请 solaris 做事。一轮会执行它请求的调用、把结果回给它，再问一次，直到它不再需要工具为止 —— 从你这一侧看，这些都只是同一轮。
+
+| 工具 | 作用 | 默认在哪些模式下声明 |
+| --- | --- | --- |
+| `read` | 读取文本文件，大文件可用 `offset`/`limit` | build、plan |
+| `write` | 新建文件，或整体覆盖 | build |
+| `edit` | 对文件做精确文本替换，一次调用可改多处 | build |
+| `ls` | 列出目录内容 | plan |
+| `grep` | 搜索文件内容，遵守 `.gitignore` | plan |
+| `find` | 按 glob 查找路径，遵守 `.gitignore` | plan |
+| `bash` | 执行 shell 命令并返回它打印的内容 | build（非 Windows） |
+| `powershell` | 执行 PowerShell 命令并返回它打印的内容 | build（Windows） |
+
+plan 模式只声明那四个只读工具，所以计划不会失手改动任何东西。`--tools` 整体替换这套集合，`--exclude-tools` 在此基础上再撤下：
+
+```bash
+# 这一次运行只读，不论当前模式
+solaris --tools read,grep,find,ls --print "review this project"
+
+# 在模式默认集合上增加一个、并去掉另一个
+solaris --tools +grep,-write
+
+# 完全拿掉 shell
+solaris --exclude-tools 'bash'
+```
+
+条目是工具名或模式，其中 `*` 匹配任意长度字符。若整个列表只由 `+name` 与 `-name` 组成，它就是在模式默认集合上增删，而不是替换 —— 这正是「只加一个工具、不必把其余挨个写出来」的用法。`--print-config` 会打印你启动的那个模式最终解析出的工具列表。
+
+`grep` 与 `find` 是 shell out 到 [ripgrep](https://github.com/BurntSushi/ripgrep) 与 [fd](https://github.com/sharkdp/fd)，而不是另写一遍：它们本来就懂 `.gitignore`、遍历目录也快，重写一份只会逐渐走样。两者请自行安装，或者用 `--tools` 把它们排除掉；缺失时工具会告诉你该装什么，而不是让整轮失败。
+
+每个结果都会回给模型，失败也一样：文件不存在、命令退出码非零、调用参数不合规，都是模型可以处置的事，而不是这一轮的终点。输出会被截断以保证一轮的成本可控 —— 读取类保留前 2000 行或 50KB，命令类保留末尾（失败信息通常在那里）—— 被截断的命令会把完整输出写入一个文件并在结果里报出路径，模型可以分段读回去。
+
+每次调用都会在它发生时出现在对话记录里，带上参数、耗时，以及失败时输出内容的第一行。
 
 ## 伙伴
 
@@ -140,9 +181,9 @@ solaris --print-config
 
 ## Provider
 
-`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、Claude 订阅、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
+`/connect` 打开的是一个内联向导，它会接管输入区，而不是弹出一个浮层。向导会依次让你选择 provider，并填上该 provider 认证所需的内容：API key、OpenAI 兼容的 base URL 加 key，或者对于本机运行时什么都不用填。目录中涵盖 Anthropic、OpenCode Go、OpenAI、Google、OpenRouter、自建的 New API 网关，以及本地 Ollama/llama.cpp 运行时。多数条目会列出自己提供的模型；网关与自定义端点则是让你自己填 URL 和 key，然后由 solaris 去问它有哪些模型。凭据保存在 `auth.json` 中，并在任何展示处以掩码显示。
 
-三条 wire 协议就覆盖了整个目录。Anthropic Messages API 承载两个 Claude 条目；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 自己则使用更新的 Responses API。谁走哪条协议是目录表里的一列，不靠猜。
+三条 wire 协议就覆盖了整个目录，而**由模型决定它走哪一条**：Anthropic Messages API 用来访问 Claude 系模型；OpenAI Chat Completions API 是兼容性下限，Google、OpenRouter、New API、本机 Ollama/llama.cpp 以及任意自定义端点都走它；OpenAI 的模型则使用更新的 Responses API。provider 自己那条 wire 是它表里没有列出的模型的兜底 —— 正因如此，一把 OpenCode Go 的 key 就能让 GPT 系走 Responses API、Claude 系走 Messages API，其余走兼容下限。key 按承载它的那条 wire 的方式走：`x-api-key` 走 Messages API、Bearer 走 OpenAI 系 —— opencode 的 Go 网关也是这个规矩（它的 `/v1/messages` 只认 `x-api-key`，OpenAI 兼容路径认 Bearer）。按会话路由的平台还会被明确告知当前是哪个会话，Go 就是靠它把请求归到订阅计划、而不是扣到按量计费的余额上。
 
 ### 环境变量
 
@@ -164,10 +205,8 @@ solaris --print-config
 - **prompt 缓存**。solaris 是**主动请求**缓存的：Anthropic 走 `cache_control` 断点（打在最后一条消息上），OpenAI 只在端点是 OpenAI 自家时发 `prompt_cache_key`。`/stats` 里那两行缓存数字之所以会有值就是因为这个；也是长对话每轮越来越便宜的原因 —— 不变的前缀会以缓存读的价格回来。
 - **上下文**。`/stats` 分别给出 `session tokens`（本会话累计花掉的）和 `context used`。只有后者说明窗口有多满：它等于最后一轮上报的用量，加上其后新提交内容的估算量。把整个会话的轮次相加会无限增长，对「单次请求的窗口」毫无意义。
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
-- **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。不指定模型名就用其中的第一个，因为空模型名 provider 不会接受。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
-- **错误。** key 被拒、模型不存在、触发限流，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
-
-唯一的缺口是 `claude-subscription`：通过 OAuth 登录尚未实现，因此向导会直接说明这一点并要求你改用 API key。provider 条目、模型列表与凭据接缝都已就位，等这个流程落地即可接上。
+- **模型名。** 连上之后 solaris 会去问 provider 有哪些模型（`GET /models`——两条 wire 都实现的唯一清单接口），并用它们填 `/model`；目录里认识的那些会带上描述与单价。**上次为该 provider 选的模型会被记住** —— 就存在 `auth.json` 里（与「当前 provider」同一处），新会话直接沿用它；没有记录时才用其中的第一个，因为空模型名 provider 不会接受。主题与模式同样会被记住，存在 `settings.json`。provider 不肯回答时，选择器退回内置目录；若目录里也没有，`/model` 会说明情况，而不是发一个空名字去换一个 400。`--model` 或 `/model <name>` 指定过的名字则原样保留，哪怕没有任何清单列过它。
+- **错误。** key 被拒、模型不存在、触发限流、账户余额不足，都会带上服务端自己的说法以及下一步该做什么。页脚始终显示当前回答的后端，所以没有凭据的会话会写 `unconnected`，而不会写出一个它从未调用过的 provider。
 
 ---
 

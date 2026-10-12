@@ -7,14 +7,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use solaris::{App, AppOptions, Clipboard};
-use solaris_backend::{AgentBackend, AgentEventStream};
-use solaris_core::{AgentEvent, BackendError, Config, TurnRequest, Usage};
+use solaris::{App, AppOptions, Clipboard, Config};
+use solaris_agent::{
+    AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
+};
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 
@@ -52,6 +54,49 @@ impl AgentBackend for FakeBackend {
     }
 }
 
+/// A backend that asks for a tool this session does not have, then answers.
+///
+/// It proves the loop is wired in without running anything: a call for a tool
+/// that was never declared is refused inside the loop, so no file and no command
+/// is touched.
+#[derive(Default)]
+struct ToolBackend {
+    round: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for ToolBackend {
+    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        let round = self.round.fetch_add(1, Ordering::Relaxed);
+        let events = if round == 0 {
+            vec![
+                AgentEvent::ToolCall(ToolCall::new(
+                    "call-1",
+                    "teleport",
+                    serde_json::json!({ "to": "mars" }),
+                )),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(2, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        } else {
+            vec![
+                AgentEvent::TextDelta("nowhere to go".to_string()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(3, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    fn label(&self) -> &str {
+        "tool"
+    }
+}
+
 struct Harness {
     tui: Tui,
     terminal: Terminal<TestBackend>,
@@ -83,7 +128,17 @@ impl Harness {
     }
 
     fn with_clipboard(clipboard: Clipboard) -> Self {
-        let backend = Arc::new(FakeBackend);
+        Self::with_backend_and_clipboard(Arc::new(FakeBackend), clipboard)
+    }
+
+    /// A harness driven by `backend` rather than the echoing fake.
+    fn with_backend(backend: Arc<dyn AgentBackend>) -> Self {
+        let (clipboard, _) = clipboard_for(None);
+        Self::with_backend_and_clipboard(backend, clipboard)
+    }
+
+    fn with_backend_and_clipboard(backend: Arc<dyn AgentBackend>, clipboard: Clipboard) -> Self {
+        let fallback = Arc::clone(&backend);
         let mut tui = Tui::new();
         let mut options = AppOptions::new(
             backend,
@@ -100,7 +155,7 @@ impl Harness {
         // footer reports what a real session would. No test has credentials and
         // the network is off limits, so an unresolved choice is filled in with
         // the fake — the UI path under test is the same either way.
-        options.backend_factory = Arc::new(|auth, model| {
+        options.backend_factory = Arc::new(move |auth, model| {
             let mut choice = solaris_provider::choose_backend(
                 auth,
                 model,
@@ -109,7 +164,7 @@ impl Harness {
                 },
             );
             if choice.provider_id.is_none() {
-                choice.backend = Arc::new(FakeBackend);
+                choice.backend = Arc::clone(&fallback);
             }
             choice
         });
@@ -388,6 +443,26 @@ async fn prompt_streams_a_reply_rendered_as_markdown() {
     assert!(!text.contains("generating"), "spinner stuck:\n{text}");
     // The footer reports the tokens the backend reported.
     assert!(text.contains("tok"), "token counter missing:\n{text}");
+}
+
+#[tokio::test]
+async fn a_tool_call_and_its_answer_are_shown_in_the_transcript() {
+    let mut harness = Harness::with_backend(Arc::new(ToolBackend::default()));
+    harness.type_str("go");
+    harness.key(KeyCode::Enter);
+
+    let text = harness.settle_on("nowhere to go").await;
+
+    assert!(text.contains("teleport"), "the call is shown:\n{text}");
+    assert!(text.contains("mars"), "its arguments are shown:\n{text}");
+    assert!(
+        text.contains('✗'),
+        "a call that did not run is marked as failed:\n{text}"
+    );
+    assert!(
+        text.contains("nowhere to go"),
+        "the model's answer follows:\n{text}"
+    );
 }
 
 #[tokio::test]
@@ -750,20 +825,15 @@ fn connecting_an_api_key_flows_into_the_model_picker() {
     );
 }
 
-#[tokio::test]
-async fn device_auth_reports_that_sign_in_is_unavailable() {
+#[test]
+fn the_second_provider_row_opens_its_api_key_step() {
     let mut harness = Harness::new();
     harness.type_str("/connect");
     harness.key(KeyCode::Enter);
-    harness.key(KeyCode::Down); // the subscription provider
+    harness.key(KeyCode::Down); // the second row — OpenCode Go
     harness.key(KeyCode::Enter);
 
-    harness.tui.tick();
     let text = harness.draw();
-
-    // The sign-in flow is not built, and saying so is better than walking the
-    // user through a code that mints a token nothing can use.
-    assert!(text.contains("not implemented"), "{text}");
-    assert!(text.contains("Press any key to dismiss"), "{text}");
-    assert!(!text.contains("Enter this code in the browser:"), "{text}");
+    assert!(text.contains("Connect OpenCode Go"), "{text}");
+    assert!(text.contains("Paste your API key:"), "{text}");
 }

@@ -301,7 +301,7 @@ impl Editor {
         self.preferred_col = None;
     }
 
-    fn current_line(&self) -> &Vec<char> {
+    fn current_line(&self) -> &[char] {
         &self.lines[self.cursor_row]
     }
 

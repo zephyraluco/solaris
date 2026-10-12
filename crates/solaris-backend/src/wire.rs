@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use solaris_core::{AgentEvent, TurnRequest, Usage};
+use crate::{AgentEvent, TurnRequest, Usage};
 
 use crate::protocols::anthropic::AnthropicStream;
 use crate::protocols::openai::OpenAiStream;
@@ -122,6 +122,18 @@ impl WireStream {
         }
     }
 
+    /// Whether the model stopped because it hit its output limit.
+    ///
+    /// A truncated message may carry tool calls whose arguments were cut
+    /// mid-JSON, so whoever runs them has to be told before it acts.
+    pub fn truncated(&self) -> bool {
+        match self {
+            Self::Anthropic(stream) => stream.truncated(),
+            Self::OpenAi(stream) => stream.truncated(),
+            Self::Responses(stream) => stream.truncated(),
+        }
+    }
+
     /// The usage the server reported, once it has reported any.
     pub fn usage(&self) -> Option<Usage> {
         match self {
@@ -130,18 +142,31 @@ impl WireStream {
             Self::Responses(stream) => stream.usage(),
         }
     }
+
+    /// Hand over the tool calls this stream assembled.
+    ///
+    /// A wire only knows a call is complete when the stream ends, so the caller
+    /// runs this at that point — before the terminal event, so the turn's
+    /// sequence reads as text, then calls, then completion.
+    pub fn flush(&mut self, out: &mut Vec<AgentEvent>) {
+        match self {
+            Self::Anthropic(stream) => stream.flush(out),
+            Self::OpenAi(stream) => stream.flush(out),
+            Self::Responses(stream) => stream.flush(out),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Message, Mode};
+    use crate::Message;
 
     fn request() -> TurnRequest {
         TurnRequest {
             history: vec![Message::system("You are solaris.")],
             prompt: "hello".to_string(),
-            mode: Mode::Build,
+            tools: Vec::new(),
         }
     }
 

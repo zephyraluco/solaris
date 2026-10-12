@@ -10,9 +10,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use solaris::{App, AppOptions, BackendFactory, Clipboard};
-use solaris_core::{Companion, Config, Mode, RecentActivity, Soul, tips};
-use solaris_provider::{AuthStore, context_window_for, provider};
+use solaris::tips;
+use solaris::{
+    App, AppOptions, BackendFactory, Clipboard, Companion, Config, Mode, Preferences,
+    RecentActivity, Soul,
+};
+use solaris_agent::{ToolRegistry, ToolSelection, default_tool_names};
+use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
 
@@ -24,9 +28,9 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    /// Colour theme to start with.
-    #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
-    theme: String,
+    /// Colour theme to start with; omitted means the remembered one, or `dark`.
+    #[arg(long, value_parser = ["dark", "light"])]
+    theme: Option<String>,
 
     /// Start in plan mode instead of build mode.
     #[arg(long)]
@@ -36,16 +40,36 @@ struct Args {
     #[arg(long)]
     provider: Option<String>,
 
+    /// Tools to declare, replacing the mode's default set. Entries are tool
+    /// names or patterns where `*` matches any characters; a list made only of
+    /// `+name` and `-name` entries edits the default set instead.
+    #[arg(short = 't', long, value_name = "LIST")]
+    tools: Option<String>,
+
+    /// Tools to withdraw, after everything else has selected them.
+    #[arg(long, value_name = "LIST")]
+    exclude_tools: Option<String>,
+
     /// Print the resolved configuration and exit without starting the UI.
     #[arg(long)]
     print_config: bool,
+
+    /// Confirm a call that changes something before it runs.
+    ///
+    /// Off by default: a terminal agent is already acting on your behalf. Turn
+    /// it on to be asked before a write, an edit or a command runs.
+    #[arg(long)]
+    confirm_tools: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let mut config = Config {
-        theme: args.theme.clone(),
+        theme: args
+            .theme
+            .clone()
+            .unwrap_or_else(|| Config::default().theme),
         mode: if args.plan { Mode::Plan } else { Mode::Build },
         ..Config::default()
     };
@@ -53,22 +77,61 @@ fn main() -> Result<()> {
         config.model = model.clone();
     }
 
+    let tools = match ToolSelection::parse(args.tools.as_deref(), args.exclude_tools.as_deref()) {
+        Ok(selection) => selection,
+        Err(message) => anyhow::bail!("{message}"),
+    };
+    // A name that matches nothing is almost always a typo, and silently
+    // declaring nothing would look like the tool simply refused to run.
+    let registry = ToolRegistry::builtin();
+    for entry in registry.unmatched(&tools) {
+        eprintln!(
+            "solaris: no tool named `{entry}` on this platform — available: {}",
+            registry.names().join(", ")
+        );
+    }
+
     let state_dir = config_dir();
     let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
     let buddy_path = state_dir.as_ref().map(|dir| dir.join("companion.json"));
     let recent_path = state_dir.as_ref().map(|dir| dir.join("recent.json"));
+    let settings_path = state_dir.as_ref().map(|dir| dir.join("settings.json"));
 
     let mut auth = load_auth(auth_path.as_deref());
     let user = user_id();
     let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
     let recent = load_recent(recent_path.as_deref());
+    let settings = load_settings(settings_path.as_deref());
 
     // `--provider` moves this run without rewriting the saved choice.
     if let Some(id) = &args.provider {
-        if provider(id).is_none() {
+        if provider_spec(id).is_none() {
             anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
         }
         auth.activate(id.clone());
+    }
+
+    // What the last session left, unless this run overrides it: a flag always
+    // wins, so `--plan` in a script keeps meaning plan. The model follows the
+    // provider it was chosen for, and is kept in `auth.json` beside it.
+    if args.theme.is_none() {
+        if let Some(theme) = &settings.theme {
+            config.theme = theme.clone();
+        }
+    }
+    if !args.plan {
+        if let Some(mode) = settings.mode {
+            config.mode = mode;
+        }
+    }
+
+    // Without `--model`, a session starts on the model this provider was last
+    // used with: the catalogue's first entry is a fallback, not a decision, and
+    // reconnecting should not quietly move the user onto it.
+    if args.model.is_none() {
+        if let Some(model) = auth.active_model() {
+            config.model = model.to_string();
+        }
     }
 
     let backend_options = BackendOptions::default();
@@ -88,6 +151,12 @@ fn main() -> Result<()> {
         println!("model: {}", describe_model(&choice.model));
         println!("theme: {}", config.theme);
         println!("mode: {}", config.mode.label());
+        println!(
+            "tools: {}",
+            registry
+                .selected_names(default_tool_names(config.mode), &tools)
+                .join(", ")
+        );
         println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {
             Some(path) => println!("credentials: {}", path.display()),
@@ -169,6 +238,8 @@ fn main() -> Result<()> {
         tip: tips::select(recent.len()).content.to_string(),
         recent,
         recent_path,
+        preferences: settings,
+        settings_path,
         quit: tui.quit_flag(),
         overlay_queue: tui.overlay_queue(),
         overlay_flag: tui.overlay_flag(),
@@ -177,6 +248,8 @@ fn main() -> Result<()> {
         // The binary wants the provider's own model list in the picker; the
         // catalogue is what it falls back to.
         discover_models: true,
+        tools,
+        ask_approval: args.confirm_tools,
     });
     tui.set_root(Box::new(app));
 
@@ -215,9 +288,6 @@ fn describe_source(source: CredentialSource) -> String {
         CredentialSource::Env(name) => format!("environment ({name})"),
         CredentialSource::None => "none needed".to_string(),
         CredentialSource::Missing => "none — not connected".to_string(),
-        CredentialSource::NotImplemented => {
-            "sign-in is not implemented yet — connect an API key".to_string()
-        }
         CredentialSource::NoModel => "present — no model named for it yet".to_string(),
     }
 }
@@ -267,6 +337,17 @@ fn load_recent(path: Option<&Path>) -> RecentActivity {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| RecentActivity::from_json(&text).ok())
+        .unwrap_or_default()
+}
+
+/// The preferences saved last time, or none when there is no usable record.
+fn load_settings(path: Option<&Path>) -> Preferences {
+    let Some(path) = path else {
+        return Preferences::default();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| Preferences::from_json(&text).ok())
         .unwrap_or_default()
 }
 

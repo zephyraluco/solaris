@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Provider catalogue, credentials and platform resolution for solaris"
 
+[lints]
+workspace = true
+
 [dependencies]
 solaris-backend = { workspace = true }
-solaris-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

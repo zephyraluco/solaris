@@ -71,6 +71,25 @@ impl Usage {
             .saturating_add(self.cache_write_tokens)
     }
 
+    /// This usage plus `other`, bucket by bucket.
+    ///
+    /// One turn can be several model calls — that is what a tool round trip is —
+    /// and what the turn cost is the sum of them. `estimated` sticks if either
+    /// side was an estimate, because the total is then partly a guess.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(other.cache_write_tokens),
+            estimated: self.estimated || other.estimated,
+        }
+    }
+
     /// Whether the provider reported nothing and nothing could be estimated.
     pub fn is_empty(&self) -> bool {
         self.total() == 0
@@ -133,6 +152,23 @@ mod tests {
         assert_eq!(usage.total(), 1_340);
         assert!(!usage.is_empty());
         assert!(Usage::default().is_empty());
+    }
+
+    #[test]
+    fn a_tool_round_trip_sums_its_model_calls() {
+        let first = Usage::new(100, 20).with_cache(10, 1);
+        let second = Usage::new(300, 5);
+
+        let total = first.merge(second);
+        assert_eq!(total.input_tokens, 400);
+        assert_eq!(total.output_tokens, 25);
+        assert_eq!(total.cache_read_tokens, 10);
+        assert_eq!(total.cache_write_tokens, 1);
+        assert!(!total.estimated);
+
+        // One estimated half makes the total partly a guess.
+        assert!(first.merge(Usage::estimate(4, 4)).estimated);
+        assert!(Usage::estimate(4, 4).merge(first).estimated);
     }
 
     #[test]

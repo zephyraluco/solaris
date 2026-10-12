@@ -330,7 +330,11 @@ mod tests {
         let lines = rendered(&data(), 80, BOX_HEIGHT);
         assert_eq!(lines.len(), BOX_HEIGHT as usize);
 
-        assert!(lines[0].starts_with("╭─ solaris v0.1.0 ─"), "{:?}", lines[0]);
+        assert!(
+            lines[0].starts_with("╭─ solaris v0.1.0 ─"),
+            "{:?}",
+            lines[0]
+        );
         assert!(lines[0].ends_with('╮'), "{:?}", lines[0]);
         assert!(lines[1].contains("Welcome back zeal!"), "{:?}", lines[1]);
         assert!(

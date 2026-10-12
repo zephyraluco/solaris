@@ -17,7 +17,7 @@
 
 ---
 
-solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a platform crate that knows the providers, a transport crate that speaks three wire protocols and nothing else, a pure-logic domain crate, and a reusable terminal UI framework that the app is only one consumer of.
+solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a transport crate that speaks three wire protocols and nothing else, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that wires the three together and is the only door the app needs, and a reusable terminal UI framework that the app is only one consumer of.
 
 The interface is complete, and a connected provider really is called. Connect a provider — or just export an API key — and every turn streams from the real model over SSE, with retries before the first token and per-turn token and cost accounting.
 
@@ -32,6 +32,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Real provider clients for the three wire protocols the catalogue covers, chosen from your credentials
 > - Full-screen TUI with a retained component tree, flex-like layout stacks and modal/inline overlays
 > - Streaming transcript with markdown rendering and collapsible thinking blocks
+> - Eight built-in tools — `read`, `write`, `edit`, `ls`, `grep`, `find` and your platform's shell — run by a multi-round tool loop
 > - Multi-line editor with word navigation, `/` command autocomplete, and a command palette
 > - Two colour themes, cycled at runtime
 > - Build and plan modes, with distinct accents and system prompt
@@ -40,7 +41,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Session statistics — turns, tokens by bucket, cost and context usage
 > - Credentials, companion and history persisted under the platform config directory
 >
-> **Not yet:** tool calling, MCP, session files on disk, and a real device-code sign-in.
+> **Not yet:** MCP, session files on disk, a real device-code sign-in, and an interactive confirmation before a tool runs.
 
 ---
 
@@ -50,6 +51,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 - **Rust 1.85 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
+- [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
 
 ## Build from source
 
@@ -82,6 +84,9 @@ cargo run --release
 | `--provider <PROVIDER>` | Send requests to this provider for this run, without changing the saved choice | the active one |
 | `--theme <THEME>` | Colour theme to start with (`dark`, `light`) | `dark` |
 | `--plan` | Start in plan mode instead of build mode | off |
+| `-t`, `--tools <LIST>` | Tools to declare, replacing the mode's default set; a list of `+name`/`-name` entries adjusts it instead | the mode's set |
+| `--exclude-tools <LIST>` | Tools to withdraw after everything else has selected them | none |
+| `--confirm-tools` | Ask before a call that changes something (`write`, `edit`, the shell) runs | off |
 | `--print-config` | Print the resolved configuration and exit without starting the UI | — |
 | `-h`, `--help` | Print help | — |
 | `-V`, `--version` | Print version | — |
@@ -132,7 +137,43 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 
 ## Modes
 
-**Build** and **plan** are the same conversation with a different accent colour and a different line in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode.
+**Build** and **plan** are the same conversation with a different accent colour and a different line in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode. They also declare different tools: build mode can run commands and change files, plan mode can only look.
+
+## Tools
+
+The model can ask solaris to do things. A turn runs what it asks for, hands back the results, and asks again until it has an answer — all of that is one turn from your side of the screen.
+
+| Tool | What it does | Declared by default in |
+| --- | --- | --- |
+| `read` | Read a text file, with `offset`/`limit` for large ones | build, plan |
+| `write` | Create a file, or replace one | build |
+| `edit` | Replace exact text in a file, several places in one call | build |
+| `ls` | List a directory | plan |
+| `grep` | Search file contents, respecting `.gitignore` | plan |
+| `find` | Find paths by glob, respecting `.gitignore` | plan |
+| `bash` | Run a shell command and return what it printed | build (not Windows) |
+| `powershell` | Run a PowerShell command and return what it printed | build (Windows) |
+
+Plan mode declares only the read-only four, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
+
+```bash
+# read-only for one run, whatever the mode
+solaris --tools read,grep,find,ls --print "review this project"
+
+# add one to the mode's default set, and drop another
+solaris --tools +grep,-write
+
+# take the shell away entirely
+solaris --exclude-tools 'bash'
+```
+
+Entries are tool names or patterns where `*` matches any run of characters. A list made only of `+name` and `-name` entries adjusts the mode's default set instead of replacing it, which is how one tool is added without naming the rest. `--print-config` shows what the mode you start in resolves to.
+
+`grep` and `find` shell out to [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd) rather than reimplementing them — they already respect `.gitignore` and walk a tree quickly, and a second implementation would drift. Install both, or leave them out with `--tools`; missing, they report what to install instead of failing the turn.
+
+Every result goes back to the model, failures included: a file that is not there, a command that exited non-zero and a call the model got wrong are all things it can react to, not the end of the turn. Output is cut to keep a turn affordable — the first 2000 lines or 50KB for a read, the last for a command, since that is where a failure prints — and a command whose output was cut has the whole of it written to a file whose path is reported, so the model can read it back in pieces.
+
+Each call appears in the transcript as it happens, with its arguments, how long it took and, when it failed, the first line of what it said.
 
 ## Companion
 
@@ -140,9 +181,9 @@ Every user gets a terminal companion, shown in the welcome box and animated betw
 
 ## Providers
 
-`/connect` opens an inline wizard that takes over the prompt region instead of opening an overlay. It walks through picking a provider and supplying whatever that provider authenticates with: an API key, an OpenAI-compatible base URL plus key, or nothing at all for a runtime on your machine. The catalogue covers Anthropic, a Claude subscription, OpenAI, Google, OpenRouter, a self-hosted New API gateway and a local Ollama/llama.cpp runtime. Most entries list the models they offer; a gateway and a custom endpoint collect their own URL and key instead, and are then asked what they have. Credentials are stored in `auth.json` and masked wherever they are displayed.
+`/connect` opens an inline wizard that takes over the prompt region instead of opening an overlay. It walks through picking a provider and supplying whatever that provider authenticates with: an API key, an OpenAI-compatible base URL plus key, or nothing at all for a runtime on your machine. The catalogue covers Anthropic, OpenCode Go, OpenAI, Google, OpenRouter, a self-hosted New API gateway and a local Ollama/llama.cpp runtime. Most entries list the models they offer; a gateway and a custom endpoint collect their own URL and key instead, and are then asked what they have. Credentials are stored in `auth.json` and masked wherever they are displayed.
 
-Three wire protocols cover the whole catalogue. The Anthropic Messages API carries both Claude entries; the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak; and OpenAI itself uses the newer Responses API. Which wire a provider speaks is a column in the catalogue, not a guess.
+Three wire protocols cover the whole catalogue, and the *model* decides which one carries it: the Anthropic Messages API reaches the Claude models, the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak, and OpenAI's models use the newer Responses API. A provider's own wire is the floor for whatever its table does not list, which is what lets a single OpenCode Go key answer GPT models on the Responses API, Claude models on the Messages API and everything else on the compatibility floor. The key travels the way the wire carrying it asks: `x-api-key` on the Messages API, a bearer token on the OpenAI ones — opencode's Go gateway included, whose `/v1/messages` takes `x-api-key` while its OpenAI-compatible paths take a bearer token. A platform that routes by conversation is also told which one this is, which is how Go attributes a turn to the plan rather than to a pay-as-you-go balance.
 
 ### Environment variables
 
@@ -164,10 +205,8 @@ Keys found in the environment win over `auth.json`, and a key in the environment
 - **Prompt caching.** solaris asks for it rather than hoping: an Anthropic `cache_control` breakpoint on the last message, and an OpenAI `prompt_cache_key` when the endpoint is OpenAI's own. That is what makes the cache rows in `/stats` move, and why a long conversation gets cheaper per turn as the unchanged prefix starts coming back as cache reads.
 - **Context.** `/stats` reports `session tokens` (everything the session has spent) and `context used` separately. Only the second says how full the window is: it is the last turn's reported usage plus a size estimate for anything submitted since, because summing a session's turns would grow without bound and say nothing about a per-request window.
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
-- **Model names.** Already connected once, solaris asks the provider which models it offers (`GET /models`, the one list endpoint both wires answer) and offers those in `/model`, annotated with the description and price from the bundled catalogue where the model is known. Name none and the first of them is used, because an empty model name is not something a provider will accept. If the provider will not answer, the bundled catalogue is what the picker shows; if there is nothing there either, `/model` says so rather than sending an empty name and collecting a 400. A name you passed with `--model` or `/model <name>` is kept exactly as written, even when nothing lists it.
-- **Errors.** A rejected key, an unknown model or a rate limit is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
-
-`claude-subscription` is the one gap: signing in over OAuth is not implemented, so the wizard says so and asks you to connect an API key instead. The provider entry, the model list and the credential seam are all in place for when the flow lands.
+- **Model names.** Already connected once, solaris asks the provider which models it offers (`GET /models`, the one list endpoint both wires answer) and offers those in `/model`, annotated with the description and price from the bundled catalogue where the model is known. The model is remembered beside the provider it was chosen for — in `auth.json`, where the active provider already lives — and a new session starts on it; when there is no such record, the first model offered is used, because an empty model name is not something a provider will accept. The theme and the mode are remembered as well, in `settings.json`. If the provider will not answer, the bundled catalogue is what the picker shows; if there is nothing there either, `/model` says so rather than sending an empty name and collecting a 400. A name you passed with `--model` or `/model <name>` is kept exactly as written, even when nothing lists it.
+- **Errors.** A rejected key, an unknown model, a rate limit or an empty account is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
 
 ---
 

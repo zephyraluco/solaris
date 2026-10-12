@@ -1,7 +1,8 @@
 //! The HTTP client every platform is reached through.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -9,7 +10,7 @@ use futures::stream::BoxStream;
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
-use solaris_core::{AgentEvent, BackendError, Price, TurnRequest, Usage};
+use crate::{AgentEvent, BackendError, Price, TurnRequest, Usage};
 
 use crate::http;
 use crate::protocols::anthropic;
@@ -25,6 +26,8 @@ use crate::{AgentBackend, AgentEventStream};
 pub struct Endpoint {
     /// Protocol to speak.
     pub wire: Wire,
+    /// Header the platform wants a conversation id in, when it asks for one.
+    pub session_header: Option<&'static str>,
     /// Base URL, without a trailing slash.
     pub base_url: String,
     /// The key or token to send, or `None` for a runtime that wants none.
@@ -39,10 +42,15 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// The URL one turn is posted to.
+    ///
+    /// The API version is part of the base URL, so a gateway that serves several
+    /// protocols under one root — opencode go answers `/responses`, `/messages`
+    /// and `/chat/completions` beneath `/zen/go/v1` — needs no more than one entry
+    /// in this match per protocol it speaks.
     pub fn url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.wire {
-            Wire::AnthropicMessages => format!("{base}/v1/messages"),
+            Wire::AnthropicMessages => format!("{base}/messages"),
             Wire::OpenAiChat => format!("{base}/chat/completions"),
             Wire::OpenAiResponses => format!("{base}/responses"),
         }
@@ -56,10 +64,25 @@ impl Endpoint {
     pub fn models_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.wire {
-            Wire::AnthropicMessages => format!("{base}/v1/models?limit=1000"),
+            Wire::AnthropicMessages => format!("{base}/models?limit=1000"),
             Wire::OpenAiChat | Wire::OpenAiResponses => format!("{base}/models"),
         }
     }
+}
+
+/// An id for this run, stable for as long as the process lives.
+///
+/// One process is one conversation here, which is exactly the granularity a
+/// platform routing by session asks for.
+fn session_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        format!("solaris-{nanos:x}-{:x}", std::process::id())
+    })
 }
 
 /// One turn, already resolved by the caller.
@@ -116,19 +139,29 @@ impl HttpBackend {
     }
 
     /// Attach the credential and the headers the wire wants.
+    ///
+    /// A key travels the way the protocol carrying it does: `x-api-key` on the
+    /// Messages API, a bearer token on the OpenAI ones — opencode's Go gateway
+    /// included, whose `/v1/messages` takes `x-api-key` while its
+    /// OpenAI-compatible paths take a bearer token.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.endpoint.wire {
-            Wire::AnthropicMessages => {
-                let request = request.header("anthropic-version", anthropic::API_VERSION);
-                match &self.endpoint.secret {
-                    Some(secret) => request.header(anthropic::API_KEY_HEADER, secret),
-                    None => request,
-                }
-            }
-            Wire::OpenAiChat | Wire::OpenAiResponses => match &self.endpoint.secret {
-                Some(secret) => request.bearer_auth(secret),
-                None => request,
-            },
+        let request = match self.endpoint.wire {
+            Wire::AnthropicMessages => request.header("anthropic-version", anthropic::API_VERSION),
+            Wire::OpenAiChat | Wire::OpenAiResponses => request,
+        };
+
+        let request = match &self.endpoint.secret {
+            Some(secret) if self.endpoint.wire.is_openai() => request.bearer_auth(secret),
+            Some(secret) => request.header(anthropic::API_KEY_HEADER, secret),
+            None => request,
+        };
+
+        // A platform that routes by conversation is told which one this is, so
+        // the turn lands on the plan it belongs to rather than on whichever
+        // balance the gateway would otherwise guess at.
+        match self.endpoint.session_header {
+            Some(header) => request.header(header, session_id()),
+            None => request,
         }
     }
 
@@ -326,7 +359,7 @@ fn request_characters(request: &TurnRequest) -> usize {
         + request
             .history
             .iter()
-            .map(|message| message.content.chars().count())
+            .map(|message| message.characters())
             .sum::<usize>()
 }
 
@@ -426,6 +459,22 @@ impl StreamEngine {
         }
         self.done = true;
 
+        // A message the model stopped writing because it ran out of room may
+        // carry tool calls with half-written arguments, so the readers are told
+        // before the calls themselves go out.
+        if self.parser.truncated() {
+            self.pending.push_back(AgentEvent::OutputTruncated);
+        }
+
+        // A stream only knows a tool call is complete once it ends, so the
+        // calls go out here — before the terminal event, so the turn reads as
+        // text, then calls, then completion.
+        let mut calls = Vec::new();
+        self.parser.flush(&mut calls);
+        for event in calls {
+            self.push(event);
+        }
+
         // A provider that reports nothing at all still gets a token count, so
         // the footer gauge says something rather than nothing.
         let usage = self
@@ -442,13 +491,16 @@ impl StreamEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_core::{Message, Mode};
+    use crate::Message;
 
     #[test]
     fn each_wire_has_its_own_path() {
+        // The base carries the API version, so a wire appends only what is its
+        // own.
         let endpoint = |wire| Endpoint {
             wire,
-            base_url: "https://example.test/".to_string(),
+            session_header: None,
+            base_url: "https://example.test/v1/".to_string(),
             secret: None,
             name: "Test",
             label: "Test",
@@ -461,11 +513,11 @@ mod tests {
         );
         assert_eq!(
             endpoint(Wire::OpenAiChat).url(),
-            "https://example.test/chat/completions"
+            "https://example.test/v1/chat/completions"
         );
         assert_eq!(
             endpoint(Wire::OpenAiResponses).url(),
-            "https://example.test/responses"
+            "https://example.test/v1/responses"
         );
 
         // The Messages API pages its list, so the largest page is asked for.
@@ -475,12 +527,131 @@ mod tests {
         );
         assert_eq!(
             endpoint(Wire::OpenAiChat).models_url(),
-            "https://example.test/models"
+            "https://example.test/v1/models"
         );
         assert_eq!(
             endpoint(Wire::OpenAiResponses).models_url(),
-            "https://example.test/models"
+            "https://example.test/v1/models"
         );
+    }
+
+    #[test]
+    fn one_gateway_root_serves_every_wire() {
+        // opencode's Go plan answers all three protocols beneath one root,
+        // `/zen/go/v1`, which is why the version lives in the base and each wire
+        // appends only the path that is its own.
+        let endpoint = |wire| Endpoint {
+            wire,
+            session_header: Some("x-opencode-session"),
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            secret: None,
+            name: "opencode go",
+            label: "opencode",
+            env_keys: &[],
+        };
+
+        assert_eq!(
+            endpoint(Wire::OpenAiChat).url(),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiResponses).url(),
+            "https://opencode.ai/zen/go/v1/responses"
+        );
+        assert_eq!(
+            endpoint(Wire::AnthropicMessages).url(),
+            "https://opencode.ai/zen/go/v1/messages"
+        );
+        assert_eq!(
+            endpoint(Wire::OpenAiChat).models_url(),
+            "https://opencode.ai/zen/go/v1/models"
+        );
+    }
+
+    #[test]
+    fn a_platform_that_routes_by_conversation_is_told_which_one() {
+        let endpoint = Endpoint {
+            wire: Wire::OpenAiChat,
+            session_header: Some("x-opencode-session"),
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            secret: Some("sk-go".to_string()),
+            name: "opencode go",
+            label: "opencode",
+            env_keys: &[],
+        };
+        let backend = HttpBackend::new(TurnPlan {
+            endpoint,
+            model: "m".to_string(),
+            max_tokens: 1,
+            price: None,
+            prompt_cache_key: None,
+        })
+        .expect("a client");
+
+        let headers = backend
+            .authorize(
+                backend
+                    .client
+                    .post("https://opencode.ai/zen/go/v1/chat/completions"),
+            )
+            .build()
+            .expect("a request")
+            .headers()
+            .clone();
+
+        let session = headers
+            .get("x-opencode-session")
+            .expect("a session id")
+            .to_str()
+            .expect("an ascii id");
+        assert!(session.starts_with("solaris-"), "{session}");
+        // Stable for the run, so the gateway can group a conversation.
+        assert_eq!(session, session_id());
+        // And the key still goes where the gateway asked for it.
+        assert_eq!(headers.get("authorization").expect("a key"), "Bearer sk-go");
+    }
+
+    #[test]
+    fn a_key_travels_the_way_its_wire_asks_for_it() {
+        let headers = |wire| {
+            let backend = HttpBackend::new(TurnPlan {
+                endpoint: Endpoint {
+                    wire,
+                    session_header: None,
+                    base_url: "https://example.test/v1".to_string(),
+                    secret: Some("sk-1".to_string()),
+                    name: "Test",
+                    label: "Test",
+                    env_keys: &[],
+                },
+                model: "m".to_string(),
+                max_tokens: 1,
+                price: None,
+                prompt_cache_key: None,
+            })
+            .expect("a client");
+
+            backend
+                .authorize(backend.client.post("https://example.test/x"))
+                .build()
+                .expect("a request")
+                .headers()
+                .clone()
+        };
+
+        // Anthropic wants its key in its own header, with its version beside it.
+        let anthropic = headers(Wire::AnthropicMessages);
+        assert_eq!(anthropic.get("x-api-key").expect("a key"), "sk-1");
+        assert!(anthropic.get("authorization").is_none());
+        assert!(anthropic.get("anthropic-version").is_some());
+
+        // The OpenAI wires take a bearer token, and know no Anthropic version.
+        for wire in [Wire::OpenAiChat, Wire::OpenAiResponses] {
+            let sent = headers(wire);
+            assert_eq!(sent.get("authorization").expect("a key"), "Bearer sk-1");
+            assert!(sent.get("x-api-key").is_none());
+            assert!(sent.get("anthropic-version").is_none());
+        }
     }
 
     #[test]
@@ -660,7 +831,7 @@ mod tests {
         let request = TurnRequest {
             history: vec![Message::system("12345"), Message::user("1234567890")],
             prompt: "123".to_string(),
-            mode: Mode::Build,
+            tools: Vec::new(),
         };
         assert_eq!(request_characters(&request), 18);
     }
@@ -670,6 +841,7 @@ mod tests {
         let backend = HttpBackend::new(TurnPlan {
             endpoint: Endpoint {
                 wire: Wire::OpenAiChat,
+                session_header: None,
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 secret: None,
                 name: "OpenRouter",

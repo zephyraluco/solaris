@@ -2,8 +2,9 @@
 resolver = "3"
 members = [
 	"crates/solaris-provider",
-	"crates/solaris-core",
 	"crates/solaris-backend",
+	"crates/solaris-tools",
+	"crates/solaris-agent",
 	"crates/solaris-tui",
 	"crates/solaris",
 ]
@@ -17,8 +18,9 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 solaris-provider = { path = "crates/solaris-provider", version = "0.1.0" }
-solaris-core = { path = "crates/solaris-core", version = "0.1.0" }
 solaris-backend = { path = "crates/solaris-backend", version = "0.1.0" }
+solaris-tools = { path = "crates/solaris-tools", version = "0.1.0" }
+solaris-agent = { path = "crates/solaris-agent", version = "0.1.0" }
 solaris-tui = { path = "crates/solaris-tui", version = "0.1.0" }
 
 # External crates
@@ -33,7 +35,25 @@ anyhow = "1"
 thiserror = "2"
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# Only solaris-tools needs this, and only on Unix, to kill a command's process
+# group; it is already in the tree through tokio.
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+
+# Clippy needs no extra flags: `cargo clippy --all-targets --all-features
+# --locked` picks all of this up. Anything below is an error, so a new warning
+# cannot land quietly.
+[workspace.lints.rust]
+future-incompatible = "warn"
+# A group, so it needs a priority below the individual lints it covers.
+nonstandard_style = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+# Nursery, but the one lint worth the noise: it is the only check that catches
+# a clone kept alive for nothing. Fixes are local; `#[expect]` with a reason if
+# a clone really is needed.
+redundant_clone = { level = "deny", priority = 9 }
 
 [profile.release]
 lto = "thin"

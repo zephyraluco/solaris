@@ -1,4 +1,4 @@
-//! Backend abstraction for solaris.
+//! Backend abstraction and the conversation vocabulary for solaris.
 //!
 //! One client serves every platform: it is handed an endpoint, a model, and
 //! whatever the caller knows about pricing, and it streams a turn back over
@@ -6,21 +6,36 @@
 //! how its credentials were found, and which models it offers are all the
 //! caller's business** — that is `solaris-provider`'s job, and this crate never
 //! learns any of it.
+//!
+//! What it does own is the vocabulary a turn is written in: the messages and
+//! their content blocks ([`Message`], [`Content`], [`Role`]), the tool
+//! declarations, calls and results the wire carries ([`ToolSpec`], [`ToolCall`],
+//! [`ToolResult`]), what a turn consumes and costs ([`Usage`], [`Price`]), and
+//! the events a backend streams back ([`AgentEvent`]). Those types are the wire's
+//! own shape — every protocol here serialises them — so they live beside the
+//! protocols that speak them rather than in a layer of their own.
 
 mod client;
+mod event;
 mod http;
+mod message;
 mod protocols;
 mod sse;
+mod tool;
+mod usage;
 mod wire;
 
 pub use client::{Endpoint, HttpBackend, TurnPlan};
+pub use event::{AgentEvent, BackendError, TurnRequest};
 pub use http::IDLE_TIMEOUT;
+pub use message::{Content, Message, Role};
+pub use tool::{ToolCall, ToolResult, ToolSpec};
+pub use usage::{Price, Usage, tokens_for_characters};
 pub use wire::Wire;
 
 use std::pin::Pin;
 
 use futures::Stream;
-use solaris_core::{AgentEvent, BackendError, TurnRequest};
 
 /// Boxed, `Send` stream of events produced by one turn.
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;

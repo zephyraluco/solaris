@@ -21,10 +21,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use solaris_backend::AgentBackend;
-use solaris_core::{
-    AgentEvent, Companion, Config, Mode, RecentActivity, SlashCommand, Soul, TurnRequest, buddy,
-    parse_slash_command, recent,
+use solaris_agent::{
+    Agent, AgentBackend, AgentEvent, AgentOptions, AgentRequest, AlwaysApprove, Approval,
+    ApprovalRequest, Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry,
+    ToolSelection, default_tool_names,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -43,17 +43,22 @@ use solaris_tui::util::{display_width, pad_to_width, rect_contains, truncate_to_
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
+use tokio::sync::oneshot;
 
+use crate::buddy::{self, Companion, Soul};
 use crate::clipboard::Clipboard;
-use crate::commands;
-use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit, DeviceAuthEvent};
+use crate::commands::{self, SlashCommand, parse_slash_command};
+use crate::config::{Config, Preferences};
+use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 use crate::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
     stats_lines,
 };
+use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, Turn};
+use crate::recent::{self, RecentActivity};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -97,6 +102,11 @@ pub struct AppOptions {
     pub recent: RecentActivity,
     /// Where recent activity is persisted; `None` keeps it session-scoped.
     pub recent_path: Option<PathBuf>,
+    /// What the last session left behind: theme, mode and the model chosen for
+    /// its provider.
+    pub preferences: Preferences,
+    /// Where the preferences are persisted; `None` keeps them session-scoped.
+    pub settings_path: Option<PathBuf>,
     pub quit: QuitFlag,
     pub overlay_queue: OverlayQueue,
     pub overlay_flag: Rc<Cell<bool>>,
@@ -110,6 +120,13 @@ pub struct AppOptions {
     /// [`AppOptions::new`], so a test that pins its own backend makes no
     /// request of its own and the catalogue is the only source.
     pub discover_models: bool,
+    /// Which tools a turn declares, on top of what the mode offers by default.
+    pub tools: ToolSelection,
+    /// Whether a call that changes something is confirmed before it runs.
+    ///
+    /// Off in tests, which drive the loop themselves and have nobody to ask; on
+    /// in the binary, where a prompt is the point.
+    pub ask_approval: bool,
 }
 
 impl AppOptions {
@@ -141,15 +158,19 @@ impl AppOptions {
             greeting: "Welcome back!".to_string(),
             buddy: Companion::new("solaris", None),
             buddy_path: None,
-            tip: solaris_core::tips::select(0).content.to_string(),
+            tip: crate::tips::select(0).content.to_string(),
             recent: RecentActivity::new(),
             recent_path: None,
+            preferences: Preferences::default(),
+            settings_path: None,
             quit,
             overlay_queue,
             overlay_flag,
             selection: Selection::handle(),
             clipboard: Clipboard::system(),
             discover_models: false,
+            tools: ToolSelection::none(),
+            ask_approval: false,
         }
     }
 }
@@ -162,6 +183,7 @@ impl AppOptions {
 /// the app takes that on so the footer and `/stats` report what is really being
 /// asked for. The context window follows the model, because the footer gauge is
 /// only honest if it measures against the window the model really has.
+/// The backend the current credentials call for, and why it was chosen.
 fn resolve_backend(
     factory: &BackendFactory,
     auth: &AuthStore,
@@ -175,15 +197,33 @@ fn resolve_backend(
     choice
 }
 
+/// Wrap a resolved backend in the agent session.
+///
+/// Every backend goes through it — including the one that refuses turns when
+/// nothing is connected — because the session is transparent until the model
+/// asks for a tool: with none declared it is exactly one model call, forwarded
+/// unchanged. The returned handle stops whichever turn the session is running.
+fn with_tools(
+    choice: BackendChoice,
+    registry: Arc<ToolRegistry>,
+    selection: &ToolSelection,
+    cwd: &Path,
+    approver: Arc<dyn Approver>,
+) -> (Arc<Agent>, Cancel) {
+    let options = AgentOptions::in_directory(cwd)
+        .with_selection(selection.clone())
+        .with_approver(approver);
+    let agent = Arc::new(Agent::new(choice, registry, options));
+    let cancel = agent.cancel_handle();
+    (agent, cancel)
+}
+
 /// The solaris application root component.
 pub struct App {
-    pub(crate) backend: Arc<dyn AgentBackend>,
+    /// The session every turn goes through, and the backend behind it.
+    pub(crate) agent: Arc<Agent>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
-    /// Provider the current backend was resolved to, when one was. The model
-    /// picker lists this provider's models, so it needs the id rather than the
-    /// backend's display label.
-    provider_id: Option<&'static str>,
     pub(crate) config: Config,
     pub(crate) theme: Theme,
     pub(crate) session: SessionState,
@@ -221,6 +261,10 @@ pub struct App {
     /// Prompts recorded by earlier sessions, and where they are saved.
     recent: RecentActivity,
     recent_path: Option<PathBuf>,
+    /// Theme, mode and model as the last session left them, and where they are
+    /// saved.
+    preferences: Preferences,
+    settings_path: Option<PathBuf>,
     /// Idle animation step of the companion, counted in 500 ms beats.
     buddy_step: u64,
     buddy_started: Instant,
@@ -228,8 +272,6 @@ pub struct App {
     quit_press: Option<(char, Instant)>,
     /// The inline `/connect` wizard while it owns the prompt region.
     inline: Option<Inline>,
-    /// Events from the background device-auth task.
-    device_rx: Option<UnboundedReceiver<DeviceAuthEvent>>,
     /// Models the active provider reported, once it has reported any. Empty
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
@@ -238,6 +280,24 @@ pub struct App {
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
     /// Whether asking the provider for its models is allowed at all.
     discover_models: bool,
+    /// Which tools a turn declares, on top of what the mode offers by default.
+    tools: ToolSelection,
+    /// Every built-in tool this platform has.
+    ///
+    /// Built once, so `edit` and `write` keep serialising against the same
+    /// per-file locks for the whole session.
+    registry: Arc<ToolRegistry>,
+    /// Directory relative tool paths resolve against.
+    cwd: PathBuf,
+    /// The approver every rebuilt loop is wired with.
+    approver: Arc<dyn Approver>,
+    /// Stops the turn in flight, tools included.
+    tool_cancel: Cancel,
+    /// Calls waiting for the user's answer; `None` when the session approves
+    /// everything without asking.
+    approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
+    /// Answers the loop is still waiting for, oldest first.
+    pending_approvals: VecDeque<oneshot::Sender<Approval>>,
 }
 
 impl App {
@@ -255,18 +315,39 @@ impl App {
             tip,
             recent,
             recent_path,
+            preferences,
+            settings_path,
             quit,
             overlay_queue,
             overlay_flag,
             selection,
             clipboard,
             discover_models,
+            tools,
+            ask_approval,
         } = options;
 
         let mut config = config;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let registry = Arc::new(ToolRegistry::builtin());
+
+        // A session that asks before acting gets a channel the UI drains; one
+        // that does not approves everything, which is what a test wants.
+        let (approver, approval_rx): (Arc<dyn Approver>, _) = if ask_approval {
+            let (tx, rx) = unbounded_channel();
+            (Arc::new(ChannelApprover::new(tx)), Some(rx))
+        } else {
+            (Arc::new(AlwaysApprove), None)
+        };
+
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
-        let backend = choice.backend;
-        let provider_id = choice.provider_id;
+        let (agent, tool_cancel) = with_tools(
+            choice,
+            Arc::clone(&registry),
+            &tools,
+            &cwd,
+            Arc::clone(&approver),
+        );
 
         let theme = Theme::by_name(&config.theme);
         selection
@@ -279,9 +360,8 @@ impl App {
         editor.set_styles(editor_styles(&theme));
 
         let mut app = Self {
-            backend,
+            agent,
             backend_factory,
-            provider_id,
             config,
             theme,
             session: SessionState::new(),
@@ -310,14 +390,22 @@ impl App {
             tip,
             recent,
             recent_path,
+            preferences,
+            settings_path,
             buddy_step: 0,
             buddy_started: Instant::now(),
             quit_press: None,
             inline: None,
-            device_rx: None,
             discovered: Vec::new(),
             models_rx: None,
             discover_models,
+            tools,
+            registry,
+            cwd,
+            approver,
+            tool_cancel,
+            approval_rx,
+            pending_approvals: VecDeque::new(),
         };
 
         app.refresh_models();
@@ -356,7 +444,15 @@ impl App {
 
     /// The label of the backend answering turns right now.
     pub fn backend_label(&self) -> &str {
-        self.backend.label()
+        self.agent.label()
+    }
+
+    /// Provider the current session was resolved to, when one was.
+    ///
+    /// The model picker lists this provider's models, so it needs the id rather
+    /// than the backend's display label.
+    fn provider_id(&self) -> Option<&'static str> {
+        self.agent.provider_id()
     }
 
     /// Resolve the backend again after the credentials or the model changed.
@@ -365,9 +461,16 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-        self.backend = choice.backend;
-        self.provider_id = choice.provider_id;
-        choice.source
+        let (agent, cancel) = with_tools(
+            choice,
+            Arc::clone(&self.registry),
+            &self.tools,
+            &self.cwd,
+            Arc::clone(&self.approver),
+        );
+        self.agent = agent;
+        self.tool_cancel = cancel;
+        self.agent.source()
     }
 
     /// Whether an overlay is currently visible.
@@ -491,22 +594,36 @@ impl App {
         }
     }
 
-    /// Ctrl+C: copy a selection, stop a turn that is streaming, or start the
+    /// Copy the selection when a range was drawn, reporting whether there was one.
+    ///
+    /// This is the first rung of the ctrl+C ladder the reference terminals use:
+    /// pi-tui binds `ctrl+c` to a copy action, Claude Code and claurst interrupt
+    /// first, and only a key with nothing left to do asks about quitting. Copy
+    /// sits on top of all of them, so a range drawn over the transcript, over a
+    /// streaming turn or over the wizard is always what the key does.
+    ///
+    /// A range holding nothing but blanks still counts as answered: the user drew
+    /// it, so the key must not fall through to clearing the prompt or arming the
+    /// quit.
+    fn copy_selection_if_any(&mut self) -> bool {
+        let selected = {
+            let selection = self.selection.borrow();
+            if !selection.is_active() {
+                return false;
+            }
+            selection.selected_text()
+        };
+
+        self.copy_selection(&selected);
+        true
+    }
+
+    /// Ctrl+C with nothing drawn: stop a turn that is streaming, or start the
     /// two-press quit.
     ///
-    /// That ladder is the one the reference terminals use — pi-tui binds
-    /// `ctrl+c` to a copy action, Claude Code and claurst interrupt first, and
-    /// only a key with nothing left to do asks about quitting.
+    /// [`App::copy_selection_if_any`] settles the copy case before this is
+    /// reached, so a drawn range never cancels a turn or clears the prompt.
     fn interrupt(&mut self) {
-        // A drawn range copies even when it holds nothing but blanks, and it
-        // must never fall through to clearing the prompt or asking to quit.
-        let has_selection = self.selection.borrow().is_active();
-        if has_selection {
-            let selected = self.selection.borrow().selected_text();
-            self.copy_selection(&selected);
-            return;
-        }
-
         if self.session.is_streaming() {
             self.cancel_turn();
             return;
@@ -544,6 +661,10 @@ impl App {
     /// send fails. Claude Code answers an interrupt by sending anything queued
     /// next, so the queue keeps running in order instead of stalling.
     fn cancel_turn(&mut self) {
+        // Stop the tool the loop is running as well. Dropping the receiver only
+        // ends the stream the UI draws from; a command already in flight would
+        // otherwise keep running for a model that is no longer listening.
+        self.tool_cancel.cancel();
         self.events_rx = None;
         if let Some(turn) = self.session.active_turn_mut() {
             turn.complete = true;
@@ -559,6 +680,7 @@ impl App {
 
     fn toggle_mode(&mut self) {
         self.config.mode = self.config.mode.next();
+        self.persist_settings();
         self.notifications
             .info(format!("{} mode", self.config.mode.label()));
     }
@@ -571,6 +693,7 @@ impl App {
     fn set_theme(&mut self, name: &str) {
         let theme = Theme::by_name(name);
         self.config.theme = theme.name.clone();
+        self.persist_settings();
         self.theme = theme;
         self.editor.set_styles(editor_styles(&self.theme));
         self.selection
@@ -586,6 +709,13 @@ impl App {
 
     fn set_model(&mut self, name: &str) {
         self.config.model = name.to_string();
+        // A model belongs to the provider that offers it, so it is remembered
+        // beside that provider rather than in the settings file.
+        if let Some(provider) = self.provider_id() {
+            self.auth.activate(provider);
+        }
+        self.auth.remember_model(name);
+        self.persist_auth();
         // The model decides the payload, the price and the size of the context
         // window, so the backend is resolved again.
         self.rebuild_backend();
@@ -668,11 +798,13 @@ impl App {
     }
 
     fn start_turn(&mut self, prompt: String) {
-        let request = TurnRequest {
-            history: self.session.history(self.config.mode),
-            prompt: prompt.clone(),
-            mode: self.config.mode,
-        };
+        // The session declares the tools a turn may use, so the app never has to
+        // know which ones a mode offers.
+        let request = AgentRequest::new(
+            self.session.history(self.config.mode),
+            prompt.clone(),
+            self.config.mode,
+        );
 
         self.session.turns.push(Turn {
             prompt,
@@ -685,19 +817,13 @@ impl App {
         let (tx, rx) = unbounded_channel();
         self.events_rx = Some(rx);
 
-        let backend = Arc::clone(&self.backend);
+        let agent = Arc::clone(&self.agent);
         tokio::spawn(async move {
             use futures::StreamExt;
-            match backend.run_turn(request).await {
-                Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
-                        if tx.send(event).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(AgentEvent::Error(error.to_string()));
+            let mut stream = agent.run_turn(request);
+            while let Some(event) = stream.next().await {
+                if tx.send(event).is_err() {
+                    break;
                 }
             }
         });
@@ -716,6 +842,28 @@ impl App {
                 }
             }
             AgentEvent::Status(text) => self.session.status = Some(text),
+            AgentEvent::ToolCall(call) => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.steps.push(ToolStep::pending(call));
+                }
+            }
+            AgentEvent::ToolResult {
+                result,
+                duration_ms,
+            } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    // The newest call with this id that has not been answered
+                    // yet, since a model may call the same tool twice.
+                    let step = turn
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|step| step.call.id == result.id && !step.is_done());
+                    if let Some(step) = step {
+                        step.finish(result, duration_ms);
+                    }
+                }
+            }
             AgentEvent::TurnComplete { usage, cost_usd } => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -723,6 +871,13 @@ impl App {
                     turn.cost_usd = cost_usd;
                 }
                 self.session.status = None;
+            }
+            // The model ran out of room, so anything it asked for in the same
+            // message was refused. Saying so explains why the next thing it does
+            // may look like a repetition.
+            AgentEvent::OutputTruncated => {
+                self.notifications
+                    .warning("the reply hit the output limit; its tool calls were refused");
             }
             AgentEvent::Error(message) => {
                 if let Some(turn) = self.session.active_turn_mut() {
@@ -743,6 +898,21 @@ impl App {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
             DialogMessage::Command(text) => self.submit(text),
+            DialogMessage::Confirm {
+                action: ConfirmAction::RunTool,
+                accepted,
+            } => {
+                // The loop is still waiting on this answer, so it is sent even
+                // when the prompt was dismissed: a denial is a real answer.
+                if let Some(reply) = self.pending_approvals.pop_front() {
+                    let answer = if accepted {
+                        Approval::Approved
+                    } else {
+                        Approval::Denied
+                    };
+                    let _ = reply.send(answer);
+                }
+            }
             DialogMessage::Confirm {
                 action: ConfirmAction::ClearTranscript,
                 accepted: true,
@@ -767,8 +937,34 @@ impl App {
         self.overlay_queue.borrow_mut().push((component, options));
     }
 
+    /// Answer a call the loop is waiting on.
+    ///
+    /// Reading the session changes nothing, so it is approved silently; anything
+    /// else is put to the user, and the loop waits for their answer.
+    fn request_approval(&mut self, request: ApprovalRequest) {
+        let ApprovalRequest { call, reply } = request;
+
+        if read_only(&call.name) {
+            let _ = reply.send(Approval::Approved);
+            return;
+        }
+
+        self.pending_approvals.push_back(reply);
+        let dialog = ConfirmDialog::new(
+            format!("Run {}?", call.name),
+            describe_call(&call),
+            ConfirmAction::RunTool,
+            &self.theme,
+            self.dialog_tx.clone(),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered().width(SizeValue::Percent(64)),
+        );
+    }
+
     fn open_help(&mut self) {
-        let lines = help_lines(&self.theme, solaris_core::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&self.theme, crate::PROMPT_SLASH_COMMANDS);
         let dialog = TextDialog::new(
             "Help",
             "↑↓ scroll · enter or esc closes",
@@ -785,7 +981,7 @@ impl App {
     }
 
     fn open_stats(&mut self) {
-        let backend = self.backend.label().to_string();
+        let backend = self.agent.label().to_string();
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -914,13 +1110,13 @@ impl App {
             return;
         }
 
-        let backend = Arc::clone(&self.backend);
+        let agent = Arc::clone(&self.agent);
         let (tx, rx) = unbounded_channel();
         self.models_rx = Some(rx);
         self.discovered.clear();
 
         tokio::spawn(async move {
-            let answer = backend.models().await.map_err(|error| error.to_string());
+            let answer = agent.models().await.map_err(|error| error.to_string());
             let _ = tx.send(answer);
         });
     }
@@ -957,7 +1153,7 @@ impl App {
                 // provider says this credential reaches no models — but with no
                 // catalogue to fall back on (a gateway, a custom endpoint) the
                 // picker would come up empty with no explanation of why.
-                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                if self.model_choices().is_empty() && self.provider_id().is_some() {
                     self.notifications
                         .warning("the provider listed no models — name one with /model <name>");
                 }
@@ -966,7 +1162,7 @@ impl App {
                 // Only worth saying when there was no catalogue to fall back on;
                 // otherwise a provider that will not answer is not the user's
                 // problem to solve.
-                if self.model_choices().is_empty() && self.provider_id.is_some() {
+                if self.model_choices().is_empty() && self.provider_id().is_some() {
                     self.notifications.warning(format!(
                         "could not list models: {message} — use /model <name>"
                     ));
@@ -1017,7 +1213,7 @@ impl App {
     /// context windows for the models we ship while leaving a gateway's own
     /// list intact. With nothing reported, the catalogue is the whole answer.
     fn model_choices(&self) -> Vec<SelectItem> {
-        let catalogue = self.provider_id.and_then(solaris_provider::provider);
+        let catalogue = self.provider_id().and_then(solaris_provider::provider_spec);
 
         if self.discovered.is_empty() {
             return catalogue
@@ -1060,7 +1256,6 @@ impl App {
         let current = self.config.model.clone();
         let picker = ModelPicker::new(&self.theme, models, Some(&current));
         self.inline = Some(Inline::Model(picker));
-        self.device_rx = None;
         self.notifications.clear();
     }
 
@@ -1086,14 +1281,12 @@ impl App {
     /// Open the `/connect` wizard in the prompt region.
     fn open_connect(&mut self) {
         self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
-        self.device_rx = None;
         self.notifications.clear();
     }
 
-    /// Drop the wizard and any device-auth task feeding it.
+    /// Drop the wizard.
     fn close_inline(&mut self) {
         self.inline = None;
-        self.device_rx = None;
     }
 
     fn handle_inline_key(&mut self, key: KeyEvent) {
@@ -1153,7 +1346,7 @@ impl App {
 
     /// Route a picked provider to the step its auth kind needs.
     fn begin_provider_setup(&mut self, provider_id: &str, name: &str) {
-        let Some(spec) = solaris_provider::provider(provider_id) else {
+        let Some(spec) = solaris_provider::provider_spec(provider_id) else {
             self.notifications
                 .error(format!("unknown provider {provider_id}"));
             self.close_inline();
@@ -1183,12 +1376,6 @@ impl App {
                     flow.enter_custom_provider(id, provider_name, url, key);
                 }
             }
-            AuthKind::DeviceCode => {
-                self.device_rx = Some(spawn_device_auth(provider_id));
-                if let Some(flow) = self.inline.as_mut() {
-                    flow.enter_device_auth(id, provider_name);
-                }
-            }
         }
     }
 
@@ -1214,15 +1401,6 @@ impl App {
                 provider_name,
                 Some(Credential::Endpoint { base_url, api_key }),
             ),
-            ConnectSubmit::DeviceAuthToken {
-                provider_id,
-                provider_name,
-                token,
-            } => (
-                provider_id,
-                provider_name,
-                Some(Credential::Token { token }),
-            ),
         };
 
         if let Some(credential) = credential {
@@ -1234,9 +1412,6 @@ impl App {
         // Connecting is what resolves a real client, so the backend is rebuilt
         // before the model step — and the new provider is asked what it offers.
         match self.rebuild_backend() {
-            CredentialSource::NotImplemented => self.notifications.warning(
-                "subscription sign-in is not implemented yet — connect an API key instead",
-            ),
             CredentialSource::Missing => self
                 .notifications
                 .warning("no usable credential — turns will say so until /connect succeeds"),
@@ -1256,7 +1431,7 @@ impl App {
         // answer lands. With nothing to offer and nothing on its way there is no
         // step to take, so the wizard closes rather than parking the user on an
         // empty screen.
-        let models: Vec<SelectItem> = solaris_provider::provider(&provider_id)
+        let models: Vec<SelectItem> = solaris_provider::provider_spec(&provider_id)
             .map(|spec| {
                 spec.models
                     .iter()
@@ -1318,6 +1493,32 @@ impl App {
         if let Err(error) = written {
             self.notifications
                 .warning(format!("could not save recent activity: {error}"));
+        }
+    }
+
+    /// Remember the theme and the mode, best-effort.
+    ///
+    /// Only choices the user made reach here: a resolved default belongs to a
+    /// flag, and writing one down would turn a fallback into a decision. The
+    /// model is not written here — it is remembered with the provider it was
+    /// chosen for, in `auth.json`.
+    fn persist_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+
+        self.preferences.theme = Some(self.config.theme.clone());
+        self.preferences.mode = Some(self.config.mode);
+
+        let written = self
+            .preferences
+            .to_json()
+            .map_err(|error| error.to_string())
+            .and_then(|json| write_json(&path, &json));
+
+        if let Err(error) = written {
+            self.notifications
+                .warning(format!("could not save preferences: {error}"));
         }
     }
 
@@ -1476,7 +1677,7 @@ impl App {
 
         // The model slot disappears while no model is named, so the footer
         // never shows an empty gap between two separators.
-        let mut facts = vec![self.backend.label().to_string()];
+        let mut facts = vec![self.agent.label().to_string()];
         if !self.config.model.is_empty() {
             facts.push(self.config.model.clone());
         }
@@ -1517,8 +1718,15 @@ impl Component for App {
             return KeyResult::Handled;
         }
 
+        // Ctrl+C copies first, wherever the range was drawn — over the wizard's
+        // own text too — so "copy" outranks the "cancel" and "interrupt" below.
+        if self.keybindings.matches("quit", &key) && self.copy_selection_if_any() {
+            return KeyResult::Handled;
+        }
+
         // The inline wizard owns the keyboard while it is up — including
-        // Ctrl+C, which cancels the wizard rather than the application.
+        // Ctrl+C, which cancels the wizard rather than the application. It only
+        // sees that key when there is nothing to copy.
         if self.inline.is_some() {
             self.handle_inline_key(key);
             return KeyResult::Handled;
@@ -1630,36 +1838,17 @@ impl Component for App {
             self.on_dialog_message(message);
         }
 
-        // Device-auth progress from the background task.
-        let mut device_events = Vec::new();
-        let mut device_done = false;
-        if let Some(rx) = self.device_rx.as_mut() {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => device_events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        device_done = true;
-                        break;
-                    }
-                }
+        // Calls the loop is waiting on: answer each one, asking the user where a
+        // prompt is warranted.
+        let mut requests = Vec::new();
+        if let Some(rx) = self.approval_rx.as_mut() {
+            while let Ok(request) = rx.try_recv() {
+                requests.push(request);
             }
         }
-        if device_done {
-            self.device_rx = None;
-        }
-        for event in device_events {
+        for request in requests {
             dirty = true;
-            if let Some(flow) = self.inline.as_mut() {
-                match event {
-                    DeviceAuthEvent::GotCode {
-                        user_code,
-                        verification_uri,
-                    } => flow.device_set_code(user_code, verification_uri),
-                    DeviceAuthEvent::TokenReceived(token) => flow.device_set_success(token),
-                    DeviceAuthEvent::Error(message) => flow.device_set_error(message),
-                }
-            }
+            self.request_approval(request);
         }
 
         // Models the provider reported to the background discovery task.
@@ -1707,6 +1896,21 @@ impl Component for App {
 
         dirty
     }
+}
+
+/// Whether calling `name` only looks at the session.
+///
+/// This is the set Plan mode declares, which is exactly the set that cannot
+/// change anything — prompting for a read would be noise.
+fn read_only(name: &str) -> bool {
+    default_tool_names(Mode::Plan).contains(&name)
+}
+
+/// The arguments of a call, as the confirmation prompt shows them.
+fn describe_call(call: &ToolCall) -> String {
+    // `Value`'s own display is the compact JSON the model sent, which is what
+    // the user needs to judge the call by.
+    truncate_to_width(&call.input.to_string(), 400, "…")
 }
 
 /// Write `json` to `path`, creating the directory when needed.
@@ -1790,21 +1994,6 @@ fn theme_description(name: &str) -> &'static str {
     }
 }
 
-/// Start the device-code task for `provider_id`.
-///
-/// The network half of OAuth is not implemented, so there is no code to issue
-/// and no token to collect, and that is what this reports. Handing back a
-/// placeholder token would be worse than saying nothing: it would connect a
-/// provider that cannot answer, and the first turn would fail with an
-/// authentication error that explains nothing about why.
-fn spawn_device_auth(provider_id: &str) -> UnboundedReceiver<DeviceAuthEvent> {
-    let (tx, rx) = unbounded_channel();
-    let _ = tx.send(DeviceAuthEvent::Error(format!(
-        "signing in to {provider_id} is not implemented yet — connect an API key instead"
-    )));
-    rx
-}
-
 /// Editor styles derived from the active theme.
 pub fn editor_styles(theme: &Theme) -> EditorStyles {
     EditorStyles {
@@ -1823,160 +2012,12 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
     }
 }
 
-/// Which inline surface owns the prompt region.
-///
-/// A command that picks or asks takes the input line over — the way claurst's
-/// wizard and Claude Code's `/login` screen do — instead of opening an overlay.
-/// Both surfaces draw through the framework's `InlineSelect`, so only their
-/// policy differs; `App` keeps them behind one type and dispatches here.
-// The wizard is a big state machine and the picker is a thin one; boxing the
-// former would only add indirection to a value that lives for one screen.
-#[allow(clippy::large_enum_variant)]
-enum Inline {
-    /// The `/connect` wizard.
-    Connect(ConnectFlow),
-    /// The `/model` picker.
-    Model(ModelPicker),
-}
-
-/// What an inline surface made of an event.
-enum InlineOutcome {
-    Connect(ConnectOutcome),
-    Model(ModelOutcome),
-}
-
-impl Inline {
-    fn is_connect(&self) -> bool {
-        matches!(self, Self::Connect(_))
-    }
-
-    fn step(&self) -> Option<ConnectStep> {
-        match self {
-            Self::Connect(flow) => Some(flow.step()),
-            Self::Model(_) => None,
-        }
-    }
-
-    fn area(&self) -> Rect {
-        match self {
-            Self::Connect(flow) => flow.area(),
-            Self::Model(picker) => picker.area(),
-        }
-    }
-
-    fn set_theme(&mut self, theme: &Theme) {
-        match self {
-            Self::Connect(flow) => flow.set_theme(theme),
-            Self::Model(picker) => picker.set_theme(theme),
-        }
-    }
-
-    fn insert_paste(&mut self, text: &str) -> bool {
-        match self {
-            Self::Connect(flow) => flow.insert_paste(text),
-            Self::Model(picker) => picker.insert_paste(text),
-        }
-    }
-
-    fn on_key(&mut self, key: KeyEvent) -> InlineOutcome {
-        match self {
-            Self::Connect(flow) => InlineOutcome::Connect(flow.on_key(key)),
-            Self::Model(picker) => InlineOutcome::Model(picker.on_key(key)),
-        }
-    }
-
-    fn on_mouse(&mut self, mouse: MouseEvent) -> InlineOutcome {
-        match self {
-            Self::Connect(flow) => InlineOutcome::Connect(flow.on_mouse(mouse)),
-            Self::Model(picker) => InlineOutcome::Model(picker.on_mouse(mouse)),
-        }
-    }
-
-    fn desired_height(&mut self, width: u16) -> u16 {
-        match self {
-            Self::Connect(flow) => flow.desired_height(width),
-            Self::Model(picker) => picker.desired_height(width),
-        }
-    }
-
-    fn render(&mut self, buf: &mut Buffer, area: Rect) {
-        match self {
-            Self::Connect(flow) => flow.render(buf, area),
-            Self::Model(picker) => picker.render(buf, area),
-        }
-    }
-
-    // Wizard-only steps: no-ops unless the connect flow is the one on screen.
-    fn enter_api_key(
-        &mut self,
-        provider_id: impl Into<String>,
-        provider_name: impl Into<String>,
-        current_key: Option<String>,
-    ) {
-        if let Self::Connect(flow) = self {
-            flow.enter_api_key(provider_id.into(), provider_name.into(), current_key);
-        }
-    }
-
-    fn enter_custom_provider(
-        &mut self,
-        provider_id: impl Into<String>,
-        provider_name: impl Into<String>,
-        current_url: Option<String>,
-        current_key: Option<String>,
-    ) {
-        if let Self::Connect(flow) = self {
-            flow.enter_custom_provider(
-                provider_id.into(),
-                provider_name.into(),
-                current_url,
-                current_key,
-            );
-        }
-    }
-
-    fn enter_device_auth(
-        &mut self,
-        provider_id: impl Into<String>,
-        provider_name: impl Into<String>,
-    ) {
-        if let Self::Connect(flow) = self {
-            flow.enter_device_auth(provider_id.into(), provider_name.into());
-        }
-    }
-
-    fn enter_models(&mut self, models: Vec<SelectItem>, current: Option<&str>) {
-        if let Self::Connect(flow) = self {
-            flow.enter_models(models, current);
-        }
-    }
-
-    fn device_set_code(&mut self, user_code: String, verification_uri: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_code(user_code, verification_uri);
-        }
-    }
-
-    fn device_set_success(&mut self, token: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_success(token);
-        }
-    }
-
-    fn device_set_error(&mut self, message: String) {
-        if let Self::Connect(flow) = self {
-            flow.device_set_error(message);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::DeviceAuthStatus;
     use crossterm::event::MouseButton;
-    use solaris_backend::AgentEventStream;
-    use solaris_core::{BackendError, Usage};
+    use solaris_agent::AgentEventStream;
+    use solaris_agent::{BackendError, ToolCall, ToolResult, TurnRequest, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -2029,6 +2070,24 @@ mod tests {
         Arc::new(FakeBackend {
             models: Ok(models.iter().map(|id| (*id).to_string()).collect()),
         })
+    }
+
+    /// A session resolved as `provider` while answering from the fake backend.
+    ///
+    /// The provider id is what the model picker reads its catalogue with, so a
+    /// test that needs one has to resolve a backend that carries it.
+    fn fake_session(provider: &'static str) -> Arc<Agent> {
+        Arc::new(Agent::new(
+            BackendChoice {
+                backend: fake_backend(),
+                provider_id: Some(provider),
+                base_url: None,
+                model: String::new(),
+                source: CredentialSource::None,
+            },
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::default(),
+        ))
     }
 
     fn app() -> App {
@@ -2126,6 +2185,46 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.recent_path = Some(path);
         App::new(options)
+    }
+
+    /// An app that persists its preferences to `path`.
+    fn app_with_settings_path(path: std::path::PathBuf) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.settings_path = Some(path);
+        App::new(options)
+    }
+
+    #[test]
+    fn the_theme_the_mode_and_the_model_are_all_remembered() {
+        let dir = std::env::temp_dir().join(format!("solaris-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let settings_path = dir.join("settings.json");
+        let auth_path = dir.join("auth.json");
+
+        let mut app = app_with_settings_path(settings_path.clone());
+        app.auth_path = Some(auth_path.clone());
+        app.agent = fake_session("opencode");
+        app.set_model("minimax-m3");
+        app.toggle_mode();
+        app.set_theme("light");
+
+        // Theme and mode are session preferences…
+        let text = std::fs::read_to_string(&settings_path).expect("settings were written");
+        let stored = Preferences::from_json(&text).expect("decodes");
+        assert_eq!(stored.theme.as_deref(), Some("light"));
+        assert_eq!(stored.mode, Some(Mode::Plan));
+
+        // …while the model is remembered beside the provider that offers it.
+        let text = std::fs::read_to_string(&auth_path).expect("credentials were written");
+        let auth = AuthStore::from_json(&text).expect("decodes");
+        assert_eq!(auth.active_provider(), Some("opencode"));
+        assert_eq!(auth.active_model(), Some("minimax-m3"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An app whose companion is named and persisted to `path`.
@@ -2569,7 +2668,7 @@ mod tests {
     #[test]
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
-        let names: Vec<&str> = solaris_provider::provider("anthropic")
+        let names: Vec<&str> = solaris_provider::provider_spec("anthropic")
             .expect("a known provider")
             .models
             .iter()
@@ -2621,6 +2720,111 @@ mod tests {
             accepted: true,
         });
         assert!(app.session.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_call_is_approved_without_asking() {
+        let mut app = app();
+        let (reply, answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" })),
+            reply,
+        });
+
+        assert!(app.pending_approvals.is_empty(), "nothing to ask about");
+        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+    }
+
+    #[tokio::test]
+    async fn a_mutating_call_waits_for_the_users_answer() {
+        let mut app = app();
+        let (reply, mut answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new(
+                "call-1",
+                "write",
+                serde_json::json!({ "path": "a.txt", "content": "hi" }),
+            ),
+            reply,
+        });
+
+        // The loop is parked until the prompt is answered.
+        assert_eq!(app.pending_approvals.len(), 1);
+        assert!(
+            answer.try_recv().is_err(),
+            "the call must not be answered before the user is"
+        );
+
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::RunTool,
+            accepted: true,
+        });
+
+        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+        assert!(app.pending_approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_declined_prompt_denies_the_call() {
+        let mut app = app();
+        let (reply, answer) = oneshot::channel();
+        app.request_approval(ApprovalRequest {
+            call: ToolCall::new("call-1", "bash", serde_json::json!({ "command": "ls" })),
+            reply,
+        });
+
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::RunTool,
+            accepted: false,
+        });
+
+        assert_eq!(answer.await.expect("an answer"), Approval::Denied);
+    }
+
+    #[test]
+    fn tool_events_become_one_step_per_call() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.session.bump();
+
+        let first = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
+        let second = ToolCall::new("call-2", "bash", serde_json::json!({ "command": "ls" }));
+        app.apply_event(AgentEvent::ToolCall(first.clone()));
+        app.apply_event(AgentEvent::ToolCall(second.clone()));
+
+        assert_eq!(app.session.turns[0].steps.len(), 2);
+        assert!(!app.session.turns[0].steps[0].is_done(), "still running");
+
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::ok(&first, "hello"),
+            duration_ms: 7,
+        });
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::error(&second, "exit code 1"),
+            duration_ms: 3,
+        });
+
+        let steps = &app.session.turns[0].steps;
+        assert!(steps[0].is_done() && !steps[0].is_error());
+        assert_eq!(steps[0].duration_ms(), Some(7));
+        assert!(steps[1].is_error());
+        assert_eq!(steps[1].duration_ms(), Some(3));
+    }
+
+    #[test]
+    fn a_result_for_a_call_that_was_never_made_is_ignored() {
+        // A backend that lost a ToolCall event must not invent a step for it.
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.session.bump();
+
+        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::ok(&call, "hello"),
+            duration_ms: 1,
+        });
+
+        assert!(app.session.turns[0].steps.is_empty());
     }
 
     #[test]
@@ -2970,34 +3174,6 @@ mod tests {
                 .and_then(Credential::secret),
             Some("sk-test")
         );
-    }
-
-    #[tokio::test]
-    async fn device_auth_reports_that_sign_in_is_not_implemented() {
-        let mut app = app();
-        app.submit("/connect".to_string());
-
-        // Row 2 is the subscription provider, which signs in over OAuth.
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.connect_step(), Some(ConnectStep::DeviceAuth));
-
-        app.tick();
-        let message = app.inline.as_ref().and_then(|inline| match inline {
-            Inline::Connect(flow) => match flow.device_status() {
-                DeviceAuthStatus::Error(message) => Some(message.clone()),
-                _ => None,
-            },
-            _ => None,
-        });
-        let message = message.expect("the wizard should report that it cannot sign in");
-        assert!(message.contains("not implemented"), "{message}");
-
-        // Dismissing it must leave no credential behind: a placeholder token
-        // would make the first real turn fail with an unexplained 401.
-        app.handle_key(key(KeyCode::Char('x')));
-        assert!(!app.auth.is_connected("claude-subscription"));
-        assert!(!app.connect_open());
     }
 
     #[test]
@@ -3462,6 +3638,39 @@ mod tests {
                 (MouseEventKind::Up(MouseButton::Left), to),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_copies_instead_of_cancelling_a_streaming_turn() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("hello".to_string());
+        assert!(app.session.is_streaming());
+
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (12, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().as_slice(), ["› hello".to_string()]);
+        assert!(
+            app.session.is_streaming(),
+            "a copy must not stop the turn that is running"
+        );
+        assert!(!app.quit.get(), "copying a selection must not quit");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_copies_over_the_wizard_instead_of_cancelling_it() {
+        let (mut app, copied) = app_with_clipboard(true);
+        app.submit("/connect".to_string());
+        assert!(app.connect_open());
+
+        // The transcript is still on screen behind the wizard, and the range can
+        // be drawn over either.
+        drag_select(&mut app, Rect::new(0, 0, 60, 12), (0, 0), (5, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(copied.borrow().len(), 1, "the range was not copied");
+        assert!(app.connect_open(), "the wizard was cancelled instead");
+        assert!(!app.quit.get(), "copying a selection must not quit");
     }
 
     #[tokio::test]
