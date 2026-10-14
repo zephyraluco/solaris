@@ -34,7 +34,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Streaming transcript with markdown rendering and collapsible thinking blocks
 > - Eight built-in tools — `read`, `write`, `edit`, `ls`, `grep`, `find` and your platform's shell — run by a multi-round tool loop
 > - Skills: a `SKILL.md` under any of the usual directories is advertised to the model by name and description, and its instructions load only when a task calls for them — or when you ask for them with `/skill:<name>`
-> - A prompt system: identity, mode, each tool's own usage guidance, the skills on offer, and a note from the platform when it needs one
+> - A prompt system: identity, mode, working directory, tool guidance, skills, project rules and user/project addenda; `/reload` refreshes filesystem instructions
 > - Mid-turn steering: a message typed while a turn runs joins it; `/queue` lines one up for after it
 > - Context compaction: when the conversation nears the model's window, older messages are summarized into a structured checkpoint — updated rather than rewritten on later compactions — and a window that turns out to be full is summarized and retried
 > - Multi-line editor with word navigation, `/` command autocomplete, and a command palette
@@ -140,6 +140,7 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `/queue` | Run a prompt after the turn in flight |
 | `/skills` | List the skills available |
 | `/skill:<name> [request]` | Load a skill's instructions |
+| `/reload` | Reload skills, project rules and additional system instructions |
 | `/clear` | Clear the transcript |
 | `/stats` | Show token and cost statistics |
 | `/quit` | Exit solaris |
@@ -220,13 +221,25 @@ Skills are looked for in these directories, in this order, and the first claim o
 | `<config dir>/skills` | user |
 | `~/.agents/skills` | user |
 | `.solaris/skills` in the working directory | project |
-| `.agents/skills` in the working directory | project |
+| `.agents/skills` in the working directory and its ancestors, up to the repository root | project |
 
-The user's own skills are read first, so a repository cannot shadow one of them by shipping a directory with the same name. `--skill <path>` adds a directory, or a single `SKILL.md`, after them.
+The user's own skills are read first, so a repository cannot shadow one of them by shipping a directory with the same name. Ancestor `.agents/skills` locations are visited nearest first; when there is no repository, discovery stops at the filesystem root. A `.git` file also marks a repository boundary. `--skill <path>` adds a directory, or a single `SKILL.md`, after the default locations. Relative explicit paths resolve from the working directory.
 
-Directories are searched recursively for `SKILL.md`, and a directory holding one is a skill rather than a place to look for more. Anything that cannot be used — a skill with no description, a name that breaks the specification, a name already taken — is reported on stderr and skipped; a bad skill never stops a session.
+Directories are searched recursively for `SKILL.md`, and a directory holding one is a skill rather than a place to look for more. Real paths prevent duplicate files and symlink cycles, and scanning order is deterministic. Frontmatter is parsed as YAML. Invalid YAML, missing descriptions and name collisions are diagnosed; invalid names warn but still load. Startup diagnostics go to stderr; a bad skill never stops a session.
 
 `/skills` lists what was found, with where each one came from. `/skill:<name> [request]` loads one now, which is how to reach a skill the model did not pick up on its own; whatever follows the name is appended to the instructions as the request. Type `/skill` and the editor offers every skill by name, badged with its source — `[u]` for a user skill, `[p]` for a project one, `[e]` for a path given with `--skill` — and when there are more than fit, the row underneath says which of them is highlighted. `/skill:` on its own is the same as `/skills`.
+
+Explicit calls read the current file and include its absolute path and resource directory. Hidden skills remain in user completion, marked `explicit only`. Skill commands expand consistently in regular input, steering and follow-ups, including `/queue /skill:pdf-tools extract report.pdf`. Unknown names, unreadable files and malformed documents are reported instead of sent as raw commands. Queued messages retain the instructions read when they were queued.
+
+## Project rules and additional prompts
+
+At startup, solaris loads a global rule file from its configuration directory, then project rules from the repository root through the working directory. Without a repository it checks ancestors up to the filesystem root. In each directory it selects the first existing file in this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`. Identical real files are included only once, and each instruction block carries its source path.
+
+For extra system instructions, create `<config dir>/APPEND_SYSTEM.md` or `<working directory>/.solaris/APPEND_SYSTEM.md`. Both are appended, user first and project second. The built-in mode and tool guidance remain part of the prompt, which also states the actual working directory.
+
+Run `/reload` after changing rules or addenda, adding/removing skills, or changing skill names and descriptions. It updates the agent's resources and editor completion without clearing conversation history. During a running turn (including queued follow-ups) or compaction, reload waits until the stream is idle. A working-directory load failure preserves the previous resources; individual bad files produce diagnostics. Changes to an explicitly invoked skill's body are read immediately on its next invocation.
+
+Library callers can use `ResourcePaths::load()`, `AgentOptions::with_prompt_context()` and `Agent::replace_resources()` at an idle boundary. Agent-owned queues expose `try_push()` to report skill expansion errors.
 
 ## Companion
 

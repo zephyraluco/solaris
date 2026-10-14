@@ -2,7 +2,7 @@
 //! turn may offer.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use solaris_backend::{AgentEventStream, BackendError};
 use solaris_provider::{BackendChoice, CredentialSource, context_window_for};
@@ -16,6 +16,7 @@ use crate::prompt;
 use crate::queue::Queue;
 use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
 use crate::skills::Skills;
+use crate::{InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -44,6 +45,8 @@ pub struct AgentOptions {
     /// written here: what the model is told exists and what it can be pointed at
     /// by name have to be the same list.
     pub skills: Skills,
+    /// Global and project instructions used by every turn.
+    pub prompt_context: PromptContext,
 }
 
 impl Default for AgentOptions {
@@ -56,6 +59,7 @@ impl Default for AgentOptions {
             max_parallel: DEFAULT_MAX_PARALLEL,
             compaction: Compaction::default(),
             skills: Skills::empty(),
+            prompt_context: PromptContext::default(),
         }
     }
 }
@@ -63,8 +67,10 @@ impl Default for AgentOptions {
 impl AgentOptions {
     /// Options rooted at `cwd`, with the default temp directory.
     pub fn in_directory(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         Self {
-            cwd: cwd.into(),
+            cwd,
             ..Default::default()
         }
     }
@@ -90,6 +96,12 @@ impl AgentOptions {
     /// The same options with `skills` as what this session may draw on.
     pub fn with_skills(mut self, skills: Skills) -> Self {
         self.skills = skills;
+        self
+    }
+
+    /// Append instruction sources to the built-in system prompt.
+    pub fn with_prompt_context(mut self, context: PromptContext) -> Self {
+        self.prompt_context = context;
         self
     }
 }
@@ -120,19 +132,28 @@ pub struct Agent {
     steering: Queue,
     /// Messages to run as the turn after this one.
     follow_up: Queue,
+    resources: Arc<RwLock<ResourceSnapshot>>,
 }
 
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
     pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self {
+        let resources = Arc::new(RwLock::new(ResourceSnapshot {
+            skills: options.skills.clone(),
+            prompt: options.prompt_context.clone(),
+            warnings: Vec::new(),
+        }));
+        let steering = Queue::for_resources(Arc::clone(&resources));
+        let follow_up = Queue::for_resources(Arc::clone(&resources));
         Self {
             choice,
             registry,
             options,
             cancel: Cancel::new(),
             conversation: Arc::new(Conversation::new()),
-            steering: Queue::new(),
-            follow_up: Queue::new(),
+            steering,
+            follow_up,
+            resources,
         }
     }
 
@@ -239,8 +260,39 @@ impl Agent {
     }
 
     /// The skills this session may draw on.
-    pub fn skills(&self) -> &Skills {
-        &self.options.skills
+    pub fn skills(&self) -> Skills {
+        self.resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .skills
+            .clone()
+    }
+
+    /// Replace resources for future turns without clearing conversation or queues.
+    /// Call at an idle boundary; an active turn keeps its existing system prompt.
+    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
+        *self
+            .resources
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+    }
+
+    /// Current instructions, also used when the application rebuilds a backend.
+    pub fn prompt_context(&self) -> PromptContext {
+        self.resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .prompt
+            .clone()
+    }
+
+    /// Validate and expand input using the current resource snapshot.
+    pub fn expand_input(&self, text: &str) -> Result<String, InputError> {
+        let resources = self
+            .resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        expand_input(text, &resources.skills)
     }
 
     /// Run one turn over `prompt`, streaming what it produces.
@@ -253,6 +305,18 @@ impl Agent {
     /// The prompt is recorded in the conversation before anything is asked, so a
     /// turn that is abandoned still leaves what the user said.
     pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
+        let resources = self
+            .resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prompt = match expand_input(&prompt.into(), &resources.skills) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Box::pin(futures::stream::once(async move {
+                    crate::AgentEvent::Error(error.to_string())
+                }));
+            }
+        };
         let tools = self
             .registry
             .select(default_tool_names(mode), &self.options.selection);
@@ -260,8 +324,15 @@ impl Agent {
         // The prompt is written per turn because every part of it can change:
         // the mode, which tools the mode leaves standing, and which platform the
         // credentials resolve to.
-        let system =
-            prompt::system_prompt(mode, &tools, &self.options.skills, self.choice.provider_id);
+        let system = prompt::build_system_prompt(
+            mode,
+            &tools,
+            &resources.skills,
+            self.choice.provider_id,
+            &self.options.cwd,
+            &resources.prompt,
+        );
+        drop(resources);
 
         session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),
@@ -272,7 +343,7 @@ impl Agent {
             follow_up: self.follow_up.clone(),
             conversation: Arc::clone(&self.conversation),
             system,
-            prompt: prompt.into(),
+            prompt,
             context_window: self.context_window(),
         })
     }
@@ -431,6 +502,129 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[tokio::test]
+    async fn skill_input_expands_in_turns_and_both_queues_with_current_body() {
+        let dir = std::env::temp_dir().join(format!("solaris-agent-input-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pdf")).expect("directory");
+        let path = dir.join("pdf/SKILL.md");
+        std::fs::write(
+            &path,
+            "---\ndescription: PDF work\ndisable-model-invocation: true\n---\nOld body",
+        )
+        .expect("skill");
+        let skills = Skills::load(
+            &[crate::SkillRoot::new(&dir, crate::SkillSource::Project)],
+            &[],
+        );
+        let completion = || {
+            vec![
+                AgentEvent::TextDelta("done".to_string()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![completion(), completion()]);
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::in_directory(&dir).with_skills(skills),
+        );
+        std::fs::write(&path, "---\ndescription: PDF work\ndisable-model-invocation: true\n---\nNew body: read references/formats.md").expect("update");
+        agent
+            .steering_handle()
+            .try_push("/skill:pdf steer")
+            .expect("steering");
+        agent
+            .follow_up_handle()
+            .try_push("/skill:pdf follow")
+            .expect("follow-up");
+        drain(agent.run_turn("/skill:pdf initial", Mode::Plan)).await;
+        let requests = inner.requests();
+        assert_eq!(requests.len(), 2);
+        let user_text: Vec<_> = requests
+            .last()
+            .expect("request")
+            .history
+            .iter()
+            .filter(|message| message.role == crate::Role::User)
+            .map(crate::Message::text)
+            .collect();
+        assert_eq!(user_text.len(), 3);
+        for (text, request) in user_text.iter().zip(["initial", "steer", "follow"]) {
+            assert!(text.contains("New body"), "{text}");
+            assert!(
+                text.contains(&dir.join("pdf").display().to_string()),
+                "{text}"
+            );
+            assert!(text.contains(&format!("Request: {request}")), "{text}");
+            assert!(!text.contains("Old body"));
+        }
+        assert!(
+            !requests[0].history[0].text().contains("PDF work"),
+            "hidden skill is not advertised"
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_skill_input_never_reaches_backend_or_conversation() {
+        let inner = Scripted::new(Vec::new());
+        let agent = agent(inner.clone());
+        let events = drain(agent.run_turn("/skill:missing request", Mode::Build)).await;
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Error(message)] if message.contains("no skill named"))
+        );
+        assert!(inner.requests().is_empty());
+        assert_eq!(agent.conversation_len(), 0);
+        assert!(agent.follow_up_handle().try_push("/skill:missing").is_err());
+        assert!(agent.follow_up_handle().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacing_resources_preserves_history_and_updates_next_system_prompt() {
+        let completion = || {
+            vec![
+                AgentEvent::TextDelta("done".to_string()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![completion(), completion()]);
+        let agent = agent(inner.clone());
+        drain(agent.run_turn("first request", Mode::Plan)).await;
+        let before = agent.conversation_len();
+        agent.replace_resources(ResourceSnapshot {
+            prompt: PromptContext {
+                project_rules: vec![crate::PromptFile {
+                    path: agent.options.cwd.join("AGENTS.md"),
+                    content: "Project rule marker".to_string(),
+                }],
+                append_system: vec![crate::PromptFile {
+                    path: agent.options.cwd.join("APPEND_SYSTEM.md"),
+                    content: "Addendum marker".to_string(),
+                }],
+            },
+            ..Default::default()
+        });
+        assert_eq!(agent.conversation_len(), before);
+        drain(agent.run_turn("second request", Mode::Plan)).await;
+        let requests = inner.requests();
+        let system = requests[1].history[0].text();
+        assert!(system.contains("Project rule marker"));
+        assert!(system.contains("Addendum marker"));
+        assert!(system.contains(&agent.options.cwd.display().to_string()));
+        assert!(
+            requests[1]
+                .history
+                .iter()
+                .any(|message| message.text() == "first request")
+        );
     }
 
     #[test]

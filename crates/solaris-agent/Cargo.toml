@@ -16,6 +16,8 @@ solaris-tools = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+serde_yaml_ng = "0.10"
+thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

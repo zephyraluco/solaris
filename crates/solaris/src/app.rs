@@ -23,8 +23,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
     Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
-    Approver, Cancel, ChannelApprover, Mode, Skills, ToolCall, ToolRegistry, ToolSelection,
-    default_tool_names,
+    Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
+    ToolRegistry, ToolSelection, default_tool_names,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -127,6 +127,10 @@ pub struct AppOptions {
     ///
     /// Empty in tests, and in a session whose directories hold no skill.
     pub skills: Skills,
+    /// Loaded global/project prompt instructions.
+    pub prompt_context: PromptContext,
+    /// Filesystem locations to revisit on /reload; absent in isolated callers.
+    pub resource_paths: Option<ResourcePaths>,
     /// Whether a call that changes something is confirmed before it runs.
     ///
     /// Off in tests, which drive the loop themselves and have nobody to ask; on
@@ -176,6 +180,8 @@ impl AppOptions {
             discover_models: false,
             tools: ToolSelection::none(),
             skills: Skills::empty(),
+            prompt_context: PromptContext::default(),
+            resource_paths: None,
             ask_approval: false,
         }
     }
@@ -214,12 +220,14 @@ fn with_tools(
     registry: Arc<ToolRegistry>,
     selection: &ToolSelection,
     skills: &Skills,
+    prompt_context: &PromptContext,
     cwd: &Path,
     approver: Arc<dyn Approver>,
 ) -> (Arc<Agent>, Cancel) {
     let options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_skills(skills.clone())
+        .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     let agent = Arc::new(Agent::new(choice, registry, options));
     let cancel = agent.cancel_handle();
@@ -292,6 +300,8 @@ pub struct App {
     tools: ToolSelection,
     /// The skills this session may draw on, found before the app was built.
     skills: Skills,
+    resource_paths: Option<ResourcePaths>,
+    reload_pending: bool,
     /// Every built-in tool this platform has.
     ///
     /// Built once, so `edit` and `write` keep serialising against the same
@@ -335,6 +345,8 @@ impl App {
             discover_models,
             tools,
             skills,
+            prompt_context,
+            resource_paths,
             ask_approval,
         } = options;
 
@@ -357,6 +369,7 @@ impl App {
             Arc::clone(&registry),
             &tools,
             &skills,
+            &prompt_context,
             &cwd,
             Arc::clone(&approver),
         );
@@ -413,6 +426,8 @@ impl App {
             discover_models,
             tools,
             skills,
+            resource_paths,
+            reload_pending: false,
             registry,
             cwd,
             approver,
@@ -484,6 +499,7 @@ impl App {
             Arc::clone(&self.registry),
             &self.tools,
             &self.skills,
+            &self.agent.prompt_context(),
             &self.cwd,
             Arc::clone(&self.approver),
         );
@@ -789,8 +805,13 @@ impl App {
     /// message that arrives just too late to be read by this turn is recorded
     /// against the turn that does read it rather than the one it was typed into.
     fn steer(&mut self, text: String) {
-        if !self.agent.steering_handle().push(text.clone()) {
-            return;
+        match self.agent.steering_handle().try_push(text.clone()) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
         }
         self.notifications
             .info(format!("steered: {}", crate::transcript::summarize(&text)));
@@ -836,6 +857,7 @@ impl App {
             "compact" => self.compact_now(),
             "queue" => self.queue_follow_up(args),
             "skills" => self.open_skills(),
+            "reload" => self.reload_resources(),
             // A skill's name is taken on the colon rather than after a space; a
             // reminder that says so is worth more than "unknown command".
             "skill" => self.notifications.error(format!(
@@ -857,25 +879,16 @@ impl App {
     /// have to spend a round working that out. The transcript shows the
     /// invocation rather than the instructions it stands for.
     fn run_skill(&mut self, name: &str, args: &str) {
-        let Some(skill) = self.skills.get(name) else {
-            self.notifications.error(format!(
-                "no skill named `{name}` — /skills lists what there is"
-            ));
-            return;
-        };
-
         let invocation = if args.is_empty() {
             format!("/skill:{name}")
         } else {
             format!("/skill:{name} {args}")
         };
-        let prompt = skill.invocation_prompt(args);
-
         if self.session.is_streaming() {
-            self.steer(prompt);
+            self.steer(invocation);
             return;
         }
-        self.start_turn(invocation, prompt);
+        self.start_turn(invocation.clone(), invocation);
     }
 
     /// Put `text` in line to run as the turn after the one in flight.
@@ -895,11 +908,56 @@ impl App {
             self.start_turn(prompt.clone(), prompt);
             return;
         }
-        if self.agent.follow_up_handle().push(text) {
-            self.notifications.info(format!(
+        match self.agent.follow_up_handle().try_push(text) {
+            Ok(true) => self.notifications.info(format!(
                 "after this turn: {}",
                 crate::transcript::summarize(text)
-            ));
+            )),
+            Ok(false) => {}
+            Err(error) => self.notifications.error(error.to_string()),
+        }
+    }
+
+    fn reload_resources(&mut self) {
+        if self.resource_paths.is_none() {
+            self.notifications
+                .warning("no resource locations configured for this session");
+            return;
+        }
+        if self.events_rx.is_some() || self.compact_rx.is_some() {
+            self.reload_pending = true;
+            self.notifications
+                .info("resources will reload when the active turn finishes".to_string());
+            return;
+        }
+        self.reload_pending = false;
+        let Some(paths) = &self.resource_paths else {
+            return;
+        };
+        match paths.load() {
+            Ok(snapshot) => {
+                let warnings = snapshot.warnings.iter().chain(snapshot.skills.warnings());
+                let diagnostics = warnings
+                    .map(|warning| format!("{} — {}", warning.path.display(), warning.message))
+                    .collect::<Vec<_>>();
+                self.skills = snapshot.skills.clone();
+                self.editor.set_hints(commands::hints(&self.skills));
+                self.agent.replace_resources(snapshot);
+                if diagnostics.is_empty() {
+                    self.notifications.info(format!(
+                        "reloaded {} skills and prompt instructions",
+                        self.skills.len()
+                    ));
+                } else {
+                    self.notifications.warning(format!(
+                        "resources reloaded with diagnostics:\n{}",
+                        diagnostics.join("\n")
+                    ));
+                }
+            }
+            Err(error) => self
+                .notifications
+                .error(format!("resources were not reloaded: {error}")),
         }
     }
 
@@ -937,6 +995,13 @@ impl App {
     }
 
     fn start_turn(&mut self, submitted: String, prompt: String) {
+        let prompt = match self.agent.expand_input(&prompt) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
         // The session owns the conversation and writes its own system prompt, so
         // the app hands over the new words and nothing else.
         self.session.turns.push(Turn {
@@ -2020,6 +2085,10 @@ impl Component for App {
                 self.session.status = None;
                 self.session.bump();
             }
+            dirty = true;
+        }
+        if self.reload_pending && self.events_rx.is_none() && self.compact_rx.is_none() {
+            self.reload_resources();
             dirty = true;
         }
 
@@ -3824,6 +3893,103 @@ mod tests {
         let reply = &app.session.turns[0].reply;
         assert!(reply.contains("Read the reference first."), "{reply}");
         assert!(reply.contains("extract report.pdf"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_stream_and_keeps_history_and_expanded_queue_content() {
+        let skills = skills_holding("reload", "pdf-tools", "PDF work", "Original instructions");
+        let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
+        let cwd = path
+            .parent()
+            .expect("skill directory")
+            .parent()
+            .expect("root")
+            .to_path_buf();
+        std::fs::create_dir_all(cwd.join(".git")).expect("repo marker");
+        let mut app = app_with_skills(skills);
+        app.resource_paths = Some(ResourcePaths {
+            cwd: cwd.clone(),
+            config_dir: None,
+            home_dir: None,
+            extra_skills: vec![cwd.clone()],
+        });
+        app.submit("first".to_string());
+        app.submit("/queue /skill:pdf-tools extract report.pdf".to_string());
+        app.submit("/reload".to_string());
+        assert!(app.reload_pending);
+        std::fs::write(
+            &path,
+            "---\ndescription: Updated PDF work\n---\nNew instructions",
+        )
+        .expect("update skill");
+        std::fs::write(cwd.join("AGENTS.md"), "Reloaded project rules").expect("rules");
+        settle_turn(&mut app).await;
+        assert!(!app.reload_pending);
+        assert_eq!(
+            app.skills.get("pdf-tools").expect("skill").description(),
+            "Updated PDF work"
+        );
+        assert_eq!(
+            app.agent.prompt_context().project_rules[0].content,
+            "Reloaded project rules"
+        );
+        assert_eq!(app.session.turns.len(), 2);
+        assert!(
+            app.session.turns[1].reply.contains("Original instructions"),
+            "already queued messages keep their expanded text"
+        );
+        assert!(
+            app.agent.conversation_len() >= 4,
+            "reload retains conversation"
+        );
+        app.submit("/skill:pdf-tools use new body".to_string());
+        settle_turn(&mut app).await;
+        assert!(app.session.turns[2].reply.contains("New instructions"));
+        std::fs::remove_file(path).expect("remove skill");
+        app.submit("/reload".to_string());
+        assert!(app.skills.is_empty());
+        assert_eq!(app.session.turns.len(), 3);
+        std::fs::remove_dir_all(cwd).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_reload_preserves_previous_resources() {
+        let skills = skills_holding("failed-reload", "pdf-tools", "PDF work", "Body");
+        let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
+        let mut app = app_with_skills(skills);
+        app.resource_paths = Some(ResourcePaths {
+            cwd: path.join("missing"),
+            config_dir: None,
+            home_dir: None,
+            extra_skills: Vec::new(),
+        });
+        app.submit("/reload".to_string());
+        assert!(app.skills.get("pdf-tools").is_some());
+        assert!(
+            app.notifications.current().is_some_and(
+                |(kind, text)| kind == NoticeKind::Error && text.contains("not reloaded")
+            )
+        );
+    }
+
+    #[test]
+    fn hidden_skill_is_offered_to_user_but_not_advertised_to_model() {
+        let skills = skills_holding("hidden-completion", "manual", "Manual work", "Body");
+        let path = skills.get("manual").expect("skill").path().to_path_buf();
+        std::fs::write(
+            &path,
+            "---\ndescription: Manual work\ndisable-model-invocation: true\n---\nBody",
+        )
+        .expect("skill");
+        let skills = Skills::load(&[], &[path]);
+        let hints = commands::hints(&skills);
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.name == "skill:manual"
+                    && hint.description.contains("explicit only"))
+        );
+        assert_eq!(skills.visible_len(), 0);
     }
 
     #[tokio::test]

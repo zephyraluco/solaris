@@ -31,7 +31,9 @@ use solaris_provider::provider_spec;
 use solaris_tools::Tool;
 
 use crate::mode::Mode;
+use crate::resources::PromptContext;
 use crate::skills::Skills;
+use std::path::Path;
 
 /// The tool a model opens a file with, which is the one a skill is read by.
 const READ_TOOL: &str = "read";
@@ -132,11 +134,31 @@ pub(crate) fn existing_summary(messages: &[Message]) -> Option<String> {
 /// `SKILL.md` scan turned up, of which only the names, descriptions and files
 /// are written here; `provider` is the id the turn is resolved to, whose note is
 /// appended last.
+#[cfg(test)]
 pub fn system_prompt(
     mode: Mode,
     tools: &[Arc<dyn Tool>],
     skills: &Skills,
     provider: Option<&str>,
+) -> String {
+    build_system_prompt(
+        mode,
+        tools,
+        skills,
+        provider,
+        Path::new("."),
+        &PromptContext::default(),
+    )
+}
+
+/// Build the prompt with the session's actual directory and instruction sources.
+pub(crate) fn build_system_prompt(
+    mode: Mode,
+    tools: &[Arc<dyn Tool>],
+    skills: &Skills,
+    provider: Option<&str>,
+    cwd: &Path,
+    context: &PromptContext,
 ) -> String {
     let mut prompt = String::new();
 
@@ -144,6 +166,7 @@ pub fn system_prompt(
         "You are solaris, a terminal assistant. You work in the directory solaris was started in, \
          you act by calling the tools declared to you, and your replies are read in a terminal.\n",
     );
+    let _ = writeln!(prompt, "\n# Working directory\n{}", cwd.display());
 
     prompt.push_str("\n# Working mode\n");
     prompt.push_str(mode.instructions());
@@ -187,6 +210,23 @@ pub fn system_prompt(
         prompt.push_str("\n# This endpoint\n");
         prompt.push_str(note);
         prompt.push('\n');
+    }
+
+    for (title, files) in [
+        ("Project instructions", &context.project_rules),
+        ("Additional instructions", &context.append_system),
+    ] {
+        if !files.is_empty() {
+            let _ = writeln!(prompt, "\n# {title}");
+            for file in files {
+                let _ = writeln!(
+                    prompt,
+                    "\n--- Begin instructions: {} ---\n{}\n--- End instructions ---",
+                    file.path.display(),
+                    file.content.trim()
+                );
+            }
+        }
     }
 
     prompt

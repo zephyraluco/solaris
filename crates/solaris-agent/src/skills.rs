@@ -19,9 +19,7 @@
 //! and it does not fail a skill over a bad name. Everything it cannot use is
 //! reported as a [`SkillWarning`] and left behind.
 //!
-//! Frontmatter is read by [`parse_frontmatter`](self) rather than by a YAML
-//! crate: the four fields worth having are scalars and block scalars, and a
-//! session should not gain a dependency for them.
+//! Frontmatter uses a YAML parser so portable skill files retain their meaning.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -36,13 +34,6 @@ const MAX_NAME_LENGTH: usize = 64;
 
 /// Longest description the specification allows.
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
-
-/// How deep below a configured directory the scan recurses.
-///
-/// Directories are followed through symlinks, so the limit is what keeps a link
-/// pointing at its own parent from scanning forever. It is far below anything a
-/// real skills tree needs.
-const MAX_DEPTH: usize = 8;
 
 /// Which of the configured places a skill came from.
 ///
@@ -179,8 +170,10 @@ impl Skill {
     /// wants them.
     pub fn invocation_prompt(&self, args: &str) -> String {
         let mut prompt = format!(
-            "Use the `{}` skill. Its instructions follow.\n\n{}\n",
+            "Use the `{}` skill.\nSkill file: {}\nResolve relative references against: {}\n\nIts instructions follow:\n\n{}\n",
             self.name,
+            self.path.display(),
+            self.base_dir.display(),
             self.instructions.trim()
         );
         let args = args.trim();
@@ -190,6 +183,35 @@ impl Skill {
             prompt.push('\n');
         }
         prompt
+    }
+
+    /// Read the current instructions, rather than invoking a stale cached body.
+    pub fn read_invocation(&self, args: &str) -> Result<String, crate::InputError> {
+        let text =
+            std::fs::read_to_string(&self.path).map_err(|source| crate::InputError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
+        let (frontmatter, instructions) =
+            parse_document(&text).map_err(|message| crate::InputError::Invalid {
+                path: self.path.clone(),
+                message,
+            })?;
+        if frontmatter
+            .description
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(crate::InputError::Invalid {
+                path: self.path.clone(),
+                message: "description is required".to_string(),
+            });
+        }
+        let current = Self {
+            instructions,
+            ..self.clone()
+        };
+        Ok(current.invocation_prompt(args))
     }
 
     /// The description as one line.
@@ -228,7 +250,14 @@ impl Skills {
         let mut warnings = Vec::new();
 
         for root in roots {
-            scan(&root.dir, root.source, true, 0, &mut found, &mut warnings);
+            scan(
+                &root.dir,
+                root.source,
+                true,
+                &mut BTreeSet::new(),
+                &mut found,
+                &mut warnings,
+            );
         }
 
         for path in extra {
@@ -241,7 +270,14 @@ impl Skills {
             }
             match path.metadata() {
                 Ok(metadata) if metadata.is_dir() => {
-                    scan(path, SkillSource::Path, true, 0, &mut found, &mut warnings);
+                    scan(
+                        path,
+                        SkillSource::Path,
+                        true,
+                        &mut BTreeSet::new(),
+                        &mut found,
+                        &mut warnings,
+                    );
                 }
                 Ok(metadata) if metadata.is_file() && is_markdown(path) => {
                     found.push(Found {
@@ -410,19 +446,25 @@ fn scan(
     dir: &Path,
     source: SkillSource,
     include_root_files: bool,
-    depth: usize,
+    visited: &mut BTreeSet<PathBuf>,
     found: &mut Vec<Found>,
     warnings: &mut Vec<SkillWarning>,
 ) {
-    if depth > MAX_DEPTH {
+    let Ok(real) = dir.canonicalize() else {
+        return;
+    };
+    if !visited.insert(real) {
         return;
     }
-
-    // A directory that cannot be read has no skills in it, as far as anyone can
-    // tell; that is not worth a warning, because a root that does not exist yet
-    // is the normal state of one nobody has written a skill in.
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(SkillWarning {
+                path: dir.to_path_buf(),
+                message: format!("could not scan skill directory: {error}"),
+            });
+            return;
+        }
     };
     let mut entries: Vec<std::fs::DirEntry> = entries.filter_map(Result::ok).collect();
     // Read order is whatever the filesystem feels like; sorting is what makes
@@ -466,7 +508,7 @@ fn scan(
         };
 
         if metadata.is_dir() {
-            scan(&path, source, false, depth + 1, found, warnings);
+            scan(&path, source, false, visited, found, warnings);
         } else if metadata.is_file() && include_root_files && is_markdown(&path) {
             found.push(Found {
                 path,
@@ -495,6 +537,19 @@ fn read_skill(
     declared: bool,
     source: SkillSource,
 ) -> (Option<Skill>, Vec<SkillWarning>) {
+    let absolute = match std::path::absolute(path) {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                None,
+                vec![SkillWarning {
+                    path: path.to_path_buf(),
+                    message: format!("could not resolve skill path: {error}"),
+                }],
+            );
+        }
+    };
+    let path = absolute.as_path();
     let mut warnings = Vec::new();
     let Ok(text) = std::fs::read_to_string(path) else {
         warnings.push(SkillWarning {
@@ -504,7 +559,16 @@ fn read_skill(
         return (None, warnings);
     };
 
-    let (frontmatter, instructions) = parse_document(&text);
+    let (frontmatter, instructions) = match parse_document(&text) {
+        Ok(document) => document,
+        Err(message) => {
+            warnings.push(SkillWarning {
+                path: path.to_path_buf(),
+                message,
+            });
+            return (None, warnings);
+        }
+    };
 
     // A loose Markdown file is only a skill if it says what it does; without a
     // description there is nothing to route a model by, and nothing to gain by
@@ -565,33 +629,41 @@ fn read_skill(
 }
 
 /// The fields of a `SKILL.md` frontmatter block that this crate reads.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "disable-model-invocation")]
     disable_model_invocation: bool,
 }
 
 /// Split a `SKILL.md` into its frontmatter and its instructions.
 ///
 /// A block only counts when the file opens with `---` and a later line is
-/// exactly `---`; anything else is a file with no frontmatter, which is how a
-/// plain Markdown skill is written, and how a block whose closing fence was
-/// mistyped reads.
-fn parse_document(text: &str) -> (Frontmatter, String) {
+/// exactly `---`. An opening fence without a closing fence is an error.
+fn parse_document(text: &str) -> Result<(Frontmatter, String), String> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
 
     let body = normalized.trim();
     let Some(rest) = normalized.strip_prefix("---\n") else {
-        return (Frontmatter::default(), body.to_string());
+        return Ok((Frontmatter::default(), body.to_string()));
     };
     let Some((yaml_end, body_start)) = find_closing_fence(rest) else {
-        return (Frontmatter::default(), body.to_string());
+        return Err("frontmatter has no closing --- fence".to_string());
     };
 
-    let frontmatter = parse_frontmatter_fields(&rest[..yaml_end]);
-    (frontmatter, rest[body_start..].trim().to_string())
+    let yaml = &rest[..yaml_end];
+    let mut frontmatter: Frontmatter = if yaml.trim().is_empty() {
+        Frontmatter::default()
+    } else {
+        serde_yaml_ng::from_str(yaml)
+            .map_err(|error| format!("invalid YAML frontmatter: {error}"))?
+    };
+    frontmatter.name = frontmatter.name.and_then(|value| non_empty(&value));
+    frontmatter.description = frontmatter.description.and_then(|value| non_empty(&value));
+    Ok((frontmatter, rest[body_start..].trim().to_string()))
 }
 
 /// Where `rest` stops being frontmatter and starts being instructions.
@@ -607,206 +679,6 @@ fn find_closing_fence(rest: &str) -> Option<(usize, usize)> {
         start += line.len();
     }
     None
-}
-
-/// Read the fields this crate uses out of a frontmatter block.
-///
-/// The block is a subset of YAML, read as one: top-level `key: value` pairs, `|`
-/// and `>` blocks, single and double quotes, `#` comments, and a plain scalar
-/// that runs on into the lines indented under it. A key this crate has no use
-/// for is passed over whole, nested structure and all — which is why a
-/// `metadata:` map costs nothing here, and also why only the three keys it reads
-/// are read at all: they are the ones that hold a scalar.
-fn parse_frontmatter_fields(yaml: &str) -> Frontmatter {
-    let mut fields = Frontmatter::default();
-    let mut lines = yaml.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // An indented line belongs to the key above it, which has already been
-        // read or passed over.
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        let Some(value) = read_value(&mut lines, value.trim(), is_scalar_key(key)) else {
-            continue;
-        };
-
-        match key {
-            "name" => fields.name = non_empty(&value),
-            "description" => fields.description = non_empty(&value),
-            "disable-model-invocation" => {
-                fields.disable_model_invocation = value.eq_ignore_ascii_case("true");
-            }
-            _ => {}
-        }
-    }
-
-    fields
-}
-
-/// Whether a key holds a value, as opposed to a structure written below it.
-fn is_scalar_key(key: &str) -> bool {
-    matches!(key, "name" | "description" | "disable-model-invocation")
-}
-
-/// Whether a value introduces a block written over the lines below it.
-fn is_block_header(value: &str) -> bool {
-    matches!(value, "|" | "|-" | "|+" | ">" | ">-" | ">+")
-}
-
-/// Read one key's value, consuming whatever lines belong to it.
-///
-/// `scalar` is whether this is a key the caller can use; a key it cannot is
-/// passed over, and so is whatever is written under it.
-fn read_value(
-    lines: &mut std::iter::Peekable<std::str::Lines<'_>>,
-    inline: &str,
-    scalar: bool,
-) -> Option<String> {
-    if is_block_header(inline) {
-        let block = read_indented(lines, inline.starts_with('>'));
-        if !scalar {
-            return None;
-        }
-        return non_empty(&block);
-    }
-
-    if inline.is_empty() {
-        if !scalar {
-            skip_indented(lines);
-            return None;
-        }
-        return non_empty(&read_indented(lines, true));
-    }
-
-    let head = unquote(strip_comment(inline));
-    if !scalar {
-        skip_indented(lines);
-        return Some(head);
-    }
-
-    // A plain scalar runs on into the lines indented under it — which is how a
-    // description written over two lines is read — until a blank line or the
-    // next key at this level.
-    let mut parts = vec![head];
-    while let Some(next) = lines.peek() {
-        if next.trim().is_empty() || !(next.starts_with(' ') || next.starts_with('\t')) {
-            break;
-        }
-        parts.push(lines.next().unwrap_or_default().trim().to_string());
-    }
-    non_empty(&parts.join(" "))
-}
-
-/// Collect an indented block, up to the first line that ends it.
-///
-/// A folded block (`>`) joins its lines with spaces and a literal one (`|`)
-/// keeps them, which is the only distinction that matters for a description.
-fn read_indented(lines: &mut std::iter::Peekable<std::str::Lines<'_>>, folded: bool) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut indent: Option<usize> = None;
-
-    while let Some(next) = lines.peek() {
-        if next.trim().is_empty() {
-            lines.next();
-            parts.push(String::new());
-            continue;
-        }
-        if !next.starts_with(' ') && !next.starts_with('\t') {
-            break;
-        }
-
-        let column = *indent.get_or_insert_with(|| next.len() - next.trim_start().len());
-        let line = lines.next().unwrap_or_default();
-        parts.push(line.get(column..).unwrap_or_default().to_string());
-    }
-
-    while parts.last().is_some_and(String::is_empty) {
-        parts.pop();
-    }
-    if folded {
-        parts.join(" ")
-    } else {
-        parts.join("\n")
-    }
-}
-
-/// Drop an indented block, for a key whose value is a structure this crate does
-/// not read.
-fn skip_indented(lines: &mut std::iter::Peekable<std::str::Lines<'_>>) {
-    while let Some(next) = lines.peek() {
-        if next.trim().is_empty() || next.starts_with(' ') || next.starts_with('\t') {
-            lines.next();
-        } else {
-            break;
-        }
-    }
-}
-
-/// Drop a `#` comment from a value, leaving one inside quotes alone.
-fn strip_comment(value: &str) -> &str {
-    let mut quote: Option<char> = None;
-    // A comment starts a value or follows a space; the start of a value counts.
-    let mut spaced = true;
-
-    for (index, character) in value.char_indices() {
-        match quote {
-            Some(open) => {
-                if character == open {
-                    quote = None;
-                }
-            }
-            None => match character {
-                '"' | '\'' => quote = Some(character),
-                '#' if spaced => return value[..index].trim_end(),
-                _ => {}
-            },
-        }
-        spaced = character == ' ' || character == '\t';
-    }
-
-    value
-}
-
-/// Remove the quotes a scalar was written with.
-fn unquote(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let quoted = bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''));
-    if !quoted {
-        return value.to_string();
-    }
-
-    let inner = &value[1..value.len() - 1];
-    if bytes[0] == b'\'' {
-        return inner.replace("''", "'");
-    }
-
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            out.push(character);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
 }
 
 /// `value` when it has anything in it, so an empty one reads as absent.
@@ -914,6 +786,52 @@ mod tests {
 
     fn load(dir: &Path) -> Skills {
         Skills::load(&[SkillRoot::new(dir, SkillSource::Project)], &[])
+    }
+
+    #[test]
+    fn yaml_escapes_are_decoded_and_malformed_documents_are_diagnosed() {
+        let dir = test_dir("yaml");
+        write(
+            &dir,
+            "escaped/SKILL.md",
+            "---\ndescription: \"Use \\u4E2D\\u6587\"\n---\nBody",
+        );
+        write(
+            &dir,
+            "broken/SKILL.md",
+            "---\ndescription: [broken\n---\nBody",
+        );
+        let skills = load(&dir);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills.get("escaped").expect("skill").description(),
+            "Use 中文"
+        );
+        assert!(
+            skills
+                .warnings()
+                .iter()
+                .any(|warning| warning.message.contains("invalid YAML"))
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn deleted_or_malformed_skill_cannot_invoke_cached_instructions() {
+        let dir = test_dir("fresh-body");
+        let path = write(&dir, "skill/SKILL.md", "---\ndescription: Work\n---\nBody");
+        let skills = load(&dir);
+        std::fs::write(&path, "---\ndescription: [broken\n---\nBody").expect("update");
+        assert!(matches!(
+            crate::expand_input("/skill:skill", &skills),
+            Err(crate::InputError::Invalid { .. })
+        ));
+        std::fs::remove_file(path).expect("remove");
+        assert!(matches!(
+            crate::expand_input("/skill:skill", &skills),
+            Err(crate::InputError::Read { .. })
+        ));
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
@@ -1147,7 +1065,8 @@ mod tests {
         // not treat the body as YAML either.
         assert!(load(&dir).is_empty());
 
-        let (frontmatter, body) = parse_document(&std::fs::read_to_string(&path).expect("read"));
+        let (frontmatter, body) =
+            parse_document(&std::fs::read_to_string(&path).expect("read")).expect("document");
         assert!(frontmatter.name.is_none());
         assert_eq!(body, "# Nothing declared");
     }
@@ -1155,7 +1074,8 @@ mod tests {
     #[test]
     fn a_body_may_contain_a_fence_that_is_not_the_end() {
         let (frontmatter, body) =
-            parse_document("---\ndescription: Has a code fence.\n---\n```\n---\n```\nEnd.\n");
+            parse_document("---\ndescription: Has a code fence.\n---\n```\n---\n```\nEnd.\n")
+                .expect("document");
         assert_eq!(
             frontmatter.description.as_deref(),
             Some("Has a code fence.")

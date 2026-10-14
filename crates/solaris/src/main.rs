@@ -15,9 +15,7 @@ use solaris::{
     App, AppOptions, BackendFactory, Clipboard, Companion, Config, Mode, Preferences,
     RecentActivity, Soul,
 };
-use solaris_agent::{
-    SkillRoot, SkillSource, Skills, ToolRegistry, ToolSelection, default_tool_names,
-};
+use solaris_agent::{ResourcePaths, ToolRegistry, ToolSelection, default_tool_names};
 use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
@@ -110,10 +108,15 @@ fn main() -> Result<()> {
     let recent = load_recent(recent_path.as_deref());
     let settings = load_settings(settings_path.as_deref());
 
-    // Skills are found once, here: the session holds the same list for every
-    // turn, and `/skills` shows the user what the model was told about.
-    let skills = load_skills(state_dir.as_deref(), &args.skill);
-    for warning in skills.warnings() {
+    let resource_paths = ResourcePaths {
+        cwd: std::env::current_dir()?,
+        config_dir: state_dir,
+        home_dir: home_dir(),
+        extra_skills: args.skill.clone(),
+    };
+    let resources = resource_paths.load()?;
+    let skills = resources.skills;
+    for warning in skills.warnings().iter().chain(&resources.warnings) {
         eprintln!("solaris: {} — {}", warning.path.display(), warning.message);
     }
 
@@ -276,6 +279,8 @@ fn main() -> Result<()> {
         discover_models: true,
         tools,
         skills,
+        prompt_context: resources.prompt,
+        resource_paths: Some(resource_paths),
         ask_approval: args.confirm_tools,
     });
     tui.set_root(Box::new(app));
@@ -335,42 +340,6 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
 
     base.map(|dir| dir.join("solaris"))
-}
-
-/// The skills this run can draw on.
-///
-/// The user's own skills are found first, so a project cannot shadow one of them
-/// by shipping a directory with the same name — the order pi reads them in, and
-/// the safer one: cloning a repository should not silently replace a skill you
-/// wrote. A `--skill` path is read last and loses every collision it takes part
-/// in, because naming one on the command line is a request to add it, not to
-/// override something.
-///
-/// The `.agents/skills` pair is the [Agent Skills](https://agentskills.io) shared
-/// location, so a skill written for another harness works here unchanged.
-fn load_skills(config_dir: Option<&Path>, extra: &[PathBuf]) -> Skills {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    let mut roots = Vec::new();
-    if let Some(dir) = config_dir {
-        roots.push(SkillRoot::new(dir.join("skills"), SkillSource::User));
-    }
-    if let Some(home) = home_dir() {
-        roots.push(SkillRoot::new(
-            home.join(".agents").join("skills"),
-            SkillSource::User,
-        ));
-    }
-    roots.push(SkillRoot::new(
-        cwd.join(".solaris").join("skills"),
-        SkillSource::Project,
-    ));
-    roots.push(SkillRoot::new(
-        cwd.join(".agents").join("skills"),
-        SkillSource::Project,
-    ));
-
-    Skills::load(&roots, extra)
 }
 
 /// The user's home directory, which is where the shared skills location is.

@@ -18,7 +18,8 @@
 //! application holds it for the session), while the loop that drains it lives for
 //! exactly one turn and has to be able to look without blocking.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use crate::{InputError, ResourceSnapshot, expand_input};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 /// Messages waiting for the agent to read them.
 ///
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Debug, Clone, Default)]
 pub struct Queue {
     pending: Arc<Mutex<Vec<String>>>,
+    resources: Option<Arc<RwLock<ResourceSnapshot>>>,
 }
 
 impl Queue {
@@ -36,17 +38,39 @@ impl Queue {
         Self::default()
     }
 
+    pub(crate) fn for_resources(resources: Arc<RwLock<ResourceSnapshot>>) -> Self {
+        Self {
+            resources: Some(resources),
+            ..Default::default()
+        }
+    }
+
     /// Add `message` to the queue.
     ///
     /// Returns whether it was queued: a blank message is not, and a caller may
     /// want to say so instead of reporting a message that will never arrive.
     pub fn push(&self, message: impl Into<String>) -> bool {
+        self.try_push(message).unwrap_or(false)
+    }
+
+    /// Expand and enqueue input, returning skill errors to the caller.
+    /// Use this instead of `push` when input may contain a skill command.
+    pub fn try_push(&self, message: impl Into<String>) -> Result<bool, InputError> {
         let message = message.into();
         if message.trim().is_empty() {
-            return false;
+            return Ok(false);
         }
+        let message = match &self.resources {
+            Some(resources) => {
+                let snapshot = resources
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                expand_input(&message, &snapshot.skills)?
+            }
+            None => message,
+        };
         self.lock().push(message);
-        true
+        Ok(true)
     }
 
     /// Take everything waiting, oldest first.

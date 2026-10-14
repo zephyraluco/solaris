@@ -21,10 +21,12 @@ mod agent;
 mod approver;
 mod compaction;
 mod conversation;
+mod input;
 mod mode;
 mod overflow;
 mod prompt;
 mod queue;
+mod resources;
 mod session;
 mod skills;
 
@@ -33,8 +35,10 @@ pub use approver::{
     AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, DenyAll, FnApprover,
 };
 pub use compaction::Compaction;
+pub use input::{InputError, expand_input};
 pub use mode::{Mode, default_tool_names};
 pub use queue::Queue;
+pub use resources::{PromptContext, PromptFile, ResourcePaths, ResourceSnapshot};
 pub use session::DEFAULT_MAX_PARALLEL;
 pub use skills::{Skill, SkillRoot, SkillSource, SkillWarning, Skills};
 

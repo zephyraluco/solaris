@@ -166,12 +166,12 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 | 方面 | pi | solaris |
 | --- | --- | --- |
 | 提示词里的形状 | `<available_skills>` XML 块 | 与其它段落一致的 Markdown 列表，一份提示词只有一种标记风格 |
-| frontmatter 解析 | `yaml` 包，完整 YAML | 自己实现的子集（顶层标量、`\|` / `>` 块、引号、注释、续行），不为这件事引一个依赖 |
+| frontmatter 解析 | `yaml` 包，完整 YAML | `serde_yaml_ng` 解析 YAML，格式错误给出诊断 |
 | 忽略文件 | 读 `.gitignore` / `.ignore` / `.fdignore` | 不读；只跳过隐藏条目与 `node_modules` |
 | 散落 `.md` 的名字回退 | 父目录名（对散落文件几乎等于技能根目录的名字） | 文件自身的名字（`release.md` → `release`），父目录只用来放它 |
-| 说明的取得 | 模型用 `read`（或 `bash`）打开 | 同上；另外 `/skill:<name>` 会把说明直接作为这一轮的提示词送出 |
+| 说明的取得 | 模型用 `read`（或 `bash`）打开；显式命令重新读取文件 | 模型按需读取；显式命令重新读取正文，携带绝对路径与基目录，普通输入及两类队列统一展开 |
 | 技能命令参与补全 | 由 `enableSkillCommands` 设置决定，手敲的 `/skill:name` 仍可用 | 总是参与：`/skill` 一敲下去就把每个技能按名字列出来，带来源徽标与 `(n/总数)` |
 | 提示词里点名的读取工具 | 由调用方传 `"read"` / `"bash"` / `"indirect"` | 只在这一轮真的声明了 `read` 时才点名，否则不写机制 |
-| 重新扫描 | `/reload` | 没有；启动时扫一次，改过的技能要重开才生效 |
+| 重新扫描 | `/reload` | `/reload` 更新技能、项目规则和追加提示词；在活动轮或压缩结束后应用，保留会话与已展开队列内容 |
 
 > pi 侧：`packages/coding-agent/src/core/skills.ts`、`utils/frontmatter.ts`、`core/system-prompt.ts`

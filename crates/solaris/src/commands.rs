@@ -82,6 +82,11 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         args: "<prompt>",
     },
     SlashCommandSpec {
+        name: "reload",
+        description: "Reload skills and project instructions",
+        args: "",
+    },
+    SlashCommandSpec {
         name: "skills",
         description: "List the skills available",
         args: "",
@@ -147,7 +152,7 @@ pub fn hints(skills: &Skills) -> Vec<CommandHint> {
         .filter(|spec| spec.name != SKILL_PREFIX)
         .map(|spec| CommandHint::new(spec.name, spec.description, spec.args))
         .collect();
-    hints.extend(skills.visible().map(skill_hint));
+    hints.extend(skills.iter().map(skill_hint));
     hints
 }
 
@@ -160,9 +165,14 @@ fn skill_hint(skill: &Skill) -> CommandHint {
     CommandHint::new(
         format!("{SKILL_PREFIX}{}", skill.name()),
         format!(
-            "[{}] {}",
+            "[{}] {}{}",
             skill.source().badge(),
-            skill.description_inline()
+            skill.description_inline(),
+            if skill.disable_model_invocation() {
+                " (explicit only)"
+            } else {
+                ""
+            }
         ),
         "[request]",
     )
