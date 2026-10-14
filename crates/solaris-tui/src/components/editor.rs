@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
 use crate::component::{Component, KeyResult, MouseResult};
-use crate::util::{display_width, rect_contains, truncate_to_width};
+use crate::util::{display_width, rect_contains, truncate_to_width, window_start};
 
 /// Maximum text rows before the editor starts scrolling.
 const MAX_TEXT_ROWS: u16 = 8;
@@ -338,8 +338,12 @@ impl Editor {
             .collect()
     }
 
+    /// The rows the popup needs: a row per command it shows, and one more for
+    /// the counter when they do not all fit.
     fn completion_rows(&self) -> u16 {
-        self.completions().len().min(MAX_COMPLETION_ROWS as usize) as u16
+        let matched = self.completions().len();
+        let shown = matched.min(MAX_COMPLETION_ROWS as usize);
+        (shown + usize::from(matched > shown)) as u16
     }
 
     fn accept_completion(&mut self) -> bool {
@@ -645,17 +649,50 @@ impl Editor {
     /// The slash-command list, drawn under the input frame rather than inside
     /// it: the highlighted row is marked with `›`, then the name, then a dimmed
     /// description.
+    ///
+    /// Every description starts in the same column so a list of names reads as a
+    /// table rather than as a ragged paragraph, and when more commands match than
+    /// fit, the row under them says which of them the highlight is on.
     fn render_completions(&self, buf: &mut Buffer, area: Rect, completions: &[usize]) {
         if area.height == 0 || area.width < 6 {
             return;
         }
 
-        for (row, hint_index) in completions.iter().take(area.height as usize).enumerate() {
+        // Two cells of marker, then the column, then a space, then at least four
+        // cells of description.
+        let widest = area.width.saturating_sub(7).max(1) as usize;
+        // Measured over every match rather than over the rows on screen: a column
+        // that moved while scrolling would be worse than none.
+        let name_column = completions
+            .iter()
+            .map(|index| display_width(&self.hints[*index].name) + 1)
+            .max()
+            .unwrap_or(1)
+            .clamp(1, widest);
+        let description_x = area.x + 2 + name_column as u16 + 1;
+        let remaining = area.width.saturating_sub(description_x - area.x);
+
+        // The counter is the last row, so it costs a command row — not worth a
+        // row that is not there.
+        let total = completions.len();
+        if total == 0 {
+            return;
+        }
+        let mut rows = total.min(area.height as usize);
+        let counter = total > rows && rows > 1;
+        if counter {
+            rows -= 1;
+        }
+
+        // A selection that the window does not show is not a selection. There is
+        // no offset to remember here — a command list is short enough that
+        // recomputing the window each frame is what reads best.
+        let highlighted = self.completion_index.min(total - 1);
+        let start = window_start(total, rows, highlighted, 0);
+
+        for (row, hint_index) in completions.iter().skip(start).take(rows).enumerate() {
             let y = area.y + row as u16;
-            let selected = row
-                == self
-                    .completion_index
-                    .min(completions.len().saturating_sub(1));
+            let selected = start + row == highlighted;
             let style = if selected {
                 self.styles.completion_selected
             } else {
@@ -669,20 +706,23 @@ impl Editor {
             // the bug that panicked whenever a filter left fewer matches than
             // the matched command's position.
             let hint = &self.hints[*hint_index];
-            let name_width = area.width.saturating_sub(4) as usize;
-            let label = truncate_to_width(&format!("/{}", hint.name), name_width, "…");
-            let label_cells = display_width(&label) as u16;
+            let label = truncate_to_width(&format!("/{}", hint.name), name_column, "…");
             buf.set_string(area.x + 2, y, &label, style);
-            let remaining = area.width.saturating_sub(2 + label_cells + 1);
+
             if remaining >= 4 {
                 let description = truncate_to_width(&hint.description, remaining as usize, "…");
-                buf.set_string(
-                    area.x + 3 + label_cells,
-                    y,
-                    description,
-                    self.styles.placeholder,
-                );
+                buf.set_string(description_x, y, description, self.styles.placeholder);
             }
+        }
+
+        if counter {
+            let position = highlighted + 1;
+            buf.set_string(
+                area.x + 2,
+                area.y + rows as u16,
+                format!("({position}/{total})"),
+                self.styles.placeholder,
+            );
         }
     }
 
@@ -1174,6 +1214,101 @@ mod tests {
         let text = buffer_text(&buf);
         assert!(text.contains("/help show help"), "{text}");
         assert!(!text.contains("/helpShow"), "{text}");
+    }
+
+    #[test]
+    fn completion_descriptions_start_in_one_column() {
+        let mut editor = Editor::new();
+        editor.set_hints(vec![
+            CommandHint::new("help", "show help", ""),
+            CommandHint::new("model", "switch model", ""),
+        ]);
+        type_text(&mut editor, "/");
+
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        editor.render(&mut buf, area);
+
+        // Descriptions used to start wherever each name happened to end, which
+        // left a short name's description out of line with a long one's. The
+        // column is counted in characters: the selected row's `›` is three bytes
+        // but one cell.
+        let text = buffer_text(&buf);
+        let column = |line: &str, needle: &str| {
+            let byte = line.find(needle).expect("the description");
+            line[..byte].chars().count()
+        };
+        let first = text.lines().nth(3).expect("the first row");
+        let second = text.lines().nth(4).expect("the second row");
+        let one = column(first, "show help");
+        let two = column(second, "switch model");
+
+        assert_eq!(
+            one,
+            two,
+            "the descriptions start in different columns ({one} vs {two}):\n{}",
+            text.replace(' ', "·")
+        );
+        assert!(one > 2 + "/model".len(), "behind the widest name: {text}");
+    }
+
+    #[test]
+    fn a_list_longer_than_the_popup_says_which_of_them_is_highlighted() {
+        let mut editor = Editor::new();
+        editor.set_hints(
+            (0..12)
+                .map(|index| CommandHint::new(format!("cmd{index:02}"), "does something", ""))
+                .collect(),
+        );
+        type_text(&mut editor, "/");
+
+        assert_eq!(
+            editor.completion_rows(),
+            MAX_COMPLETION_ROWS + 1,
+            "the matches, capped, plus a row for the counter"
+        );
+        assert_eq!(
+            editor.desired_height(60),
+            Some(2 + MAX_COMPLETION_ROWS + 1 + 1)
+        );
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        editor.render(&mut buf, area);
+
+        let text = buffer_text(&buf);
+        assert!(text.contains("(1/12)"), "{text}");
+    }
+
+    #[test]
+    fn the_list_follows_the_highlight_past_the_last_row() {
+        let mut editor = Editor::new();
+        editor.set_hints(
+            (0..12)
+                .map(|index| CommandHint::new(format!("cmd{index:02}"), "does something", ""))
+                .collect(),
+        );
+        type_text(&mut editor, "/");
+        for _ in 0..7 {
+            editor.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        }
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        editor.render(&mut buf, area);
+
+        // The highlight used to walk off the bottom of a list that stayed put,
+        // leaving nothing marked on screen.
+        let text = buffer_text(&buf);
+        assert!(text.contains("(8/12)"), "{text}");
+        assert!(
+            text.contains("› /cmd07"),
+            "the highlighted command is on screen: {text}"
+        );
+        assert!(
+            !text.contains("/cmd00"),
+            "and the list has moved past its first rows: {text}"
+        );
     }
 
     #[test]

@@ -44,6 +44,14 @@ impl Tool for EditTool {
          lines, in one edit instead of several overlapping ones. Keep `oldText` small but unique."
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "Each `oldText` must match the file exactly and occur once, so copy it verbatim and \
+             include enough surrounding lines to be unambiguous. Several changes to one file go \
+             in a single call's `edits`.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

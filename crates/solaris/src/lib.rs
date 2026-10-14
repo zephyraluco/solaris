@@ -43,7 +43,7 @@ pub use config::{Config, Preferences};
 pub use connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 pub use dialogs::{ConfirmAction, DialogMessage};
 pub use recent::{RecentActivity, RecentEntry};
-pub use state::{NoticeKind, NotificationQueue, SessionState, Turn};
+pub use state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, Turn};
 
 // The vocabulary a turn is written in comes from the agent, which is the app's
 // only door to a backend and to the tools.

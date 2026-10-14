@@ -43,6 +43,13 @@ impl Tool for WriteTool {
          file."
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "`write` replaces the whole file with `content`. To change part of a file that \
+             already exists, use `edit` — it keeps the rest untouched.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

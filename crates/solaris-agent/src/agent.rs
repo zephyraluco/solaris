@@ -1,38 +1,22 @@
-//! The session: a resolved backend, the tools a turn may offer, and the handles
-//! the application holds on to.
+//! The session: a resolved backend, the conversation it extends, and the tools a
+//! turn may offer.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use solaris_backend::{AgentEventStream, BackendError, Message};
-use solaris_provider::{BackendChoice, CredentialSource};
+use solaris_backend::{AgentEventStream, BackendError};
+use solaris_provider::{BackendChoice, CredentialSource, context_window_for};
 use solaris_tools::{Cancel, ToolRegistry, ToolSelection};
 
 use crate::approver::{AlwaysApprove, Approver};
+use crate::compaction::Compaction;
+use crate::conversation::Conversation;
 use crate::mode::{Mode, default_tool_names};
-use crate::session::{self, DEFAULT_MAX_PARALLEL};
-
-/// One turn, as the application asks for it.
-#[derive(Debug, Clone)]
-pub struct AgentRequest {
-    /// Prior conversation, oldest first, excluding `prompt`.
-    pub history: Vec<Message>,
-    /// The new user prompt.
-    pub prompt: String,
-    /// The mode the turn runs in, which decides the tools it may use.
-    pub mode: Mode,
-}
-
-impl AgentRequest {
-    /// A request in `mode`, with nothing said yet.
-    pub fn new(history: Vec<Message>, prompt: impl Into<String>, mode: Mode) -> Self {
-        Self {
-            history,
-            prompt: prompt.into(),
-            mode,
-        }
-    }
-}
+use crate::prompt;
+use crate::queue::Queue;
+use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
+use crate::skills::Skills;
+use crate::{InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -53,6 +37,16 @@ pub struct AgentOptions {
     /// There is no cap on how many rounds a turn may take: the loop runs until
     /// the model stops asking, fails, or the turn is cancelled.
     pub max_parallel: usize,
+    /// When the conversation is summarized to stay inside the context window.
+    pub compaction: Compaction,
+    /// The skills this session may draw on.
+    ///
+    /// Held here rather than in the application because the system prompt is
+    /// written here: what the model is told exists and what it can be pointed at
+    /// by name have to be the same list.
+    pub skills: Skills,
+    /// Global and project instructions used by every turn.
+    pub prompt_context: PromptContext,
 }
 
 impl Default for AgentOptions {
@@ -63,6 +57,9 @@ impl Default for AgentOptions {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             temp_dir: std::env::temp_dir(),
             max_parallel: DEFAULT_MAX_PARALLEL,
+            compaction: Compaction::default(),
+            skills: Skills::empty(),
+            prompt_context: PromptContext::default(),
         }
     }
 }
@@ -70,8 +67,10 @@ impl Default for AgentOptions {
 impl AgentOptions {
     /// Options rooted at `cwd`, with the default temp directory.
     pub fn in_directory(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         Self {
-            cwd: cwd.into(),
+            cwd,
             ..Default::default()
         }
     }
@@ -87,6 +86,24 @@ impl AgentOptions {
         self.selection = selection;
         self
     }
+
+    /// The same options with `compaction` deciding when to summarize.
+    pub fn with_compaction(mut self, compaction: Compaction) -> Self {
+        self.compaction = compaction;
+        self
+    }
+
+    /// The same options with `skills` as what this session may draw on.
+    pub fn with_skills(mut self, skills: Skills) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// Append instruction sources to the built-in system prompt.
+    pub fn with_prompt_context(mut self, context: PromptContext) -> Self {
+        self.prompt_context = context;
+        self
+    }
 }
 
 /// A session with a model behind it.
@@ -95,6 +112,11 @@ impl AgentOptions {
 /// which tools a turn declares, running them, feeding the results back, asking
 /// again — happens behind this type. So the app never learns which tools exist,
 /// how many model calls a turn took, or which platform answered.
+///
+/// The conversation lives here rather than in the application because it is the
+/// model's view, not the user's: a summary has to still stand on the next turn, a
+/// steered message has to still be where it landed, and neither is something the
+/// transcript can be asked to reconstruct. [`Agent::clear`] is what forgets it.
 pub struct Agent {
     /// The backend the credentials resolved to, and how it was chosen.
     choice: BackendChoice,
@@ -104,16 +126,34 @@ pub struct Agent {
     options: AgentOptions,
     /// Stops the turn in flight, tools included.
     cancel: Cancel,
+    /// The conversation every turn extends.
+    conversation: Arc<Conversation>,
+    /// Messages that correct the turn that is running.
+    steering: Queue,
+    /// Messages to run as the turn after this one.
+    follow_up: Queue,
+    resources: Arc<RwLock<ResourceSnapshot>>,
 }
 
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
     pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self {
+        let resources = Arc::new(RwLock::new(ResourceSnapshot {
+            skills: options.skills.clone(),
+            prompt: options.prompt_context.clone(),
+            warnings: Vec::new(),
+        }));
+        let steering = Queue::for_resources(Arc::clone(&resources));
+        let follow_up = Queue::for_resources(Arc::clone(&resources));
         Self {
             choice,
             registry,
             options,
             cancel: Cancel::new(),
+            conversation: Arc::new(Conversation::new()),
+            steering,
+            follow_up,
+            resources,
         }
     }
 
@@ -124,6 +164,61 @@ impl Agent {
     /// is running.
     pub fn cancel_handle(&self) -> Cancel {
         self.cancel.clone()
+    }
+
+    /// A handle for messages that correct the turn that is running.
+    ///
+    /// Queued, not delivered: the loop folds a message into the conversation
+    /// before it asks the model again, so one sent while the model is answering
+    /// or while a command runs reaches it at the start of the next round rather
+    /// than in the middle of one. A message that arrives after the model's last
+    /// word still counts — the loop reads the queue once more before deciding the
+    /// turn is over, which is how "stop, do this instead" is heard.
+    pub fn steering_handle(&self) -> Queue {
+        self.steering.clone()
+    }
+
+    /// A handle for messages to run as the turn *after* the one that is running.
+    ///
+    /// The difference from [`steering_handle`](Agent::steering_handle) is when the
+    /// model reads it: a steered message joins the turn in flight, while a
+    /// follow-up becomes a turn of its own. Both reach the same conversation, so
+    /// the choice is about attribution and not about capability — "then run the
+    /// tests" wants its own turn and its own cost line.
+    pub fn follow_up_handle(&self) -> Queue {
+        self.follow_up.clone()
+    }
+
+    /// Forget the conversation, for `/clear`.
+    ///
+    /// The transcript is the application's to clear; what this clears is what the
+    /// model would be sent, which is the part that costs money to carry.
+    pub fn clear(&self) {
+        self.conversation.clear();
+    }
+
+    /// How many messages the model will be sent next turn.
+    ///
+    /// A count rather than a token total because it is the one number the
+    /// application has that the agent cannot state more honestly: what the
+    /// conversation costs is the provider's to say, and it says it per turn in
+    /// the usage.
+    pub fn conversation_len(&self) -> usize {
+        self.conversation.len()
+    }
+
+    /// Summarize the conversation now, at the user's request.
+    ///
+    /// Returns how many messages the summary replaced, or `None` when there was
+    /// nothing worth summarizing or the model would not produce one.
+    pub async fn compact(&self) -> Option<usize> {
+        session::compact_now(
+            &self.choice.backend,
+            &self.conversation,
+            self.options.compaction,
+            &self.cancel,
+        )
+        .await
     }
 
     /// Short human-readable label shown in the status bar.
@@ -153,31 +248,104 @@ impl Agent {
         self.choice.backend.models().await
     }
 
+    /// The context window of the model this session will ask.
+    fn context_window(&self) -> u32 {
+        context_window_for(&self.choice.model)
+    }
+
     /// The tools a turn in `mode` would declare.
     pub fn tool_names(&self, mode: Mode) -> Vec<String> {
         self.registry
             .selected_names(default_tool_names(mode), &self.options.selection)
     }
 
-    /// Run one turn, streaming what it produces.
+    /// The skills this session may draw on.
+    pub fn skills(&self) -> Skills {
+        self.resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .skills
+            .clone()
+    }
+
+    /// Replace resources for future turns without clearing conversation or queues.
+    /// Call at an idle boundary; an active turn keeps its existing system prompt.
+    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
+        *self
+            .resources
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+    }
+
+    /// Current instructions, also used when the application rebuilds a backend.
+    pub fn prompt_context(&self) -> PromptContext {
+        self.resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .prompt
+            .clone()
+    }
+
+    /// Validate and expand input using the current resource snapshot.
+    pub fn expand_input(&self, text: &str) -> Result<String, InputError> {
+        let resources = self
+            .resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        expand_input(text, &resources.skills)
+    }
+
+    /// Run one turn over `prompt`, streaming what it produces.
     ///
     /// The turn runs in its own task, so the caller can keep drawing while a
     /// command runs; dropping the stream abandons it. A failure to answer is an
     /// [`AgentEvent::Error`](crate::AgentEvent::Error) in the stream rather than
     /// a start-up error, because the loop is what finds out.
-    pub fn run_turn(&self, request: AgentRequest) -> AgentEventStream {
+    ///
+    /// The prompt is recorded in the conversation before anything is asked, so a
+    /// turn that is abandoned still leaves what the user said.
+    pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
+        let resources = self
+            .resources
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prompt = match expand_input(&prompt.into(), &resources.skills) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Box::pin(futures::stream::once(async move {
+                    crate::AgentEvent::Error(error.to_string())
+                }));
+            }
+        };
         let tools = self
             .registry
-            .select(default_tool_names(request.mode), &self.options.selection);
+            .select(default_tool_names(mode), &self.options.selection);
 
-        session::start(
-            Arc::clone(&self.choice.backend),
+        // The prompt is written per turn because every part of it can change:
+        // the mode, which tools the mode leaves standing, and which platform the
+        // credentials resolve to.
+        let system = prompt::build_system_prompt(
+            mode,
+            &tools,
+            &resources.skills,
+            self.choice.provider_id,
+            &self.options.cwd,
+            &resources.prompt,
+        );
+        drop(resources);
+
+        session::start(TurnInput {
+            inner: Arc::clone(&self.choice.backend),
             tools,
-            &self.options,
-            self.cancel.clone(),
-            request.history,
-            request.prompt,
-        )
+            options: self.options.clone(),
+            cancel: self.cancel.clone(),
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+            conversation: Arc::clone(&self.conversation),
+            system,
+            prompt,
+            context_window: self.context_window(),
+        })
     }
 }
 
@@ -186,10 +354,11 @@ impl std::fmt::Debug for Agent {
         f.debug_struct("Agent")
             .field("backend", &self.label())
             .field("tools", &self.registry.len())
+            .field("messages", &self.conversation.len())
+            .field("compaction", &self.options.compaction)
             .finish()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +504,129 @@ mod tests {
         events
     }
 
+    #[tokio::test]
+    async fn skill_input_expands_in_turns_and_both_queues_with_current_body() {
+        let dir = std::env::temp_dir().join(format!("solaris-agent-input-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pdf")).expect("directory");
+        let path = dir.join("pdf/SKILL.md");
+        std::fs::write(
+            &path,
+            "---\ndescription: PDF work\ndisable-model-invocation: true\n---\nOld body",
+        )
+        .expect("skill");
+        let skills = Skills::load(
+            &[crate::SkillRoot::new(&dir, crate::SkillSource::Project)],
+            &[],
+        );
+        let completion = || {
+            vec![
+                AgentEvent::TextDelta("done".to_string()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![completion(), completion()]);
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::in_directory(&dir).with_skills(skills),
+        );
+        std::fs::write(&path, "---\ndescription: PDF work\ndisable-model-invocation: true\n---\nNew body: read references/formats.md").expect("update");
+        agent
+            .steering_handle()
+            .try_push("/skill:pdf steer")
+            .expect("steering");
+        agent
+            .follow_up_handle()
+            .try_push("/skill:pdf follow")
+            .expect("follow-up");
+        drain(agent.run_turn("/skill:pdf initial", Mode::Plan)).await;
+        let requests = inner.requests();
+        assert_eq!(requests.len(), 2);
+        let user_text: Vec<_> = requests
+            .last()
+            .expect("request")
+            .history
+            .iter()
+            .filter(|message| message.role == crate::Role::User)
+            .map(crate::Message::text)
+            .collect();
+        assert_eq!(user_text.len(), 3);
+        for (text, request) in user_text.iter().zip(["initial", "steer", "follow"]) {
+            assert!(text.contains("New body"), "{text}");
+            assert!(
+                text.contains(&dir.join("pdf").display().to_string()),
+                "{text}"
+            );
+            assert!(text.contains(&format!("Request: {request}")), "{text}");
+            assert!(!text.contains("Old body"));
+        }
+        assert!(
+            !requests[0].history[0].text().contains("PDF work"),
+            "hidden skill is not advertised"
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_skill_input_never_reaches_backend_or_conversation() {
+        let inner = Scripted::new(Vec::new());
+        let agent = agent(inner.clone());
+        let events = drain(agent.run_turn("/skill:missing request", Mode::Build)).await;
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Error(message)] if message.contains("no skill named"))
+        );
+        assert!(inner.requests().is_empty());
+        assert_eq!(agent.conversation_len(), 0);
+        assert!(agent.follow_up_handle().try_push("/skill:missing").is_err());
+        assert!(agent.follow_up_handle().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacing_resources_preserves_history_and_updates_next_system_prompt() {
+        let completion = || {
+            vec![
+                AgentEvent::TextDelta("done".to_string()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![completion(), completion()]);
+        let agent = agent(inner.clone());
+        drain(agent.run_turn("first request", Mode::Plan)).await;
+        let before = agent.conversation_len();
+        agent.replace_resources(ResourceSnapshot {
+            prompt: PromptContext {
+                project_rules: vec![crate::PromptFile {
+                    path: agent.options.cwd.join("AGENTS.md"),
+                    content: "Project rule marker".to_string(),
+                }],
+                append_system: vec![crate::PromptFile {
+                    path: agent.options.cwd.join("APPEND_SYSTEM.md"),
+                    content: "Addendum marker".to_string(),
+                }],
+            },
+            ..Default::default()
+        });
+        assert_eq!(agent.conversation_len(), before);
+        drain(agent.run_turn("second request", Mode::Plan)).await;
+        let requests = inner.requests();
+        let system = requests[1].history[0].text();
+        assert!(system.contains("Project rule marker"));
+        assert!(system.contains("Addendum marker"));
+        assert!(system.contains(&agent.options.cwd.display().to_string()));
+        assert!(
+            requests[1]
+                .history
+                .iter()
+                .any(|message| message.text() == "first request")
+        );
+    }
+
     #[test]
     fn build_mode_offers_more_than_plan_mode() {
         let agent = agent(Scripted::new(Vec::new()));
@@ -365,7 +657,7 @@ mod tests {
         let inner = Scripted::new(vec![Vec::new()]);
         let agent = agent(inner.clone());
 
-        drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Plan))).await;
+        drain(agent.run_turn("hi", Mode::Plan)).await;
 
         let mut names: Vec<String> = inner.requests()[0]
             .tools
@@ -386,7 +678,7 @@ mod tests {
             only("cancel-now"),
         );
 
-        drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Build))).await;
+        drain(agent.run_turn("hi", Mode::Build)).await;
 
         let spec = &inner.requests()[0].tools[0];
         assert_eq!(spec.name, tool.name());
@@ -448,7 +740,7 @@ mod tests {
         // the stop has to reach the loop that is running.
         *tool.cancel.lock().expect("lock") = Some(agent.cancel_handle());
 
-        let events = drain(agent.run_turn(AgentRequest::new(Vec::new(), "hi", Mode::Build))).await;
+        let events = drain(agent.run_turn("hi", Mode::Build)).await;
 
         assert_eq!(tool.runs.load(Ordering::SeqCst), 1);
         let Some(AgentEvent::Error(message)) = events.last() else {

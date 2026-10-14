@@ -1,4 +1,5 @@
-//! Text width, wrapping, and truncation helpers.
+//! Text width, wrapping and truncation, and the two helpers a list needs to
+//! keep its columns and its row window straight.
 //!
 //! Widths are measured in terminal cells via `unicode-width`, so CJK and
 //! emoji-containing text wraps correctly.
@@ -133,6 +134,33 @@ pub fn digit_count(value: usize) -> usize {
         .map_or(1, |digits| digits as usize + 1)
 }
 
+/// The first row a list of `total` rows should draw, so that `highlighted` is
+/// among the `visible` rows on screen.
+///
+/// `offset` is the row the list started at last time. Passing it back keeps the
+/// window where it is while the highlight moves inside it, so the list does not
+/// jump back to the top the moment the highlight steps up a line; passing `0`
+/// recomputes the window from the highlight on every frame.
+///
+/// Every list in the framework windows this way — the editor's command popup,
+/// the inline selectors behind `/model` and `/connect`, and the overlay lists —
+/// which is what makes sure a highlight can never walk off the bottom of one.
+pub fn window_start(total: usize, visible: usize, highlighted: usize, offset: usize) -> usize {
+    if visible == 0 || visible >= total {
+        return 0;
+    }
+
+    let highlighted = highlighted.min(total - 1);
+    let mut start = offset.min(total - visible);
+    if highlighted < start {
+        start = highlighted;
+    }
+    if highlighted >= start + visible {
+        start = highlighted + 1 - visible;
+    }
+    start
+}
+
 /// Whether `(x, y)` falls inside `rect`.
 pub fn rect_contains(rect: ratatui::layout::Rect, x: u16, y: u16) -> bool {
     rect.width > 0
@@ -146,6 +174,31 @@ pub fn rect_contains(rect: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_keeps_the_highlight_on_screen() {
+        // Everything fits, so there is no window to move.
+        assert_eq!(window_start(3, 8, 2, 0), 0);
+        // The highlight is inside the first window.
+        assert_eq!(window_start(13, 5, 4, 0), 0);
+        // It reaches the last row, and then the window follows it.
+        assert_eq!(window_start(13, 5, 5, 0), 1);
+        assert_eq!(window_start(13, 5, 12, 0), 8);
+        // The last window, a highlight past the end, and nothing to show.
+        assert_eq!(window_start(13, 5, 99, 0), 8);
+        assert_eq!(window_start(13, 0, 3, 0), 0);
+        assert_eq!(window_start(0, 5, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_remembered_window_holds_still_until_the_highlight_reaches_its_edge() {
+        // The highlight steps back up inside the window; the window stays.
+        assert_eq!(window_start(13, 5, 6, 4), 4);
+        // It reaches the top edge, so the window follows it up.
+        assert_eq!(window_start(13, 5, 3, 4), 3);
+        // A remembered window past the end is pulled back into the list.
+        assert_eq!(window_start(13, 5, 12, 9), 8);
+    }
 
     #[test]
     fn wraps_on_word_boundaries() {

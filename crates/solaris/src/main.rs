@@ -15,7 +15,7 @@ use solaris::{
     App, AppOptions, BackendFactory, Clipboard, Companion, Config, Mode, Preferences,
     RecentActivity, Soul,
 };
-use solaris_agent::{ToolRegistry, ToolSelection, default_tool_names};
+use solaris_agent::{ResourcePaths, ToolRegistry, ToolSelection, default_tool_names};
 use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
@@ -49,6 +49,11 @@ struct Args {
     /// Tools to withdraw, after everything else has selected them.
     #[arg(long, value_name = "LIST")]
     exclude_tools: Option<String>,
+
+    /// Skill directory, or a single `SKILL.md`, to load as well as the usual
+    /// locations. Repeat the flag for more than one.
+    #[arg(long = "skill", value_name = "PATH")]
+    skill: Vec<PathBuf>,
 
     /// Print the resolved configuration and exit without starting the UI.
     #[arg(long)]
@@ -103,6 +108,18 @@ fn main() -> Result<()> {
     let recent = load_recent(recent_path.as_deref());
     let settings = load_settings(settings_path.as_deref());
 
+    let resource_paths = ResourcePaths {
+        cwd: std::env::current_dir()?,
+        config_dir: state_dir,
+        home_dir: home_dir(),
+        extra_skills: args.skill.clone(),
+    };
+    let resources = resource_paths.load()?;
+    let skills = resources.skills;
+    for warning in skills.warnings().iter().chain(&resources.warnings) {
+        eprintln!("solaris: {} — {}", warning.path.display(), warning.message);
+    }
+
     // `--provider` moves this run without rewriting the saved choice.
     if let Some(id) = &args.provider {
         if provider_spec(id).is_none() {
@@ -156,6 +173,18 @@ fn main() -> Result<()> {
             registry
                 .selected_names(default_tool_names(config.mode), &tools)
                 .join(", ")
+        );
+        println!(
+            "skills: {}",
+            if skills.is_empty() {
+                "none".to_string()
+            } else {
+                skills
+                    .iter()
+                    .map(|skill| skill.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         );
         println!("context window: {}", context_window_for(&choice.model));
         match &auth_path {
@@ -249,6 +278,9 @@ fn main() -> Result<()> {
         // catalogue is what it falls back to.
         discover_models: true,
         tools,
+        skills,
+        prompt_context: resources.prompt,
+        resource_paths: Some(resource_paths),
         ask_approval: args.confirm_tools,
     });
     tui.set_root(Box::new(app));
@@ -308,6 +340,17 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
 
     base.map(|dir| dir.join("solaris"))
+}
+
+/// The user's home directory, which is where the shared skills location is.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let home = std::env::var_os("USERPROFILE");
+
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var_os("HOME");
+
+    home.map(PathBuf::from)
 }
 
 /// Read the credential store, treating a missing or unreadable file as empty:

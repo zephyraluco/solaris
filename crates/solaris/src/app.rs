@@ -22,9 +22,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentOptions, AgentRequest, AlwaysApprove, Approval,
-    ApprovalRequest, Approver, Cancel, ChannelApprover, Mode, ToolCall, ToolRegistry,
-    ToolSelection, default_tool_names,
+    Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
+    Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
+    ToolRegistry, ToolSelection, default_tool_names,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -47,18 +47,18 @@ use tokio::sync::oneshot;
 
 use crate::buddy::{self, Companion, Soul};
 use crate::clipboard::Clipboard;
-use crate::commands::{self, SlashCommand, parse_slash_command};
+use crate::commands::{self, SKILL_PREFIX, SlashCommand, parse_slash_command};
 use crate::config::{Config, Preferences};
 use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
 use crate::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
-    stats_lines,
+    skills_lines, stats_lines,
 };
 use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
 use crate::recent::{self, RecentActivity};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -122,6 +122,15 @@ pub struct AppOptions {
     pub discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     pub tools: ToolSelection,
+    /// The skills this session found, which are listed in the system prompt and
+    /// loadable by name with `/skill:<name>`.
+    ///
+    /// Empty in tests, and in a session whose directories hold no skill.
+    pub skills: Skills,
+    /// Loaded global/project prompt instructions.
+    pub prompt_context: PromptContext,
+    /// Filesystem locations to revisit on /reload; absent in isolated callers.
+    pub resource_paths: Option<ResourcePaths>,
     /// Whether a call that changes something is confirmed before it runs.
     ///
     /// Off in tests, which drive the loop themselves and have nobody to ask; on
@@ -170,6 +179,9 @@ impl AppOptions {
             clipboard: Clipboard::system(),
             discover_models: false,
             tools: ToolSelection::none(),
+            skills: Skills::empty(),
+            prompt_context: PromptContext::default(),
+            resource_paths: None,
             ask_approval: false,
         }
     }
@@ -207,11 +219,15 @@ fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
     selection: &ToolSelection,
+    skills: &Skills,
+    prompt_context: &PromptContext,
     cwd: &Path,
     approver: Arc<dyn Approver>,
 ) -> (Arc<Agent>, Cancel) {
     let options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
+        .with_skills(skills.clone())
+        .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     let agent = Arc::new(Agent::new(choice, registry, options));
     let cancel = agent.cancel_handle();
@@ -241,8 +257,6 @@ pub struct App {
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
-    /// Prompts typed while a turn was streaming; run in order afterwards.
-    queued_prompts: VecDeque<String>,
     spinner_frame: u16,
     frame: u64,
     last_transcript: Rect,
@@ -278,10 +292,16 @@ pub struct App {
     discovered: Vec<String>,
     /// Answer from the background model-discovery task, while one is in flight.
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
+    /// Answer from a `/compact` that is in flight.
+    compact_rx: Option<UnboundedReceiver<Option<usize>>>,
     /// Whether asking the provider for its models is allowed at all.
     discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     tools: ToolSelection,
+    /// The skills this session may draw on, found before the app was built.
+    skills: Skills,
+    resource_paths: Option<ResourcePaths>,
+    reload_pending: bool,
     /// Every built-in tool this platform has.
     ///
     /// Built once, so `edit` and `write` keep serialising against the same
@@ -324,6 +344,9 @@ impl App {
             clipboard,
             discover_models,
             tools,
+            skills,
+            prompt_context,
+            resource_paths,
             ask_approval,
         } = options;
 
@@ -345,6 +368,8 @@ impl App {
             choice,
             Arc::clone(&registry),
             &tools,
+            &skills,
+            &prompt_context,
             &cwd,
             Arc::clone(&approver),
         );
@@ -356,7 +381,7 @@ impl App {
         let (dialog_tx, dialog_rx) = unbounded_channel();
 
         let mut editor = Editor::with_placeholder("Ask anything…  /help for commands");
-        editor.set_hints(commands::hints());
+        editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
 
         let mut app = Self {
@@ -377,7 +402,6 @@ impl App {
             dialog_tx,
             dialog_rx,
             events_rx: None,
-            queued_prompts: VecDeque::new(),
             spinner_frame: 0,
             frame: 0,
             last_transcript: Rect::default(),
@@ -398,8 +422,12 @@ impl App {
             inline: None,
             discovered: Vec::new(),
             models_rx: None,
+            compact_rx: None,
             discover_models,
             tools,
+            skills,
+            resource_paths,
+            reload_pending: false,
             registry,
             cwd,
             approver,
@@ -442,6 +470,11 @@ impl App {
         &self.config.model
     }
 
+    /// The skills this session may draw on.
+    pub fn skills(&self) -> &Skills {
+        &self.skills
+    }
+
     /// The label of the backend answering turns right now.
     pub fn backend_label(&self) -> &str {
         self.agent.label()
@@ -465,6 +498,8 @@ impl App {
             choice,
             Arc::clone(&self.registry),
             &self.tools,
+            &self.skills,
+            &self.agent.prompt_context(),
             &self.cwd,
             Arc::clone(&self.approver),
         );
@@ -672,10 +707,6 @@ impl App {
             self.session.bump();
         }
         self.notifications.info("cancelled");
-
-        if let Some(next) = self.queued_prompts.pop_front() {
-            self.start_turn(next);
-        }
     }
 
     fn toggle_mode(&mut self) {
@@ -735,9 +766,12 @@ impl App {
 
     /// Submit prompt text: a slash command runs, anything else starts a turn.
     ///
-    /// Prompts submitted while a turn is streaming are queued and run in order
-    /// once it finishes; starting a second turn concurrently would attribute
-    /// the in-flight deltas to the wrong turn.
+    /// A prompt submitted while a turn is streaming joins that turn instead of
+    /// waiting behind it: starting a second turn concurrently would attribute
+    /// the in-flight deltas to the wrong turn, and waiting means the correction
+    /// arrives after the model has done the thing being corrected. The loop
+    /// folds it in before it asks again, so the message reaches the model as
+    /// soon as the current round finishes.
     pub(crate) fn submit(&mut self, text: String) {
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
@@ -756,19 +790,51 @@ impl App {
         self.record_activity(&trimmed);
 
         if self.session.is_streaming() {
-            self.queued_prompts.push_back(trimmed.clone());
-            self.notifications.info(format!(
-                "queued: {}",
-                crate::transcript::summarize(&trimmed)
-            ));
+            self.steer(trimmed);
             return;
         }
 
-        self.start_turn(trimmed);
+        self.start_turn(trimmed.clone(), trimmed);
+    }
+
+    /// Add `text` to the turn that is running.
+    ///
+    /// The message goes into the agent's steering queue, and the agent reports
+    /// it back as a [`AgentEvent::Steered`] event once the loop has actually
+    /// folded it in — that is when the turn's record gets the note, so a
+    /// message that arrives just too late to be read by this turn is recorded
+    /// against the turn that does read it rather than the one it was typed into.
+    fn steer(&mut self, text: String) {
+        match self.agent.steering_handle().try_push(text.clone()) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        }
+        self.notifications
+            .info(format!("steered: {}", crate::transcript::summarize(&text)));
     }
 
     fn execute_command(&mut self, command: SlashCommand) {
         let args = command.args.trim();
+
+        // A skill is invoked as `/skill:<name>`: the colon keeps the name part of
+        // the same word, which is what lets the editor offer every skill once
+        // `/skill` has been typed, and the parser hands that word back whole.
+        if let Some(name) = command.name.strip_prefix(SKILL_PREFIX) {
+            if name.is_empty() {
+                // `/skill:` on its own is the prefix a completion is built out
+                // of rather than a command; listing is what was about to be
+                // picked from anyway.
+                self.open_skills();
+            } else {
+                self.run_skill(name, args);
+            }
+            return;
+        }
+
         match command.name.as_str() {
             "help" => self.open_help(),
             "connect" => self.open_connect(),
@@ -788,6 +854,15 @@ impl App {
             }
             "mode" => self.toggle_mode(),
             "clear" => self.open_clear_confirm(),
+            "compact" => self.compact_now(),
+            "queue" => self.queue_follow_up(args),
+            "skills" => self.open_skills(),
+            "reload" => self.reload_resources(),
+            // A skill's name is taken on the colon rather than after a space; a
+            // reminder that says so is worth more than "unknown command".
+            "skill" => self.notifications.error(format!(
+                "a skill is loaded as `{SKILL_PREFIX}<name>` — /skills lists them"
+            )),
             "stats" => self.open_stats(),
             "buddy" => self.open_buddy(args),
             "quit" | "exit" => self.quit.set(true),
@@ -797,17 +872,140 @@ impl App {
         }
     }
 
-    fn start_turn(&mut self, prompt: String) {
-        // The session declares the tools a turn may use, so the app never has to
-        // know which ones a mode offers.
-        let request = AgentRequest::new(
-            self.session.history(self.config.mode),
-            prompt.clone(),
-            self.config.mode,
-        );
+    /// Run a skill as the next turn's prompt.
+    ///
+    /// The instructions travel as the prompt because that is what the command
+    /// means: the user has decided the skill applies, and the model should not
+    /// have to spend a round working that out. The transcript shows the
+    /// invocation rather than the instructions it stands for.
+    fn run_skill(&mut self, name: &str, args: &str) {
+        let invocation = if args.is_empty() {
+            format!("/skill:{name}")
+        } else {
+            format!("/skill:{name} {args}")
+        };
+        if self.session.is_streaming() {
+            self.steer(invocation);
+            return;
+        }
+        self.start_turn(invocation.clone(), invocation);
+    }
 
+    /// Put `text` in line to run as the turn after the one in flight.
+    ///
+    /// This is what makes `steering` a choice rather than the only option: a
+    /// message typed while a turn runs is steered into it, and `/queue` is how to
+    /// say "this one after that one instead".
+    fn queue_follow_up(&mut self, text: &str) {
+        if text.is_empty() {
+            self.notifications
+                .error("usage: /queue <prompt>".to_string());
+            return;
+        }
+        if !self.session.is_streaming() {
+            // Nothing to wait behind, so it is simply the next turn.
+            let prompt = text.to_string();
+            self.start_turn(prompt.clone(), prompt);
+            return;
+        }
+        match self.agent.follow_up_handle().try_push(text) {
+            Ok(true) => self.notifications.info(format!(
+                "after this turn: {}",
+                crate::transcript::summarize(text)
+            )),
+            Ok(false) => {}
+            Err(error) => self.notifications.error(error.to_string()),
+        }
+    }
+
+    fn reload_resources(&mut self) {
+        if self.resource_paths.is_none() {
+            self.notifications
+                .warning("no resource locations configured for this session");
+            return;
+        }
+        if self.events_rx.is_some() || self.compact_rx.is_some() {
+            self.reload_pending = true;
+            self.notifications
+                .info("resources will reload when the active turn finishes".to_string());
+            return;
+        }
+        self.reload_pending = false;
+        let Some(paths) = &self.resource_paths else {
+            return;
+        };
+        match paths.load() {
+            Ok(snapshot) => {
+                let warnings = snapshot.warnings.iter().chain(snapshot.skills.warnings());
+                let diagnostics = warnings
+                    .map(|warning| format!("{} — {}", warning.path.display(), warning.message))
+                    .collect::<Vec<_>>();
+                self.skills = snapshot.skills.clone();
+                self.editor.set_hints(commands::hints(&self.skills));
+                self.agent.replace_resources(snapshot);
+                if diagnostics.is_empty() {
+                    self.notifications.info(format!(
+                        "reloaded {} skills and prompt instructions",
+                        self.skills.len()
+                    ));
+                } else {
+                    self.notifications.warning(format!(
+                        "resources reloaded with diagnostics:\n{}",
+                        diagnostics.join("\n")
+                    ));
+                }
+            }
+            Err(error) => self
+                .notifications
+                .error(format!("resources were not reloaded: {error}")),
+        }
+    }
+
+    /// Summarize the conversation now.
+    ///
+    /// It runs off the event loop because it is a model call of its own, and its
+    /// answer comes back the same way model discovery's does.
+    fn compact_now(&mut self) {
+        if self.compact_rx.is_some() {
+            self.notifications.info("already compacting".to_string());
+            return;
+        }
+        let agent = Arc::clone(&self.agent);
+        let (tx, rx) = unbounded_channel();
+        self.compact_rx = Some(rx);
+        self.notifications.clear();
+        self.notifications.info("compacting…".to_string());
+
+        tokio::spawn(async move {
+            let _ = tx.send(agent.compact().await);
+        });
+    }
+
+    /// Report what the manual compaction did.
+    fn on_compacted(&mut self, dropped: Option<usize>) {
+        match dropped {
+            Some(dropped) => self.notifications.info(format!(
+                "summarized {dropped} messages; {} left in context",
+                self.agent.conversation_len()
+            )),
+            None => self
+                .notifications
+                .warning("nothing to summarize, or the model would not produce a summary"),
+        }
+    }
+
+    fn start_turn(&mut self, submitted: String, prompt: String) {
+        let prompt = match self.agent.expand_input(&prompt) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        // The session owns the conversation and writes its own system prompt, so
+        // the app hands over the new words and nothing else.
         self.session.turns.push(Turn {
-            prompt,
+            prompt: submitted,
             ..Default::default()
         });
         self.session.follow_end = true;
@@ -818,9 +1016,10 @@ impl App {
         self.events_rx = Some(rx);
 
         let agent = Arc::clone(&self.agent);
+        let mode = self.config.mode;
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream = agent.run_turn(request);
+            let mut stream = agent.run_turn(prompt, mode);
             while let Some(event) = stream.next().await {
                 if tx.send(event).is_err() {
                     break;
@@ -879,6 +1078,43 @@ impl App {
                 self.notifications
                     .warning("the reply hit the output limit; its tool calls were refused");
             }
+            // The conversation was summarized to make room. It is worth a
+            // banner because the model suddenly remembers less, and worth a line
+            // in the transcript because a session that forgot things should say
+            // so where it can be read back later.
+            AgentEvent::Compacted { dropped } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.compacted += dropped;
+                }
+                self.notifications.warning(format!(
+                    "summarized {dropped} earlier messages to make room in the context window"
+                ));
+            }
+            // A message the user steered in has been read. Recorded here rather
+            // than when it was typed, so it lands in the turn that read it.
+            AgentEvent::Steered { text } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    let after_steps = turn.steps.iter().filter(|step| step.is_done()).count();
+                    turn.steering.push(SteeringNote { text, after_steps });
+                }
+            }
+            // A queued prompt is now being run as a turn of its own. The turn it
+            // arrived during is over, so it is closed and a new one opened with
+            // this prompt: everything that streams from here belongs to it.
+            AgentEvent::FollowUp { prompt } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.complete = true;
+                    if turn.reply.is_empty() {
+                        turn.reply = "_(superseded by the queued prompt)_".to_string();
+                    }
+                }
+                self.session.turns.push(Turn {
+                    prompt,
+                    ..Default::default()
+                });
+                self.session.follow_end = true;
+                self.spinner_frame = 0;
+            }
             AgentEvent::Error(message) => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -923,6 +1159,11 @@ impl App {
                 self.session.bump();
                 // The highlight points at rows that no longer exist.
                 self.selection.borrow_mut().clear();
+                // The transcript and the conversation are not the same thing:
+                // clearing what is on screen must also forget what the model
+                // would be sent, or the next turn answers a conversation the
+                // user can no longer see.
+                self.agent.clear();
                 self.notifications.info("transcript cleared");
             }
             DialogMessage::Confirm {
@@ -967,6 +1208,30 @@ impl App {
         let lines = help_lines(&self.theme, crate::PROMPT_SLASH_COMMANDS);
         let dialog = TextDialog::new(
             "Help",
+            "↑↓ scroll · enter or esc closes",
+            lines,
+            &self.theme,
+            self.dialog_tx.clone(),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered()
+                .width(SizeValue::Percent(74))
+                .max_height(SizeValue::Percent(85)),
+        );
+    }
+
+    /// Show the skills this session found, and where each one lives.
+    fn open_skills(&mut self) {
+        if self.skills.is_empty() {
+            self.notifications
+                .info("no skills found — a skill is a directory holding a SKILL.md".to_string());
+            return;
+        }
+
+        let lines = skills_lines(&self.skills, &self.theme);
+        let dialog = TextDialog::new(
+            "Skills",
             "↑↓ scroll · enter or esc closes",
             lines,
             &self.theme,
@@ -1821,11 +2086,10 @@ impl Component for App {
                 self.session.bump();
             }
             dirty = true;
-
-            // Run the next queued prompt now that the turn is over.
-            if let Some(next) = self.queued_prompts.pop_front() {
-                self.start_turn(next);
-            }
+        }
+        if self.reload_pending && self.events_rx.is_none() && self.compact_rx.is_none() {
+            self.reload_resources();
+            dirty = true;
         }
 
         // Dialog results.
@@ -1872,6 +2136,21 @@ impl Component for App {
         for answer in discovered {
             dirty = true;
             self.on_models_discovered(answer);
+        }
+
+        // Answer from a `/compact` that was running.
+        let mut compacted = None;
+        if let Some(rx) = self.compact_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(answer) => compacted = Some(answer),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => compacted = Some(None),
+            }
+        }
+        if let Some(answer) = compacted {
+            self.compact_rx = None;
+            dirty = true;
+            self.on_compacted(answer);
         }
 
         if self.notifications.tick() {
@@ -2017,10 +2296,30 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{BackendError, ToolCall, ToolResult, TurnRequest, Usage};
+    use solaris_agent::{
+        BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, TurnRequest, Usage,
+    };
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// The prompt a request asks about, wherever the loop put it.
+    ///
+    /// The agent records the prompt in the conversation before it asks anything,
+    /// so a round's own `prompt` is empty and the words are the last user message
+    /// instead. The fake reads both so it answers the same way either way.
+    fn asked(request: &TurnRequest) -> String {
+        if !request.prompt.trim().is_empty() {
+            return request.prompt.trim().to_string();
+        }
+        request
+            .history
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User && !message.text().is_empty())
+            .map(|message| message.text())
+            .unwrap_or_default()
+    }
 
     /// A backend that answers with a prompt-echoing markdown reply, so the app's
     /// own behaviour can be driven without a provider and without a network.
@@ -2034,7 +2333,7 @@ mod tests {
         async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             let reply = format!(
                 "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-                request.prompt.trim()
+                asked(&request)
             );
             let events = vec![
                 AgentEvent::ThinkingDelta("thinking ".to_string()),
@@ -3448,19 +3747,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupting_still_runs_a_queued_prompt() {
+    async fn interrupting_a_turn_leaves_nothing_waiting_behind_it() {
         let mut app = app();
         app.submit("first".to_string());
+        // A second prompt joins the running turn rather than queueing behind it.
         app.submit("second".to_string());
-        assert_eq!(app.queued_prompts.len(), 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
-        // Claude Code sends what is queued after an interrupt, so the queue is
-        // never left waiting on a turn that no longer exists.
-        assert!(app.queued_prompts.is_empty());
-        assert_eq!(app.session.turns.len(), 2);
+        assert!(!app.session.is_streaming(), "the turn kept streaming");
+        assert_eq!(
+            app.session.turns.len(),
+            1,
+            "an interrupt must not start another turn"
+        );
+        assert!(app.session.turns.iter().all(|turn| turn.complete));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_submitted_while_streaming_steers_the_running_turn() {
+        let mut app = app();
+
+        app.submit("first".to_string());
         assert!(app.session.is_streaming());
+        app.submit("second".to_string());
+
+        // No concurrent turn, and the message is waiting for the loop that is
+        // running to read it rather than being run as a turn of its own.
+        assert_eq!(app.session.turns.len(), 1, "a concurrent turn was started");
+        assert!(
+            app.agent.steering_handle().has_pending(),
+            "the message never reached the running turn"
+        );
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("steered")),
+            "the user is told what happened to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steered_message_is_recorded_when_the_loop_says_it_was_read() {
+        let call = ToolCall::new("call-1", "read", serde_json::json!({}));
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: "read it".into(),
+            steps: vec![
+                ToolStep {
+                    call: call.clone(),
+                    result: Some(ToolResult::ok(&call, "one")),
+                    duration_ms: None,
+                },
+                ToolStep::pending(call),
+            ],
+            ..Default::default()
+        });
+
+        app.apply_event(AgentEvent::Steered {
+            text: "also check the tests".into(),
+        });
+
+        // The note is recorded against the turn that read it, and remembers how
+        // much had already run — only the finished call counts.
+        let note = &app.session.turns[0].steering[0];
+        assert_eq!(note.text, "also check the tests");
+        assert_eq!(note.after_steps, 1);
     }
 
     #[test]
@@ -3480,6 +3832,266 @@ mod tests {
         typing.handle_key(key(KeyCode::Char('a')));
         typing.handle_key(key(KeyCode::Char('?')));
         assert!(typing.overlay_queue.borrow().is_empty());
+    }
+
+    /// An app that found `skills` before it was built.
+    fn app_with_skills(skills: Skills) -> App {
+        let backend = fake_backend();
+        let quit: QuitFlag = Rc::new(Cell::new(false));
+        let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
+        let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        options.skills = skills;
+        App::new(options)
+    }
+
+    /// A skills directory holding one skill, found the way the binary finds it.
+    fn skills_holding(tag: &str, name: &str, description: &str, body: &str) -> Skills {
+        let dir = std::env::temp_dir().join(format!("solaris-skills-{tag}-{}", std::process::id()));
+        let path = dir.join(name).join("SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("a skill directory")).expect("skills dir");
+        std::fs::write(
+            &path,
+            format!("---\ndescription: {description}\n---\n{body}\n"),
+        )
+        .expect("the skill was written");
+        Skills::load(&[SkillRoot::new(&dir, SkillSource::Project)], &[])
+    }
+
+    /// Tick until the turn in flight has finished, or give up.
+    async fn settle_turn(app: &mut App) {
+        for _ in 0..500 {
+            app.tick();
+            if !app.session.is_streaming() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the turn never completed");
+    }
+
+    #[tokio::test]
+    async fn invoking_a_skill_asks_the_model_for_its_instructions() {
+        let skills = skills_holding(
+            "invoke",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Read the reference first.",
+        );
+        let mut app = app_with_skills(skills);
+
+        app.submit("/skill:pdf-tools extract report.pdf".to_string());
+
+        // The transcript shows what was typed, not the block it stood for.
+        assert_eq!(
+            app.session.turns[0].prompt,
+            "/skill:pdf-tools extract report.pdf"
+        );
+
+        settle_turn(&mut app).await;
+
+        let reply = &app.session.turns[0].reply;
+        assert!(reply.contains("Read the reference first."), "{reply}");
+        assert!(reply.contains("extract report.pdf"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_stream_and_keeps_history_and_expanded_queue_content() {
+        let skills = skills_holding("reload", "pdf-tools", "PDF work", "Original instructions");
+        let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
+        let cwd = path
+            .parent()
+            .expect("skill directory")
+            .parent()
+            .expect("root")
+            .to_path_buf();
+        std::fs::create_dir_all(cwd.join(".git")).expect("repo marker");
+        let mut app = app_with_skills(skills);
+        app.resource_paths = Some(ResourcePaths {
+            cwd: cwd.clone(),
+            config_dir: None,
+            home_dir: None,
+            extra_skills: vec![cwd.clone()],
+        });
+        app.submit("first".to_string());
+        app.submit("/queue /skill:pdf-tools extract report.pdf".to_string());
+        app.submit("/reload".to_string());
+        assert!(app.reload_pending);
+        std::fs::write(
+            &path,
+            "---\ndescription: Updated PDF work\n---\nNew instructions",
+        )
+        .expect("update skill");
+        std::fs::write(cwd.join("AGENTS.md"), "Reloaded project rules").expect("rules");
+        settle_turn(&mut app).await;
+        assert!(!app.reload_pending);
+        assert_eq!(
+            app.skills.get("pdf-tools").expect("skill").description(),
+            "Updated PDF work"
+        );
+        assert_eq!(
+            app.agent.prompt_context().project_rules[0].content,
+            "Reloaded project rules"
+        );
+        assert_eq!(app.session.turns.len(), 2);
+        assert!(
+            app.session.turns[1].reply.contains("Original instructions"),
+            "already queued messages keep their expanded text"
+        );
+        assert!(
+            app.agent.conversation_len() >= 4,
+            "reload retains conversation"
+        );
+        app.submit("/skill:pdf-tools use new body".to_string());
+        settle_turn(&mut app).await;
+        assert!(app.session.turns[2].reply.contains("New instructions"));
+        std::fs::remove_file(path).expect("remove skill");
+        app.submit("/reload".to_string());
+        assert!(app.skills.is_empty());
+        assert_eq!(app.session.turns.len(), 3);
+        std::fs::remove_dir_all(cwd).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_reload_preserves_previous_resources() {
+        let skills = skills_holding("failed-reload", "pdf-tools", "PDF work", "Body");
+        let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
+        let mut app = app_with_skills(skills);
+        app.resource_paths = Some(ResourcePaths {
+            cwd: path.join("missing"),
+            config_dir: None,
+            home_dir: None,
+            extra_skills: Vec::new(),
+        });
+        app.submit("/reload".to_string());
+        assert!(app.skills.get("pdf-tools").is_some());
+        assert!(
+            app.notifications.current().is_some_and(
+                |(kind, text)| kind == NoticeKind::Error && text.contains("not reloaded")
+            )
+        );
+    }
+
+    #[test]
+    fn hidden_skill_is_offered_to_user_but_not_advertised_to_model() {
+        let skills = skills_holding("hidden-completion", "manual", "Manual work", "Body");
+        let path = skills.get("manual").expect("skill").path().to_path_buf();
+        std::fs::write(
+            &path,
+            "---\ndescription: Manual work\ndisable-model-invocation: true\n---\nBody",
+        )
+        .expect("skill");
+        let skills = Skills::load(&[], &[path]);
+        let hints = commands::hints(&skills);
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.name == "skill:manual"
+                    && hint.description.contains("explicit only"))
+        );
+        assert_eq!(skills.visible_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_skill_prefix_offers_every_skill_by_name() {
+        let skills = skills_holding(
+            "offered",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Read the reference first.",
+        );
+        let mut app = app_with_skills(skills);
+
+        for character in "/skill".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+
+        let text = rendered_text(&mut app, 100, 30);
+        assert!(text.contains("› /skills"), "{text}");
+        assert!(
+            text.contains("  /skill:pdf-tools [p] Extract text from PDFs."),
+            "every skill is offered, with what it is for and where it came from: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.trim_end() == "› /skill"),
+            "the bare prefix is a prefix, not a row of its own: {text}"
+        );
+    }
+
+    #[test]
+    fn a_skill_named_after_a_space_is_a_reminder_rather_than_a_run() {
+        let mut app = app_with_skills(skills_holding(
+            "space",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill pdf-tools do it".to_string());
+
+        assert!(app.session.turns.is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Error);
+        assert!(text.contains("skill:<name>"), "{text}");
+    }
+
+    #[test]
+    fn the_skill_prefix_on_its_own_lists_what_there_is() {
+        let mut app = app_with_skills(skills_holding(
+            "prefix",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill:".to_string());
+
+        assert_eq!(app.overlay_queue.borrow().len(), 1);
+        assert!(app.session.turns.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_skill_is_reported_rather_than_run() {
+        let mut app = app_with_skills(skills_holding(
+            "unknown",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skill:nope do it".to_string());
+
+        assert!(app.session.turns.is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Error);
+        assert!(text.contains("no skill named"), "{text}");
+    }
+
+    #[test]
+    fn listing_skills_without_any_says_none_were_found() {
+        let mut app = app();
+
+        app.submit("/skills".to_string());
+
+        assert!(app.overlay_queue.borrow().is_empty());
+        let (kind, text) = app.notifications.current().expect("a notice");
+        assert_eq!(kind, NoticeKind::Info);
+        assert!(text.contains("no skills found"), "{text}");
+    }
+
+    #[test]
+    fn listing_skills_shows_the_ones_that_were_found() {
+        let mut app = app_with_skills(skills_holding(
+            "list",
+            "pdf-tools",
+            "Extract text from PDFs.",
+            "Body.",
+        ));
+
+        app.submit("/skills".to_string());
+
+        assert_eq!(app.overlay_queue.borrow().len(), 1);
+        assert_eq!(app.skills().len(), 1);
     }
 
     #[tokio::test]
@@ -3514,42 +4126,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompts_submitted_while_streaming_are_queued_and_run_in_order() {
+    async fn a_queued_prompt_is_run_as_its_own_turn_when_the_loop_reports_it() {
         let mut app = app();
-
         app.submit("first".to_string());
-        assert!(app.session.is_streaming());
-        // A second prompt must not start a concurrent turn.
-        app.submit("second".to_string());
-        assert_eq!(app.session.turns.len(), 1, "concurrent turn started");
-        assert_eq!(app.queued_prompts.len(), 1);
 
-        for _ in 0..1000 {
+        // The loop reports that it has taken the queued prompt and is starting a
+        // turn with it: everything that streams from here belongs to that turn.
+        app.apply_event(AgentEvent::FollowUp {
+            prompt: "run the tests".into(),
+        });
+
+        assert_eq!(app.session.turns.len(), 2, "a turn was not opened for it");
+        assert!(app.session.turns[0].complete, "the old turn is finished");
+        assert_eq!(app.session.turns[1].prompt, "run the tests");
+        assert!(!app.session.turns[1].complete, "and the new one is running");
+    }
+
+    #[tokio::test]
+    async fn queueing_while_streaming_waits_for_the_turn_in_flight() {
+        let mut app = app();
+        app.submit("first".to_string());
+
+        app.submit("/queue run the tests".to_string());
+
+        // No second turn yet, and no steering either: this is the queue for after.
+        assert_eq!(app.session.turns.len(), 1);
+        assert!(app.agent.follow_up_handle().has_pending());
+        assert!(
+            app.agent.steering_handle().is_empty(),
+            "a queued prompt is not a correction"
+        );
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("after this turn")),
+            "the user is told when it will run"
+        );
+    }
+
+    #[tokio::test]
+    async fn queueing_with_nothing_in_flight_just_runs_it() {
+        let mut app = app();
+        app.submit("/queue do it now".to_string());
+
+        assert_eq!(app.session.turns.len(), 1, "it started straight away");
+        assert_eq!(app.session.turns[0].prompt, "do it now");
+        assert!(app.agent.follow_up_handle().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queueing_nothing_says_how_to_queue() {
+        let mut app = app();
+        app.submit("/queue".to_string());
+
+        assert!(app.session.turns.is_empty());
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("/queue <prompt>")),
+        );
+    }
+
+    #[tokio::test]
+    async fn compacting_an_empty_conversation_says_there_was_nothing_to_do() {
+        let mut app = app();
+        app.submit("/compact".to_string());
+
+        for _ in 0..200 {
             app.tick();
-            if app.queued_prompts.is_empty()
-                && !app.session.is_streaming()
-                && app.session.turns.len() == 2
-            {
+            if app.compact_rx.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        assert_eq!(
-            app.session
-                .turns
-                .iter()
-                .map(|turn| turn.prompt.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first", "second"]
-        );
+        assert!(app.compact_rx.is_none(), "the answer never came back");
         assert!(
-            app.session.turns.iter().all(|turn| turn.complete),
-            "a queued turn never completed"
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("nothing to summarize")),
+            "an empty conversation has nothing to summarize"
         );
-        // Deltas were attributed to the right turn.
-        assert!(app.session.turns[0].reply.contains("first"));
-        assert!(app.session.turns[1].reply.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_is_reported_and_recorded_on_the_turn() {
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: "long one".into(),
+            ..Default::default()
+        });
+
+        app.apply_event(AgentEvent::Compacted { dropped: 12 });
+
+        assert_eq!(app.session.turns[0].compacted, 12);
+        assert!(
+            app.notifications
+                .current()
+                .is_some_and(|(_, text)| text.contains("12")),
+            "the user is told the model now remembers less"
+        );
     }
 
     /// An app whose copies are recorded instead of written to the real

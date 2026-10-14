@@ -5,9 +5,21 @@
 //! this one table rather than each keeping a list of their own. Running a
 //! command is deliberately not here — the table is data, and
 //! `App::execute_command` is what decides what each name does.
+//!
+//! Skills are the one thing that does not fit a fixed table: a skill is not one
+//! command but one per skill, so the table carries the `skill:` prefix alone and
+//! [`hints`] expands it into a row per skill for the editor.
 
+use solaris_agent::{Skill, Skills};
 use solaris_tui::components::editor::CommandHint;
 use solaris_tui::components::select_list::SelectItem;
+
+/// What an invocation is written as: `/skill:<name>`.
+///
+/// The colon rather than a space, because the name is the part being completed —
+/// it lets the editor offer every skill once `/skill` has been typed, the same
+/// way [pi](https://github.com/earendil-works/pi) spells it.
+pub const SKILL_PREFIX: &str = "skill:";
 
 // --------------------------------------------------------------- the table
 
@@ -60,6 +72,31 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         args: "",
     },
     SlashCommandSpec {
+        name: "compact",
+        description: "Summarize the conversation to free up context",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "queue",
+        description: "Run a prompt after the turn in flight",
+        args: "<prompt>",
+    },
+    SlashCommandSpec {
+        name: "reload",
+        description: "Reload skills and project instructions",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "skills",
+        description: "List the skills available",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: SKILL_PREFIX,
+        description: "Load a skill's instructions",
+        args: "<name> [request]",
+    },
+    SlashCommandSpec {
         name: "clear",
         description: "Clear the transcript",
         args: "",
@@ -104,11 +141,41 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 // --------------------------------------------------------------- the views
 
 /// Completion hints for the editor's slash-command popup.
-pub fn hints() -> Vec<CommandHint> {
-    PROMPT_SLASH_COMMANDS
+///
+/// The `skill:` entry is left out here even though `/help` and the palette carry
+/// it: a placeholder for a name the editor can list itself is worse than the
+/// names. Typing `/skill` offers every skill by name, with what it is for and
+/// where it came from, and picking one completes the whole invocation.
+pub fn hints(skills: &Skills) -> Vec<CommandHint> {
+    let mut hints: Vec<CommandHint> = PROMPT_SLASH_COMMANDS
         .iter()
+        .filter(|spec| spec.name != SKILL_PREFIX)
         .map(|spec| CommandHint::new(spec.name, spec.description, spec.args))
-        .collect()
+        .collect();
+    hints.extend(skills.iter().map(skill_hint));
+    hints
+}
+
+/// One skill as a completion row.
+///
+/// The badge comes first so the descriptions line up behind it, and the
+/// invocation carries an `args`, which is what makes the editor leave a space
+/// after it for the request.
+fn skill_hint(skill: &Skill) -> CommandHint {
+    CommandHint::new(
+        format!("{SKILL_PREFIX}{}", skill.name()),
+        format!(
+            "[{}] {}{}",
+            skill.source().badge(),
+            skill.description_inline(),
+            if skill.disable_model_invocation() {
+                " (explicit only)"
+            } else {
+                ""
+            }
+        ),
+        "[request]",
+    )
 }
 
 /// Items for the Ctrl+K command palette.
@@ -129,6 +196,17 @@ pub fn palette_items() -> Vec<SelectItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_agent::{SkillRoot, SkillSource};
+
+    /// A skills set holding one skill called `name`, found in a directory of its
+    /// own — the loader is the only way to build one from outside its crate.
+    fn skills_holding(name: &str, description: &str) -> Skills {
+        let dir = std::env::temp_dir().join(format!("solaris-commands-{name}"));
+        let path = dir.join(name).join("SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("a skill directory")).expect("skills dir");
+        std::fs::write(&path, format!("---\ndescription: {description}\n---\n")).expect("write");
+        Skills::load(&[SkillRoot::new(&dir, SkillSource::Project)], &[])
+    }
 
     #[test]
     fn parses_name_and_args() {
@@ -168,14 +246,39 @@ mod tests {
     }
 
     #[test]
-    fn hints_cover_every_command() {
-        let hints = hints();
-        assert_eq!(hints.len(), PROMPT_SLASH_COMMANDS.len());
-        for (hint, spec) in hints.iter().zip(PROMPT_SLASH_COMMANDS) {
+    fn hints_cover_every_command_that_is_not_a_skill() {
+        let hints = hints(&Skills::empty());
+        let expected: Vec<&SlashCommandSpec> = PROMPT_SLASH_COMMANDS
+            .iter()
+            .filter(|spec| spec.name != SKILL_PREFIX)
+            .collect();
+
+        assert_eq!(hints.len(), expected.len());
+        for (hint, spec) in hints.iter().zip(expected) {
             assert_eq!(hint.name, spec.name);
             assert_eq!(hint.description, spec.description);
             assert_eq!(hint.args, spec.args);
         }
+    }
+
+    #[test]
+    fn hints_offer_one_badged_row_per_skill_and_no_placeholder() {
+        let skills = skills_holding("pdf-tools", "Extract text from PDFs.");
+        let hints = hints(&skills);
+
+        assert!(
+            hints.iter().all(|hint| hint.name != SKILL_PREFIX),
+            "`skill:` is a prefix, not a row: {:?}",
+            hints.iter().map(|hint| &hint.name).collect::<Vec<_>>()
+        );
+
+        let hint = hints.last().expect("a row for the skill");
+        assert_eq!(hint.name, "skill:pdf-tools");
+        assert_eq!(hint.description, "[p] Extract text from PDFs.");
+        assert_eq!(
+            hint.args, "[request]",
+            "an args is what makes the editor leave room for the request"
+        );
     }
 
     #[test]

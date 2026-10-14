@@ -33,6 +33,10 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Full-screen TUI with a retained component tree, flex-like layout stacks and modal/inline overlays
 > - Streaming transcript with markdown rendering and collapsible thinking blocks
 > - Eight built-in tools — `read`, `write`, `edit`, `ls`, `grep`, `find` and your platform's shell — run by a multi-round tool loop
+> - Skills: a `SKILL.md` under any of the usual directories is advertised to the model by name and description, and its instructions load only when a task calls for them — or when you ask for them with `/skill:<name>`
+> - A prompt system: identity, mode, working directory, tool guidance, skills, project rules and user/project addenda; `/reload` refreshes filesystem instructions
+> - Mid-turn steering: a message typed while a turn runs joins it; `/queue` lines one up for after it
+> - Context compaction: when the conversation nears the model's window, older messages are summarized into a structured checkpoint — updated rather than rewritten on later compactions — and a window that turns out to be full is summarized and retried
 > - Multi-line editor with word navigation, `/` command autocomplete, and a command palette
 > - Two colour themes, cycled at runtime
 > - Build and plan modes, with distinct accents and system prompt
@@ -86,6 +90,7 @@ cargo run --release
 | `--plan` | Start in plan mode instead of build mode | off |
 | `-t`, `--tools <LIST>` | Tools to declare, replacing the mode's default set; a list of `+name`/`-name` entries adjusts it instead | the mode's set |
 | `--exclude-tools <LIST>` | Tools to withdraw after everything else has selected them | none |
+| `--skill <PATH>` | A skill directory, or a single `SKILL.md`, to load as well as the usual locations; repeat for more than one | none |
 | `--confirm-tools` | Ask before a call that changes something (`write`, `edit`, the shell) runs | off |
 | `--print-config` | Print the resolved configuration and exit without starting the UI | — |
 | `-h`, `--help` | Print help | — |
@@ -131,13 +136,18 @@ The prompt is the only text field. Type a message and press `Enter`, or type `/`
 | `/buddy [name <name>]` | Show your companion |
 | `/model [name]` | Switch the active model |
 | `/mode` | Toggle build / plan mode |
+| `/compact` | Summarize the conversation to free up context |
+| `/queue` | Run a prompt after the turn in flight |
+| `/skills` | List the skills available |
+| `/skill:<name> [request]` | Load a skill's instructions |
+| `/reload` | Reload skills, project rules and additional system instructions |
 | `/clear` | Clear the transcript |
 | `/stats` | Show token and cost statistics |
 | `/quit` | Exit solaris |
 
 ## Modes
 
-**Build** and **plan** are the same conversation with a different accent colour and a different line in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode. They also declare different tools: build mode can run commands and change files, plan mode can only look.
+**Build** and **plan** are the same conversation with a different accent colour, a different set of declared tools and a different paragraph in the system prompt. `Tab` or `/mode` switches between them, and `--plan` starts you in plan mode. Build mode can run commands and change files; plan mode can only look, and is told so rather than left to discover the missing tools.
 
 ## Tools
 
@@ -174,6 +184,62 @@ Entries are tool names or patterns where `*` matches any run of characters. A li
 Every result goes back to the model, failures included: a file that is not there, a command that exited non-zero and a call the model got wrong are all things it can react to, not the end of the turn. Output is cut to keep a turn affordable — the first 2000 lines or 50KB for a read, the last for a command, since that is where a failure prints — and a command whose output was cut has the whole of it written to a file whose path is reported, so the model can read it back in pieces.
 
 Each call appears in the transcript as it happens, with its arguments, how long it took and, when it failed, the first line of what it said.
+
+## Skills
+
+A skill is a directory holding a `SKILL.md`: frontmatter saying what it is and when it applies, then the instructions, usually with scripts and references beside it.
+
+```text
+pdf-tools/
+├── SKILL.md
+├── scripts/
+│   └── extract.sh
+└── references/
+    └── formats.md
+```
+
+```markdown
+---
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading, converting, or inspecting PDFs.
+---
+
+# PDF tools
+
+Read `references/formats.md` before converting a document, and resolve that path
+against this skill's directory.
+```
+
+solaris tells the model that each skill exists — its name, its description and the file — and nothing else, so the instructions cost no context until a task actually matches. The description is what routes the model to the skill, so it should say what the skill does *and* when it applies. `name` is optional: without one, a `SKILL.md` is named for the directory holding it. The block also takes `disable-model-invocation: true`, which keeps a skill out of the model's list so that only `/skill:<name>` reaches it.
+
+The format is the [Agent Skills](https://agentskills.io/specification) specification, so a skill written for another harness works here unchanged.
+
+Skills are looked for in these directories, in this order, and the first claim on a name keeps it:
+
+| Location | Scope |
+| --- | --- |
+| `<config dir>/skills` | user |
+| `~/.agents/skills` | user |
+| `.solaris/skills` in the working directory | project |
+| `.agents/skills` in the working directory and its ancestors, up to the repository root | project |
+
+The user's own skills are read first, so a repository cannot shadow one of them by shipping a directory with the same name. Ancestor `.agents/skills` locations are visited nearest first; when there is no repository, discovery stops at the filesystem root. A `.git` file also marks a repository boundary. `--skill <path>` adds a directory, or a single `SKILL.md`, after the default locations. Relative explicit paths resolve from the working directory.
+
+Directories are searched recursively for `SKILL.md`, and a directory holding one is a skill rather than a place to look for more. Real paths prevent duplicate files and symlink cycles, and scanning order is deterministic. Frontmatter is parsed as YAML. Invalid YAML, missing descriptions and name collisions are diagnosed; invalid names warn but still load. Startup diagnostics go to stderr; a bad skill never stops a session.
+
+`/skills` lists what was found, with where each one came from. `/skill:<name> [request]` loads one now, which is how to reach a skill the model did not pick up on its own; whatever follows the name is appended to the instructions as the request. Type `/skill` and the editor offers every skill by name, badged with its source — `[u]` for a user skill, `[p]` for a project one, `[e]` for a path given with `--skill` — and when there are more than fit, the row underneath says which of them is highlighted. `/skill:` on its own is the same as `/skills`.
+
+Explicit calls read the current file and include its absolute path and resource directory. Hidden skills remain in user completion, marked `explicit only`. Skill commands expand consistently in regular input, steering and follow-ups, including `/queue /skill:pdf-tools extract report.pdf`. Unknown names, unreadable files and malformed documents are reported instead of sent as raw commands. Queued messages retain the instructions read when they were queued.
+
+## Project rules and additional prompts
+
+At startup, solaris loads a global rule file from its configuration directory, then project rules from the repository root through the working directory. Without a repository it checks ancestors up to the filesystem root. In each directory it selects the first existing file in this order: `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`. Identical real files are included only once, and each instruction block carries its source path.
+
+For extra system instructions, create `<config dir>/APPEND_SYSTEM.md` or `<working directory>/.solaris/APPEND_SYSTEM.md`. Both are appended, user first and project second. The built-in mode and tool guidance remain part of the prompt, which also states the actual working directory.
+
+Run `/reload` after changing rules or addenda, adding/removing skills, or changing skill names and descriptions. It updates the agent's resources and editor completion without clearing conversation history. During a running turn (including queued follow-ups) or compaction, reload waits until the stream is idle. A working-directory load failure preserves the previous resources; individual bad files produce diagnostics. Changes to an explicitly invoked skill's body are read immediately on its next invocation.
+
+Library callers can use `ResourcePaths::load()`, `AgentOptions::with_prompt_context()` and `Agent::replace_resources()` at an idle boundary. Agent-owned queues expose `try_push()` to report skill expansion errors.
 
 ## Companion
 
@@ -221,6 +287,8 @@ solaris resolves a single state directory, in this order:
 3. `$XDG_CONFIG_HOME/solaris`, falling back to `~/.config/solaris`.
 
 `--print-config` prints the paths it actually resolved.
+
+Skills live in `skills/` inside that directory; see [Skills](#skills).
 
 ## Files
 

@@ -53,6 +53,13 @@ impl Tool for LsTool {
          are not applied here — use `find` for that."
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "`ls` lists one directory's entries. To look inside files use `grep`, and to match \
+             paths anywhere below a directory use `find`.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

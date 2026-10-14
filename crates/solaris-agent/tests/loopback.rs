@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_agent::{
-    Agent, AgentEvent, AgentOptions, AgentRequest, Message, Mode, Tool, ToolRegistry, ToolSelection,
-};
+use solaris_agent::{Agent, AgentEvent, AgentOptions, Mode, Tool, ToolRegistry, ToolSelection};
 use solaris_backend::{Endpoint, HttpBackend, TurnPlan, Wire};
 use solaris_provider::{BackendChoice, CredentialSource};
 use solaris_tools::tools::read::ReadTool;
@@ -172,8 +170,8 @@ fn agent(addr: SocketAddr, dir: &Path) -> Agent {
 }
 
 /// Read a turn's stream to its end.
-async fn drain(agent: &Agent, history: Vec<Message>, prompt: &str) -> Vec<AgentEvent> {
-    let mut stream = agent.run_turn(AgentRequest::new(history, prompt, Mode::Build));
+async fn drain(agent: &Agent, prompt: &str) -> Vec<AgentEvent> {
+    let mut stream = agent.run_turn(prompt, Mode::Build);
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -196,12 +194,7 @@ async fn a_tool_call_round_trips_through_a_real_socket() {
     let (addr, requests) = serve(vec![tool_call_body(), text_body("it says hello")]).await;
     let agent = agent(addr, &dir);
 
-    let events = drain(
-        &agent,
-        vec![Message::system("You are solaris.")],
-        "read a.txt",
-    )
-    .await;
+    let events = drain(&agent, "read a.txt").await;
 
     // The tool ran, and its output came back to the caller.
     let results: Vec<&str> = events
@@ -258,7 +251,7 @@ async fn a_turn_with_no_tool_call_is_a_single_request() {
     let (addr, requests) = serve(vec![text_body("no tools needed")]).await;
     let agent = agent(addr, &dir);
 
-    let events = drain(&agent, Vec::new(), "hello").await;
+    let events = drain(&agent, "hello").await;
 
     assert!(
         events.iter().all(|event| !matches!(

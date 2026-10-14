@@ -52,6 +52,13 @@ impl Tool for FindTool {
          are skipped, and dotfiles are included. Use `grep` to search what is inside files."
     }
 
+    fn guideline(&self) -> Option<&'static str> {
+        Some(
+            "`find` matches *paths* by glob. When you need to search what is inside files, use \
+             `grep` instead.",
+        )
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

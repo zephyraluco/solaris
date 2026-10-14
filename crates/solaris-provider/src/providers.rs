@@ -108,6 +108,15 @@ pub struct ProviderSpec {
     /// a coding agent from a stray request, and to attribute the turn to the
     /// plan rather than to the pay-as-you-go balance.
     pub session_header: Option<&'static str>,
+    /// Extra system-prompt text this platform needs, when it needs any.
+    ///
+    /// The agent writes one system prompt for every platform and appends this to
+    /// it, so an entry stays `None` unless something about *this* endpoint
+    /// changes how the model should be addressed — a gateway that routes to any
+    /// family, or a local runtime holding a small model. Platform facts that
+    /// already travel on the wire (the endpoint, the model, the declared tools)
+    /// belong nowhere here.
+    pub prompt: Option<&'static str>,
 }
 
 /// Context window assumed for a model the catalogue does not list.
@@ -121,6 +130,29 @@ const fn usd(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Pric
     Price::per_million(input, output, cache_read, cache_write)
 }
 
+/// Prompt text for an endpoint that routes to whichever model family it likes.
+///
+/// Shared by every gateway entry: what matters is not *which* gateway but that a
+/// single key can reach several families, so nothing may be assumed about the
+/// model behind it.
+const GATEWAY_PROMPT: &str = "This endpoint is a gateway that may route to any model family, \
+     so rely only on the tools declared to you and on the conversation itself, never on one \
+     provider's particular features.";
+
+/// Prompt text for a runtime on this machine.
+///
+/// A local model is usually much smaller than a hosted one: it can follow a short
+/// instruction but loses accuracy over a long one, so it is told to stay inside
+/// its means rather than left to discover the limit.
+const LOCAL_PROMPT: &str = "You are a small model running on the machine you are editing. Keep \
+     replies short, read a file before editing it, and prefer a few deliberate tool calls over \
+     many speculative ones.";
+
+/// Prompt text for an endpoint whose behaviour its deployer chose.
+const SELF_HOSTED_PROMPT: &str = "This is a self-hosted endpoint whose behaviour is set by \
+     whoever runs it. If a request is refused or a field is rejected, say so plainly instead of \
+     repeating the same call.";
+
 /// Every provider the wizard lists, in display order.
 pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
@@ -131,6 +163,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: None,
         wire: Wire::AnthropicMessages,
         session_header: None,
+        prompt: None,
         base_url: Some("https://api.anthropic.com/v1"),
         env_keys: &["ANTHROPIC_API_KEY"],
         base_url_envs: &["ANTHROPIC_BASE_URL"],
@@ -171,6 +204,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // lineup is OpenAI-compatible.
         wire: Wire::OpenAiChat,
         session_header: Some("x-opencode-session"),
+        prompt: Some(GATEWAY_PROMPT),
         // Go lives under zen's host but has a path of its own, and a Go key
         // reaches only what the plan includes.
         base_url: Some("https://opencode.ai/zen/go/v1"),
@@ -270,6 +304,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: None,
         wire: Wire::OpenAiResponses,
         session_header: None,
+        prompt: None,
         base_url: Some("https://api.openai.com/v1"),
         env_keys: &["OPENAI_API_KEY"],
         base_url_envs: &["OPENAI_BASE_URL"],
@@ -302,6 +337,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // an OpenAI-compatible endpoint that speaks this one.
         wire: Wire::OpenAiChat,
         session_header: None,
+        prompt: None,
         base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         env_keys: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         base_url_envs: &[],
@@ -332,6 +368,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: None,
         wire: Wire::OpenAiChat,
         session_header: None,
+        prompt: Some(GATEWAY_PROMPT),
         // A gateway lives wherever it was deployed, so the endpoint comes from
         // `/connect` rather than from this table.
         base_url: None,
@@ -350,6 +387,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: None,
         wire: Wire::OpenAiChat,
         session_header: None,
+        prompt: Some(GATEWAY_PROMPT),
         base_url: Some("https://openrouter.ai/api/v1"),
         env_keys: &["OPENROUTER_API_KEY"],
         base_url_envs: &["OPENROUTER_BASE_URL"],
@@ -372,6 +410,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: Some("LOCAL"),
         wire: Wire::OpenAiChat,
         session_header: None,
+        prompt: Some(LOCAL_PROMPT),
         base_url: Some("http://localhost:11434/v1"),
         env_keys: &[],
         base_url_envs: &["SOLARIS_LOCAL_BASE_URL"],
@@ -402,6 +441,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         badge: None,
         wire: Wire::OpenAiChat,
         session_header: None,
+        prompt: Some(SELF_HOSTED_PROMPT),
         // The endpoint is whatever `/connect` collected.
         base_url: None,
         env_keys: &[],
