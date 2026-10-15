@@ -292,6 +292,8 @@ pub struct App {
     discovered: Vec<String>,
     /// Answer from the background model-discovery task, while one is in flight.
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
+    models_error: Option<String>,
+    oauth: Option<OAuthPending>,
     /// Answer from a `/compact` that is in flight.
     compact_rx: Option<UnboundedReceiver<Option<usize>>>,
     /// Whether asking the provider for its models is allowed at all.
@@ -318,6 +320,24 @@ pub struct App {
     approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
     /// Answers the loop is still waiting for, oldest first.
     pending_approvals: VecDeque<oneshot::Sender<Approval>>,
+}
+
+struct OAuthPending {
+    rx: oneshot::Receiver<Result<Credential, String>>,
+    task: tokio::task::JoinHandle<()>,
+    action: OAuthAction,
+}
+
+enum OAuthAction {
+    Login,
+    Turn(String, String),
+    Models,
+}
+
+impl Drop for OAuthPending {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl App {
@@ -422,6 +442,8 @@ impl App {
             inline: None,
             discovered: Vec::new(),
             models_rx: None,
+            models_error: None,
+            oauth: None,
             compact_rx: None,
             discover_models,
             tools,
@@ -995,6 +1017,24 @@ impl App {
     }
 
     fn start_turn(&mut self, submitted: String, prompt: String) {
+        if self.oauth.is_some() {
+            self.notifications.warning(
+                "OpenAI authorization is in progress; wait before submitting another prompt",
+            );
+            return;
+        }
+        if self.auth.active_provider() == Some("openai") {
+            if let Some(credential) = self
+                .auth
+                .credential("openai")
+                .filter(|c| solaris_provider::oauth::needs_refresh(c))
+                .cloned()
+            {
+                self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
+                self.notifications.info("Refreshing OpenAI authorization…");
+                return;
+            }
+        }
         let prompt = match self.agent.expand_input(&prompt) {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -1366,19 +1406,38 @@ impl App {
 
     /// Ask the backend which models the provider offers, in the background.
     ///
-    /// Discovery never blocks the UI: until an answer lands the picker falls
-    /// back to the catalogue, and if none ever does it keeps doing that. A
-    /// second call replaces the first, so a stale answer cannot arrive after a
-    /// newer one.
+    /// Discovery never blocks the UI. ChatGPT uses only the remote catalog;
+    /// other providers may still use their bundled catalog. Replacing the
+    /// receiver prevents a stale answer from an earlier request being adopted.
     fn refresh_models(&mut self) {
+        self.models_error = None;
+        self.models_rx = None;
+        self.discovered.clear();
         if !self.discover_models {
+            if self.uses_chatgpt() {
+                self.models_error = Some("Model discovery is disabled.".into());
+            }
             return;
+        }
+
+        if self.uses_chatgpt() {
+            if self.oauth.is_some() {
+                return;
+            }
+            if let Some(credential) = self
+                .auth
+                .credential("openai")
+                .filter(|credential| solaris_provider::oauth::needs_refresh(credential))
+                .cloned()
+            {
+                self.refresh_openai_credential(credential, OAuthAction::Models);
+                return;
+            }
         }
 
         let agent = Arc::clone(&self.agent);
         let (tx, rx) = unbounded_channel();
         self.models_rx = Some(rx);
-        self.discovered.clear();
 
         tokio::spawn(async move {
             let answer = agent.models().await.map_err(|error| error.to_string());
@@ -1393,13 +1452,24 @@ impl App {
                 // The provider's own list is the one that knows which models
                 // this credential can actually reach, so an unnamed model takes
                 // the first of them — the same substitution the catalogue gets.
-                let adopt = self.config.model.is_empty();
+                let adopt = self.config.model.is_empty()
+                    || (self.uses_chatgpt() && !models.contains(&self.config.model));
+                self.models_error = None;
                 self.discovered = models;
 
                 if adopt {
                     if let Some(first) = self.discovered.first().cloned() {
                         self.config.model = first;
-                        self.rebuild_backend();
+                        if self.uses_chatgpt() {
+                            let choice = resolve_backend(
+                                &self.backend_factory,
+                                &self.auth,
+                                &mut self.config,
+                            );
+                            self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                        } else {
+                            self.rebuild_backend();
+                        }
                     }
                 }
                 let count = self.discovered.len();
@@ -1414,6 +1484,13 @@ impl App {
                 }
             }
             Ok(_) => {
+                if self.uses_chatgpt() {
+                    self.discovered.clear();
+                    self.models_error = Some(
+                        "OpenAI returned no visible models for this account. Press r to retry."
+                            .into(),
+                    );
+                }
                 // An empty list is an answer rather than a failure — the
                 // provider says this credential reaches no models — but with no
                 // catalogue to fall back on (a gateway, a custom endpoint) the
@@ -1424,6 +1501,12 @@ impl App {
                 }
             }
             Err(message) => {
+                if self.uses_chatgpt() {
+                    self.discovered.clear();
+                    self.models_error = Some(format!(
+                        "Could not list OpenAI models: {message}. Press r to retry."
+                    ));
+                }
                 // Only worth saying when there was no catalogue to fall back on;
                 // otherwise a provider that will not answer is not the user's
                 // problem to solve.
@@ -1455,6 +1538,29 @@ impl App {
     /// pick, and the notice the answer produced already says how to name a model
     /// by hand.
     fn fill_in_models(&mut self) {
+        if self.uses_chatgpt() {
+            let models = self.model_choices();
+            let status = self.model_discovery_status();
+            let current = self.config.model.clone();
+            match self.inline.as_mut() {
+                Some(Inline::Connect(flow)) if flow.step() == ConnectStep::Model => {
+                    let empty = models.is_empty();
+                    flow.enter_models(models, Some(&current));
+                    if empty {
+                        flow.model_status(status);
+                    }
+                }
+                Some(Inline::Model(picker)) => {
+                    *picker = if models.is_empty() {
+                        ModelPicker::new(&self.theme, models, None).with_status(status)
+                    } else {
+                        ModelPicker::new(&self.theme, models, Some(&current))
+                    };
+                }
+                _ => {}
+            }
+            return;
+        }
         if !self.connect_is_choosing_a_model() {
             return;
         }
@@ -1481,6 +1587,9 @@ impl App {
         let catalogue = self.provider_id().and_then(solaris_provider::provider_spec);
 
         if self.discovered.is_empty() {
+            if self.uses_chatgpt() {
+                return Vec::new();
+            }
             return catalogue
                 .map(|spec| {
                     spec.models
@@ -1510,6 +1619,15 @@ impl App {
     /// provider's models can be asked for. With nothing connected there is
     /// nothing to choose between, so the user is told what to do instead.
     fn open_model_picker(&mut self) {
+        if self.uses_chatgpt() {
+            self.refresh_models();
+            self.inline = Some(Inline::Model(
+                ModelPicker::new(&self.theme, Vec::new(), None)
+                    .with_status(self.model_discovery_status()),
+            ));
+            self.notifications.clear();
+            return;
+        }
         let models = self.model_choices();
 
         if models.is_empty() {
@@ -1543,14 +1661,115 @@ impl App {
 
     // ----------------------------------------------------------------- connect
 
+    fn uses_chatgpt(&self) -> bool {
+        self.auth.active_provider() == Some("openai")
+            && matches!(
+                self.auth.credential("openai"),
+                Some(Credential::ChatGpt { .. })
+            )
+    }
+
+    fn model_discovery_status(&self) -> String {
+        self.models_error
+            .clone()
+            .unwrap_or_else(|| "Loading OpenAI account models…".into())
+    }
+
+    fn refresh_openai_credential(&mut self, credential: Credential, action: OAuthAction) {
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = solaris_provider::oauth::refresh(&credential)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.oauth = Some(OAuthPending { rx, task, action });
+    }
+
+    fn begin_openai_login(&mut self) {
+        self.oauth = None;
+        let login = match solaris_provider::oauth::Login::bind() {
+            Ok(login) => login,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                self.close_inline();
+                return;
+            }
+        };
+        if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
+            flow.enter_browser_auth(login.url().to_string());
+        }
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = login.complete().await.map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.oauth = Some(OAuthPending {
+            rx,
+            task,
+            action: OAuthAction::Login,
+        });
+    }
+
+    fn poll_oauth(&mut self) -> bool {
+        let result = match self.oauth.as_mut().map(|pending| pending.rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(oneshot::error::TryRecvError::Closed)) => {
+                Err("OpenAI authorization was interrupted".into())
+            }
+            _ => return false,
+        };
+        let mut pending = match self.oauth.take() {
+            Some(pending) => pending,
+            None => return false,
+        };
+        let action = std::mem::replace(&mut pending.action, OAuthAction::Login);
+        match result {
+            Ok(credential) => {
+                if matches!(action, OAuthAction::Login) {
+                    self.finish_connect("openai".into(), "OpenAI".into(), Some(credential));
+                } else {
+                    self.auth.store("openai", credential);
+                    self.persist_auth();
+                    let choice =
+                        resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+                    self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                    match action {
+                        OAuthAction::Turn(submitted, prompt) => self.start_turn(submitted, prompt),
+                        OAuthAction::Models => self.refresh_models(),
+                        OAuthAction::Login => {}
+                    }
+                }
+            }
+            Err(error) => {
+                if matches!(action, OAuthAction::Models) {
+                    self.on_models_discovered(Err(error));
+                } else {
+                    self.notifications.error(error);
+                    self.close_inline();
+                }
+            }
+        }
+        true
+    }
+
     /// Open the `/connect` wizard in the prompt region.
     fn open_connect(&mut self) {
+        self.oauth = None;
         self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
         self.notifications.clear();
     }
 
     /// Drop the wizard.
     fn close_inline(&mut self) {
+        // Credential refresh belongs to the pending request, not to the wizard.
+        if self
+            .oauth
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.action, OAuthAction::Login))
+        {
+            self.oauth = None;
+        }
         self.inline = None;
     }
 
@@ -1571,6 +1790,18 @@ impl App {
             ConnectOutcome::Closed => self.close_inline(),
             ConnectOutcome::ProviderPicked { id, name } => self.begin_provider_setup(&id, &name),
             ConnectOutcome::Submit(submit) => self.apply_connect_submit(submit),
+            ConnectOutcome::CopyBrowserUrl(url) => {
+                if (self.clipboard.write)(&url) {
+                    self.notifications.info("OpenAI authorization URL copied");
+                } else {
+                    self.notifications
+                        .warning("Could not copy URL; open the displayed URL manually");
+                }
+            }
+            ConnectOutcome::RetryModels => {
+                self.refresh_models();
+                self.fill_in_models();
+            }
             ConnectOutcome::ModelPicked { model_id } => {
                 self.set_model(&model_id);
                 self.close_inline();
@@ -1583,6 +1814,10 @@ impl App {
         match outcome {
             ModelOutcome::Handled => {}
             ModelOutcome::Closed => self.close_inline(),
+            ModelOutcome::Retry => {
+                self.refresh_models();
+                self.fill_in_models();
+            }
             ModelOutcome::Picked { model_id } => {
                 self.set_model(&model_id);
                 self.close_inline();
@@ -1622,6 +1857,7 @@ impl App {
         let provider_name = name.to_string();
 
         match spec.auth {
+            AuthKind::ChatGpt => self.begin_openai_login(),
             // Nothing to collect: activate it straight away.
             AuthKind::Local => {
                 self.apply_connect_outcome(ConnectOutcome::Submit(ConnectSubmit::Local {
@@ -1668,6 +1904,15 @@ impl App {
             ),
         };
 
+        self.finish_connect(provider_id, provider_name, credential);
+    }
+
+    fn finish_connect(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        credential: Option<Credential>,
+    ) {
         if let Some(credential) = credential {
             self.auth.store(provider_id.clone(), credential);
         }
@@ -1696,22 +1941,35 @@ impl App {
         // answer lands. With nothing to offer and nothing on its way there is no
         // step to take, so the wizard closes rather than parking the user on an
         // empty screen.
-        let models: Vec<SelectItem> = solaris_provider::provider_spec(&provider_id)
-            .map(|spec| {
-                spec.models
-                    .iter()
-                    .map(|spec| SelectItem::new(spec.id, spec.id).description(spec.description))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let models: Vec<SelectItem> = if matches!(
+            self.auth.credential(&provider_id),
+            Some(Credential::ChatGpt { .. })
+        ) {
+            Vec::new()
+        } else {
+            solaris_provider::provider_spec(&provider_id)
+                .map(|spec| {
+                    spec.models
+                        .iter()
+                        .map(|model| {
+                            SelectItem::new(model.id, model.id).description(model.description)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let pending = self.models_rx.is_some();
         let current = self.config.model.clone();
+        let chatgpt = self.uses_chatgpt();
 
         match self.inline.as_mut() {
-            Some(flow) if !models.is_empty() || pending => {
+            Some(flow) if !models.is_empty() || pending || chatgpt => {
                 flow.enter_models(models, Some(&current));
             }
             _ => self.close_inline(),
+        }
+        if chatgpt {
+            self.fill_in_models();
         }
     }
 
@@ -1725,12 +1983,7 @@ impl App {
             .auth
             .to_json()
             .map_err(|error| error.to_string())
-            .and_then(|json| {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                std::fs::write(&path, json).map_err(|error| error.to_string())
-            });
+            .and_then(|json| write_credentials(&path, &json).map_err(|error| error.to_string()));
 
         if let Err(error) = written {
             self.notifications
@@ -2053,7 +2306,7 @@ impl Component for App {
     }
 
     fn tick(&mut self) -> bool {
-        let mut dirty = false;
+        let mut dirty = self.poll_oauth();
 
         // Drain backend events without holding a borrow across the handler.
         let mut events = Vec::new();
@@ -2190,6 +2443,36 @@ fn describe_call(call: &ToolCall) -> String {
     // `Value`'s own display is the compact JSON the model sent, which is what
     // the user needs to judge the call by.
     truncate_to_width(&call.input.to_string(), 400, "…")
+}
+
+/// Replace credentials atomically so a crash cannot truncate a rotating token.
+fn write_credentials(path: &Path, json: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos());
+    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), suffix));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Write `json` to `path`, creating the directory when needed.
@@ -3234,6 +3517,187 @@ mod tests {
     }
 
     // ------------------------------------------------------------- /connect
+
+    fn chatgpt_credential() -> Credential {
+        Credential::ChatGpt {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            id_token: "id".into(),
+            account_id: "account".into(),
+            expires_at: u64::MAX,
+        }
+    }
+
+    fn connect_chatgpt_for_test(app: &mut App) {
+        let mut flow = ConnectFlow::new(&app.theme);
+        flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
+        app.inline = Some(Inline::Connect(flow));
+        app.finish_connect("openai".into(), "OpenAI".into(), Some(chatgpt_credential()));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_picker_waits_for_account_catalog_without_any_bundled_models() {
+        let mut app = app_reporting_models_as("openai", &["account-a", "account-b", "account-c"]);
+        connect_chatgpt_for_test(&mut app);
+        let loading = rendered_text(&mut app, 90, 22);
+        assert!(loading.contains("Loading OpenAI account models"));
+        assert!(app.model_choices().is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        settle_discovery(&mut app).await;
+        assert_eq!(
+            app.model_choices()
+                .iter()
+                .map(|model| model.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["account-a", "account-b", "account-c"]
+        );
+        assert_eq!(app.config.model, "account-a");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_picker_keeps_catalog_failure_visible_and_can_retry() {
+        let mut app = app_connected_to_but_faked("openai");
+        connect_chatgpt_for_test(&mut app);
+        settle_discovery(&mut app).await;
+        let text = rendered_text(&mut app, 100, 22);
+        assert!(text.contains("Could not list OpenAI models"));
+        assert!(text.contains("this backend cannot list models"));
+        assert!(app.model_choices().is_empty());
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.models_rx.is_some());
+        assert!(app.models_error.is_none());
+        assert!(rendered_text(&mut app, 100, 22).contains("Loading OpenAI account models"));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_empty_account_catalog_is_not_replaced_by_public_api_models() {
+        let mut app = app_reporting_models_as("openai", &[]);
+        connect_chatgpt_for_test(&mut app);
+        settle_discovery(&mut app).await;
+        assert!(app.model_choices().is_empty());
+        assert!(rendered_text(&mut app, 100, 22).contains("OpenAI returned no visible models"));
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+    }
+
+    #[tokio::test]
+    async fn reopening_chatgpt_model_picker_requests_a_fresh_account_catalog() {
+        let mut app = app_reporting_models_as("openai", &["account-current"]);
+        connect_chatgpt_for_test(&mut app);
+        settle_discovery(&mut app).await;
+        app.close_inline();
+        app.open_model_picker();
+        assert!(app.model_choices().is_empty());
+        assert!(rendered_text(&mut app, 100, 22).contains("Loading OpenAI account models"));
+        settle_discovery(&mut app).await;
+        let text = rendered_text(&mut app, 100, 22);
+        assert!(text.contains("account-current"));
+        assert!(!text.contains("Loading"));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_model_discovery_refreshes_expired_credentials_before_fetching_catalog() {
+        let mut app = app_reporting_models_as("openai", &["account-current"]);
+        let mut credential = chatgpt_credential();
+        if let Credential::ChatGpt { expires_at, .. } = &mut credential {
+            *expires_at = 0;
+        }
+        app.auth.store("openai", credential);
+        app.auth.activate("openai");
+        app.refresh_models();
+        assert!(app.models_rx.is_none());
+        assert!(matches!(
+            app.oauth.as_ref().map(|pending| &pending.action),
+            Some(OAuthAction::Models)
+        ));
+        // Replace the not-yet-polled network task with a deterministic refresh.
+        app.oauth = None;
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = tx.send(Ok(chatgpt_credential()));
+        });
+        app.oauth = Some(OAuthPending {
+            rx,
+            task,
+            action: OAuthAction::Models,
+        });
+        tokio::task::yield_now().await;
+        assert!(app.poll_oauth());
+        assert!(app.models_rx.is_some());
+        settle_discovery(&mut app).await;
+        assert_eq!(app.discovered, vec!["account-current"]);
+    }
+
+    #[tokio::test]
+    async fn browser_authorization_completion_stores_credentials_and_opens_model_picker() {
+        let mut app = app();
+        let mut flow = ConnectFlow::new(&app.theme);
+        flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
+        app.inline = Some(Inline::Connect(flow));
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = tx.send(Ok(chatgpt_credential()));
+        });
+        app.oauth = Some(OAuthPending {
+            rx,
+            task,
+            action: OAuthAction::Login,
+        });
+        tokio::task::yield_now().await;
+        assert!(app.poll_oauth());
+        assert_eq!(app.auth.active_provider(), Some("openai"));
+        assert_eq!(app.auth.credential("openai"), Some(&chatgpt_credential()));
+        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        assert!(app.model_choices().is_empty());
+        assert!(rendered_text(&mut app, 80, 20).contains("Model discovery is disabled"));
+        app.on_models_discovered(Ok(vec![
+            "account-model-one".into(),
+            "account-model-two".into(),
+            "account-model-three".into(),
+        ]));
+        let text = rendered_text(&mut app, 80, 20);
+        assert!(text.contains("account-model-three"));
+        assert!(!text.contains("gpt-5-codex"));
+    }
+
+    #[tokio::test]
+    async fn refreshed_credentials_resume_the_deferred_turn() {
+        let mut app = app_connected_to_but_faked("openai");
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = tx.send(Ok(chatgpt_credential()));
+        });
+        app.oauth = Some(OAuthPending {
+            rx,
+            task,
+            action: OAuthAction::Turn("hello".into(), "hello".into()),
+        });
+        tokio::task::yield_now().await;
+        assert!(app.poll_oauth());
+        assert_eq!(app.auth.credential("openai"), Some(&chatgpt_credential()));
+        assert_eq!(app.session.turns.last().unwrap().prompt, "hello");
+        assert!(app.oauth.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_browser_authorization_discards_late_credentials() {
+        let mut app = app();
+        let mut flow = ConnectFlow::new(&app.theme);
+        flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
+        app.inline = Some(Inline::Connect(flow));
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(std::future::pending());
+        app.oauth = Some(OAuthPending {
+            rx,
+            task,
+            action: OAuthAction::Login,
+        });
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.oauth.is_none());
+        assert!(tx.send(Ok(chatgpt_credential())).is_err());
+        assert!(app.auth.credential("openai").is_none());
+    }
 
     #[test]
     fn connect_command_opens_the_wizard() {

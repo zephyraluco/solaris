@@ -12,6 +12,7 @@
 //! and another.
 
 pub mod choose;
+pub mod oauth;
 pub mod providers;
 
 pub use choose::{
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A stored credential.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
     /// A provider API key.
@@ -40,6 +41,22 @@ pub enum Credential {
     Endpoint { base_url: String, api_key: String },
     /// An OAuth access token.
     Token { token: String },
+    /// ChatGPT integration credentials, not an OpenAI API key.
+    ChatGpt {
+        access_token: String,
+        refresh_token: String,
+        id_token: String,
+        expires_at: u64,
+        account_id: String,
+    },
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("kind", &self.kind())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Credential {
@@ -49,6 +66,7 @@ impl Credential {
             Credential::ApiKey { .. } => "api key",
             Credential::Endpoint { .. } => "endpoint",
             Credential::Token { .. } => "oauth token",
+            Credential::ChatGpt { .. } => "ChatGPT OAuth",
         }
     }
 
@@ -58,6 +76,7 @@ impl Credential {
             Credential::ApiKey { key } => mask_secret(key),
             Credential::Endpoint { base_url, .. } => base_url.clone(),
             Credential::Token { token } => mask_secret(token),
+            Credential::ChatGpt { .. } => "ChatGPT (authorized)".to_string(),
         }
     }
 
@@ -67,6 +86,7 @@ impl Credential {
             Credential::ApiKey { key } => Some(key),
             Credential::Endpoint { api_key, .. } => Some(api_key),
             Credential::Token { token } => Some(token),
+            Credential::ChatGpt { access_token, .. } => Some(access_token),
         }
     }
 }
@@ -235,6 +255,30 @@ pub enum AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chatgpt_credentials_round_trip_without_debug_leaks() {
+        let credential = Credential::ChatGpt {
+            access_token: "private-access".into(),
+            refresh_token: "private-refresh".into(),
+            id_token: "private-id".into(),
+            expires_at: 1234,
+            account_id: "account".into(),
+        };
+        let mut auth = AuthStore::new();
+        auth.store("openai", credential);
+        auth.activate("openai");
+        assert_eq!(
+            AuthStore::from_json(&auth.to_json().unwrap()).unwrap(),
+            auth
+        );
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("private-"));
+        assert_eq!(
+            auth.active_credential().unwrap().masked(),
+            "ChatGPT (authorized)"
+        );
+    }
 
     #[test]
     fn masking_keeps_only_the_last_four_characters() {

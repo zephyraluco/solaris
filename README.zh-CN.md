@@ -252,7 +252,11 @@ solaris 只把「这个技能存在」告诉模型 —— 名字、描述和文�
 
 ### 环境变量
 
-环境里的 key 优先于 `auth.json`，而且只靠它就能跑：`ANTHROPIC_API_KEY=… solaris` 完全不需要 `/connect`。
+在 `/connect` 中选择 **OpenAI** 会直接显示浏览器授权网址，不再要求填写 API key。按 `c` 复制完整链接，在与 solaris 同一台机器的浏览器中登录 OpenAI / ChatGPT 并授权；浏览器回调到 `http://localhost:1455/auth/callback` 后，向导自动进入模型选择。按 Esc 取消，五分钟未完成则超时；1455 端口被占用时会提示错误，请先关闭占用它的程序再重试。账户必须具备 OpenAI 授予的 Codex 使用权限，ChatGPT 授权不等于取得通用 OpenAI API key。
+
+授权使用 PKCE 和随机 state。访问令牌、刷新令牌、ID 令牌、过期时间和账户 ID 保存在本机 `auth.json`，**这是敏感文件，请勿提交或分享**（Unix 上写入权限为 `0600`；Windows 使用所在用户目录的 ACL）。获取模型清单或发送新一轮请求前会刷新临近过期的令牌并保存更新。账户令牌仅发给固定的 ChatGPT/Codex 集成端点，忽略 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`，不会被转发到自定义网关。模型选择只展示账户的远程 Codex 清单，按服务端优先级排序并遵守可见性标记，不再提供内置兜底模型。加载中、空清单和请求失败均会明确提示；按 `r` 重试，或重新打开 `/model` 刷新。清单使用的 Codex 协议版本独立于 Solaris 自身版本，因为 OpenAI 会按 Codex 客户端版本筛选模型。
+
+其他情况下，环境里的 key 优先于 `auth.json`，而且只靠它就能跑：`ANTHROPIC_API_KEY=… solaris` 完全不需要 `/connect`。未保存 ChatGPT 授权时仍兼容既有 OpenAI API key 文件及环境变量配置。
 
 | 变量 | Provider |
 | --- | --- |

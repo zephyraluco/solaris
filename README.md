@@ -253,7 +253,11 @@ Three wire protocols cover the whole catalogue, and the *model* decides which on
 
 ### Environment variables
 
-Keys found in the environment win over `auth.json`, and a key in the environment is enough on its own: `ANTHROPIC_API_KEY=… solaris` needs no `/connect` at all.
+Selecting **OpenAI** in `/connect` now goes directly to ChatGPT browser authorization instead of an API-key field. Press `c` to copy the complete URL, then sign in to OpenAI / ChatGPT and authorize in a browser on the same machine. The callback at `http://localhost:1455/auth/callback` advances the wizard to model selection. Esc cancels; login times out after five minutes. If port 1455 is occupied, close the program using it and retry. Your account must have the required Codex entitlement; this authorization does not grant a general-purpose OpenAI API key.
+
+The flow uses PKCE and a random state. Access, refresh and ID tokens, expiry and account ID are saved locally in `auth.json`. **Treat this as a secret file: do not commit or share it.** Writes use `0600` on Unix and the containing user directory's ACL on Windows. Tokens nearing expiry are refreshed and persisted before model discovery or a new turn. Account tokens only go to the fixed ChatGPT/Codex integration endpoint, ignoring `OPENAI_BASE_URL` and `OPENAI_API_KEY`; they are never forwarded to a custom gateway. The model picker only shows the account's remote Codex catalog, sorted by priority and respecting its visibility flags. There are no bundled fallback models. Loading, an empty catalog and request failures are shown explicitly; press `r` to retry, or reopen `/model` to refresh. The catalog protocol version is independent of Solaris's package version because OpenAI gates catalog entries by Codex client version.
+
+Otherwise, keys found in the environment win over `auth.json`, and a key in the environment is enough on its own: `ANTHROPIC_API_KEY=… solaris` needs no `/connect` at all. Existing OpenAI API-key files and environment configuration remain compatible when no ChatGPT authorization is stored.
 
 | Variable | Provider |
 | --- | --- |

@@ -20,6 +20,8 @@ pub enum AuthKind {
     ApiKey,
     /// An OpenAI-compatible endpoint: base URL plus an optional key.
     ApiKeyWithUrl,
+    /// ChatGPT account authorization in a browser.
+    ChatGpt,
 }
 
 /// One model a provider offers.
@@ -299,8 +301,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "openai",
         name: "OpenAI",
-        description: "GPT models — API key",
-        auth: AuthKind::ApiKey,
+        description: "ChatGPT account — browser authorization",
+        auth: AuthKind::ChatGpt,
         badge: None,
         wire: Wire::OpenAiResponses,
         session_header: None,
@@ -671,17 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn only_key_providers_read_the_environment() {
+    fn environment_keys_are_only_read_by_providers_supporting_api_keys() {
         // A gateway's key arrives with its URL, so the environment cannot set
         // one up. The other direction is not a rule: opencode go needs nothing
         // but a key, and that key is collected in `/connect` rather than read
         // from a variable.
         for spec in PROVIDERS {
             if !spec.env_keys.is_empty() {
-                assert_eq!(
-                    spec.auth,
-                    AuthKind::ApiKey,
-                    "{} reads the environment but is not a key provider",
+                // OpenAI keeps environment/API-key compatibility, while the
+                // interactive wizard now uses ChatGPT browser authorization.
+                assert!(
+                    matches!(spec.auth, AuthKind::ApiKey | AuthKind::ChatGpt),
+                    "{} cannot accept an environment API key",
                     spec.id
                 );
             }

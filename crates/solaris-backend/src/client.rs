@@ -19,6 +19,10 @@ use crate::sse::{SseDecoder, SseEvent};
 use crate::wire::{self, Wire, WireStream};
 use crate::{AgentBackend, AgentEventStream};
 
+// This is the Codex catalog protocol version, not Solaris's package version.
+// The service gates models by client version; 0.1.0 returns an empty catalog.
+const CODEX_CATALOG_VERSION: &str = "0.162.1";
+
 /// Where one turn goes, how it authenticates, and which protocol to speak.
 ///
 /// Fixed at the moment the backend is built: nothing here is looked up later.
@@ -113,6 +117,7 @@ pub struct HttpBackend {
     max_tokens: u32,
     price: Option<Price>,
     prompt_cache_key: Option<&'static str>,
+    chatgpt: Option<(String, u64)>,
 }
 
 impl HttpBackend {
@@ -125,7 +130,14 @@ impl HttpBackend {
             max_tokens: plan.max_tokens,
             price: plan.price,
             prompt_cache_key: plan.prompt_cache_key,
+            chatgpt: None,
         })
+    }
+
+    /// Use the ChatGPT/Codex request profile rather than the public API profile.
+    pub fn with_chatgpt(mut self, account_id: String, expires_at: u64) -> Self {
+        self.chatgpt = Some((account_id, expires_at));
+        self
     }
 
     /// Where requests go, for `--print-config`.
@@ -145,6 +157,13 @@ impl HttpBackend {
     /// included, whose `/v1/messages` takes `x-api-key` while its
     /// OpenAI-compatible paths take a bearer token.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = if let Some((account, _)) = &self.chatgpt {
+            request
+                .header("ChatGPT-Account-Id", account)
+                .header("originator", "solaris")
+        } else {
+            request
+        };
         let request = match self.endpoint.wire {
             Wire::AnthropicMessages => request.header("anthropic-version", anthropic::API_VERSION),
             Wire::OpenAiChat | Wire::OpenAiResponses => request,
@@ -208,6 +227,16 @@ impl HttpBackend {
 #[async_trait::async_trait]
 impl AgentBackend for HttpBackend {
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        if let Some((_, expires_at)) = &self.chatgpt {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |t| t.as_secs());
+            if *expires_at <= now {
+                return Err(BackendError::new(
+                    "OpenAI authorization expired — run /connect again",
+                ));
+            }
+        }
         let url = self.endpoint.url();
         let mut body = wire::request_body(
             self.endpoint.wire,
@@ -217,6 +246,13 @@ impl AgentBackend for HttpBackend {
             self.prompt_cache_key,
         );
         let mut repaired: Vec<Repair> = Vec::new();
+        if self.chatgpt.is_some() {
+            body.as_object_mut()
+                .map(|body| body.remove("max_output_tokens"));
+            if body.get("instructions").is_none() {
+                body["instructions"] = Value::String(String::new());
+            }
+        }
         let mut pending: VecDeque<AgentEvent> = VecDeque::new();
         let mut attempt = 0usize;
 
@@ -291,18 +327,30 @@ impl AgentBackend for HttpBackend {
     /// Ask the provider which models it offers.
     ///
     /// One attempt, no retries: this feeds a picker, so a slow or unreachable
-    /// provider should cost nothing more than falling back to the catalogue.
+    /// provider reports an error rather than leaving the picker loading forever.
     async fn models(&self) -> Result<Vec<String>, BackendError> {
-        let url = self.endpoint.models_url();
+        let url = if self.chatgpt.is_some() {
+            format!(
+                "{}?client_version={}",
+                self.endpoint.models_url(),
+                CODEX_CATALOG_VERSION
+            )
+        } else {
+            self.endpoint.models_url()
+        };
         let response = self
             .authorize(self.client.get(&url))
             .header("accept", "application/json")
+            .timeout(Duration::from_secs(30))
             .send()
             .await
             .map_err(|error| self.unreachable(&error))?;
 
         let status = response.status();
-        let body = describe_body(response).await;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.unreachable(&error))?;
 
         if !status.is_success() {
             return Err(BackendError::new(http::describe(
@@ -317,12 +365,54 @@ impl AgentBackend for HttpBackend {
         // base URL that stops short of a gateway's API gets its web front end
         // back, which answers 200 with a page, and reading that as "no models"
         // would hide a wrong URL behind a plausible-looking answer.
-        let Some(models) = parse_models(&body) else {
+        let models = if self.chatgpt.is_some() {
+            parse_codex_models(&body)
+        } else {
+            parse_models(&body)
+        };
+        let Some(models) = models else {
             return Err(BackendError::new(self.not_a_model_list(&url, &body)));
         };
 
         Ok(models)
     }
+}
+
+fn parse_codex_models(body: &str) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Catalog {
+        models: Vec<Model>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Model {
+        slug: String,
+        #[serde(default)]
+        visibility: Option<String>,
+        #[serde(default)]
+        priority: i64,
+    }
+    let mut catalog: Catalog = serde_json::from_str(body).ok()?;
+    if catalog
+        .models
+        .iter()
+        .any(|model| model.slug.trim().is_empty())
+    {
+        return None;
+    }
+    catalog.models.sort_by_key(|model| model.priority);
+    Some(
+        catalog
+            .models
+            .into_iter()
+            .filter(|model| {
+                model
+                    .visibility
+                    .as_deref()
+                    .is_none_or(|visibility| visibility == "list")
+            })
+            .map(|model| model.slug)
+            .collect(),
+    )
 }
 
 /// Model ids out of a `{"data": [{"id": …}]}` list.

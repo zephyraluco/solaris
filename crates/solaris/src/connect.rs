@@ -34,6 +34,8 @@ pub enum ConnectStep {
     Provider,
     /// Step 2a — paste an API key.
     ApiKey,
+    /// OpenAI browser authorization; the application owns the callback task.
+    BrowserAuth,
     /// Step 2b — a custom OpenAI-compatible endpoint (URL plus optional key).
     CustomProvider,
     /// Step 3 — pick a model from the provider that just connected.
@@ -74,6 +76,10 @@ pub enum ConnectOutcome {
     ProviderPicked { id: String, name: String },
     /// A credential was confirmed; the application applies it.
     Submit(ConnectSubmit),
+    /// Copy the complete URL, including the part wrapped off screen.
+    CopyBrowserUrl(String),
+    /// Fetch the provider's model catalog again.
+    RetryModels,
     /// A model was chosen for the provider that just connected.
     ModelPicked { model_id: String },
 }
@@ -128,7 +134,9 @@ impl ConnectFlow {
             .collect();
 
         let providers = InlineSelect::new(styles, "Connect", "Select a provider:", items)
-            .with_note("solaris can be used with a provider API key, billed based on usage.");
+            .with_note(
+                "Connect a provider with an API key, a ChatGPT account, or a local runtime.",
+            );
 
         Self {
             step: ConnectStep::Provider,
@@ -189,6 +197,12 @@ impl ConnectFlow {
         self.seeded[0] = !self.input.is_empty();
     }
 
+    /// Show a browser URL (or a safe error) while waiting for authorization.
+    pub fn enter_browser_auth(&mut self, message: String) {
+        self.enter_text_step(ConnectStep::BrowserAuth, "openai".into(), "OpenAI".into());
+        self.input = message;
+    }
+
     /// Step 2b — collect an endpoint URL and an optional key.
     ///
     /// Both fields pre-fill from what is already stored for the provider.
@@ -228,6 +242,12 @@ impl ConnectFlow {
             picker.select_value(current);
         }
         self.models = picker;
+    }
+
+    /// Keep an empty model step visible with its loading/error explanation.
+    pub fn model_status(&mut self, message: String) {
+        self.models = InlineSelect::new(self.styles, self.title(), "Select a model:", Vec::new())
+            .with_note(message);
     }
 
     fn enter_text_step(&mut self, step: ConnectStep, provider_id: String, provider_name: String) {
@@ -346,11 +366,21 @@ impl ConnectFlow {
                 InlineSelectOutcome::Picked(index) => self.confirm_provider(index),
                 InlineSelectOutcome::Handled => ConnectOutcome::Handled,
             },
+            ConnectStep::Model if key.code == KeyCode::Char('r') && plain_text_key(&key) => {
+                ConnectOutcome::RetryModels
+            }
             ConnectStep::Model => match self.models.on_key(key) {
                 InlineSelectOutcome::Picked(_) => self.confirm_model(),
                 InlineSelectOutcome::Handled => ConnectOutcome::Handled,
             },
             ConnectStep::ApiKey => self.api_key_key(key),
+            ConnectStep::BrowserAuth => {
+                if key.code == KeyCode::Char('c') && plain_text_key(&key) {
+                    ConnectOutcome::CopyBrowserUrl(self.input.clone())
+                } else {
+                    ConnectOutcome::Handled
+                }
+            }
             ConnectStep::CustomProvider => self.custom_provider_key(key),
         }
     }
@@ -512,6 +542,7 @@ impl ConnectFlow {
 
         let hints: Vec<&str> = match self.step {
             ConnectStep::ApiKey => vec!["enter confirm", "ctrl+u clear"],
+            ConnectStep::BrowserAuth => vec!["c copy URL"],
             ConnectStep::CustomProvider => {
                 vec!["tab switch field", "enter confirm", "ctrl+u clear"]
             }
@@ -592,6 +623,22 @@ impl ConnectFlow {
         lines.push(Line::from(Span::styled(self.title(), self.styles.title)));
 
         match self.step {
+            ConnectStep::BrowserAuth => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Open this URL to sign in to OpenAI / ChatGPT:",
+                    self.styles.text,
+                )));
+                // Wrap even a long query string without dropping characters.
+                let chars: Vec<char> = self.input.chars().collect();
+                for chunk in chars.chunks(usize::from(width.max(1))) {
+                    lines.push(Line::from(Span::styled(
+                        chunk.iter().collect::<String>(),
+                        self.styles.text,
+                    )));
+                }
+                lines.push(Line::from("Waiting for browser authorization…"));
+            }
             ConnectStep::ApiKey => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(self.question(), self.styles.text)));
@@ -684,6 +731,24 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_step_copies_complete_url_and_never_collects_an_api_key() {
+        let mut flow = new_flow();
+        let url = "https://auth.openai.com/oauth/authorize?state=example";
+        flow.enter_browser_auth(url.into());
+        let text = rendered(&mut flow, 45, 12);
+        assert!(text.contains("OpenAI / ChatGPT"));
+        assert!(!text.contains("Paste your API key"));
+        assert!(text.contains("c copy URL"));
+        assert_eq!(
+            flow.on_key(key(KeyCode::Char('c'))),
+            ConnectOutcome::CopyBrowserUrl(url.into())
+        );
+        assert!(!flow.insert_paste("secret"));
+        assert_eq!(flow.on_key(key(KeyCode::Enter)), ConnectOutcome::Handled);
+        assert_eq!(flow.on_key(key(KeyCode::Esc)), ConnectOutcome::Closed);
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -1155,7 +1220,7 @@ mod tests {
 
         assert_eq!(rows[0], "Connect");
         assert_eq!(rows[1], "");
-        assert!(rows[2].starts_with("solaris can be used with a provider API key"));
+        assert!(rows[2].starts_with("Connect a provider with an API key"));
         assert!(text.contains("Select a provider:"));
         assert!(text.contains("❯ 1. Anthropic · Claude models — API key"));
         assert!(text.contains("  2. OpenCode Go · Monthly plan — open coding models"));

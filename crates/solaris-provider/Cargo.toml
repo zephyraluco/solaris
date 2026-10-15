@@ -15,6 +15,12 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "system-proxy", "form"] }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+url = "2"
 
 [dev-dependencies]
 # The resolution tests drive the async entry point.

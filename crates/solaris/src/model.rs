@@ -20,6 +20,8 @@ pub enum ModelOutcome {
     Closed,
     /// A model was confirmed as the new active one.
     Picked { model_id: String },
+    /// Refresh the provider's model catalog.
+    Retry,
 }
 
 /// The `/model` picker.
@@ -45,6 +47,12 @@ impl ModelPicker {
     /// Repaint with another theme's palette.
     pub fn set_theme(&mut self, theme: &Theme) {
         self.picker.set_styles(InlineStyles::from_theme(theme));
+    }
+
+    /// Explain a loading or failed catalog without inventing selectable rows.
+    pub fn with_status(mut self, message: String) -> Self {
+        self.picker = self.picker.with_note(message);
+        self
     }
 
     /// The area the picker last drew into.
@@ -81,6 +89,9 @@ impl ModelPicker {
             return ModelOutcome::Closed;
         }
 
+        if key.code == KeyCode::Char('r') && key.modifiers.is_empty() {
+            return ModelOutcome::Retry;
+        }
         match self.picker.on_key(key) {
             InlineSelectOutcome::Picked(_) => self.picked(),
             InlineSelectOutcome::Handled => ModelOutcome::Handled,

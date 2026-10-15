@@ -134,6 +134,67 @@ fn turn() -> TurnRequest {
 }
 
 #[tokio::test]
+async fn chatgpt_profile_sends_account_header_and_supported_responses_fields() {
+    let (addr, seen) = serve(response("200 OK", "text/event-stream",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")).await;
+    let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-5-codex", 8192, None)
+        .with_chatgpt("account-123".into(), u64::MAX);
+    let events: Vec<_> = backend.run_turn(turn()).await.unwrap().collect().await;
+    assert!(events.iter().any(AgentEvent::is_terminal));
+    let request = tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("chatgpt-account-id: account-123")
+    );
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["instructions"], "You are solaris.");
+    assert_eq!(body["store"], false);
+    assert!(body.get("max_output_tokens").is_none());
+}
+
+#[tokio::test]
+async fn expired_chatgpt_credentials_are_refused_before_network_access() {
+    let backend = backend_with(
+        "127.0.0.1:9".parse().unwrap(),
+        Wire::OpenAiResponses,
+        "gpt-5",
+        8192,
+        None,
+    )
+    .with_chatgpt("account".into(), 0);
+    let error = match backend.run_turn(turn()).await {
+        Ok(_) => panic!("expired credentials must not reach the network"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("authorization expired"));
+}
+
+#[tokio::test]
+async fn chatgpt_model_discovery_reads_codex_slugs_instead_of_public_api_ids() {
+    let (addr, seen) = serve(response(
+        "200 OK",
+        "application/json",
+        r#"{"models":[{"slug":"gpt-5-codex","visibility":"list","priority":2,"supported_in_api":false},{"slug":"hidden","visibility":"hide","priority":0},{"slug":"gpt-5","visibility":"list","priority":1}]}"#,
+    ))
+    .await;
+    let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-5-codex", 8192, None)
+        .with_chatgpt("account".into(), u64::MAX);
+    assert_eq!(
+        backend.models().await.unwrap(),
+        vec!["gpt-5", "gpt-5-codex"]
+    );
+    let request = seen.await.unwrap();
+    assert!(request.starts_with("GET /v1/models?client_version=0.162.1 "));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("chatgpt-account-id: account")
+    );
+}
+
+#[tokio::test]
 async fn a_streamed_reply_arrives_over_a_real_socket() {
     let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
                 data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\

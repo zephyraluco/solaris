@@ -166,6 +166,21 @@ impl Agent {
         self.cancel.clone()
     }
 
+    /// Replace transport credentials at an idle boundary without losing the
+    /// conversation, queued input, resources, tools or cancellation handle.
+    pub fn with_refreshed_backend(&self, choice: BackendChoice) -> Self {
+        Self {
+            choice,
+            registry: Arc::clone(&self.registry),
+            options: self.options.clone(),
+            cancel: self.cancel.clone(),
+            conversation: Arc::clone(&self.conversation),
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+            resources: Arc::clone(&self.resources),
+        }
+    }
+
     /// A handle for messages that correct the turn that is running.
     ///
     /// Queued, not delivered: the loop folds a message into the conversation
@@ -478,6 +493,18 @@ mod tests {
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::default(),
         )
+    }
+
+    #[test]
+    fn refreshing_backend_keeps_conversation_and_resource_identity() {
+        let original = agent(Scripted::new(Vec::new()));
+        original
+            .conversation
+            .push(solaris_backend::Message::user("remember this"));
+        let refreshed = original.with_refreshed_backend(choice(Scripted::new(Vec::new())));
+        assert_eq!(refreshed.conversation_len(), 1);
+        assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
+        assert!(Arc::ptr_eq(&original.resources, &refreshed.resources));
     }
 
     /// A tool as the registry and the loop want it.

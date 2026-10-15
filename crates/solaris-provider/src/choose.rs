@@ -162,9 +162,31 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         );
     };
 
-    let model = real_model(spec, model);
     // The protocol follows the model, so it is resolved once the model is.
-    let wire = spec.wire_for(&model);
+    let chatgpt = if spec.id == "openai" {
+        match auth.credential("openai") {
+            Some(Credential::ChatGpt {
+                account_id,
+                expires_at,
+                ..
+            }) => Some((account_id.clone(), *expires_at)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Account-authorized models come from the remote Codex catalog, not the
+    // public API catalog. Keep an unnamed model empty until discovery answers.
+    let model = if chatgpt.is_some() {
+        model.to_string()
+    } else {
+        real_model(spec, model)
+    };
+    let wire = if chatgpt.is_some() {
+        solaris_backend::Wire::OpenAiResponses
+    } else {
+        spec.wire_for(&model)
+    };
 
     let endpoint = Endpoint {
         wire,
@@ -182,7 +204,11 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     // prompt-cache key rides along.
     let plan = TurnPlan {
         max_tokens: max_output_for(&model),
-        price: price_for(&model),
+        price: if chatgpt.is_some() {
+            None
+        } else {
+            price_for(&model)
+        },
         prompt_cache_key,
         model: model.clone(),
         endpoint,
@@ -190,6 +216,10 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     match HttpBackend::new(plan) {
         Ok(backend) => {
+            let backend = match chatgpt {
+                Some((account, expiry)) => backend.with_chatgpt(account, expiry),
+                None => backend,
+            };
             let base_url = backend.base_url().to_string();
 
             // With no model named and none in the catalogue there is nothing a
@@ -378,6 +408,25 @@ fn resolve(
 ) -> Option<(String, Option<String>, CredentialSource)> {
     let stored = auth.credential(spec.id);
 
+    // Account tokens are scoped to the Codex integration, never the public API
+    // or a base-URL override. An environment API key must not change this route.
+    if let Some(Credential::ChatGpt {
+        access_token,
+        account_id,
+        ..
+    }) = stored
+    {
+        return (spec.id == "openai" && !access_token.is_empty() && !account_id.is_empty()).then(
+            || {
+                (
+                    "https://chatgpt.com/backend-api/codex".to_string(),
+                    Some(access_token.clone()),
+                    CredentialSource::Stored,
+                )
+            },
+        );
+    }
+
     let base_url = match spec.base_url {
         Some(default) => lookup(spec.base_url_envs)
             .map(|(_, url)| url)
@@ -400,7 +449,7 @@ fn resolve(
         Some(secret) => Some((base_url, Some(secret), CredentialSource::Stored)),
         // A provider that authenticates with a key cannot be called without
         // one; a local runtime and a keyless endpoint can.
-        None if spec.auth == AuthKind::ApiKey => None,
+        None if matches!(spec.auth, AuthKind::ApiKey | AuthKind::ChatGpt) => None,
         None => Some((base_url, None, CredentialSource::None)),
     }
 }
@@ -865,5 +914,68 @@ mod tests {
     #[test]
     fn an_empty_environment_reports_nothing() {
         assert_eq!((empty_environment())(&["HOME"]), None);
+    }
+
+    #[test]
+    fn chatgpt_tokens_ignore_api_key_and_url_overrides() {
+        let auth = auth_with(
+            "openai",
+            Some(Credential::ChatGpt {
+                access_token: "account-access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        let choice = choose_backend(
+            &auth,
+            "gpt-5-codex",
+            options_with(&[
+                ("OPENAI_API_KEY", "api-key"),
+                ("OPENAI_BASE_URL", "https://untrusted.test/v1"),
+            ]),
+        );
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex")
+        );
+        assert_eq!(choice.source, CredentialSource::Stored);
+    }
+
+    #[test]
+    fn chatgpt_without_a_selected_model_does_not_adopt_a_public_api_default() {
+        let auth = auth_with(
+            "openai",
+            Some(Credential::ChatGpt {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        let choice = choose_backend(&auth, "", options());
+        assert!(choice.model.is_empty());
+        assert_eq!(choice.source, CredentialSource::NoModel);
+        assert_eq!(choice.provider_id, Some("openai"));
+    }
+
+    #[test]
+    fn chatgpt_tokens_cannot_authenticate_other_providers() {
+        let auth = auth_with(
+            "custom",
+            Some(Credential::ChatGpt {
+                access_token: "account-access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        assert_eq!(
+            choose_backend(&auth, "gpt-5", options()).source,
+            CredentialSource::Missing
+        );
     }
 }
