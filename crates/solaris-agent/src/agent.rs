@@ -16,6 +16,7 @@ use crate::prompt;
 use crate::queue::Queue;
 use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
 use crate::skills::Skills;
+use crate::subagent::{SubagentRunner, SubagentTool};
 use crate::{InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
@@ -47,6 +48,8 @@ pub struct AgentOptions {
     pub skills: Skills,
     /// Global and project instructions used by every turn.
     pub prompt_context: PromptContext,
+    /// Whether this agent may delegate. Children always disable delegation.
+    pub subagents: bool,
 }
 
 impl Default for AgentOptions {
@@ -60,6 +63,7 @@ impl Default for AgentOptions {
             compaction: Compaction::default(),
             skills: Skills::empty(),
             prompt_context: PromptContext::default(),
+            subagents: true,
         }
     }
 }
@@ -104,6 +108,12 @@ impl AgentOptions {
         self.prompt_context = context;
         self
     }
+
+    /// Enable or disable the runtime's subagent tool.
+    pub fn with_subagents(mut self, enabled: bool) -> Self {
+        self.subagents = enabled;
+        self
+    }
 }
 
 /// A session with a model behind it.
@@ -138,6 +148,13 @@ pub struct Agent {
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
     pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self {
+        let registry = if options.subagents {
+            let mut registry = registry.as_ref().clone();
+            registry.add(Arc::new(SubagentTool));
+            Arc::new(registry)
+        } else {
+            registry
+        };
         let resources = Arc::new(RwLock::new(ResourceSnapshot {
             skills: options.skills.clone(),
             prompt: options.prompt_context.clone(),
@@ -270,8 +287,18 @@ impl Agent {
 
     /// The tools a turn in `mode` would declare.
     pub fn tool_names(&self, mode: Mode) -> Vec<String> {
+        self.turn_tools(mode)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    fn turn_tools(&self, mode: Mode) -> Vec<Arc<dyn solaris_tools::Tool>> {
         self.registry
-            .selected_names(default_tool_names(mode), &self.options.selection)
+            .select(default_tool_names(mode), &self.options.selection)
+            .into_iter()
+            .filter(|tool| self.options.subagents || tool.name() != crate::SUBAGENT_TOOL)
+            .collect()
     }
 
     /// The skills this session may draw on.
@@ -332,9 +359,19 @@ impl Agent {
                 }));
             }
         };
-        let tools = self
-            .registry
-            .select(default_tool_names(mode), &self.options.selection);
+        let tools = self.turn_tools(mode);
+        let subagent = tools
+            .iter()
+            .any(|tool| tool.name() == crate::SUBAGENT_TOOL)
+            .then(|| {
+                Arc::new(SubagentRunner {
+                    choice: self.choice.clone(),
+                    registry: Arc::clone(&self.registry),
+                    options: self.options.clone(),
+                    resources: resources.clone(),
+                    mode,
+                })
+            });
 
         // The prompt is written per turn because every part of it can change:
         // the mode, which tools the mode leaves standing, and which platform the
@@ -360,6 +397,7 @@ impl Agent {
             system,
             prompt,
             context_window: self.context_window(),
+            subagent,
         })
     }
 }
@@ -664,7 +702,10 @@ mod tests {
         assert!(build.contains(&"edit".to_string()));
         assert!(build.contains(&"write".to_string()));
 
-        assert_eq!(agent.tool_names(Mode::Plan), ["find", "grep", "ls", "read"]);
+        assert_eq!(
+            agent.tool_names(Mode::Plan),
+            ["find", "grep", "ls", "read", "subagent"]
+        );
     }
 
     #[test]
@@ -692,7 +733,7 @@ mod tests {
             .map(|spec| spec.name.clone())
             .collect();
         names.sort();
-        assert_eq!(names, ["find", "grep", "ls", "read"]);
+        assert_eq!(names, ["find", "grep", "ls", "read", "subagent"]);
     }
 
     #[tokio::test]

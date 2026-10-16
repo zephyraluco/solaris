@@ -163,8 +163,9 @@ The model can ask solaris to do things. A turn runs what it asks for, hands back
 | `find` | Find paths by glob, respecting `.gitignore` | plan |
 | `bash` | Run a shell command and return what it printed | build (not Windows) |
 | `powershell` | Run a PowerShell command and return what it printed | build (Windows) |
+| `subagent` | Delegate an isolated task to `explore` or `general` | build, plan (`explore` only) |
 
-Plan mode declares only the read-only four, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
+Plan mode declares the four read-only tools plus delegation to read-only `explore` children, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
 
 ```bash
 # read-only for one run, whatever the mode
@@ -279,6 +280,23 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 - **Errors.** A rejected key, an unknown model, a rate limit or an empty account is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
 
 ---
+
+## Subagents
+
+The model can call `subagent` to delegate a self-contained task:
+
+```json
+{"agent":"explore","prompt":"Find the authentication entry points. Report the relevant files and how they connect; do not change files."}
+```
+
+- **`explore`** is read-only (read/search/list); **`general`** can implement a task in Build mode. Plan mode rejects `general`.
+- Children use the current provider/model and their own conversation. They inherit project instructions, skills, approval policy, working directory and explicit tool allowlists/exclusions, but do not see the parent's history. Put necessary context and constraints in `prompt`.
+- Calls wait for their result. Independent calls may run concurrently under the existing parallel-tool limit (default 4). Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
+- Children cannot delegate recursively. Each is limited to 20 model requests (including compaction), five minutes and a 16 KiB returned report. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
+- Ctrl+C or abandoning the parent stream cancels child work too. Child token usage/cost is included in session totals, but child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
+- Disable delegation with `--exclude-tools subagent`. Library callers may also use `AgentOptions::with_subagents(false)`.
+
+This initial implementation is foreground-only: no persistent child sessions, resume IDs, background tasks or per-child model overrides.
 
 # Configuration
 

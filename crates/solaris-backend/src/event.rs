@@ -24,6 +24,9 @@ pub enum AgentEvent {
         result: ToolResult,
         duration_ms: u64,
     },
+    /// Usage spent in isolated subagent contexts. Included in the eventual
+    /// turn total, but must not be counted as occupying the parent's window.
+    SubagentUsage { usage: Usage, cost_usd: f64 },
     /// A message the user queued for after this turn is now being run as one.
     ///
     /// Not terminal: the turn it arrived during is over, and another has begun in
@@ -143,6 +146,13 @@ mod tests {
             .is_terminal()
         );
         assert!(!AgentEvent::TextDelta("hi".to_string()).is_terminal());
+        assert!(
+            !AgentEvent::SubagentUsage {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0
+            }
+            .is_terminal()
+        );
         assert!(
             !AgentEvent::OutputTruncated.is_terminal(),
             "a cut-off message still has a completion after it"

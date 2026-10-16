@@ -119,6 +119,64 @@ struct Harness {
     terminal: Terminal<TestBackend>,
 }
 
+struct DelegatingBackend;
+
+#[async_trait::async_trait]
+impl AgentBackend for DelegatingBackend {
+    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        let child = asked(&request).starts_with("You are an isolated");
+        let answered = request
+            .history
+            .iter()
+            .any(|message| message.tool_results().next().is_some());
+        let event = if child {
+            AgentEvent::TextDelta("delegated finding".into())
+        } else if answered {
+            assert!(
+                request
+                    .history
+                    .iter()
+                    .flat_map(|message| message.tool_results())
+                    .any(|result| result.output == "delegated finding" && !result.is_error)
+            );
+            AgentEvent::TextDelta("Parent integrated the subagent result.".into())
+        } else {
+            assert!(request.tools.iter().any(|tool| tool.name == "subagent"));
+            AgentEvent::ToolCall(ToolCall::new(
+                "delegate-1",
+                "subagent",
+                serde_json::json!({"agent":"explore","prompt":"Investigate the task and report."}),
+            ))
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            event,
+            AgentEvent::TurnComplete {
+                usage: Usage::new(2, 1),
+                cost_usd: 0.0,
+            },
+        ])))
+    }
+    fn label(&self) -> &str {
+        "delegating"
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_task_runs_and_returns_its_result_through_the_tui() {
+    let mut harness = Harness::with_backend(Arc::new(DelegatingBackend));
+    harness.type_str("Delegate a focused investigation.");
+    harness.key(KeyCode::Enter);
+    let text = harness
+        .settle_turn("Parent integrated the subagent result.")
+        .await;
+    assert!(
+        text.contains("Parent integrated the subagent result."),
+        "{text}"
+    );
+    assert!(text.contains("✓ subagent"), "{text}");
+    assert!(!text.contains("generating"), "{text}");
+}
+
 /// A clipboard that records whatever is copied to it and hands back `paste`
 /// when asked, so tests never touch the machine's real one.
 fn clipboard_for(paste: Option<&str>) -> (Clipboard, Rc<RefCell<Vec<String>>>) {

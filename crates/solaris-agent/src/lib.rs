@@ -29,6 +29,7 @@ mod queue;
 mod resources;
 mod session;
 mod skills;
+mod subagent;
 
 pub use agent::{Agent, AgentOptions};
 pub use approver::{
@@ -41,6 +42,7 @@ pub use queue::Queue;
 pub use resources::{PromptContext, PromptFile, ResourcePaths, ResourceSnapshot};
 pub use session::DEFAULT_MAX_PARALLEL;
 pub use skills::{Skill, SkillRoot, SkillSource, SkillWarning, Skills};
+pub use subagent::{SUBAGENT_TOOL, agent_tool_registry};
 
 // The conversation: what a turn is written in and what it streams back.
 pub use solaris_backend::{

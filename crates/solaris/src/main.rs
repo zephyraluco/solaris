@@ -15,7 +15,7 @@ use solaris::{
     App, AppOptions, BackendFactory, Clipboard, Companion, Config, Mode, Preferences,
     RecentActivity, Soul,
 };
-use solaris_agent::{ResourcePaths, ToolRegistry, ToolSelection, default_tool_names};
+use solaris_agent::{ResourcePaths, ToolSelection, default_tool_names};
 use solaris_provider::{AuthStore, context_window_for, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     };
     // A name that matches nothing is almost always a typo, and silently
     // declaring nothing would look like the tool simply refused to run.
-    let registry = ToolRegistry::builtin();
+    let registry = solaris_agent::agent_tool_registry();
     for entry in registry.unmatched(&tools) {
         eprintln!(
             "solaris: no tool named `{entry}` on this platform — available: {}",

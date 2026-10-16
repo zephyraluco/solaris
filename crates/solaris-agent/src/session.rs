@@ -35,6 +35,7 @@ use crate::prompt::{
     COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
 };
 use crate::queue::Queue;
+use crate::subagent::{SUBAGENT_TOOL, SubagentRunner};
 
 /// Tool calls from one round that run at the same time.
 ///
@@ -64,6 +65,7 @@ pub(crate) struct TurnInput {
     pub prompt: String,
     /// The model's context window, which sizes the compaction budget.
     pub context_window: u32,
+    pub subagent: Option<Arc<SubagentRunner>>,
 }
 
 /// Start a turn, streaming what it produces.
@@ -87,6 +89,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         system,
         prompt,
         context_window,
+        subagent,
     } = input;
 
     let specs = tools
@@ -108,14 +111,16 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         context_window,
         max_parallel: options.max_parallel,
         system,
+        subagent,
     };
 
     let (tx, rx) = unbounded_channel();
+    let cancel = runner.cancel.clone();
     tokio::spawn(async move {
         runner.drive(prompt, tx).await;
     });
 
-    Box::pin(EventStream { rx })
+    Box::pin(EventStream { rx, cancel })
 }
 
 /// The state one turn's loop runs with, owned outright so it can outlive the
@@ -141,6 +146,7 @@ struct Runner {
     max_parallel: usize,
     /// The system prompt, sent ahead of the conversation on every round.
     system: String,
+    subagent: Option<Arc<SubagentRunner>>,
 }
 
 impl Runner {
@@ -241,6 +247,16 @@ impl Runner {
                 self.conversation.repair();
                 return;
             };
+            let results = results
+                .into_iter()
+                .map(|outcome| {
+                    total = total.merge(outcome.usage);
+                    cost_usd += outcome.cost_usd;
+                    Content::ToolResult {
+                        result: outcome.result,
+                    }
+                })
+                .collect();
             self.conversation
                 .push(Message::with_content(Role::User, results));
 
@@ -263,7 +279,13 @@ impl Runner {
             tools: self.specs.clone(),
         };
 
-        let stream = match self.inner.run_turn(request).await {
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
+            _ = tx.closed() => return Round::Failed,
+            result = self.inner.run_turn(request) => result,
+        };
+        let stream = match result {
             Ok(stream) => stream,
             Err(error) => return self.report_failure(error.to_string(), tx),
         };
@@ -415,7 +437,16 @@ impl Runner {
         let mut truncated = false;
         let mut completed = false;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
+                _ = tx.closed() => return Round::Failed,
+                event = stream.next() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 AgentEvent::TextDelta(chunk) => {
                     text.push_str(&chunk);
@@ -478,25 +509,32 @@ impl Runner {
     }
 
     /// Run one call, or explain why it did not run.
-    async fn run_call(&self, call: &ToolCall) -> ToolResult {
+    async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == call.name) else {
             return ToolResult::error(
                 call,
                 format!("there is no tool called `{}` in this session", call.name),
-            );
+            )
+            .into();
         };
 
-        if self.approver.approve(call).await == Approval::Denied {
+        let approval = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&self.cancel) => return ToolResult::error(call, "the turn was cancelled while waiting for approval").into(),
+            approval = self.approver.approve(call) => approval,
+        };
+        if approval == Approval::Denied {
             return ToolResult::error(
                 call,
                 "the call was declined, so it did not run — ask instead of acting, or try \
                  something else",
-            );
+            )
+            .into();
         }
 
         // Waiting for that answer is exactly when a cancel is likely to arrive.
         if self.cancel.is_cancelled() {
-            return ToolResult::error(call, "the turn was cancelled before this call ran");
+            return ToolResult::error(call, "the turn was cancelled before this call ran").into();
         }
 
         let ctx = ToolContext {
@@ -504,12 +542,30 @@ impl Runner {
             temp_dir: self.temp_dir.clone(),
             cancel: self.cancel.clone(),
         };
-        let output = tool.run(call.input.clone(), &ctx).await;
+        let (output, usage, cost_usd) = if call.name == SUBAGENT_TOOL {
+            let Some(subagent) = &self.subagent else {
+                return ToolResult::error(call, "subagent delegation is disabled in this session")
+                    .into();
+            };
+            let result = subagent.run(call.input.clone(), &ctx, tx, &call.id).await;
+            (result.output, result.totals.usage, result.totals.cost_usd)
+        } else {
+            (
+                tool.run(call.input.clone(), &ctx).await,
+                Usage::default(),
+                0.0,
+            )
+        };
 
-        if output.is_error {
+        let result = if output.is_error {
             ToolResult::error(call, output.text)
         } else {
             ToolResult::ok(call, output.text)
+        };
+        CallOutcome {
+            result,
+            usage,
+            cost_usd,
         }
     }
 
@@ -522,7 +578,7 @@ impl Runner {
         &self,
         calls: &[ToolCall],
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<Content>> {
+    ) -> Option<Vec<CallOutcome>> {
         if self.runs_one_at_a_time(calls) {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
@@ -566,23 +622,31 @@ impl Runner {
         &self,
         call: &ToolCall,
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Content> {
+    ) -> Option<CallOutcome> {
         let started = Instant::now();
         // A stop that arrived between calls means nothing more should start.
         let result = if self.cancel.is_cancelled() {
-            ToolResult::error(call, "the turn was cancelled before this call ran")
+            ToolResult::error(call, "the turn was cancelled before this call ran").into()
         } else {
-            self.run_call(call).await
+            self.run_call(call, tx).await
         };
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+        if !result.usage.is_empty() || result.cost_usd != 0.0 {
+            tx.send(AgentEvent::SubagentUsage {
+                usage: result.usage,
+                cost_usd: result.cost_usd,
+            })
+            .ok()?;
+        }
+
         tx.send(AgentEvent::ToolResult {
-            result: result.clone(),
+            result: result.result.clone(),
             duration_ms: elapsed,
         })
         .ok()?;
 
-        Some(Content::ToolResult { result })
+        Some(result)
     }
 
     /// Refuse every call in a message the model never finished writing.
@@ -594,7 +658,7 @@ impl Runner {
         &self,
         calls: &[ToolCall],
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<Content>> {
+    ) -> Option<Vec<CallOutcome>> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let result = ToolResult::error(
@@ -607,9 +671,31 @@ impl Runner {
                 duration_ms: 0,
             })
             .ok()?;
-            results.push(Content::ToolResult { result });
+            results.push(result.into());
         }
         Some(results)
+    }
+}
+
+struct CallOutcome {
+    result: ToolResult,
+    usage: Usage,
+    cost_usd: f64,
+}
+
+impl From<ToolResult> for CallOutcome {
+    fn from(result: ToolResult) -> Self {
+        Self {
+            result,
+            usage: Usage::default(),
+            cost_usd: 0.0,
+        }
+    }
+}
+
+async fn wait_for_cancel(cancel: &Cancel) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -642,13 +728,22 @@ pub(crate) async fn summarize(
         prompt,
         tools: Vec::new(),
     };
-    let mut stream = inner.run_turn(request).await.ok()?;
+    let mut stream = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return None,
+        result = inner.run_turn(request) => result.ok()?,
+    };
 
     let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        if cancel.is_cancelled() {
-            return None;
-        }
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => return None,
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
             AgentEvent::TextDelta(chunk) => summary.push_str(&chunk),
             AgentEvent::Error(_) => return None,
@@ -739,6 +834,13 @@ fn assistant_blocks(text: String, calls: &[ToolCall]) -> Vec<Content> {
 /// needed from one, and it is three lines.
 struct EventStream {
     rx: UnboundedReceiver<AgentEvent>,
+    cancel: Cancel,
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Stream for EventStream {
@@ -1018,6 +1120,7 @@ mod tests {
                 ),
                 prompt: prompt.to_string(),
                 context_window: self.context_window,
+                subagent: None,
             });
             let mut events = Vec::new();
             while let Some(event) = stream.next().await {
@@ -1413,6 +1516,7 @@ mod tests {
             ),
             prompt: "do it".to_string(),
             context_window: 0,
+            subagent: None,
         });
         // Read one round's worth, then walk away.
         while let Some(event) = stream.next().await {

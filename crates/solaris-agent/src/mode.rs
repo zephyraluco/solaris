@@ -50,10 +50,10 @@ impl Mode {
 }
 
 /// The tools Build mode declares: it runs commands and changes files.
-const BUILD_TOOLS: &[&str] = &["read", SHELL_TOOL, "edit", "write"];
+const BUILD_TOOLS: &[&str] = &["read", SHELL_TOOL, "edit", "write", "subagent"];
 
 /// The tools Plan mode declares: it only looks.
-const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
+const PLAN_TOOLS: &[&str] = &["read", "grep", "find", "ls", "subagent"];
 
 /// The tools a mode declares when nothing else is configured.
 ///
@@ -81,7 +81,7 @@ mod tests {
         assert!(!build.contains(&"grep"), "not in the default set");
 
         let plan = default_tool_names(Mode::Plan);
-        assert_eq!(plan, ["read", "grep", "find", "ls"]);
+        assert_eq!(plan, ["read", "grep", "find", "ls", "subagent"]);
         assert!(!plan.contains(&SHELL_TOOL));
         assert!(!plan.contains(&"write"));
     }

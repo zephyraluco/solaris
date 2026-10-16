@@ -84,6 +84,8 @@ pub struct Turn {
     pub compacted: usize,
     /// Tokens the turn consumed, as the backend reported or estimated them.
     pub usage: Usage,
+    /// Tokens spent in child contexts, already included in `usage` on completion.
+    pub subagent_tokens: u32,
     /// Cost reported for this turn.
     pub cost_usd: f64,
     /// Whether streamed events for this turn finished.
@@ -160,7 +162,7 @@ impl SessionState {
         match self
             .turns
             .iter()
-            .rposition(|turn| turn.complete && turn.tokens() > 0)
+            .rposition(|turn| turn.complete && turn.tokens() > turn.subagent_tokens)
         {
             Some(index) => {
                 let trailing: usize = self.turns[index + 1..]
@@ -169,6 +171,7 @@ impl SessionState {
                     .sum();
                 self.turns[index]
                     .tokens()
+                    .saturating_sub(self.turns[index].subagent_tokens)
                     .saturating_add(tokens_for_characters(trailing))
             }
             // Nothing has been measured yet, so estimate the prompts rather
@@ -323,6 +326,21 @@ impl NotificationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_usage_is_billed_but_does_not_fill_the_parent_context_window() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            usage: Usage::new(120, 30),
+            subagent_tokens: 100,
+            cost_usd: 1.5,
+            complete: true,
+            ..Default::default()
+        });
+        assert_eq!(session.total_tokens(), 150);
+        assert_eq!(session.total_cost(), 1.5);
+        assert_eq!(session.context_tokens(), 50);
+    }
 
     #[test]
     fn streaming_turn_is_the_last_incomplete_one() {

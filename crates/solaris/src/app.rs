@@ -1103,6 +1103,15 @@ impl App {
                     }
                 }
             }
+            AgentEvent::SubagentUsage { usage, cost_usd } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    turn.subagent_tokens = turn.subagent_tokens.saturating_add(usage.total());
+                    // Preserve already consumed child usage even if the parent
+                    // fails. A successful TurnComplete replaces this with totals.
+                    turn.usage = turn.usage.merge(usage);
+                    turn.cost_usd += cost_usd;
+                }
+            }
             AgentEvent::TurnComplete { usage, cost_usd } => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
