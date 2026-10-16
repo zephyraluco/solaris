@@ -19,6 +19,7 @@
 
 mod agent;
 mod approver;
+mod background;
 mod compaction;
 mod conversation;
 mod input;

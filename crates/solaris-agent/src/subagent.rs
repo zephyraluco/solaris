@@ -1,4 +1,4 @@
-//! Bounded, foreground delegation with isolated conversations and inherited policy.
+//! Bounded delegation with isolated conversations and inherited policy.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,7 @@ use solaris_backend::{
 };
 use solaris_provider::BackendChoice;
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
 use crate::{Agent, AgentOptions, Mode, ResourceSnapshot, default_tool_names};
 
@@ -41,7 +41,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a self-contained task to an isolated subagent using the current model: explore (read-only) or general (Build mode only). Waits for its result."
+        "Delegate a self-contained task to an isolated subagent using the current model: explore (read-only) or general (Build mode only). Waits by default; background=true returns a task ID immediately and notifies you when it finishes."
     }
 
     fn parameters(&self) -> Value {
@@ -49,7 +49,8 @@ impl Tool for SubagentTool {
             "type": "object",
             "properties": {
                 "agent": { "type": "string", "enum": ["explore", "general"] },
-                "prompt": { "type": "string", "description": "Complete task, relevant context, paths, constraints and expected result. The child cannot see the parent conversation." }
+                "prompt": { "type": "string", "description": "Complete task, relevant context, paths, constraints and expected result. The child cannot see the parent conversation." },
+                "background": { "type": "boolean", "default": false, "description": "Return a task ID immediately so you can continue independent work. The final report or failure is delivered automatically; do not poll. Background work is scoped to this turn." }
             },
             "required": ["agent", "prompt"],
             "additionalProperties": false
@@ -58,7 +59,7 @@ impl Tool for SubagentTool {
 
     fn guideline(&self) -> Option<&'static str> {
         Some(
-            "Use explore for focused read-only codebase research, general for a bounded implementation task in Build mode. Supply all relevant context; children see project instructions but not this conversation. Independent tasks may run in parallel; give writing tasks disjoint files. Children share the workspace, not a filesystem sandbox, and cannot delegate further. Review their results before relying on them. Each call waits for completion and is limited to 20 model requests / 5 minutes; return only a concise final report.",
+            "Use explore for focused read-only codebase research, general for a bounded implementation task in Build mode. Supply all relevant context; children see project instructions but not this conversation. Foreground calls wait by default; independent calls in the same round may run in parallel. Set background=true to receive a task ID immediately and continue other work; completion reports arrive automatically as background notifications before a later model round. Do not poll or repeat a task while it runs. If you have no more work, stop calling tools: the runtime waits for pending children and resumes you with their results before ending the turn. Give concurrent writing tasks disjoint files. Children share the workspace, not a filesystem sandbox, and cannot delegate further. Review their results before relying on them. Each child is limited to 20 model requests / 5 minutes; return only a concise final report.",
         )
     }
 
@@ -76,9 +77,11 @@ enum Kind {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Task {
+pub(crate) struct Task {
     agent: Kind,
     prompt: String,
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Snapshot captured at the parent's turn boundary, not a reference to its history.
@@ -88,6 +91,7 @@ pub(crate) struct SubagentRunner {
     pub options: AgentOptions,
     pub resources: ResourceSnapshot,
     pub mode: Mode,
+    pub slots: Semaphore,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -111,30 +115,71 @@ impl From<ToolOutput> for SubagentResult {
 }
 
 impl SubagentRunner {
+    pub fn parse(&self, input: Value) -> Result<Task, ToolOutput> {
+        let task: Task = serde_json::from_value(input).map_err(|_| {
+            ToolOutput::error("subagent requires an agent (explore or general), a prompt string and optionally a background boolean, with no other fields")
+        })?;
+        if task.prompt.trim().is_empty() || task.prompt.len() > 64 * 1024 {
+            return Err(ToolOutput::error(
+                "subagent prompt must be non-empty and at most 64 KiB",
+            ));
+        }
+        if self.mode == Mode::Plan && matches!(task.agent, Kind::General) {
+            return Err(ToolOutput::error(
+                "Plan mode only permits explore subagents; general would allow changes",
+            ));
+        }
+        Ok(task)
+    }
+
     pub async fn run(
         &self,
-        input: Value,
+        task: Task,
         ctx: &ToolContext,
         tx: &UnboundedSender<AgentEvent>,
         call_id: &str,
     ) -> SubagentResult {
-        let task: Task = match serde_json::from_value(input) {
-            Ok(task) => task,
-            Err(_) => return ToolOutput::error("subagent requires an agent (explore or general) and a prompt string, with no other fields").into(),
-        };
-        if task.prompt.trim().is_empty() || task.prompt.len() > 64 * 1024 {
-            return ToolOutput::error("subagent prompt must be non-empty and at most 64 KiB")
-                .into();
-        }
         if ctx.is_cancelled() {
             return ToolOutput::error("subagent was cancelled before it started").into();
         }
-        if self.mode == Mode::Plan && matches!(task.agent, Kind::General) {
-            return ToolOutput::error(
-                "Plan mode only permits explore subagents; general would allow changes",
-            )
-            .into();
-        }
+
+        let totals = Arc::new(Mutex::new(Totals::default()));
+        let label = format!("subagent {call_id} ({:?})", task.agent);
+        let _ = tx.send(AgentEvent::Status(format!("{label}: queued")));
+        // The deadline includes waiting for a shared foreground/background slot.
+        let output = tokio::select! {
+            biased;
+            _ = crate::session::wait_for_cancel(&ctx.cancel) => ToolOutput::error("subagent was cancelled"),
+            _ = tx.closed() => ToolOutput::error("subagent was cancelled"),
+            _ = tokio::time::sleep(TIMEOUT) => ToolOutput::error("subagent timed out after 5 minutes"),
+            output = self.execute(task, ctx, tx, &label, Arc::clone(&totals)) => output,
+        };
+        let _ = tx.send(AgentEvent::Status(format!(
+            "{label}: {}",
+            if output.is_error {
+                "failed"
+            } else {
+                "complete"
+            }
+        )));
+        let totals = *totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SubagentResult { output, totals }
+    }
+
+    async fn execute(
+        &self,
+        task: Task,
+        ctx: &ToolContext,
+        tx: &UnboundedSender<AgentEvent>,
+        label: &str,
+        totals: Arc<Mutex<Totals>>,
+    ) -> ToolOutput {
+        let Ok(_permit) = self.slots.acquire().await else {
+            return ToolOutput::error("subagent execution is closed");
+        };
+        let _ = tx.send(AgentEvent::Status(format!("{label}: running")));
 
         let mode = match task.agent {
             Kind::Explore => Mode::Plan,
@@ -152,11 +197,13 @@ impl SubagentRunner {
             })
             .collect();
         let registry = Arc::new(ToolRegistry::with_tools(tools));
-        let totals = Arc::new(Mutex::new(Totals::default()));
         let backend = Arc::new(BoundedBackend {
             inner: Arc::clone(&self.choice.backend),
             requests: AtomicUsize::new(0),
             totals: Arc::clone(&totals),
+            // Background work may outlive the parent's next request, which can
+            // fail or be cancelled. Bill each completed child request at once.
+            usage_tx: task.background.then(|| tx.clone()),
         });
         let mut choice = self.choice.clone();
         choice.backend = backend;
@@ -179,21 +226,7 @@ impl SubagentRunner {
         // A dropped parent future must also stop its child, including when the
         // child is waiting on network IO or on an approval.
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
-        let label = format!("subagent {call_id} ({:?})", task.agent);
-        let _ = tx.send(AgentEvent::Status(format!("{label}: running")));
-        let output = collect(&mut stream, ctx, tx, &label).await;
-        let _ = tx.send(AgentEvent::Status(format!(
-            "{label}: {}",
-            if output.is_error {
-                "failed"
-            } else {
-                "complete"
-            }
-        )));
-        let totals = *totals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        SubagentResult { output, totals }
+        collect(&mut stream, ctx, tx, label).await
     }
 }
 
@@ -262,6 +295,7 @@ struct BoundedBackend {
     inner: Arc<dyn AgentBackend>,
     requests: AtomicUsize,
     totals: Arc<Mutex<Totals>>,
+    usage_tx: Option<UnboundedSender<AgentEvent>>,
 }
 
 #[async_trait]
@@ -274,6 +308,7 @@ impl AgentBackend for BoundedBackend {
         }
         let stream = self.inner.run_turn(request).await?;
         let totals = Arc::clone(&self.totals);
+        let usage_tx = self.usage_tx.clone();
         Ok(Box::pin(stream.map(move |event| {
             if let AgentEvent::TurnComplete { usage, cost_usd } = &event {
                 let mut totals = totals
@@ -281,6 +316,12 @@ impl AgentBackend for BoundedBackend {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 totals.usage = totals.usage.merge(*usage);
                 totals.cost_usd += cost_usd;
+                if let Some(tx) = &usage_tx {
+                    let _ = tx.send(AgentEvent::SubagentUsage {
+                        usage: *usage,
+                        cost_usd: *cost_usd,
+                    });
+                }
             }
             event
         })))
@@ -336,11 +377,32 @@ mod tests {
         for input in [
             json!({"agent":"unknown","prompt":"task"}),
             json!({"agent":"explore","prompt":1}),
+            json!({"agent":"explore","prompt":"task","background":"true"}),
             json!({"agent":"explore","prompt":"task","model":"other"}),
             json!({"prompt":"task"}),
         ] {
             assert!(serde_json::from_value::<Task>(input).is_err());
         }
         assert_eq!(SubagentTool.parameters()["additionalProperties"], false);
+    }
+
+    #[test]
+    fn delegation_waits_by_default_and_accepts_an_explicit_background_boolean() {
+        for (input, background) in [
+            (json!({"agent":"explore","prompt":"task"}), false),
+            (
+                json!({"agent":"general","prompt":"task","background":false}),
+                false,
+            ),
+            (
+                json!({"agent":"explore","prompt":"task","background":true}),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Task>(input).unwrap().background,
+                background
+            );
+        }
     }
 }

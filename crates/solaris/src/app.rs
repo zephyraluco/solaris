@@ -1112,6 +1112,35 @@ impl App {
                     turn.cost_usd += cost_usd;
                 }
             }
+            AgentEvent::SubagentComplete {
+                task_id,
+                output,
+                is_error,
+                duration_ms,
+            } => {
+                let status = if is_error { "failed" } else { "complete" };
+                let notice = format!("background subagent {task_id}: {status}");
+                if is_error {
+                    self.notifications.warning(notice);
+                } else {
+                    self.notifications.info(notice);
+                }
+                if let Some(turn) = self.session.active_turn_mut() {
+                    let call = ToolCall::new(
+                        task_id,
+                        "subagent",
+                        serde_json::json!({"background": true, "status": status}),
+                    );
+                    let result = if is_error {
+                        solaris_agent::ToolResult::error(&call, output)
+                    } else {
+                        solaris_agent::ToolResult::ok(&call, output)
+                    };
+                    let mut step = ToolStep::pending(call);
+                    step.finish(result, duration_ms);
+                    turn.steps.push(step);
+                }
+            }
             AgentEvent::TurnComplete { usage, cost_usd } => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
@@ -3416,6 +3445,43 @@ mod tests {
         });
 
         assert!(app.session.turns[0].steps.is_empty());
+    }
+
+    #[test]
+    fn background_reports_are_separate_steps_and_notify_on_success_or_failure() {
+        for is_error in [false, true] {
+            let mut app = app();
+            app.session.turns.push(Turn::default());
+            let call = ToolCall::new("launch", "subagent", serde_json::json!({"background":true}));
+            app.apply_event(AgentEvent::ToolCall(call.clone()));
+            app.apply_event(AgentEvent::ToolResult {
+                result: ToolResult::ok(&call, r#"{"task_id":"subagent-1","status":"started"}"#),
+                duration_ms: 1,
+            });
+            app.apply_event(AgentEvent::SubagentComplete {
+                task_id: "subagent-1".into(),
+                output: "background report".into(),
+                is_error,
+                duration_ms: 123,
+            });
+            let turn = &app.session.turns[0];
+            assert_eq!(turn.steps.len(), 2);
+            assert!(
+                turn.steps[0]
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .output
+                    .contains("started")
+            );
+            assert_eq!(
+                turn.steps[1].result.as_ref().unwrap().output,
+                "background report"
+            );
+            assert_eq!(turn.steps[1].is_error(), is_error);
+            assert_eq!(turn.steps[1].duration_ms(), Some(123));
+            assert!(!turn.complete);
+        }
     }
 
     #[test]

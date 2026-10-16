@@ -30,7 +30,8 @@ pub struct AgentOptions {
     pub cwd: PathBuf,
     /// Where a truncated shell output is written.
     pub temp_dir: PathBuf,
-    /// Most tool calls from one round that run at the same time.
+    /// Most tool calls from one round that run at the same time, and the shared
+    /// limit on active foreground/background children across rounds.
     ///
     /// `1` runs every round one call at a time; a round holding a tool that
     /// declared itself sequential does that whatever this says.
@@ -370,6 +371,7 @@ impl Agent {
                     options: self.options.clone(),
                     resources: resources.clone(),
                     mode,
+                    slots: tokio::sync::Semaphore::new(self.options.max_parallel.max(1)),
                 })
             });
 

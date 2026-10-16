@@ -119,7 +119,9 @@ struct Harness {
     terminal: Terminal<TestBackend>,
 }
 
-struct DelegatingBackend;
+struct DelegatingBackend {
+    background: bool,
+}
 
 #[async_trait::async_trait]
 impl AgentBackend for DelegatingBackend {
@@ -131,6 +133,16 @@ impl AgentBackend for DelegatingBackend {
             .any(|message| message.tool_results().next().is_some());
         let event = if child {
             AgentEvent::TextDelta("delegated finding".into())
+        } else if self.background
+            && request.history.iter().any(|message| {
+                let text = message.text();
+                text.starts_with("Background subagent notification ")
+                    && text.contains("delegated finding")
+            })
+        {
+            AgentEvent::TextDelta("Parent integrated the background result.".into())
+        } else if answered && self.background {
+            AgentEvent::TextDelta("Parent is continuing independent work.".into())
         } else if answered {
             assert!(
                 request
@@ -145,7 +157,7 @@ impl AgentBackend for DelegatingBackend {
             AgentEvent::ToolCall(ToolCall::new(
                 "delegate-1",
                 "subagent",
-                serde_json::json!({"agent":"explore","prompt":"Investigate the task and report."}),
+                serde_json::json!({"agent":"explore","prompt":"Investigate the task and report.","background":self.background}),
             ))
         };
         Ok(Box::pin(futures::stream::iter(vec![
@@ -163,7 +175,7 @@ impl AgentBackend for DelegatingBackend {
 
 #[tokio::test]
 async fn a_subagent_task_runs_and_returns_its_result_through_the_tui() {
-    let mut harness = Harness::with_backend(Arc::new(DelegatingBackend));
+    let mut harness = Harness::with_backend(Arc::new(DelegatingBackend { background: false }));
     harness.type_str("Delegate a focused investigation.");
     harness.key(KeyCode::Enter);
     let text = harness
@@ -171,6 +183,22 @@ async fn a_subagent_task_runs_and_returns_its_result_through_the_tui() {
         .await;
     assert!(
         text.contains("Parent integrated the subagent result."),
+        "{text}"
+    );
+    assert!(text.contains("✓ subagent"), "{text}");
+    assert!(!text.contains("generating"), "{text}");
+}
+
+#[tokio::test]
+async fn a_background_subagent_notifies_and_returns_its_report_through_the_tui() {
+    let mut harness = Harness::with_backend(Arc::new(DelegatingBackend { background: true }));
+    harness.type_str("Delegate an investigation in the background.");
+    harness.key(KeyCode::Enter);
+    let text = harness
+        .settle_turn("Parent integrated the background result.")
+        .await;
+    assert!(
+        text.contains("Parent integrated the background result."),
         "{text}"
     );
     assert!(text.contains("✓ subagent"), "{text}");

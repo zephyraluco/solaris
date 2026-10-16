@@ -291,12 +291,21 @@ The model can call `subagent` to delegate a self-contained task:
 
 - **`explore`** is read-only (read/search/list); **`general`** can implement a task in Build mode. Plan mode rejects `general`.
 - Children use the current provider/model and their own conversation. They inherit project instructions, skills, approval policy, working directory and explicit tool allowlists/exclusions, but do not see the parent's history. Put necessary context and constraints in `prompt`.
-- Calls wait for their result. Independent calls may run concurrently under the existing parallel-tool limit (default 4). Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
+- **Foreground (default):** omit `background` or set it to `false` to wait for the report before continuing. Successive calls are serial; independent calls in one round may run concurrently under the parallel-tool limit (default 4).
+- **Background:** set `"background":true` to immediately receive `{"task_id":"subagent-1","status":"started"}` and continue other work. Completion or failure is reported automatically and the final report is delivered between model rounds; do not poll. Foreground and background children share the active-child limit; excess tasks queue.
+- Background tasks belong to the current turn. When the parent has no other work, it waits for notifications and resumes to integrate the reports before ending the turn. Tasks do not survive the turn or process exit.
+- Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
 - Children cannot delegate recursively. Each is limited to 20 model requests (including compaction), five minutes and a 16 KiB returned report. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
 - Ctrl+C or abandoning the parent stream cancels child work too. Child token usage/cost is included in session totals, but child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
 - Disable delegation with `--exclude-tools subagent`. Library callers may also use `AgentOptions::with_subagents(false)`.
 
-This initial implementation is foreground-only: no persistent child sessions, resume IDs, background tasks or per-child model overrides.
+For example, launch a background investigation with:
+
+```json
+{"agent":"explore","prompt":"Find test coverage gaps. Report relevant paths and suggestions; do not change files.","background":true}
+```
+
+Persistent child sessions, resume IDs and per-child model overrides are not supported. The five-minute deadline includes time queued for an execution slot.
 
 # Configuration
 

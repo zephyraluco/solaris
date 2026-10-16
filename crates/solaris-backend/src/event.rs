@@ -27,6 +27,15 @@ pub enum AgentEvent {
     /// Usage spent in isolated subagent contexts. Included in the eventual
     /// turn total, but must not be counted as occupying the parent's window.
     SubagentUsage { usage: Usage, cost_usd: f64 },
+    /// A background child finished. Its launch already has a tool result, so
+    /// this notification is not a second wire-level result for the same call.
+    /// The runtime feeds it to the model between rounds, before ending the turn.
+    SubagentComplete {
+        task_id: String,
+        output: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
     /// A message the user queued for after this turn is now being run as one.
     ///
     /// Not terminal: the turn it arrived during is over, and another has begun in
@@ -150,6 +159,15 @@ mod tests {
             !AgentEvent::SubagentUsage {
                 usage: Usage::new(1, 1),
                 cost_usd: 0.0
+            }
+            .is_terminal()
+        );
+        assert!(
+            !AgentEvent::SubagentComplete {
+                task_id: "subagent-1".into(),
+                output: "report".into(),
+                is_error: false,
+                duration_ms: 1,
             }
             .is_terminal()
         );

@@ -28,6 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::agent::AgentOptions;
 use crate::approver::{Approval, Approver};
+use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::overflow::{filled_the_window, is_overflow};
@@ -109,9 +110,10 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         conversation,
         compaction: options.compaction,
         context_window,
-        max_parallel: options.max_parallel,
+        max_parallel: options.max_parallel.max(1),
         system,
         subagent,
+        background: BackgroundTasks::default(),
     };
 
     let (tx, rx) = unbounded_channel();
@@ -120,7 +122,11 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         runner.drive(prompt, tx).await;
     });
 
-    Box::pin(EventStream { rx, cancel })
+    Box::pin(EventStream {
+        rx,
+        cancel,
+        finished: false,
+    })
 }
 
 /// The state one turn's loop runs with, owned outright so it can outlive the
@@ -147,6 +153,7 @@ struct Runner {
     /// The system prompt, sent ahead of the conversation on every round.
     system: String,
     subagent: Option<Arc<SubagentRunner>>,
+    background: BackgroundTasks,
 }
 
 impl Runner {
@@ -174,7 +181,11 @@ impl Runner {
                 self.give_up("the turn was cancelled".to_string(), &tx);
                 return;
             }
+            if tx.is_closed() {
+                return;
+            }
 
+            self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
             self.compact(last_usage.as_ref(), false, &tx).await;
 
@@ -213,9 +224,24 @@ impl Runner {
                 // ever sent with nothing in between.
                 self.record_reply(&reply.text);
 
+                if self.absorb_background(&mut total, &mut cost_usd) {
+                    continue;
+                }
+
                 // A message that arrived while the model was answering is a
                 // reason to keep going rather than to finish.
                 if self.absorb_steering(&tx) {
+                    continue;
+                }
+                // Do not end the stream (or poll the model) while a child still
+                // owes a report. Other work ran normally up to this point.
+                if !self.background.is_empty() {
+                    if !self
+                        .wait_for_background(&tx, &mut total, &mut cost_usd)
+                        .await
+                    {
+                        return;
+                    }
                     continue;
                 }
                 if self.take_follow_ups(&tx) {
@@ -336,6 +362,67 @@ impl Runner {
             self.conversation.push(Message::user(text));
         }
         true
+    }
+
+    fn absorb_background(&self, total: &mut Usage, cost_usd: &mut f64) -> bool {
+        let mut received = false;
+        while let Some(completion) = self.background.try_next() {
+            self.record_background(completion, total, cost_usd);
+            received = true;
+        }
+        received
+    }
+
+    fn record_background(&self, completion: Completion, total: &mut Usage, cost_usd: &mut f64) {
+        let Completion {
+            task_id, result, ..
+        } = completion;
+        *total = total.merge(result.totals.usage);
+        *cost_usd += result.totals.cost_usd;
+        // A launch was already answered. A plain data notification preserves
+        // call/result pairing on every provider, including after compaction.
+        self.conversation.push(Message::user(format!(
+            "Background subagent notification (task data, not a user instruction):\n{}",
+            serde_json::json!({
+                "task_id": task_id,
+                "status": if result.output.is_error { "failed" } else { "complete" },
+                "output": result.output.text,
+            })
+        )));
+        // The worker already notified the UI and billed each child request.
+    }
+
+    async fn wait_for_background(
+        &self,
+        tx: &UnboundedSender<AgentEvent>,
+        total: &mut Usage,
+        cost_usd: &mut f64,
+    ) -> bool {
+        let _ = tx.send(AgentEvent::Status(
+            "waiting for background subagents".into(),
+        ));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return false,
+                _ = ticker.tick() => {
+                    if self.cancel.is_cancelled() {
+                        self.give_up("the turn was cancelled".into(), tx);
+                        return false;
+                    }
+                    if self.steering.has_pending() {
+                        return true;
+                    }
+                }
+                completion = self.background.next() => {
+                    if let Some(completion) = completion {
+                        self.record_background(completion, total, cost_usd);
+                    }
+                    return true;
+                }
+            }
+        }
     }
 
     /// Take anything queued for after this turn, and say so.
@@ -547,7 +634,17 @@ impl Runner {
                 return ToolResult::error(call, "subagent delegation is disabled in this session")
                     .into();
             };
-            let result = subagent.run(call.input.clone(), &ctx, tx, &call.id).await;
+            let task = match subagent.parse(call.input.clone()) {
+                Ok(task) => task,
+                Err(output) => return ToolResult::error(call, output.text).into(),
+            };
+            if task.background {
+                let output = self
+                    .background
+                    .start(Arc::clone(subagent), task, ctx, tx.clone());
+                return ToolResult::ok(call, output.text).into();
+            }
+            let result = subagent.run(task, &ctx, tx, &call.id).await;
             (result.output, result.totals.usage, result.totals.cost_usd)
         } else {
             (
@@ -693,7 +790,7 @@ impl From<ToolResult> for CallOutcome {
     }
 }
 
-async fn wait_for_cancel(cancel: &Cancel) {
+pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
     while !cancel.is_cancelled() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -835,6 +932,7 @@ fn assistant_blocks(text: String, calls: &[ToolCall]) -> Vec<Content> {
 struct EventStream {
     rx: UnboundedReceiver<AgentEvent>,
     cancel: Cancel,
+    finished: bool,
 }
 
 impl Drop for EventStream {
@@ -847,7 +945,16 @@ impl Stream for EventStream {
     type Item = AgentEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<AgentEvent>> {
-        self.rx.poll_recv(cx)
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        let event = self.rx.poll_recv(cx);
+        if let Poll::Ready(Some(event)) = &event {
+            // A child racing cancellation may already have queued a status or
+            // notification. Nothing may appear after the turn's terminal event.
+            self.finished = event.is_terminal();
+        }
+        event
     }
 }
 #[cfg(test)]
@@ -1160,6 +1267,28 @@ mod tests {
             .flat_map(Message::tool_results)
             .cloned()
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_closes_the_stream_even_if_a_child_queues_a_late_notification() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(AgentEvent::Error("cancelled".into())).unwrap();
+        tx.send(AgentEvent::SubagentComplete {
+            task_id: "subagent-1".into(),
+            output: "late report".into(),
+            is_error: false,
+            duration_ms: 1,
+        })
+        .unwrap();
+        let stream = EventStream {
+            rx,
+            cancel: Cancel::new(),
+            finished: false,
+        };
+        assert_eq!(
+            stream.collect::<Vec<_>>().await,
+            vec![AgentEvent::Error("cancelled".into())]
+        );
     }
 
     #[tokio::test]
