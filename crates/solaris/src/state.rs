@@ -18,7 +18,8 @@ pub struct ToolStep {
     pub result: Option<ToolResult>,
     /// How long the call took, once it has run.
     pub duration_ms: Option<u64>,
-    /// Reusable disclosure state; record updates never reset the user's choice.
+    /// Reusable disclosure state; the first call also anchors an ordinary tool
+    /// group's expansion. Record updates never reset the user's choice.
     pub disclosure: CollapsibleState,
     /// Child activity belongs to one collapsible row, not top-level tool steps.
     pub subagent: Option<Box<SubagentStep>>,

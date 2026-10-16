@@ -184,7 +184,7 @@ Entries are tool names or patterns where `*` matches any run of characters. A li
 
 Every result goes back to the model, failures included: a file that is not there, a command that exited non-zero and a call the model got wrong are all things it can react to, not the end of the turn. Output is cut to keep a turn affordable — the first 2000 lines or 50KB for a read, the last for a command, since that is where a failure prints — and a command whose output was cut has the whole of it written to a file whose path is reported, so the model can read it back in pieces.
 
-Each call appears in the transcript as it happens, with its arguments, how long it took and, when it failed, the first line of what it said.
+Calls appear as they happen, folded by default: consecutive ordinary tools share a summary such as `→ Explored: 8 reads, 3 searches`, while each shell command has its own `→ Shell: cargo test` row. Click a title to expand or collapse it. Tool groups reveal each call's argument summary and duration, with failed calls in red; shell rows reveal their output. Headers always use `→` when folded and `↓` when expanded, with no spinner. Running headers do not turn red. Once execution ends, errors turn the header red without adding messages or changing your expansion choice. Subagents also include errors from their tool calls in this final check.
 
 ## Skills
 

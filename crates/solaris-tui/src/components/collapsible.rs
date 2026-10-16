@@ -26,7 +26,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Widget};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::loader::{FRAMES_PER_STEP, SPINNER};
 use crate::component::{Component, KeyResult, MouseResult};
 use crate::selection::SelectionHandle;
 use crate::theme::Theme;
@@ -171,8 +170,8 @@ impl<T: PartialEq> CollapsibleInteraction<T> {
     }
 }
 
-/// Collapsed by default, with a spinner while running, `→` when idle, and `↓`
-/// when expanded. Body lines are caller-supplied, so tools, logs, and other
+/// Collapsed by default, with `→` when folded and `↓` when expanded, regardless
+/// of execution status. Body lines are caller-supplied, so tools, logs, and other
 /// records share the component without depending on application data types.
 pub struct Collapsible {
     title: Line<'static>,
@@ -182,8 +181,6 @@ pub struct Collapsible {
     styles: CollapsibleStyles,
     indent: u16,
     body_indent: u16,
-    frame: u16,
-    ticks: u32,
     revision: u64,
     last_area: Rect,
     interaction: CollapsibleInteraction,
@@ -200,8 +197,6 @@ impl Collapsible {
             styles: CollapsibleStyles::default(),
             indent: 0,
             body_indent: 2,
-            frame: 0,
-            ticks: 0,
             revision: 1,
             last_area: Rect::default(),
             interaction: CollapsibleInteraction::default(),
@@ -287,18 +282,7 @@ impl Collapsible {
     pub fn set_status(&mut self, status: CollapsibleStatus) {
         if self.status != status {
             self.status = status;
-            self.ticks = 0;
             self.bump();
-        }
-    }
-
-    /// Use a containing view's shared clock instead of calling `tick`.
-    pub fn set_spinner_frame(&mut self, frame: u16) {
-        if self.frame != frame {
-            self.frame = frame;
-            if self.status == CollapsibleStatus::Running && !self.state.is_expanded() {
-                self.bump();
-            }
         }
     }
 
@@ -313,13 +297,7 @@ impl Collapsible {
             return Vec::new();
         }
         let expanded = self.state.is_expanded();
-        let glyph = if expanded {
-            "↓"
-        } else if self.status == CollapsibleStatus::Running {
-            SPINNER[usize::from(self.frame) % SPINNER.len()]
-        } else {
-            "→"
-        };
+        let glyph = if expanded { "↓" } else { "→" };
         let marker_style = match self.status {
             CollapsibleStatus::Failed => self.styles.failed,
             CollapsibleStatus::Running if !expanded => self.styles.running,
@@ -417,20 +395,6 @@ impl Component for Collapsible {
                 MouseResult::Handled
             }
         }
-    }
-
-    fn tick(&mut self) -> bool {
-        if self.status != CollapsibleStatus::Running || self.state.is_expanded() {
-            return false;
-        }
-        self.ticks += 1;
-        if self.ticks < FRAMES_PER_STEP {
-            return false;
-        }
-        self.ticks = 0;
-        self.frame = self.frame.wrapping_add(1);
-        self.bump();
-        true
     }
 
     fn desired_height(&mut self, width: u16) -> Option<u16> {
@@ -582,34 +546,27 @@ mod tests {
     }
 
     #[test]
-    fn running_animates_and_expanded_or_finished_headers_stop_animating() {
+    fn all_statuses_keep_static_arrows_without_animation_redraws() {
         let mut output = output();
-        output.set_status(CollapsibleStatus::Running);
-        assert_eq!(text(&output.lines(40)[0]), "⠋ Tool output");
-        for _ in 1..FRAMES_PER_STEP {
-            assert!(!output.tick());
+        for status in [
+            CollapsibleStatus::Idle,
+            CollapsibleStatus::Running,
+            CollapsibleStatus::Failed,
+        ] {
+            output.set_status(status);
+            for expanded in [false, true] {
+                output.set_expanded(expanded);
+                let lines = output.lines(40);
+                let glyph = if expanded { "↓" } else { "→" };
+                assert_eq!(text(&lines[0]), format!("{glyph} Tool output"));
+                let version = output.version();
+                for _ in 0..120 {
+                    assert!(!output.tick());
+                }
+                assert_eq!(output.version(), version);
+                assert_eq!(output.lines(40), lines);
+            }
         }
-        let version = output.version();
-        assert!(output.tick());
-        assert!(output.version() > version);
-        assert_eq!(text(&output.lines(40)[0]), "⠙ Tool output");
-        output.set_expanded(true);
-        for _ in 0..FRAMES_PER_STEP {
-            assert!(!output.tick());
-        }
-        assert_eq!(text(&output.lines(40)[0]), "↓ Tool output");
-        output.set_expanded(false);
-        output.set_status(CollapsibleStatus::Idle);
-        assert!(!output.tick());
-        assert_eq!(text(&output.lines(40)[0]), "→ Tool output");
-    }
-
-    #[test]
-    fn a_shared_frame_drives_the_same_header_renderer() {
-        let mut output = output();
-        output.set_status(CollapsibleStatus::Running);
-        output.set_spinner_frame(3);
-        assert!(text(&output.lines(40)[0]).starts_with(SPINNER[3]));
     }
 
     #[test]

@@ -455,11 +455,13 @@ while !quit {
 
 ### 5.6 可复用折叠组件
 
-[`Collapsible`](../crates/solaris-tui/src/components/collapsible.rs) 实现 `Component`：调用方提供带样式的标题与正文行，以及 `Idle` / `Running` / `Failed` 状态。组件负责默认折叠、运行中的 spinner、`→` / `↓`、缩进、保留样式的终端列宽截断、点击与键盘交互、高度与缓存版本，不认识子代理、工具调用或会话。
+[`Collapsible`](../crates/solaris-tui/src/components/collapsible.rs) 实现 `Component`：调用方提供带样式的标题与正文行，以及 `Idle` / `Running` / `Failed` 状态。组件负责默认折叠、固定的 `→` / `↓`、缩进、保留样式的终端列宽截断、点击与键盘交互、高度与缓存版本，不认识子代理、工具调用或会话。组件没有转圈动画、帧状态或定时重绘。
 
-保留式布局直接使用组件的 `render`、`handle_mouse` 和 `tick`。聊天记录这样的逐行视图使用同一个 `lines(width)` 渲染器，将 `CollapsibleState` 留在记录中，再通过 `with_state` 恢复；更新标题、正文或完成状态不会重置展开选择。`CollapsibleInteraction<T>` 为多个虚拟标题提供共用的按下/释放、拖选和选区识别，调用方只映射命中坐标和记录 ID、处理视口滚动。
+保留式布局直接使用组件的 `render` 和 `handle_mouse`。聊天记录这样的逐行视图使用同一个 `lines(width)` 渲染器，将 `CollapsibleState` 留在记录中，再通过 `with_state` 恢复；更新标题、正文或完成状态不会重置展开选择。`CollapsibleInteraction<T>` 为多个虚拟标题提供共用的按下/释放、拖选和选区识别，调用方只映射命中坐标和记录 ID、处理视口滚动。
 
-应用目前只把子代理接到这个组件上：`ToolStep.disclosure` 保存通用展开状态，`SubagentStep` 只保存子任务数据；`transcript` 生成子代理标题、统计与工具行，`App` 不再包含子代理专属的折叠手势。普通工具调用等视图可复用同一组件，而无需改变子代理执行器。
+应用将普通工具组、Shell 命令与子代理都接到这个组件上：连续的普通调用合为 `→ Explored: 8 reads, 3 searches`，展开后显示各次调用的参数摘要与耗时，失败的调用标红；每个 Shell 命令独立显示为 `→ Shell: cargo test`，展开后显示输出。Shell、子代理与 steering 消息都会分隔普通工具组，不改变记录顺序。折叠标题始终显示 `→`，展开后显示 `↓`；不论内部工具是否已经失败，运行中的标题都不会变红。执行结束后才汇总错误：普通工具组检查组内调用，子代理检查最终结果与内部调用，Shell 检查命令结果；中断也视为失败。失败仅将标题标红，不追加错误或中断信息，不改变展开状态，不触发其他行为。
+
+`ToolStep.disclosure` 保存通用展开状态，普通工具组由第一条调用持有；后续调用追加、结果到达、完成状态更新都不会重置展开选择。`SubagentStep` 只保存子任务数据。`transcript` 负责标题、统计、正文与命中几何，`App` 共用折叠手势与展开时的视口调整，不依赖具体工具或子代理执行器。
 
 ## 6. solaris：应用层
 

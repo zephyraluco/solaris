@@ -3748,6 +3748,58 @@ mod tests {
     }
 
     #[test]
+    fn expanding_tool_disclosures_at_the_viewport_bottom_reveals_their_bodies() {
+        for shell in [false, true] {
+            let mut app = app();
+            let call = if shell {
+                ToolCall::new("tool", "shell", serde_json::json!({"command":"cargo test"}))
+            } else {
+                ToolCall::new("tool", "read", serde_json::json!({"path":"inside.txt"}))
+            };
+            let mut step = ToolStep::pending(call.clone());
+            step.finish(
+                ToolResult::ok(&call, "first output line\nsecond output line"),
+                3,
+            );
+            app.session.turns.push(Turn {
+                prompt: (0..20).map(|n| format!("line {n}\n")).collect(),
+                steps: if shell {
+                    vec![step]
+                } else {
+                    vec![step.clone(), step]
+                },
+                complete: true,
+                ..Default::default()
+            });
+            let text = rendered_text(&mut app, 80, 14);
+            assert!(app.session.scroll > 0);
+            let title = if shell { "Shell:" } else { "Explored:" };
+            let row = text.lines().position(|line| line.contains(title)).unwrap() as u16;
+            assert_eq!(row, app.last_transcript.bottom() - 1);
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column: 2,
+                    row,
+                    modifiers: KeyModifiers::empty(),
+                });
+            }
+            let expanded = rendered_text(&mut app, 80, 14);
+            assert!(expanded.contains(&format!("↓ {title}")), "{expanded}");
+            let detail = if shell {
+                "second output line"
+            } else {
+                "Read inside.txt"
+            };
+            assert!(expanded.contains(detail), "{expanded}");
+            assert!(app.session.turns[0].steps[0].disclosure.is_expanded());
+        }
+    }
+
+    #[test]
     fn palette_choice_runs_the_command() {
         let mut app = app();
         app.on_dialog_message(DialogMessage::Command("/mode".into()));

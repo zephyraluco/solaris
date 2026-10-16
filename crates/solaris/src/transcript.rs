@@ -221,12 +221,8 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
     }
 }
 
-/// One line per tool call, so a turn says what it did rather than only what it
-/// concluded.
-///
-/// The line is the tool, its arguments and how long it took. A failed call also
-/// shows the first line of what it said, because that is the part a person
-/// needs; the full text went to the model either way.
+/// Consecutive ordinary calls share a disclosure; shell commands and child
+/// agents each own one. Steering notes remain outside the groups they separate.
 fn push_steps(
     out: &mut Vec<Line<'static>>,
     turn: &Turn,
@@ -245,30 +241,61 @@ fn push_steps(
     }
 
     let mut finished = 0usize;
-    for (step_index, step) in turn.steps.iter().enumerate() {
-        if let Some(view) = subagent_view(step, turn.complete, theme, spinner_frame) {
-            headers.push(CollapsibleHeader {
-                row: out.len(),
-                target: (turn_index, step_index),
-                marker_offset: view.marker_offset(),
-                body_rows: step
+    let mut step_index = 0;
+    while step_index < turn.steps.len() {
+        let step = &turn.steps[step_index];
+        let mut end = step_index + 1;
+        let (view, body_rows) =
+            if let Some(view) = subagent_view(step, turn.complete, theme, spinner_frame) {
+                let body_rows = step
                     .subagent
                     .as_ref()
-                    .map_or(0, |child| child.steps.len().max(1)),
-            });
-            out.extend(view.lines(width as u16));
-        } else {
-            push_tool_step(out, step, width, theme);
-        }
+                    .map_or(0, |child| child.steps.len().max(1));
+                (view, body_rows)
+            } else if is_shell(step) {
+                let body_rows = step
+                    .result
+                    .as_ref()
+                    .map_or(1, |result| result.output.lines().count().max(1));
+                (shell_view(step, turn.complete, theme), body_rows)
+            } else {
+                let mut group_finished = finished + usize::from(step.is_done());
+                while end < turn.steps.len()
+                    && turn.steps[end].subagent.is_none()
+                    && !is_shell(&turn.steps[end])
+                    && !notes
+                        .peek()
+                        .is_some_and(|note| note.after_steps <= group_finished)
+                {
+                    group_finished += usize::from(turn.steps[end].is_done());
+                    end += 1;
+                }
+                (
+                    tool_group_view(
+                        &turn.steps[step_index..end],
+                        turn.complete,
+                        theme,
+                        spinner_frame,
+                    ),
+                    end - step_index,
+                )
+            };
+        headers.push(CollapsibleHeader {
+            row: out.len(),
+            target: (turn_index, step_index),
+            marker_offset: view.marker_offset(),
+            body_rows,
+        });
+        out.extend(view.lines(width as u16));
 
-        // A note that followed this call is drawn after it, once the call is
-        // known to have finished.
-        if step.is_done() {
-            finished += 1;
-            while let Some(note) = notes.next_if(|note| note.after_steps <= finished) {
-                push_steering(out, &note.text, width, theme);
-            }
+        finished += turn.steps[step_index..end]
+            .iter()
+            .filter(|step| step.is_done())
+            .count();
+        while let Some(note) = notes.next_if(|note| note.after_steps <= finished) {
+            push_steering(out, &note.text, width, theme);
         }
+        step_index = end;
     }
 
     // A note that arrived after the last call — while the answer streamed, say.
@@ -277,43 +304,93 @@ fn push_steps(
     }
 }
 
-fn push_tool_step(out: &mut Vec<Line<'static>>, step: &ToolStep, width: usize, theme: &Theme) {
-    let (glyph, colour) = match step.result.as_ref() {
-        None => ("⋯", theme.muted),
-        Some(result) if result.is_error => ("✗", theme.error),
-        Some(_) => ("✓", theme.success),
-    };
+fn is_shell(step: &ToolStep) -> bool {
+    matches!(step.call.name.as_str(), "shell" | "bash" | "powershell")
+}
 
-    // Arguments are what makes a call recognisable at a glance. Values are
-    // printed as compact JSON, so this is always one line.
-    let mut detail = format!("{}", step.call.input);
-    if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
-        detail.push_str(" — ");
-        detail.push_str(&summarize(&result.output));
+fn tool_group_view(
+    steps: &[ToolStep],
+    turn_complete: bool,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+) -> Collapsible {
+    let pending = steps.iter().any(|step| !step.is_done());
+    let running = pending && !turn_complete;
+    let interrupted = pending && turn_complete;
+    let failed = !running && (interrupted || steps.iter().any(ToolStep::is_error));
+    let label = if running { "Exploring" } else { "Explored" };
+    let title = format!("{label}: {}", tool_counts(steps, running));
+    // The first call anchors the group, so appending calls or receiving results
+    // cannot replace the user's disclosure state.
+    let mut view = step_view(&steps[0], title, running, failed, theme);
+    if steps[0].disclosure.is_expanded() {
+        let mut body = Vec::new();
+        for step in steps {
+            push_tool_step(&mut body, step, running, theme, spinner_frame);
+        }
+        view.set_content(body);
     }
+    view
+}
+
+fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsible {
+    let running = !step.is_done() && !turn_complete;
+    let interrupted = !step.is_done() && turn_complete;
+    let failed = !running && (interrupted || step.is_error());
+    let command = step.call.input["command"]
+        .as_str()
+        .map(single_line)
+        .unwrap_or_else(|| step.call.input.to_string());
+    let mut title = format!("Shell: {command}");
     if let Some(elapsed) = step.duration_ms() {
-        detail.push_str(&format!("  ·  {elapsed}ms"));
+        title.push_str(&format!("  ·  {elapsed}ms"));
     }
+    let mut view = step_view(step, title, running, failed, theme);
+    if step.disclosure.is_expanded() {
+        let output = match &step.result {
+            Some(result) if result.output.is_empty() => "No output.",
+            Some(result) => &result.output,
+            None if running => "Running…",
+            None => "No output.",
+        };
+        let style = Style::default().fg(if failed { theme.error } else { theme.muted });
+        view.set_content(
+            output
+                .lines()
+                .map(|line| Line::styled(single_line(line), style))
+                .collect(),
+        );
+    }
+    view
+}
 
-    // Indent, glyph, space, the tool name, then two spaces before the detail.
-    let used = 6 + step.call.name.chars().count();
-    out.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(format!("{glyph} "), Style::default().fg(colour)),
-        Span::styled(
-            step.call.name.clone(),
-            Style::default()
-                .fg(theme.assistant)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "  {}",
-                truncate_to_width(&detail, width.saturating_sub(used).max(8), "…")
-            ),
-            Style::default().fg(theme.muted),
-        ),
-    ]));
+fn step_view(
+    step: &ToolStep,
+    title: String,
+    running: bool,
+    failed: bool,
+    theme: &Theme,
+) -> Collapsible {
+    let mut view = Collapsible::new(title)
+        .with_state(step.disclosure)
+        .styles(CollapsibleStyles::from_theme(theme))
+        .indentation(2, 4);
+    // Failure only changes the palette after execution has stopped. It never
+    // adds a message or changes the user's disclosure state.
+    view.set_status(if running {
+        CollapsibleStatus::Running
+    } else if failed {
+        CollapsibleStatus::Failed
+    } else {
+        CollapsibleStatus::Idle
+    });
+    view
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 fn spinner(frame: Option<u16>) -> &'static str {
@@ -329,36 +406,22 @@ fn subagent_view(
     let child = step.subagent.as_ref()?;
     let running = child.result.is_none() && !turn_complete;
     let interrupted = child.result.is_none() && turn_complete;
-    let failed = interrupted || child.result.as_ref().is_some_and(|result| result.is_error);
+    let failed = !running
+        && (interrupted
+            || child.result.as_ref().is_some_and(|result| result.is_error)
+            || child.steps.iter().any(ToolStep::is_error));
     let label = match step.call.input["agent"].as_str() {
         Some("explore") if running => "Exploring",
         Some("explore") => "Explored",
         Some("general") => "General",
         _ => "Subagent",
     };
-    let mut detail = format!("{label}: {}", subagent_counts(&child.steps, running));
-    if interrupted {
-        detail.push_str(" — interrupted");
-    } else if let Some(result) = child.result.as_ref().filter(|result| result.is_error) {
-        detail.push_str(" — ");
-        detail.push_str(&summarize(&result.output));
-    }
-    let mut view = Collapsible::new(detail)
-        .with_state(step.disclosure)
-        .styles(CollapsibleStyles::from_theme(theme))
-        .indentation(2, 4);
-    view.set_status(if failed {
-        CollapsibleStatus::Failed
-    } else if running {
-        CollapsibleStatus::Running
-    } else {
-        CollapsibleStatus::Idle
-    });
-    view.set_spinner_frame(spinner_frame.unwrap_or(0));
+    let detail = format!("{label}: {}", tool_counts(&child.steps, running));
+    let mut view = step_view(step, detail, running, failed, theme);
     if step.disclosure.is_expanded() {
         let mut body = Vec::new();
         for tool in &child.steps {
-            push_child_step(&mut body, tool, running, theme, spinner_frame);
+            push_tool_step(&mut body, tool, running, theme, spinner_frame);
         }
         if child.steps.is_empty() {
             body.push(Line::styled(
@@ -371,7 +434,7 @@ fn subagent_view(
     Some(view)
 }
 
-fn subagent_counts(steps: &[ToolStep], running: bool) -> String {
+fn tool_counts(steps: &[ToolStep], running: bool) -> String {
     let mut counts = BTreeMap::<(&str, &str), usize>::new();
     for step in steps {
         let label = match step.call.name.as_str() {
@@ -403,7 +466,7 @@ fn subagent_counts(steps: &[ToolStep], running: bool) -> String {
         .join(", ")
 }
 
-fn push_child_step(
+fn push_tool_step(
     out: &mut Vec<Line<'static>>,
     step: &ToolStep,
     running: bool,
@@ -420,6 +483,11 @@ fn push_child_step(
         "grep" => "Grep",
         "find" => "Find",
         "ls" => "List",
+        "glob" => "Glob",
+        "edit" => "Edit",
+        "patch" => "Patch",
+        "write" => "Write",
+        "shell" | "bash" | "powershell" => "Shell",
         "webfetch" => "WebFetch",
         "websearch" => "WebSearch",
         name => name,
@@ -444,21 +512,16 @@ fn push_child_step(
             }
         }
     }
-    if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
-        detail.push_str(" — ");
-        detail.push_str(&summarize(&result.output));
+    if let Some(elapsed) = step.duration_ms() {
+        detail.push_str(&format!("  ·  {elapsed}ms"));
     }
-    let detail: String = detail
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect();
     let colour = if step.is_error() {
         theme.error
     } else {
         theme.muted
     };
     out.push(Line::styled(
-        format!("{glyph} {label} {detail}"),
+        format!("{glyph} {} {}", single_line(label), single_line(&detail)),
         Style::default().fg(colour),
     ));
 }
@@ -566,19 +629,62 @@ mod tests {
     }
 
     #[test]
-    fn tool_steps_are_rendered_beside_the_turn() {
+    fn ordinary_tool_calls_default_to_a_single_collapsed_count_summary() {
+        let mut steps = Vec::new();
+        for index in 0..8 {
+            let call = ToolCall::new(
+                format!("read-{index}"),
+                "read",
+                serde_json::json!({"path":format!("file-{index}.rs")}),
+            );
+            let mut step = ToolStep::pending(call.clone());
+            step.finish(ToolResult::ok(&call, "private output"), 7);
+            steps.push(step);
+        }
+        for name in ["grep", "find", "glob"] {
+            let call = ToolCall::new(name, name, serde_json::json!({"pattern":"secret"}));
+            let mut step = ToolStep::pending(call.clone());
+            step.finish(ToolResult::ok(&call, "private output"), 3);
+            steps.push(step);
+        }
+        let session = session_with(Turn {
+            steps,
+            complete: true,
+            ..Default::default()
+        });
+        let lines = build(&session, area(80, 30), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            text.matches("→ Explored: 8 reads, 3 searches").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            !text.contains("file-") && !text.contains("secret"),
+            "{text}"
+        );
+        assert!(!text.contains("private output"), "{text}");
+        assert_eq!(lines.len(), 2, "{text}");
+    }
+
+    #[test]
+    fn expanding_a_tool_group_shows_calls_and_marks_failures_without_messages() {
         let call = ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" }));
         let mut done = ToolStep::pending(call.clone());
         done.finish(ToolResult::ok(&call, "hello"), 7);
+        done.disclosure.set_expanded(true);
 
-        let failing = ToolCall::new("call-2", "bash", serde_json::json!({ "command": "false" }));
+        let failing = ToolCall::new("call-2", "grep", serde_json::json!({ "pattern": "x" }));
         let mut failed = ToolStep::pending(failing.clone());
-        failed.finish(ToolResult::error(&failing, "exit code 1"), 3);
+        failed.finish(
+            ToolResult::error(&failing, "search failed\nmore details"),
+            3,
+        );
 
         let running = ToolStep::pending(ToolCall::new(
             "call-3",
-            "grep",
-            serde_json::json!({ "pattern": "x" }),
+            "write",
+            serde_json::json!({ "path": "b.txt", "content": "new text" }),
         ));
 
         let session = session_with(Turn {
@@ -588,23 +694,379 @@ mod tests {
             ..Default::default()
         });
 
-        let lines = build(&session, area(80, 30), &Theme::dark(), None, &welcome());
+        let theme = Theme::dark();
+        let lines = build(&session, area(80, 30), &theme, Some(1), &welcome());
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(text.contains("✓ read"), "{text}");
         assert!(
-            text.contains(r#"{"path":"a.txt"}"#),
-            "arguments are shown: {text}"
+            text.contains("↓ Exploring: 1 read, 1 search, 1 write"),
+            "{text}"
         );
+        assert_eq!(lines[1].style.fg, Some(theme.muted));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.muted));
+        assert!(text.contains("    → Read a.txt"), "{text}");
         assert!(text.contains("7ms"), "timing is shown: {text}");
-
-        assert!(text.contains("✗ bash"), "{text}");
+        let failure = lines
+            .iter()
+            .find(|line| line_text(line).contains("→ Grep"))
+            .unwrap();
+        assert_eq!(failure.style.fg, Some(theme.error));
         assert!(
-            text.contains("exit code 1"),
-            "a failure says why, not just that it failed: {text}"
+            text.contains("    ⠙ Write b.txt"),
+            "a call in flight: {text}"
+        );
+        assert!(
+            !text.contains("hello")
+                && !text.contains("search failed")
+                && !text.contains("more details"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn tool_groups_only_turn_red_after_all_calls_finish_without_adding_messages() {
+        for theme in [Theme::dark(), Theme::light()] {
+            for expanded in [false, true] {
+                let call = ToolCall::new("read", "read", serde_json::json!({"path":"a.rs"}));
+                let mut failed = ToolStep::pending(call.clone());
+                failed.disclosure.set_expanded(expanded);
+                failed.finish(ToolResult::error(&call, "private error details"), 1);
+                let call = ToolCall::new("search", "grep", serde_json::json!({"pattern":"needle"}));
+                let mut steps = vec![failed, ToolStep::pending(call.clone())];
+
+                let view = tool_group_view(&steps, false, &theme, Some(1));
+                let lines = view.lines(90);
+                let glyph = if expanded { "↓" } else { "→" };
+                assert_eq!(
+                    line_text(&lines[0]),
+                    format!("  {glyph} Exploring: 1 read, 1 search")
+                );
+                assert_eq!(lines[0].style.fg, Some(theme.muted));
+                assert_eq!(
+                    lines[0].spans[0].style.fg,
+                    Some(if expanded { theme.muted } else { theme.accent })
+                );
+                assert_eq!(view.state().is_expanded(), expanded);
+
+                steps[1].finish(ToolResult::ok(&call, "matches"), 2);
+                let view = tool_group_view(&steps, false, &theme, Some(1));
+                let lines = view.lines(90);
+                let glyph = if expanded { "↓" } else { "→" };
+                assert_eq!(
+                    line_text(&lines[0]),
+                    format!("  {glyph} Explored: 1 read, 1 search")
+                );
+                assert_eq!(lines[0].style.fg, Some(theme.error));
+                assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
+                assert_eq!(view.state().is_expanded(), expanded);
+                assert_eq!(lines.len(), if expanded { 3 } else { 1 });
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|line| line_text(line).contains("private error details"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_shell_command_has_its_own_disclosure_and_output() {
+        for name in ["shell", "bash", "powershell"] {
+            let call = ToolCall::new(name, name, serde_json::json!({"command":"cargo test"}));
+            let mut step = ToolStep::pending(call.clone());
+            step.finish(
+                ToolResult::ok(&call, "running 2 tests\n\n  test result: ok"),
+                12,
+            );
+            let mut session = session_with(Turn {
+                steps: vec![step.clone(), step],
+                complete: true,
+                ..Default::default()
+            });
+            let lines = build(&session, area(80, 30), &Theme::dark(), None, &welcome());
+            let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert_eq!(text.matches("→ Shell: cargo test").count(), 2, "{text}");
+            assert!(!text.contains("running 2 tests"), "{text}");
+            session.turns[0].steps[0].disclosure.set_expanded(true);
+            let lines = build(&session, area(80, 30), &Theme::dark(), None, &welcome());
+            let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("↓ Shell: cargo test  ·  12ms"), "{text}");
+            assert_eq!(text.matches("→ Shell: cargo test").count(), 1, "{text}");
+            assert!(
+                text.contains("    running 2 tests\n    \n      test result: ok"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_disclosures_preserve_expansion_when_results_arrive() {
+        let call = ToolCall::new("test", "shell", serde_json::json!({"command":"cargo test"}));
+        let mut session = session_with(Turn {
+            steps: vec![ToolStep::pending(call.clone())],
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let theme = Theme::dark();
+        for frame in [0, 1] {
+            let lines = view.lines(&session, area(80, 30), &theme, Some(frame), &welcome());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line_text(line).contains("→ Shell:"))
+            );
+        }
+        session.turns[0].steps[0].disclosure.set_expanded(true);
+        session.bump();
+        let lines = view.lines(&session, area(80, 30), &theme, Some(1), &welcome());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains("↓ Shell:"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains("Running…"))
         );
 
-        assert!(text.contains("⋯ grep"), "a call in flight: {text}");
+        session.turns[0].steps[0].finish(ToolResult::ok(&call, "tests passed"), 9);
+        session.turns[0].complete = true;
+        session.bump();
+        let lines = view.lines(&session, area(80, 30), &theme, None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("↓ Shell: cargo test") && text.contains("    tests passed"),
+            "{text}"
+        );
+        assert!(!SPINNER.iter().any(|glyph| text.contains(glyph)), "{text}");
+    }
+
+    #[test]
+    fn ordinary_groups_preserve_expansion_when_calls_are_appended_and_finished() {
+        let call = ToolCall::new("read", "read", serde_json::json!({"path":"a.rs"}));
+        let mut step = ToolStep::pending(call.clone());
+        step.disclosure.set_expanded(true);
+        let mut session = session_with(Turn {
+            steps: vec![step],
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let theme = Theme::dark();
+        let lines = view.lines(&session, area(80, 30), &theme, Some(0), &welcome());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains("↓ Exploring: 1 read"))
+        );
+        session.turns[0].steps.push(ToolStep::pending(call.clone()));
+        for step in &mut session.turns[0].steps {
+            step.finish(ToolResult::ok(&call, "data"), 2);
+        }
+        session.turns[0].complete = true;
+        session.bump();
+        let lines = view.lines(&session, area(80, 30), &theme, None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("↓ Explored: 2 reads"), "{text}");
+        assert_eq!(text.matches("    → Read a.rs").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn shell_commands_child_agents_and_steering_notes_separate_ordinary_groups() {
+        let mut steps = Vec::new();
+        for (name, input) in [
+            ("read", serde_json::json!({"path":"a.rs"})),
+            ("grep", serde_json::json!({"pattern":"needle"})),
+            ("shell", serde_json::json!({"command":"cargo test"})),
+            ("read", serde_json::json!({"path":"b.rs"})),
+            ("subagent", serde_json::json!({"agent":"general"})),
+            ("read", serde_json::json!({"path":"c.rs"})),
+        ] {
+            let call = ToolCall::new(name, name, input);
+            let mut step = ToolStep::pending(call.clone());
+            step.finish(ToolResult::ok(&call, "done"), 1);
+            steps.push(step);
+        }
+        let session = session_with(Turn {
+            steps,
+            steering: vec![crate::state::SteeringNote {
+                text: "check this first".into(),
+                after_steps: 1,
+            }],
+            complete: true,
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let lines = view.lines(&session, area(80, 30), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(text.matches("→ Explored:").count(), 4, "{text}");
+        let rows: Vec<_> = text.lines().collect();
+        assert!(
+            rows[1].contains("1 read") && rows[2].contains("steered"),
+            "{text}"
+        );
+        assert!(
+            rows[3].contains("1 search") && rows[4].contains("Shell:"),
+            "{text}"
+        );
+        assert!(
+            rows[6].contains("General:") && rows[7].contains("1 read"),
+            "{text}"
+        );
+        assert_eq!(view.collapsible_at(2), None, "steering is not a disclosure");
+        for (row, step) in [(1, 0), (3, 1), (4, 2), (5, 3), (6, 4), (7, 5)] {
+            assert_eq!(
+                view.collapsible_at(row).map(|header| header.target),
+                Some((0, step))
+            );
+        }
+    }
+
+    #[test]
+    fn failed_shells_only_colour_the_title_and_keep_output_behind_the_disclosure() {
+        let call = ToolCall::new("test", "shell", serde_json::json!({"command":"cargo test"}));
+        let mut step = ToolStep::pending(call.clone());
+        step.finish(
+            ToolResult::error(&call, "exit code 1\nsecond error line"),
+            4,
+        );
+        let mut session = session_with(Turn {
+            steps: vec![step],
+            complete: true,
+            ..Default::default()
+        });
+        let theme = Theme::dark();
+        let lines = build(&session, area(80, 30), &theme, None, &welcome());
+        assert_eq!(line_text(&lines[1]), "  → Shell: cargo test  ·  4ms");
+        assert_eq!(lines[1].style.fg, Some(theme.error));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.error));
+        assert_eq!(lines.len(), 2);
+
+        session.turns[0].steps[0].disclosure.set_expanded(true);
+        let lines = build(&session, area(80, 30), &theme, None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(line_text(&lines[1]), "  ↓ Shell: cargo test  ·  4ms");
+        assert!(
+            text.contains("    exit code 1\n    second error line"),
+            "{text}"
+        );
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn interrupted_ordinary_calls_and_shell_commands_stop_spinning() {
+        let mut session = session_with(Turn {
+            steps: vec![
+                ToolStep::pending(ToolCall::new(
+                    "read",
+                    "read",
+                    serde_json::json!({"path":"a.rs"}),
+                )),
+                ToolStep::pending(ToolCall::new(
+                    "test",
+                    "shell",
+                    serde_json::json!({"command":"cargo test"}),
+                )),
+            ],
+            complete: true,
+            ..Default::default()
+        });
+        for step in &mut session.turns[0].steps {
+            step.disclosure.set_expanded(true);
+        }
+        let lines = build(&session, area(80, 30), &Theme::dark(), Some(1), &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("↓ Explored: 1 read"), "{text}");
+        assert!(text.contains("↓ Shell: cargo test"), "{text}");
+        assert!(!text.to_lowercase().contains("interrupted"), "{text}");
+        let theme = Theme::dark();
+        for line in lines.iter().filter(|line| line_text(line).contains('↓')) {
+            assert_eq!(line.spans[0].style.fg, Some(theme.error));
+        }
+        assert!(!SPINNER.iter().any(|glyph| text.contains(glyph)), "{text}");
+    }
+
+    #[test]
+    fn an_empty_shell_result_has_a_body_and_accurate_header_geometry() {
+        let call = ToolCall::new("test", "shell", serde_json::json!({"command":"true"}));
+        let mut step = ToolStep::pending(call.clone());
+        step.disclosure.set_expanded(true);
+        step.finish(ToolResult::ok(&call, ""), 1);
+        let session = session_with(Turn {
+            steps: vec![step],
+            complete: true,
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let lines = view.lines(&session, area(80, 30), &Theme::dark(), None, &welcome());
+        assert!(line_text(&lines[2]).contains("No output."));
+        assert_eq!(view.collapsible_at(1).unwrap().body_rows, 1);
+        assert_eq!(view.collapsible_at(2), None);
+    }
+
+    #[test]
+    fn collapsed_ordinary_groups_keep_the_right_arrow_while_running() {
+        let call = ToolCall::new("read", "read", serde_json::json!({"path":"a.rs"}));
+        let mut session = session_with(Turn {
+            steps: vec![ToolStep::pending(call.clone())],
+            ..Default::default()
+        });
+        for frame in [0, 1] {
+            let lines = build(
+                &session,
+                area(80, 30),
+                &Theme::dark(),
+                Some(frame),
+                &welcome(),
+            );
+            assert_eq!(line_text(&lines[1]), "  → Exploring: 1 read");
+        }
+        session.turns[0].steps[0].finish(ToolResult::ok(&call, "data"), 1);
+        let lines = build(&session, area(80, 30), &Theme::dark(), Some(1), &welcome());
+        assert_eq!(line_text(&lines[1]), "  → Explored: 1 read");
+    }
+
+    #[test]
+    fn ordinary_groups_and_shell_outputs_fit_narrow_widths_without_control_characters() {
+        for theme in [Theme::dark(), Theme::light()] {
+            for expanded in [false, true] {
+                let mut steps = Vec::new();
+                for (name, input) in [
+                    (
+                        "read",
+                        serde_json::json!({"path":"源代码👩‍💻e\u{301}".repeat(20)}),
+                    ),
+                    (
+                        "powershell",
+                        serde_json::json!({"command":"echo 中文👩‍💻\necho more\ttext"}),
+                    ),
+                ] {
+                    let call = ToolCall::new(name, name, input);
+                    let mut step = ToolStep::pending(call.clone());
+                    step.disclosure.set_expanded(expanded);
+                    step.finish(
+                        ToolResult::ok(&call, "  中文👩‍💻e\u{301}\toutput\n\nsecond\u{1b}line"),
+                        1,
+                    );
+                    steps.push(step);
+                }
+                let session = session_with(Turn {
+                    steps,
+                    complete: true,
+                    ..Default::default()
+                });
+                for width in [8, 12, 24, 40] {
+                    let lines = build(&session, area(width, 30), &theme, None, &welcome());
+                    for line in &lines {
+                        assert!(
+                            line.width() <= usize::from(width),
+                            "width={width}: {line:?}"
+                        );
+                        assert!(!line_text(line).chars().any(char::is_control), "{line:?}");
+                    }
+                }
+            }
+        }
     }
 
     fn subagent_step(expanded: bool, complete: bool) -> ToolStep {
@@ -663,12 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn a_running_collapsed_subagent_animates_instead_of_showing_a_right_arrow() {
+    fn a_running_collapsed_subagent_keeps_the_right_arrow() {
         let session = session_with(Turn {
             steps: vec![subagent_step(false, false)],
             ..Default::default()
         });
-        for (frame, glyph) in [(0, "⠋"), (1, "⠙")] {
+        for frame in [0, 1] {
             let lines = build(
                 &session,
                 area(90, 20),
@@ -681,10 +1143,7 @@ mod tests {
                 .map(line_text)
                 .find(|line| line.contains("Exploring:"))
                 .unwrap();
-            assert!(
-                title.starts_with(&format!("  {glyph} Exploring:")),
-                "{title}"
-            );
+            assert!(title.starts_with("  → Exploring:"), "{title}");
         }
     }
 
@@ -727,13 +1186,14 @@ mod tests {
         });
         let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("interrupted"), "{text}");
+        assert!(!text.contains("interrupted"), "{text}");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Theme::dark().error));
         assert!(text.contains("    → Read "), "{text}");
         assert!(!SPINNER.iter().any(|glyph| text.contains(glyph)), "{text}");
     }
 
     #[test]
-    fn failed_subagent_titles_keep_the_arrow_and_show_the_error_in_colour() {
+    fn failed_subagent_titles_only_change_colour_without_adding_messages() {
         let mut step = subagent_step(false, false);
         step.finish(ToolResult::error(&step.call, "child timed out"), 10);
         let session = session_with(Turn {
@@ -747,8 +1207,72 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("Explored:"))
             .unwrap();
-        assert!(line_text(title).contains("→ Explored:") && line_text(title).contains("timed out"));
+        assert_eq!(line_text(title), "  → Explored: 1 fetch, 1 read, 1 search");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line_text(line).contains("timed out"))
+        );
+        assert_eq!(lines.len(), 2);
         assert_eq!(title.spans[0].style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn subagents_only_aggregate_tool_errors_after_the_child_finishes() {
+        for background in [false, true] {
+            for expanded in [false, true] {
+                let theme = Theme::dark();
+                let mut step = subagent_step(expanded, false);
+                step.call.input["background"] = serde_json::json!(background);
+                let child = step.subagent.as_mut().unwrap();
+                for (index, tool) in child.steps.iter_mut().enumerate() {
+                    let result = if index == 0 {
+                        ToolResult::error(&tool.call, "private nested failure")
+                    } else {
+                        ToolResult::ok(&tool.call, "data")
+                    };
+                    tool.finish(result, 1);
+                }
+                if background {
+                    step.finish(
+                        ToolResult::ok(&step.call, r#"{"task_id":"task-1","status":"started"}"#),
+                        1,
+                    );
+                }
+                let view = subagent_view(&step, false, &theme, Some(1)).unwrap();
+                let lines = view.lines(90);
+                let glyph = if expanded { "↓" } else { "→" };
+                assert_eq!(
+                    line_text(&lines[0]),
+                    format!("  {glyph} Exploring: 1 fetch, 1 read, 1 search")
+                );
+                assert_eq!(lines[0].style.fg, Some(theme.muted));
+                assert_eq!(
+                    lines[0].spans[0].style.fg,
+                    Some(if expanded { theme.muted } else { theme.accent })
+                );
+                assert_eq!(view.state().is_expanded(), expanded);
+
+                let result = ToolResult::ok(&step.call, "recovered final report");
+                step.subagent.as_mut().unwrap().finish(result, 10);
+                let view = subagent_view(&step, false, &theme, Some(1)).unwrap();
+                let lines = view.lines(90);
+                let glyph = if expanded { "↓" } else { "→" };
+                assert_eq!(
+                    line_text(&lines[0]),
+                    format!("  {glyph} Explored: 1 fetch, 1 read, 1 search")
+                );
+                assert_eq!(lines[0].style.fg, Some(theme.error));
+                assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
+                assert_eq!(view.state().is_expanded(), expanded);
+                assert_eq!(lines.len(), if expanded { 4 } else { 1 });
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|line| line_text(line).contains("private nested failure"))
+                );
+            }
+        }
     }
 
     #[test]
@@ -806,9 +1330,11 @@ mod tests {
             "read",
             serde_json::json!({ "path": "x".repeat(200) }),
         );
+        let mut step = ToolStep::pending(call);
+        step.disclosure.set_expanded(true);
         let session = session_with(Turn {
             prompt: "p".to_string(),
-            steps: vec![ToolStep::pending(call)],
+            steps: vec![step],
             ..Default::default()
         });
 
@@ -816,7 +1342,7 @@ mod tests {
         let step = lines
             .iter()
             .map(line_text)
-            .find(|line| line.contains("read"))
+            .find(|line| line.contains("Read"))
             .expect("a step line");
         assert!(step.contains('…'), "{step}");
         assert!(step.chars().count() <= 40, "{step}");

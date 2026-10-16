@@ -123,6 +123,50 @@ struct DelegatingBackend {
     background: bool,
 }
 
+/// Real read and shell calls, with deterministic local inputs and no network.
+struct InspectingBackend;
+
+#[async_trait::async_trait]
+impl AgentBackend for InspectingBackend {
+    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        let answered = request
+            .history
+            .iter()
+            .any(|message| message.tool_results().next().is_some());
+        let mut events = if answered {
+            vec![AgentEvent::TextDelta("Inspection finished.".into())]
+        } else {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+            let read = |id| {
+                AgentEvent::ToolCall(ToolCall::new(
+                    id,
+                    "read",
+                    serde_json::json!({"path":path,"offset":1,"limit":1}),
+                ))
+            };
+            vec![
+                read("first"),
+                read("second"),
+                AgentEvent::ToolCall(ToolCall::new(
+                    "command",
+                    if cfg!(windows) { "powershell" } else { "bash" },
+                    serde_json::json!({"command":"echo solaris-shell-output"}),
+                )),
+                read("third"),
+            ]
+        };
+        events.push(AgentEvent::TurnComplete {
+            usage: Usage::new(2, 1),
+            cost_usd: 0.0,
+        });
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    fn label(&self) -> &str {
+        "inspecting"
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentBackend for DelegatingBackend {
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
@@ -274,6 +318,86 @@ async fn dragging_and_copying_a_subagent_title_does_not_expand_it() {
     assert_eq!(copied.borrow().last().map(String::as_str), Some("Explored"));
 }
 
+#[tokio::test]
+async fn ordinary_tool_groups_and_shell_outputs_expand_independently_through_the_tui() {
+    let mut harness = Harness::with_backend(Arc::new(InspectingBackend));
+    harness.type_str("Inspect the project.");
+    harness.key(KeyCode::Enter);
+    let text = harness.settle_turn("Inspection finished.").await;
+    assert!(text.contains("→ Explored: 2 reads"), "{text}");
+    assert!(
+        text.contains("→ Shell: echo solaris-shell-output"),
+        "{text}"
+    );
+    assert!(text.contains("→ Explored: 1 read"), "{text}");
+    assert!(!text.contains("→ Read "), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim() == "solaris-shell-output"),
+        "{text}"
+    );
+
+    let expanded = harness.toggle_disclosure("→ Explored: 2 reads");
+    assert!(expanded.contains("↓ Explored: 2 reads"), "{expanded}");
+    assert_eq!(expanded.matches("→ Read ").count(), 2, "{expanded}");
+    assert!(expanded.contains("lib.rs:1-1"), "{expanded}");
+
+    let expanded = harness.toggle_disclosure("→ Shell:");
+    assert!(
+        expanded.contains("↓ Shell: echo solaris-shell-output"),
+        "{expanded}"
+    );
+    assert!(
+        expanded
+            .lines()
+            .any(|line| line.trim() == "solaris-shell-output"),
+        "{expanded}"
+    );
+
+    let collapsed = harness.toggle_disclosure("↓ Explored: 2 reads");
+    assert!(collapsed.contains("→ Explored: 2 reads"), "{collapsed}");
+    assert!(!collapsed.contains("→ Read "), "{collapsed}");
+    assert!(collapsed.contains("↓ Shell:"), "{collapsed}");
+    assert!(
+        collapsed
+            .lines()
+            .any(|line| line.trim() == "solaris-shell-output"),
+        "{collapsed}"
+    );
+    let collapsed = harness.toggle_disclosure("↓ Shell:");
+    assert!(
+        !collapsed
+            .lines()
+            .any(|line| line.trim() == "solaris-shell-output"),
+        "{collapsed}"
+    );
+}
+
+#[tokio::test]
+async fn dragging_and_copying_ordinary_group_and_shell_titles_does_not_expand_them() {
+    for (title, word) in [("→ Explored: 2 reads", "Explored"), ("→ Shell:", "Shell")] {
+        let (clipboard, copied) = clipboard_for(None);
+        let mut harness =
+            Harness::with_backend_and_clipboard(Arc::new(InspectingBackend), clipboard);
+        harness.type_str("Inspect.");
+        harness.key(KeyCode::Enter);
+        let text = harness.settle_turn("Inspection finished.").await;
+        let row = text.lines().position(|line| line.contains(title)).unwrap() as u16;
+        let end = 4 + word.len() as u16 - 1;
+        harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
+        harness.mouse(MouseEventKind::Drag(MouseButton::Left), end, row);
+        harness.mouse(MouseEventKind::Up(MouseButton::Left), end, row);
+        let selected = harness.draw();
+        assert!(
+            selected.contains(title) && !selected.contains('↓'),
+            "{selected}"
+        );
+        harness.ctrl('c');
+        assert_eq!(copied.borrow().last().map(String::as_str), Some(word));
+    }
+}
+
 /// A clipboard that records whatever is copied to it and hands back `paste`
 /// when asked, so tests never touch the machine's real one.
 fn clipboard_for(paste: Option<&str>) -> (Clipboard, Rc<RefCell<Vec<String>>>) {
@@ -376,6 +500,17 @@ impl Harness {
             row,
             modifiers: KeyModifiers::empty(),
         });
+    }
+
+    fn toggle_disclosure(&mut self, title: &str) -> String {
+        let text = self.draw();
+        let row = text
+            .lines()
+            .position(|line| line.contains(title))
+            .expect(title) as u16;
+        self.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
+        self.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
+        self.draw()
     }
 
     fn type_str(&mut self, text: &str) {
@@ -646,13 +781,25 @@ async fn a_tool_call_and_its_answer_are_shown_in_the_transcript() {
     harness.type_str("go");
     harness.key(KeyCode::Enter);
 
-    let text = harness.settle_on("nowhere to go").await;
+    let text = harness.settle_turn("nowhere to go").await;
 
-    assert!(text.contains("teleport"), "the call is shown:\n{text}");
-    assert!(text.contains("mars"), "its arguments are shown:\n{text}");
+    assert!(text.contains("→ Explored: 1 tool call"), "{text}");
     assert!(
-        text.contains('✗'),
-        "a call that did not run is marked as failed:\n{text}"
+        !text.contains("teleport"),
+        "a collapsed failure only changes colour:\n{text}"
+    );
+    let row = text
+        .lines()
+        .position(|line| line.contains("→ Explored:"))
+        .unwrap() as u16;
+    assert_eq!(
+        harness.terminal.backend().buffer()[(2, row)].fg,
+        Theme::dark().error
+    );
+    let expanded = harness.toggle_disclosure("→ Explored:");
+    assert!(
+        expanded.contains("teleport") && expanded.contains("mars"),
+        "{expanded}"
     );
     assert!(
         text.contains("nowhere to go"),
