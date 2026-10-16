@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use solaris_agent::{ToolCall, ToolResult, Usage, tokens_for_characters};
+use solaris_tui::components::CollapsibleState;
 
 /// One tool call the model made, and what running it produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +18,8 @@ pub struct ToolStep {
     pub result: Option<ToolResult>,
     /// How long the call took, once it has run.
     pub duration_ms: Option<u64>,
+    /// Reusable disclosure state; record updates never reset the user's choice.
+    pub disclosure: CollapsibleState,
     /// Child activity belongs to one collapsible row, not top-level tool steps.
     pub subagent: Option<Box<SubagentStep>>,
 }
@@ -26,8 +29,6 @@ pub struct ToolStep {
 pub struct SubagentStep {
     /// Runtime identity used to route concurrent child tool events.
     pub task_id: Option<String>,
-    /// False until the user opens this title, including while the child runs.
-    pub expanded: bool,
     /// Tool calls inside the child, never mixed into the parent's step list.
     pub steps: Vec<ToolStep>,
     /// The child's final report or failure, not the background launch receipt.
@@ -52,6 +53,7 @@ impl ToolStep {
             call,
             result: None,
             duration_ms: None,
+            disclosure: CollapsibleState::default(),
             subagent,
         }
     }

@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -33,6 +33,7 @@ use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
 use solaris_tui::components::select_list::SelectItem;
 use solaris_tui::components::welcome::{WelcomeData, WelcomeEntry};
+use solaris_tui::components::{CollapsibleAction, CollapsibleHit, CollapsibleInteraction};
 use solaris_tui::keys::Keybindings;
 use solaris_tui::layout::{self, Axis, Entry};
 use solaris_tui::overlay::{OverlayOptions, SizeValue};
@@ -260,8 +261,8 @@ pub struct App {
     spinner_frame: u16,
     frame: u64,
     last_transcript: Rect,
-    /// A title press becomes a toggle only on release, never during selection.
-    subagent_press: Option<(u16, u16, usize, usize)>,
+    /// Shared disclosure interaction; targets identify transcript records.
+    collapsible_mouse: CollapsibleInteraction<(usize, usize)>,
     /// Credentials collected by `/connect`.
     pub(crate) auth: AuthStore,
     /// Where credentials are saved after a change.
@@ -427,7 +428,7 @@ impl App {
             spinner_frame: 0,
             frame: 0,
             last_transcript: Rect::default(),
-            subagent_press: None,
+            collapsible_mouse: CollapsibleInteraction::default(),
             auth,
             auth_path,
             buddy,
@@ -2169,7 +2170,7 @@ impl App {
     fn render_session(&mut self, buf: &mut Buffer, area: Rect) {
         if area.width < 12 || area.height < 4 {
             self.last_transcript = Rect::default();
-            self.subagent_press = None;
+            self.collapsible_mouse.cancel();
             return;
         }
 
@@ -2237,67 +2238,57 @@ impl App {
         }
     }
 
-    fn handle_subagent_mouse(&mut self, event: MouseEvent) -> bool {
+    fn handle_collapsible_mouse(&mut self, event: MouseEvent) -> bool {
         let over_transcript = rect_contains(self.last_transcript, event.column, event.row);
         let row = usize::from(self.session.scroll)
             + usize::from(event.row.saturating_sub(self.last_transcript.y));
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.subagent_press = over_transcript
-                    .then(|| self.transcript.subagent_at(row))
-                    .flatten()
-                    .map(|(turn, step)| (event.column, event.row, turn, step));
-                self.subagent_press.is_some()
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let Some((x, y, turn, step)) = self.subagent_press.take() else {
-                    return false;
-                };
-                if over_transcript
-                    && (event.column, event.row) == (x, y)
-                    && self.transcript.subagent_at(row) == Some((turn, step))
-                    && (!self.selection.borrow().is_active()
-                        || event.column == self.last_transcript.x.saturating_add(2))
+        let header = over_transcript
+            .then(|| self.transcript.collapsible_at(row))
+            .flatten();
+        let hit = header.map(|header| {
+            CollapsibleHit::new(
+                header.target,
+                Rect::new(
+                    self.last_transcript.x,
+                    event.row,
+                    self.last_transcript.width,
+                    1,
+                ),
+                header.marker_offset,
+            )
+        });
+        let selected = self.selection.borrow().is_active();
+        match self.collapsible_mouse.handle_mouse(event, hit, selected) {
+            CollapsibleAction::Ignored => false,
+            CollapsibleAction::Handled => true,
+            CollapsibleAction::Toggle((turn, step)) => {
+                if let Some(step) = self
+                    .session
+                    .turns
+                    .get_mut(turn)
+                    .and_then(|turn| turn.steps.get_mut(step))
                 {
-                    if let Some(child) = self
-                        .session
-                        .turns
-                        .get_mut(turn)
-                        .and_then(|turn| turn.steps.get_mut(step))
-                        .and_then(|step| step.subagent.as_mut())
-                    {
-                        child.expanded = !child.expanded;
-                        if child.expanded {
-                            // A title on the viewport's bottom row must reveal
-                            // its details, not expand entirely below the screen.
-                            let reveal =
-                                child.steps.len().max(1).min(usize::from(
-                                    self.last_transcript.height.saturating_sub(1),
-                                ));
-                            let end = usize::from(event.row - self.last_transcript.y) + 1 + reveal;
-                            let shift =
-                                end.saturating_sub(usize::from(self.last_transcript.height));
-                            self.session.scroll = self
-                                .session
-                                .scroll
-                                .saturating_add(u16::try_from(shift).unwrap_or(u16::MAX));
-                        }
-                        // Keep the title in view instead of jumping to the tail
-                        // when expansion adds more content below the viewport.
-                        self.session.follow_end = false;
-                        self.session.bump();
-                        self.selection.borrow_mut().clear();
+                    if step.disclosure.toggle() {
+                        // A title on the viewport's bottom row must reveal
+                        // its details, not expand entirely below the screen.
+                        let reveal = header
+                            .map_or(0, |header| header.body_rows)
+                            .min(usize::from(self.last_transcript.height.saturating_sub(1)));
+                        let end = usize::from(event.row - self.last_transcript.y) + 1 + reveal;
+                        let shift = end.saturating_sub(usize::from(self.last_transcript.height));
+                        self.session.scroll = self
+                            .session
+                            .scroll
+                            .saturating_add(u16::try_from(shift).unwrap_or(u16::MAX));
                     }
+                    // Keep the title in view instead of jumping to the tail
+                    // when expansion adds more content below the viewport.
+                    self.session.follow_end = false;
+                    self.session.bump();
+                    self.selection.borrow_mut().clear();
                 }
                 true
             }
-            MouseEventKind::Drag(MouseButton::Left)
-            | MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown => {
-                self.subagent_press = None;
-                false
-            }
-            _ => false,
         }
     }
 
@@ -2416,7 +2407,7 @@ impl Component for App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
-        if self.handle_subagent_mouse(event) {
+        if self.handle_collapsible_mouse(event) {
             return MouseResult::Handled;
         }
         // The wizard only takes mouse events inside its own area; the
@@ -3602,7 +3593,7 @@ mod tests {
             assert_eq!(child.result.as_ref().unwrap().output, "background report");
             assert_eq!(child.result.as_ref().unwrap().is_error, is_error);
             assert_eq!(child.duration_ms, Some(123));
-            assert!(!child.expanded);
+            assert!(!turn.steps[0].disclosure.is_expanded());
             assert!(!turn.complete);
         }
     }
@@ -3621,11 +3612,7 @@ mod tests {
             call_id: "launch".into(),
             task_id: "subagent-1".into(),
         });
-        app.session.turns[0].steps[0]
-            .subagent
-            .as_mut()
-            .unwrap()
-            .expanded = true;
+        app.session.turns[0].steps[0].disclosure.set_expanded(true);
         app.apply_event(AgentEvent::SubagentComplete {
             task_id: "subagent-1".into(),
             output: "fast child report".into(),
@@ -3642,7 +3629,7 @@ mod tests {
         assert_eq!(child.result.as_ref().unwrap().output, "fast child report");
         assert_eq!(child.duration_ms, Some(5));
         assert!(
-            child.expanded,
+            turn.steps[0].disclosure.is_expanded(),
             "completion must preserve the user's expansion choice"
         );
     }
@@ -3682,7 +3669,7 @@ mod tests {
         );
         for (step, id) in steps.iter().zip(["one", "two"]) {
             let child = step.subagent.as_ref().unwrap();
-            assert!(!child.expanded && child.result.is_none());
+            assert!(!step.disclosure.is_expanded() && child.result.is_none());
             assert_eq!(child.steps.len(), 1);
             assert_eq!(
                 child.steps[0].result.as_ref().unwrap().output,
@@ -3733,22 +3720,10 @@ mod tests {
         app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2));
         app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 10));
         app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 10));
-        assert!(
-            !app.session.turns[1].steps[0]
-                .subagent
-                .as_ref()
-                .unwrap()
-                .expanded
-        );
+        assert!(!app.session.turns[1].steps[0].disclosure.is_expanded());
         app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2));
         app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 2));
-        assert!(
-            app.session.turns[1].steps[0]
-                .subagent
-                .as_ref()
-                .unwrap()
-                .expanded
-        );
+        assert!(app.session.turns[1].steps[0].disclosure.is_expanded());
         let expanded = rendered_text(&mut app, 80, 14);
         assert!(
             expanded.contains("↓ Explored:") && expanded.contains("Read inside.txt"),
@@ -3769,13 +3744,7 @@ mod tests {
                 modifiers: KeyModifiers::empty(),
             });
         }
-        assert!(
-            !app.session.turns[1].steps[0]
-                .subagent
-                .as_ref()
-                .unwrap()
-                .expanded
-        );
+        assert!(!app.session.turns[1].steps[0].disclosure.is_expanded());
     }
 
     #[test]
@@ -4631,6 +4600,7 @@ mod tests {
                     call: call.clone(),
                     result: Some(ToolResult::ok(&call, "one")),
                     duration_ms: None,
+                    disclosure: Default::default(),
                     subagent: None,
                 },
                 ToolStep::pending(call),

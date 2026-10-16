@@ -4,6 +4,7 @@
 //! fuzzy select list, markdown rendering, a scrolling viewport, and the
 //! welcome box.
 
+pub mod collapsible;
 pub mod editor;
 pub mod fuzzy;
 pub mod inline_select;
@@ -16,6 +17,10 @@ pub mod spacer;
 pub mod text;
 pub mod welcome;
 
+pub use collapsible::{
+    Collapsible, CollapsibleAction, CollapsibleHit, CollapsibleInteraction, CollapsibleState,
+    CollapsibleStatus, CollapsibleStyles,
+};
 pub use editor::{CommandHint, Editor};
 pub use fuzzy::{fuzzy_match, fuzzy_score};
 pub use inline_select::{InlineSelect, InlineSelectOutcome, InlineStyles};

@@ -12,13 +12,23 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::welcome::{WelcomeData, WelcomeStyles, render_welcome};
+use solaris_tui::components::{Collapsible, CollapsibleStatus, CollapsibleStyles};
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{truncate_to_width, wrap_text};
 
 use crate::state::{SessionState, ToolStep, Turn};
 
-/// Spinner glyphs shown while a response streams.
-pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Spinner glyphs shared with the reusable TUI activity indicators.
+pub use solaris_tui::components::loader::SPINNER;
+
+/// A virtual disclosure header; the target identifies an application record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollapsibleHeader {
+    pub row: usize,
+    pub target: (usize, usize),
+    pub marker_offset: u16,
+    pub body_rows: usize,
+}
 
 /// Cached transcript lines.
 #[derive(Default)]
@@ -32,8 +42,8 @@ pub struct TranscriptView {
     /// invalidates them even if the session revision was not bumped.
     cache_empty: bool,
     lines: Vec<Line<'static>>,
-    /// Absolute transcript row, turn index, and top-level step index.
-    subagent_headers: Vec<(usize, usize, usize)>,
+    /// Header geometry for any collapsible record, not just child agents.
+    collapsible_headers: Vec<CollapsibleHeader>,
     initialized: bool,
 }
 
@@ -71,14 +81,14 @@ impl TranscriptView {
             || self.cache_spinner != spinner_key;
 
         if stale {
-            self.subagent_headers.clear();
+            self.collapsible_headers.clear();
             self.lines = build_with_headers(
                 session,
                 area,
                 theme,
                 spinner_frame,
                 welcome,
-                &mut self.subagent_headers,
+                &mut self.collapsible_headers,
             );
             self.cache_width = area.width;
             self.cache_height = area.height;
@@ -93,11 +103,11 @@ impl TranscriptView {
     }
 
     /// Resolve a title in the rendered transcript, before the viewport scroll.
-    pub fn subagent_at(&self, row: usize) -> Option<(usize, usize)> {
-        self.subagent_headers
+    pub fn collapsible_at(&self, row: usize) -> Option<CollapsibleHeader> {
+        self.collapsible_headers
             .iter()
-            .find(|(line, _, _)| *line == row)
-            .map(|(_, turn, step)| (*turn, *step))
+            .find(|header| header.row == row)
+            .copied()
     }
 
     /// Force a rebuild on the next call.
@@ -133,7 +143,7 @@ fn build_with_headers(
     theme: &Theme,
     spinner_frame: Option<u16>,
     welcome: &WelcomeData,
-    headers: &mut Vec<(usize, usize, usize)>,
+    headers: &mut Vec<CollapsibleHeader>,
 ) -> Vec<Line<'static>> {
     let width = area.width.max(8) as usize;
     let markdown = MarkdownStyle::from_theme(theme);
@@ -224,7 +234,7 @@ fn push_steps(
     theme: &Theme,
     spinner_frame: Option<u16>,
     turn_index: usize,
-    headers: &mut Vec<(usize, usize, usize)>,
+    headers: &mut Vec<CollapsibleHeader>,
 ) {
     // Messages the user steered in are drawn where they arrived, among the
     // calls they followed: where the correction landed is why the model's next
@@ -236,9 +246,17 @@ fn push_steps(
 
     let mut finished = 0usize;
     for (step_index, step) in turn.steps.iter().enumerate() {
-        if step.subagent.is_some() {
-            headers.push((out.len(), turn_index, step_index));
-            push_subagent(out, step, turn.complete, width, theme, spinner_frame);
+        if let Some(view) = subagent_view(step, turn.complete, theme, spinner_frame) {
+            headers.push(CollapsibleHeader {
+                row: out.len(),
+                target: (turn_index, step_index),
+                marker_offset: view.marker_offset(),
+                body_rows: step
+                    .subagent
+                    .as_ref()
+                    .map_or(0, |child| child.steps.len().max(1)),
+            });
+            out.extend(view.lines(width as u16));
         } else {
             push_tool_step(out, step, width, theme);
         }
@@ -302,25 +320,16 @@ fn spinner(frame: Option<u16>) -> &'static str {
     SPINNER[usize::from(frame.unwrap_or(0)) % SPINNER.len()]
 }
 
-fn push_subagent(
-    out: &mut Vec<Line<'static>>,
+fn subagent_view(
     step: &ToolStep,
     turn_complete: bool,
-    width: usize,
     theme: &Theme,
     spinner_frame: Option<u16>,
-) {
-    let Some(child) = &step.subagent else { return };
+) -> Option<Collapsible> {
+    let child = step.subagent.as_ref()?;
     let running = child.result.is_none() && !turn_complete;
     let interrupted = child.result.is_none() && turn_complete;
     let failed = interrupted || child.result.as_ref().is_some_and(|result| result.is_error);
-    let glyph = if child.expanded {
-        "↓"
-    } else if running {
-        spinner(spinner_frame)
-    } else {
-        "→"
-    };
     let label = match step.call.input["agent"].as_str() {
         Some("explore") if running => "Exploring",
         Some("explore") => "Explored",
@@ -334,32 +343,32 @@ fn push_subagent(
         detail.push_str(" — ");
         detail.push_str(&summarize(&result.output));
     }
-    let colour = if failed { theme.error } else { theme.muted };
-    out.push(Line::from(vec![
-        Span::styled(
-            format!("  {glyph} "),
-            Style::default().fg(if running && !child.expanded {
-                theme.accent
-            } else {
-                colour
-            }),
-        ),
-        Span::styled(
-            truncate_to_width(&detail, width.saturating_sub(4), "…"),
-            Style::default().fg(colour),
-        ),
-    ]));
-    if child.expanded {
+    let mut view = Collapsible::new(detail)
+        .with_state(step.disclosure)
+        .styles(CollapsibleStyles::from_theme(theme))
+        .indentation(2, 4);
+    view.set_status(if failed {
+        CollapsibleStatus::Failed
+    } else if running {
+        CollapsibleStatus::Running
+    } else {
+        CollapsibleStatus::Idle
+    });
+    view.set_spinner_frame(spinner_frame.unwrap_or(0));
+    if step.disclosure.is_expanded() {
+        let mut body = Vec::new();
         for tool in &child.steps {
-            push_child_step(out, tool, running, width, theme, spinner_frame);
+            push_child_step(&mut body, tool, running, theme, spinner_frame);
         }
         if child.steps.is_empty() {
-            out.push(Line::styled(
-                truncate_to_width("    No tool calls.", width, "…"),
+            body.push(Line::styled(
+                "No tool calls.",
                 Style::default().fg(theme.dim),
             ));
         }
+        view.set_content(body);
     }
+    Some(view)
 }
 
 fn subagent_counts(steps: &[ToolStep], running: bool) -> String {
@@ -398,7 +407,6 @@ fn push_child_step(
     out: &mut Vec<Line<'static>>,
     step: &ToolStep,
     running: bool,
-    width: usize,
     theme: &Theme,
     spinner_frame: Option<u16>,
 ) {
@@ -450,7 +458,7 @@ fn push_child_step(
         theme.muted
     };
     out.push(Line::styled(
-        truncate_to_width(&format!("    {glyph} {label} {detail}"), width, "…"),
+        format!("{glyph} {label} {detail}"),
         Style::default().fg(colour),
     ));
 }
@@ -608,8 +616,8 @@ mod tests {
             }),
         );
         let mut step = ToolStep::pending(call.clone());
+        step.disclosure.set_expanded(expanded);
         let child = step.subagent.as_mut().unwrap();
-        child.expanded = expanded;
         for (name, input) in [
             (
                 "webfetch",
@@ -769,18 +777,26 @@ mod tests {
             ..Default::default()
         });
         view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
-        assert_eq!(view.subagent_at(2), Some((0, 0)));
-        assert_eq!(view.subagent_at(3), Some((0, 1)));
-        session.turns[0].steps[0]
-            .subagent
-            .as_mut()
-            .unwrap()
-            .expanded = true;
+        assert_eq!(
+            view.collapsible_at(2).map(|header| header.target),
+            Some((0, 0))
+        );
+        assert_eq!(
+            view.collapsible_at(3).map(|header| header.target),
+            Some((0, 1))
+        );
+        session.turns[0].steps[0].disclosure.set_expanded(true);
         session.bump();
         view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
-        assert_eq!(view.subagent_at(2), Some((0, 0)));
-        assert_eq!(view.subagent_at(3), None);
-        assert_eq!(view.subagent_at(6), Some((0, 1)));
+        assert_eq!(
+            view.collapsible_at(2).map(|header| header.target),
+            Some((0, 0))
+        );
+        assert_eq!(view.collapsible_at(3), None);
+        assert_eq!(
+            view.collapsible_at(6).map(|header| header.target),
+            Some((0, 1))
+        );
     }
 
     #[test]
