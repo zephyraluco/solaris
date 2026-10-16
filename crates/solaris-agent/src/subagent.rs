@@ -152,7 +152,7 @@ impl SubagentRunner {
             _ = crate::session::wait_for_cancel(&ctx.cancel) => ToolOutput::error("subagent was cancelled"),
             _ = tx.closed() => ToolOutput::error("subagent was cancelled"),
             _ = tokio::time::sleep(TIMEOUT) => ToolOutput::error("subagent timed out after 5 minutes"),
-            output = self.execute(task, ctx, tx, &label, Arc::clone(&totals)) => output,
+            output = self.execute(task, ctx, tx, call_id, Arc::clone(&totals)) => output,
         };
         let _ = tx.send(AgentEvent::Status(format!(
             "{label}: {}",
@@ -173,13 +173,13 @@ impl SubagentRunner {
         task: Task,
         ctx: &ToolContext,
         tx: &UnboundedSender<AgentEvent>,
-        label: &str,
+        task_id: &str,
         totals: Arc<Mutex<Totals>>,
     ) -> ToolOutput {
         let Ok(_permit) = self.slots.acquire().await else {
             return ToolOutput::error("subagent execution is closed");
         };
-        let _ = tx.send(AgentEvent::Status(format!("{label}: running")));
+        let _ = tx.send(AgentEvent::Status(format!("subagent {task_id}: running")));
 
         let mode = match task.agent {
             Kind::Explore => Mode::Plan,
@@ -226,7 +226,7 @@ impl SubagentRunner {
         // A dropped parent future must also stop its child, including when the
         // child is waiting on network IO or on an approval.
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
-        collect(&mut stream, ctx, tx, label).await
+        collect(&mut stream, ctx, tx, task_id).await
     }
 }
 
@@ -241,7 +241,7 @@ async fn collect(
     stream: &mut AgentEventStream,
     ctx: &ToolContext,
     tx: &UnboundedSender<AgentEvent>,
-    label: &str,
+    task_id: &str,
 ) -> ToolOutput {
     let deadline = tokio::time::sleep(TIMEOUT);
     tokio::pin!(deadline);
@@ -268,9 +268,20 @@ async fn collect(
                     // Earlier round text is progress, not the child's final answer.
                     text.clear();
                     clipped = false;
-                    let _ = tx.send(AgentEvent::Status(format!("{label}: {}", call.name)));
+                    let _ = tx.send(AgentEvent::Status(format!("subagent {task_id}: {}", call.name)));
+                    let _ = tx.send(AgentEvent::SubagentToolCall {
+                        task_id: task_id.to_string(),
+                        call,
+                    });
                 }
-                Some(AgentEvent::Error(error)) => return ToolOutput::error(format!("{label} failed: {error}")),
+                Some(AgentEvent::ToolResult { result, duration_ms }) => {
+                    let _ = tx.send(AgentEvent::SubagentToolResult {
+                        task_id: task_id.to_string(),
+                        result,
+                        duration_ms,
+                    });
+                }
+                Some(AgentEvent::Error(error)) => return ToolOutput::error(format!("subagent {task_id} failed: {error}")),
                 Some(AgentEvent::TurnComplete { .. }) => completed = true,
                 None => break,
                 _ => {}

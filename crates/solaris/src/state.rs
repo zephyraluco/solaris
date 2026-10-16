@@ -17,20 +17,61 @@ pub struct ToolStep {
     pub result: Option<ToolResult>,
     /// How long the call took, once it has run.
     pub duration_ms: Option<u64>,
+    /// Child activity belongs to one collapsible row, not top-level tool steps.
+    pub subagent: Option<Box<SubagentStep>>,
+}
+
+/// Display state for one child, independent of its launch acknowledgement.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubagentStep {
+    /// Runtime identity used to route concurrent child tool events.
+    pub task_id: Option<String>,
+    /// False until the user opens this title, including while the child runs.
+    pub expanded: bool,
+    /// Tool calls inside the child, never mixed into the parent's step list.
+    pub steps: Vec<ToolStep>,
+    /// The child's final report or failure, not the background launch receipt.
+    pub result: Option<ToolResult>,
+    /// Total child duration, including its wait for an execution slot.
+    pub duration_ms: Option<u64>,
+}
+
+impl SubagentStep {
+    /// Finish without changing whether the user has expanded the row.
+    pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
+        self.result = Some(result);
+        self.duration_ms = Some(duration_ms);
+    }
 }
 
 impl ToolStep {
     /// A step whose call has not run yet.
     pub fn pending(call: ToolCall) -> Self {
+        let subagent = (call.name == "subagent").then(Box::default);
         Self {
             call,
             result: None,
             duration_ms: None,
+            subagent,
         }
     }
 
     /// Record what the call produced.
     pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
+        if let Some(child) = &mut self.subagent {
+            let background = self.call.input["background"].as_bool() == Some(true);
+            if background && !result.is_error {
+                // Also accept a launch acknowledgement without a Started event
+                // for callers replaying older transcripts. It is not completion.
+                if child.task_id.is_none() {
+                    child.task_id = serde_json::from_str::<serde_json::Value>(&result.output)
+                        .ok()
+                        .and_then(|value| value["task_id"].as_str().map(str::to_string));
+                }
+            } else {
+                child.finish(result.clone(), duration_ms);
+            }
+        }
         self.result = Some(result);
         self.duration_ms = Some(duration_ms);
     }
@@ -93,6 +134,15 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Locate child activity by its runtime ID, even after its launch returned.
+    pub fn subagent_mut(&mut self, task_id: &str) -> Option<&mut ToolStep> {
+        self.steps.iter_mut().rev().find(|step| {
+            step.subagent
+                .as_ref()
+                .is_some_and(|child| child.task_id.as_deref() == Some(task_id))
+        })
+    }
+
     /// Every token the turn touched.
     pub fn tokens(&self) -> u32 {
         self.usage.total()

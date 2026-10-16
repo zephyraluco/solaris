@@ -57,11 +57,18 @@ impl BackgroundTasks {
         task: Task,
         ctx: ToolContext,
         tx: UnboundedSender<AgentEvent>,
+        call_id: &str,
     ) -> ToolOutput {
         let mut state = self.lock();
         state.next_id += 1;
         let id = format!("subagent-{}", state.next_id);
         let task_id = id.clone();
+        // Link before spawning: a fast child may finish before the parent even
+        // receives the launch acknowledgement, including on a multithread runtime.
+        let _ = tx.send(AgentEvent::SubagentStarted {
+            call_id: call_id.to_string(),
+            task_id: task_id.clone(),
+        });
         let started = Instant::now();
         let worker_tx = tx.clone();
         let handle = tokio::spawn(async move {

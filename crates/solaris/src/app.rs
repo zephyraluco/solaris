@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -260,6 +260,8 @@ pub struct App {
     spinner_frame: u16,
     frame: u64,
     last_transcript: Rect,
+    /// A title press becomes a toggle only on release, never during selection.
+    subagent_press: Option<(u16, u16, usize, usize)>,
     /// Credentials collected by `/connect`.
     pub(crate) auth: AuthStore,
     /// Where credentials are saved after a change.
@@ -425,6 +427,7 @@ impl App {
             spinner_frame: 0,
             frame: 0,
             last_transcript: Rect::default(),
+            subagent_press: None,
             auth,
             auth_path,
             buddy,
@@ -1112,6 +1115,50 @@ impl App {
                     turn.cost_usd += cost_usd;
                 }
             }
+            AgentEvent::SubagentStarted { call_id, task_id } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    if let Some(child) = turn
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|step| step.call.id == call_id)
+                        .and_then(|step| step.subagent.as_mut())
+                    {
+                        child.task_id = Some(task_id);
+                    }
+                }
+            }
+            AgentEvent::SubagentToolCall { task_id, call } => {
+                if let Some(child) = self
+                    .session
+                    .active_turn_mut()
+                    .and_then(|turn| turn.subagent_mut(&task_id))
+                    .and_then(|step| step.subagent.as_mut())
+                {
+                    child.steps.push(ToolStep::pending(call));
+                }
+            }
+            AgentEvent::SubagentToolResult {
+                task_id,
+                result,
+                duration_ms,
+            } => {
+                if let Some(child) = self
+                    .session
+                    .active_turn_mut()
+                    .and_then(|turn| turn.subagent_mut(&task_id))
+                    .and_then(|step| step.subagent.as_mut())
+                {
+                    if let Some(step) = child
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|step| step.call.id == result.id && !step.is_done())
+                    {
+                        step.finish(result, duration_ms);
+                    }
+                }
+            }
             AgentEvent::SubagentComplete {
                 task_id,
                 output,
@@ -1125,20 +1172,19 @@ impl App {
                 } else {
                     self.notifications.info(notice);
                 }
-                if let Some(turn) = self.session.active_turn_mut() {
-                    let call = ToolCall::new(
-                        task_id,
-                        "subagent",
-                        serde_json::json!({"background": true, "status": status}),
-                    );
+                if let Some(step) = self
+                    .session
+                    .active_turn_mut()
+                    .and_then(|turn| turn.subagent_mut(&task_id))
+                {
                     let result = if is_error {
-                        solaris_agent::ToolResult::error(&call, output)
+                        solaris_agent::ToolResult::error(&step.call, output)
                     } else {
-                        solaris_agent::ToolResult::ok(&call, output)
+                        solaris_agent::ToolResult::ok(&step.call, output)
                     };
-                    let mut step = ToolStep::pending(call);
-                    step.finish(result, duration_ms);
-                    turn.steps.push(step);
+                    if let Some(child) = &mut step.subagent {
+                        child.finish(result, duration_ms);
+                    }
                 }
             }
             AgentEvent::TurnComplete { usage, cost_usd } => {
@@ -2122,6 +2168,8 @@ impl App {
     /// Render the transcript, the prompt region, and the status footer.
     fn render_session(&mut self, buf: &mut Buffer, area: Rect) {
         if area.width < 12 || area.height < 4 {
+            self.last_transcript = Rect::default();
+            self.subagent_press = None;
             return;
         }
 
@@ -2186,6 +2234,70 @@ impl App {
             .enumerate()
         {
             buf.set_line(area.x, area.y + row as u16, line, area.width);
+        }
+    }
+
+    fn handle_subagent_mouse(&mut self, event: MouseEvent) -> bool {
+        let over_transcript = rect_contains(self.last_transcript, event.column, event.row);
+        let row = usize::from(self.session.scroll)
+            + usize::from(event.row.saturating_sub(self.last_transcript.y));
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.subagent_press = over_transcript
+                    .then(|| self.transcript.subagent_at(row))
+                    .flatten()
+                    .map(|(turn, step)| (event.column, event.row, turn, step));
+                self.subagent_press.is_some()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some((x, y, turn, step)) = self.subagent_press.take() else {
+                    return false;
+                };
+                if over_transcript
+                    && (event.column, event.row) == (x, y)
+                    && self.transcript.subagent_at(row) == Some((turn, step))
+                    && (!self.selection.borrow().is_active()
+                        || event.column == self.last_transcript.x.saturating_add(2))
+                {
+                    if let Some(child) = self
+                        .session
+                        .turns
+                        .get_mut(turn)
+                        .and_then(|turn| turn.steps.get_mut(step))
+                        .and_then(|step| step.subagent.as_mut())
+                    {
+                        child.expanded = !child.expanded;
+                        if child.expanded {
+                            // A title on the viewport's bottom row must reveal
+                            // its details, not expand entirely below the screen.
+                            let reveal =
+                                child.steps.len().max(1).min(usize::from(
+                                    self.last_transcript.height.saturating_sub(1),
+                                ));
+                            let end = usize::from(event.row - self.last_transcript.y) + 1 + reveal;
+                            let shift =
+                                end.saturating_sub(usize::from(self.last_transcript.height));
+                            self.session.scroll = self
+                                .session
+                                .scroll
+                                .saturating_add(u16::try_from(shift).unwrap_or(u16::MAX));
+                        }
+                        // Keep the title in view instead of jumping to the tail
+                        // when expansion adds more content below the viewport.
+                        self.session.follow_end = false;
+                        self.session.bump();
+                        self.selection.borrow_mut().clear();
+                    }
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown => {
+                self.subagent_press = None;
+                false
+            }
+            _ => false,
         }
     }
 
@@ -2304,6 +2416,9 @@ impl Component for App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
+        if self.handle_subagent_mouse(event) {
+            return MouseResult::Handled;
+        }
         // The wizard only takes mouse events inside its own area; the
         // transcript keeps scrolling everywhere else.
         let over_wizard = self
@@ -3448,7 +3563,7 @@ mod tests {
     }
 
     #[test]
-    fn background_reports_are_separate_steps_and_notify_on_success_or_failure() {
+    fn background_reports_finish_the_launch_group_and_notify_on_success_or_failure() {
         for is_error in [false, true] {
             let mut app = app();
             app.session.turns.push(Turn::default());
@@ -3458,6 +3573,15 @@ mod tests {
                 result: ToolResult::ok(&call, r#"{"task_id":"subagent-1","status":"started"}"#),
                 duration_ms: 1,
             });
+            assert!(
+                app.session.turns[0].steps[0]
+                    .subagent
+                    .as_ref()
+                    .unwrap()
+                    .result
+                    .is_none(),
+                "a background launch acknowledgement must keep its spinner running"
+            );
             app.apply_event(AgentEvent::SubagentComplete {
                 task_id: "subagent-1".into(),
                 output: "background report".into(),
@@ -3465,7 +3589,7 @@ mod tests {
                 duration_ms: 123,
             });
             let turn = &app.session.turns[0];
-            assert_eq!(turn.steps.len(), 2);
+            assert_eq!(turn.steps.len(), 1);
             assert!(
                 turn.steps[0]
                     .result
@@ -3474,14 +3598,184 @@ mod tests {
                     .output
                     .contains("started")
             );
-            assert_eq!(
-                turn.steps[1].result.as_ref().unwrap().output,
-                "background report"
-            );
-            assert_eq!(turn.steps[1].is_error(), is_error);
-            assert_eq!(turn.steps[1].duration_ms(), Some(123));
+            let child = turn.steps[0].subagent.as_ref().unwrap();
+            assert_eq!(child.result.as_ref().unwrap().output, "background report");
+            assert_eq!(child.result.as_ref().unwrap().is_error, is_error);
+            assert_eq!(child.duration_ms, Some(123));
+            assert!(!child.expanded);
             assert!(!turn.complete);
         }
+    }
+
+    #[test]
+    fn a_background_completion_before_the_launch_ack_updates_one_group_without_losing_the_report() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        let call = ToolCall::new(
+            "launch",
+            "subagent",
+            serde_json::json!({"agent":"explore","background":true}),
+        );
+        app.apply_event(AgentEvent::ToolCall(call.clone()));
+        app.apply_event(AgentEvent::SubagentStarted {
+            call_id: "launch".into(),
+            task_id: "subagent-1".into(),
+        });
+        app.session.turns[0].steps[0]
+            .subagent
+            .as_mut()
+            .unwrap()
+            .expanded = true;
+        app.apply_event(AgentEvent::SubagentComplete {
+            task_id: "subagent-1".into(),
+            output: "fast child report".into(),
+            is_error: false,
+            duration_ms: 5,
+        });
+        app.apply_event(AgentEvent::ToolResult {
+            result: ToolResult::ok(&call, r#"{"task_id":"subagent-1","status":"started"}"#),
+            duration_ms: 1,
+        });
+        let turn = &app.session.turns[0];
+        assert_eq!(turn.steps.len(), 1);
+        let child = turn.steps[0].subagent.as_ref().unwrap();
+        assert_eq!(child.result.as_ref().unwrap().output, "fast child report");
+        assert_eq!(child.duration_ms, Some(5));
+        assert!(
+            child.expanded,
+            "completion must preserve the user's expansion choice"
+        );
+    }
+
+    #[test]
+    fn parallel_child_tool_events_are_nested_under_the_right_launch_even_with_reused_tool_ids() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        for id in ["one", "two"] {
+            app.apply_event(AgentEvent::ToolCall(ToolCall::new(
+                id,
+                "subagent",
+                serde_json::json!({"agent":"explore"}),
+            )));
+            app.apply_event(AgentEvent::SubagentStarted {
+                call_id: id.into(),
+                task_id: format!("task-{id}"),
+            });
+            app.apply_event(AgentEvent::SubagentToolCall {
+                task_id: format!("task-{id}"),
+                call: ToolCall::new("same-id", "read", serde_json::json!({"path":id})),
+            });
+        }
+        for id in ["two", "one"] {
+            let call = ToolCall::new("same-id", "read", serde_json::json!({"path":id}));
+            app.apply_event(AgentEvent::SubagentToolResult {
+                task_id: format!("task-{id}"),
+                result: ToolResult::ok(&call, format!("data-{id}")),
+                duration_ms: 2,
+            });
+        }
+        let steps = &app.session.turns[0].steps;
+        assert_eq!(
+            steps.len(),
+            2,
+            "child calls must not become top-level steps"
+        );
+        for (step, id) in steps.iter().zip(["one", "two"]) {
+            let child = step.subagent.as_ref().unwrap();
+            assert!(!child.expanded && child.result.is_none());
+            assert_eq!(child.steps.len(), 1);
+            assert_eq!(
+                child.steps[0].result.as_ref().unwrap().output,
+                format!("data-{id}")
+            );
+        }
+    }
+
+    #[test]
+    fn title_clicks_work_after_scrolling_and_dragging_a_title_does_not_toggle_it() {
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: (0..20).map(|n| format!("line {n}\n")).collect(),
+            complete: true,
+            ..Default::default()
+        });
+        app.session.turns.push(Turn {
+            prompt: "Delegate".into(),
+            complete: true,
+            ..Default::default()
+        });
+        // Insert into the completed turn directly so this also tests history rows.
+        let call = ToolCall::new("launch", "subagent", serde_json::json!({"agent":"explore"}));
+        let mut step = ToolStep::pending(call.clone());
+        step.subagent
+            .as_mut()
+            .unwrap()
+            .steps
+            .push(ToolStep::pending(ToolCall::new(
+                "read",
+                "read",
+                serde_json::json!({"path":"inside.txt"}),
+            )));
+        step.finish(ToolResult::ok(&call, "report"), 3);
+        app.session.turns[1].steps.push(step);
+        let text = rendered_text(&mut app, 80, 14);
+        assert!(app.session.scroll > 0);
+        let row = text
+            .lines()
+            .position(|line| line.contains("→ Explored:"))
+            .unwrap() as u16;
+        let pointer = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2));
+        app.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 10));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 10));
+        assert!(
+            !app.session.turns[1].steps[0]
+                .subagent
+                .as_ref()
+                .unwrap()
+                .expanded
+        );
+        app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2));
+        app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 2));
+        assert!(
+            app.session.turns[1].steps[0]
+                .subagent
+                .as_ref()
+                .unwrap()
+                .expanded
+        );
+        let expanded = rendered_text(&mut app, 80, 14);
+        assert!(
+            expanded.contains("↓ Explored:") && expanded.contains("Read inside.txt"),
+            "{expanded}"
+        );
+        let row = expanded
+            .lines()
+            .position(|line| line.contains("↓ Explored:"))
+            .unwrap() as u16;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: 2,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+        }
+        assert!(
+            !app.session.turns[1].steps[0]
+                .subagent
+                .as_ref()
+                .unwrap()
+                .expanded
+        );
     }
 
     #[test]
@@ -4337,6 +4631,7 @@ mod tests {
                     call: call.clone(),
                     result: Some(ToolResult::ok(&call, "one")),
                     duration_ms: None,
+                    subagent: None,
                 },
                 ToolStep::pending(call),
             ],

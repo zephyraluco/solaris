@@ -131,7 +131,16 @@ impl AgentBackend for DelegatingBackend {
             .history
             .iter()
             .any(|message| message.tool_results().next().is_some());
-        let event = if child {
+        let event = if child && !answered {
+            AgentEvent::ToolCall(ToolCall::new(
+                "child-read",
+                "read",
+                serde_json::json!({
+                    "path": std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+                    "offset": 1, "limit": 4,
+                }),
+            ))
+        } else if child {
             AgentEvent::TextDelta("delegated finding".into())
         } else if self.background
             && request.history.iter().any(|message| {
@@ -185,7 +194,29 @@ async fn a_subagent_task_runs_and_returns_its_result_through_the_tui() {
         text.contains("Parent integrated the subagent result."),
         "{text}"
     );
-    assert!(text.contains("✓ subagent"), "{text}");
+    assert!(text.contains("→ Explored:"), "{text}");
+    assert!(text.contains("1 read"), "{text}");
+    assert!(
+        !text.contains("Read "),
+        "child calls are folded by default: {text}"
+    );
+    let row = text
+        .lines()
+        .position(|line| line.contains("→ Explored:"))
+        .unwrap() as u16;
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
+    let expanded = harness.draw();
+    assert!(expanded.contains("↓ Explored: 1 read"), "{expanded}");
+    assert!(
+        expanded.contains("→ Read ") && expanded.contains("lib.rs:1-4"),
+        "{expanded}"
+    );
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
+    let collapsed = harness.draw();
+    assert!(collapsed.contains("→ Explored: 1 read"), "{collapsed}");
+    assert!(!collapsed.contains("→ Read "), "{collapsed}");
     assert!(!text.contains("generating"), "{text}");
 }
 
@@ -201,8 +232,46 @@ async fn a_background_subagent_notifies_and_returns_its_report_through_the_tui()
         text.contains("Parent integrated the background result."),
         "{text}"
     );
-    assert!(text.contains("✓ subagent"), "{text}");
+    assert_eq!(text.matches("→ Explored:").count(), 1, "{text}");
+    assert!(text.contains("1 read"), "{text}");
+    let row = text
+        .lines()
+        .position(|line| line.contains("→ Explored:"))
+        .unwrap() as u16;
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
+    let expanded = harness.draw();
+    assert_eq!(expanded.matches("↓ Explored:").count(), 1, "{expanded}");
+    assert!(expanded.contains("→ Read "), "{expanded}");
     assert!(!text.contains("generating"), "{text}");
+}
+
+#[tokio::test]
+async fn dragging_and_copying_a_subagent_title_does_not_expand_it() {
+    let (clipboard, copied) = clipboard_for(None);
+    let mut harness = Harness::with_backend_and_clipboard(
+        Arc::new(DelegatingBackend { background: false }),
+        clipboard,
+    );
+    harness.type_str("Delegate the investigation.");
+    harness.key(KeyCode::Enter);
+    let text = harness
+        .settle_turn("Parent integrated the subagent result.")
+        .await;
+    let row = text
+        .lines()
+        .position(|line| line.contains("→ Explored:"))
+        .unwrap() as u16;
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 11, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 11, row);
+    let selected = harness.draw();
+    assert!(
+        selected.contains("→ Explored:") && !selected.contains("↓ Explored:"),
+        "{selected}"
+    );
+    harness.ctrl('c');
+    assert_eq!(copied.borrow().last().map(String::as_str), Some("Explored"));
 }
 
 /// A clipboard that records whatever is copied to it and hands back `paste`

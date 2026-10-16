@@ -639,12 +639,17 @@ impl Runner {
                 Err(output) => return ToolResult::error(call, output.text).into(),
             };
             if task.background {
-                let output = self
-                    .background
-                    .start(Arc::clone(subagent), task, ctx, tx.clone());
+                let output =
+                    self.background
+                        .start(Arc::clone(subagent), task, ctx, tx.clone(), &call.id);
                 return ToolResult::ok(call, output.text).into();
             }
-            let result = subagent.run(task, &ctx, tx, &call.id).await;
+            let task_id = format!("foreground-{}", call.id);
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                call_id: call.id.clone(),
+                task_id: task_id.clone(),
+            });
+            let result = subagent.run(task, &ctx, tx, &task_id).await;
             (result.output, result.totals.usage, result.totals.cost_usd)
         } else {
             (

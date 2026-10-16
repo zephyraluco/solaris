@@ -297,6 +297,7 @@ The model can call `subagent` to delegate a self-contained task:
 - Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
 - Children cannot delegate recursively. Each is limited to 20 model requests (including compaction), five minutes and a 16 KiB returned report. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
 - Ctrl+C or abandoning the parent stream cancels child work too. Child token usage/cost is included in session totals, but child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
+- Each child defaults to one collapsed activity-summary row: a spinner while running, then `→` when finished. Click the title to expand its nested tool calls (`↓`), and click again to collapse. Foreground and background children use the same display; a background launch acknowledgement does not mark the child complete.
 - Disable delegation with `--exclude-tools subagent`. Library callers may also use `AgentOptions::with_subagents(false)`.
 
 For example, launch a background investigation with:

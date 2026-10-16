@@ -255,6 +255,23 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
         );
     }
     assert_eq!(agent.conversation_len(), 4);
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::SubagentStarted { call_id, task_id }
+            if call_id == "work" && task_id == "foreground-work")));
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::SubagentToolCall { task_id, call }
+            if task_id == "foreground-work" && call.name == "read")));
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::SubagentToolResult { task_id, result, .. }
+            if task_id == "foreground-work" && result.output == "private child tool output")));
+    for request in model.requests().iter().filter(|request| !is_child(request)) {
+        assert!(!request.history.iter().any(|message| {
+            message.text().contains("private child tool output")
+                || message
+                    .tool_results()
+                    .any(|result| result.output.contains("private child tool output"))
+        }));
+    }
     assert!(
         matches!(events.last(), Some(AgentEvent::TurnComplete {usage, cost_usd})
         if *usage == Usage::new(8, 4) && *cost_usd == 1.0)
@@ -469,6 +486,38 @@ async fn independent_subagents_run_concurrently_and_keep_result_order() {
         .map(|result| result.id.as_str())
         .collect();
     assert_eq!(ids, vec!["one", "two"]);
+}
+
+#[tokio::test]
+async fn parallel_child_tools_with_identical_ids_keep_distinct_display_task_ids() {
+    let mut model = Model::new("explore");
+    model.parallel = true;
+    model.child_tool = Some("read");
+    let agent = agent(
+        Arc::new(model),
+        AgentOptions::default(),
+        &Arc::new(AtomicUsize::new(0)),
+    );
+    let events = run(&agent, Mode::Build).await;
+    let mut scopes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::SubagentToolCall { task_id, call } => {
+                assert_eq!(call.id, "work");
+                Some(task_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    scopes.sort_unstable();
+    assert_eq!(scopes, ["foreground-one", "foreground-two"]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::SubagentToolResult { .. }))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

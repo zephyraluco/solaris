@@ -641,6 +641,23 @@ async fn completed_child_request_usage_survives_parent_cancellation() {
     wait_stopped(&model).await;
 }
 
+#[tokio::test]
+async fn background_tool_display_events_are_linked_before_the_child_starts() {
+    let mut model = Model::new(1);
+    model.child_tool_before_wait = true;
+    let model = Arc::new(model);
+    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
+    let events = run_with_release(&model, &agent).await;
+    let started = events.iter().position(|event| matches!(event,
+        AgentEvent::SubagentStarted { call_id, task_id } if call_id == "launch-0" && task_id == "subagent-1")).unwrap();
+    let tool = events.iter().position(|event| matches!(event,
+        AgentEvent::SubagentToolCall { task_id, call } if task_id == "subagent-1" && call.id == "child-read")).unwrap();
+    assert!(started < tool);
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::SubagentToolResult { task_id, result, .. } if task_id == "subagent-1" && result.id == "child-read")));
+    assert_eq!(completions(&events).len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_failure_aborts_its_background_children() {
     let mut model = Model::new(1);

@@ -5,6 +5,8 @@
 //! except while it is empty, when the welcome box's animated companion needs a
 //! fresh frame every tick.
 
+use std::collections::BTreeMap;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,7 +15,7 @@ use solaris_tui::components::welcome::{WelcomeData, WelcomeStyles, render_welcom
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{truncate_to_width, wrap_text};
 
-use crate::state::{SessionState, Turn};
+use crate::state::{SessionState, ToolStep, Turn};
 
 /// Spinner glyphs shown while a response streams.
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -30,6 +32,8 @@ pub struct TranscriptView {
     /// invalidates them even if the session revision was not bumped.
     cache_empty: bool,
     lines: Vec<Line<'static>>,
+    /// Absolute transcript row, turn index, and top-level step index.
+    subagent_headers: Vec<(usize, usize, usize)>,
     initialized: bool,
 }
 
@@ -67,7 +71,15 @@ impl TranscriptView {
             || self.cache_spinner != spinner_key;
 
         if stale {
-            self.lines = build(session, area, theme, spinner_frame, welcome);
+            self.subagent_headers.clear();
+            self.lines = build_with_headers(
+                session,
+                area,
+                theme,
+                spinner_frame,
+                welcome,
+                &mut self.subagent_headers,
+            );
             self.cache_width = area.width;
             self.cache_height = area.height;
             self.cache_version = session.version;
@@ -78,6 +90,14 @@ impl TranscriptView {
         }
 
         &self.lines
+    }
+
+    /// Resolve a title in the rendered transcript, before the viewport scroll.
+    pub fn subagent_at(&self, row: usize) -> Option<(usize, usize)> {
+        self.subagent_headers
+            .iter()
+            .find(|(line, _, _)| *line == row)
+            .map(|(_, turn, step)| (*turn, *step))
     }
 
     /// Force a rebuild on the next call.
@@ -97,6 +117,24 @@ pub fn build(
     spinner_frame: Option<u16>,
     welcome: &WelcomeData,
 ) -> Vec<Line<'static>> {
+    build_with_headers(
+        session,
+        area,
+        theme,
+        spinner_frame,
+        welcome,
+        &mut Vec::new(),
+    )
+}
+
+fn build_with_headers(
+    session: &SessionState,
+    area: Rect,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+    welcome: &WelcomeData,
+    headers: &mut Vec<(usize, usize, usize)>,
+) -> Vec<Line<'static>> {
     let width = area.width.max(8) as usize;
     let markdown = MarkdownStyle::from_theme(theme);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -113,7 +151,7 @@ pub fn build(
         }
         push_prompt(&mut out, &turn.prompt, width, theme);
         push_compaction(&mut out, turn, theme);
-        push_steps(&mut out, turn, width, theme);
+        push_steps(&mut out, turn, width, theme, spinner_frame, index, headers);
         push_thinking(&mut out, turn, width, theme);
         if !turn.reply.trim().is_empty() {
             out.push(Line::default());
@@ -179,7 +217,15 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
 /// The line is the tool, its arguments and how long it took. A failed call also
 /// shows the first line of what it said, because that is the part a person
 /// needs; the full text went to the model either way.
-fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &Theme) {
+fn push_steps(
+    out: &mut Vec<Line<'static>>,
+    turn: &Turn,
+    width: usize,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+    turn_index: usize,
+    headers: &mut Vec<(usize, usize, usize)>,
+) {
     // Messages the user steered in are drawn where they arrived, among the
     // calls they followed: where the correction landed is why the model's next
     // move changed, so collecting them at the end would lose the point of them.
@@ -189,43 +235,13 @@ fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &T
     }
 
     let mut finished = 0usize;
-    for step in &turn.steps {
-        let (glyph, colour) = match step.result.as_ref() {
-            None => ("⋯", theme.muted),
-            Some(result) if result.is_error => ("✗", theme.error),
-            Some(_) => ("✓", theme.success),
-        };
-
-        // Arguments are what makes a call recognisable at a glance. Values are
-        // printed as compact JSON, so this is always one line.
-        let mut detail = format!("{}", step.call.input);
-        if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
-            detail.push_str(" — ");
-            detail.push_str(&summarize(&result.output));
+    for (step_index, step) in turn.steps.iter().enumerate() {
+        if step.subagent.is_some() {
+            headers.push((out.len(), turn_index, step_index));
+            push_subagent(out, step, turn.complete, width, theme, spinner_frame);
+        } else {
+            push_tool_step(out, step, width, theme);
         }
-        if let Some(elapsed) = step.duration_ms() {
-            detail.push_str(&format!("  ·  {elapsed}ms"));
-        }
-
-        // Indent, glyph, space, the tool name, then two spaces before the detail.
-        let used = 6 + step.call.name.chars().count();
-        out.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(format!("{glyph} "), Style::default().fg(colour)),
-            Span::styled(
-                step.call.name.clone(),
-                Style::default()
-                    .fg(theme.assistant)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "  {}",
-                    truncate_to_width(&detail, width.saturating_sub(used).max(8), "…")
-                ),
-                Style::default().fg(theme.muted),
-            ),
-        ]));
 
         // A note that followed this call is drawn after it, once the call is
         // known to have finished.
@@ -241,6 +257,202 @@ fn push_steps(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &T
     for note in notes {
         push_steering(out, &note.text, width, theme);
     }
+}
+
+fn push_tool_step(out: &mut Vec<Line<'static>>, step: &ToolStep, width: usize, theme: &Theme) {
+    let (glyph, colour) = match step.result.as_ref() {
+        None => ("⋯", theme.muted),
+        Some(result) if result.is_error => ("✗", theme.error),
+        Some(_) => ("✓", theme.success),
+    };
+
+    // Arguments are what makes a call recognisable at a glance. Values are
+    // printed as compact JSON, so this is always one line.
+    let mut detail = format!("{}", step.call.input);
+    if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
+        detail.push_str(" — ");
+        detail.push_str(&summarize(&result.output));
+    }
+    if let Some(elapsed) = step.duration_ms() {
+        detail.push_str(&format!("  ·  {elapsed}ms"));
+    }
+
+    // Indent, glyph, space, the tool name, then two spaces before the detail.
+    let used = 6 + step.call.name.chars().count();
+    out.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(format!("{glyph} "), Style::default().fg(colour)),
+        Span::styled(
+            step.call.name.clone(),
+            Style::default()
+                .fg(theme.assistant)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {}",
+                truncate_to_width(&detail, width.saturating_sub(used).max(8), "…")
+            ),
+            Style::default().fg(theme.muted),
+        ),
+    ]));
+}
+
+fn spinner(frame: Option<u16>) -> &'static str {
+    SPINNER[usize::from(frame.unwrap_or(0)) % SPINNER.len()]
+}
+
+fn push_subagent(
+    out: &mut Vec<Line<'static>>,
+    step: &ToolStep,
+    turn_complete: bool,
+    width: usize,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+) {
+    let Some(child) = &step.subagent else { return };
+    let running = child.result.is_none() && !turn_complete;
+    let interrupted = child.result.is_none() && turn_complete;
+    let failed = interrupted || child.result.as_ref().is_some_and(|result| result.is_error);
+    let glyph = if child.expanded {
+        "↓"
+    } else if running {
+        spinner(spinner_frame)
+    } else {
+        "→"
+    };
+    let label = match step.call.input["agent"].as_str() {
+        Some("explore") if running => "Exploring",
+        Some("explore") => "Explored",
+        Some("general") => "General",
+        _ => "Subagent",
+    };
+    let mut detail = format!("{label}: {}", subagent_counts(&child.steps, running));
+    if interrupted {
+        detail.push_str(" — interrupted");
+    } else if let Some(result) = child.result.as_ref().filter(|result| result.is_error) {
+        detail.push_str(" — ");
+        detail.push_str(&summarize(&result.output));
+    }
+    let colour = if failed { theme.error } else { theme.muted };
+    out.push(Line::from(vec![
+        Span::styled(
+            format!("  {glyph} "),
+            Style::default().fg(if running && !child.expanded {
+                theme.accent
+            } else {
+                colour
+            }),
+        ),
+        Span::styled(
+            truncate_to_width(&detail, width.saturating_sub(4), "…"),
+            Style::default().fg(colour),
+        ),
+    ]));
+    if child.expanded {
+        for tool in &child.steps {
+            push_child_step(out, tool, running, width, theme, spinner_frame);
+        }
+        if child.steps.is_empty() {
+            out.push(Line::styled(
+                truncate_to_width("    No tool calls.", width, "…"),
+                Style::default().fg(theme.dim),
+            ));
+        }
+    }
+}
+
+fn subagent_counts(steps: &[ToolStep], running: bool) -> String {
+    let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    for step in steps {
+        let label = match step.call.name.as_str() {
+            "read" => ("read", "reads"),
+            "webfetch" => ("fetch", "fetches"),
+            "grep" | "find" | "glob" | "websearch" => ("search", "searches"),
+            "ls" => ("listing", "listings"),
+            "edit" | "patch" => ("edit", "edits"),
+            "write" => ("write", "writes"),
+            "shell" | "bash" | "powershell" => ("command", "commands"),
+            _ => ("tool call", "tool calls"),
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return if running {
+            "starting…"
+        } else {
+            "no tool calls"
+        }
+        .to_string();
+    }
+    counts
+        .into_iter()
+        .map(|((single, plural), count)| {
+            format!("{count} {}", if count == 1 { single } else { plural })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn push_child_step(
+    out: &mut Vec<Line<'static>>,
+    step: &ToolStep,
+    running: bool,
+    width: usize,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+) {
+    let glyph = if running && !step.is_done() {
+        spinner(spinner_frame)
+    } else {
+        "→"
+    };
+    let label = match step.call.name.as_str() {
+        "read" => "Read",
+        "grep" => "Grep",
+        "find" => "Find",
+        "ls" => "List",
+        "webfetch" => "WebFetch",
+        "websearch" => "WebSearch",
+        name => name,
+    };
+    let input = &step.call.input;
+    let mut detail = ["path", "url", "command", "pattern"]
+        .iter()
+        .find_map(|key| input[*key].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string());
+    if step.call.name == "read" {
+        let offset = input["offset"].as_u64();
+        let limit = input["limit"].as_u64();
+        if offset.is_some() || limit.is_some() {
+            let start = offset.unwrap_or(1);
+            detail.push_str(&format!(":{start}"));
+            if let Some(limit) = limit {
+                detail.push_str(&format!(
+                    "-{}",
+                    start.saturating_add(limit.saturating_sub(1))
+                ));
+            }
+        }
+    }
+    if let Some(result) = step.result.as_ref().filter(|result| result.is_error) {
+        detail.push_str(" — ");
+        detail.push_str(&summarize(&result.output));
+    }
+    let detail: String = detail
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let colour = if step.is_error() {
+        theme.error
+    } else {
+        theme.muted
+    };
+    out.push(Line::styled(
+        truncate_to_width(&format!("    {glyph} {label} {detail}"), width, "…"),
+        Style::default().fg(colour),
+    ));
 }
 
 /// A message the user added while the turn was running.
@@ -385,6 +597,190 @@ mod tests {
         );
 
         assert!(text.contains("⋯ grep"), "a call in flight: {text}");
+    }
+
+    fn subagent_step(expanded: bool, complete: bool) -> ToolStep {
+        let call = ToolCall::new(
+            "delegate",
+            "subagent",
+            serde_json::json!({
+                "agent": "explore", "prompt": "Investigate the source",
+            }),
+        );
+        let mut step = ToolStep::pending(call.clone());
+        let child = step.subagent.as_mut().unwrap();
+        child.expanded = expanded;
+        for (name, input) in [
+            (
+                "webfetch",
+                serde_json::json!({"url":"https://example.com/docs"}),
+            ),
+            (
+                "read",
+                serde_json::json!({"path":"src/agent.rs", "offset":175, "limit":255}),
+            ),
+            ("grep", serde_json::json!({"pattern":"SubagentRunner"})),
+        ] {
+            let call = ToolCall::new(name, name, input);
+            let mut nested = ToolStep::pending(call.clone());
+            if complete {
+                nested.finish(ToolResult::ok(&call, "private tool data"), 1);
+            }
+            child.steps.push(nested);
+        }
+        if complete {
+            step.finish(ToolResult::ok(&call, "final report"), 10);
+        }
+        step
+    }
+
+    #[test]
+    fn subagents_default_to_one_collapsed_summary_with_a_right_arrow() {
+        let session = session_with(Turn {
+            steps: vec![subagent_step(false, true)],
+            complete: true,
+            ..Default::default()
+        });
+        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("→ Explored: 1 fetch, 1 read, 1 search"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("src/agent.rs") && !text.contains("example.com"),
+            "{text}"
+        );
+        assert!(!text.contains("private tool data"), "{text}");
+    }
+
+    #[test]
+    fn a_running_collapsed_subagent_animates_instead_of_showing_a_right_arrow() {
+        let session = session_with(Turn {
+            steps: vec![subagent_step(false, false)],
+            ..Default::default()
+        });
+        for (frame, glyph) in [(0, "⠋"), (1, "⠙")] {
+            let lines = build(
+                &session,
+                area(90, 20),
+                &Theme::dark(),
+                Some(frame),
+                &welcome(),
+            );
+            let title = lines
+                .iter()
+                .map(line_text)
+                .find(|line| line.contains("Exploring:"))
+                .unwrap();
+            assert!(
+                title.starts_with(&format!("  {glyph} Exploring:")),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_subagents_show_a_down_arrow_and_indented_child_calls() {
+        let session = session_with(Turn {
+            steps: vec![subagent_step(true, true)],
+            complete: true,
+            ..Default::default()
+        });
+        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("↓ Explored:"), "{text}");
+        assert!(
+            text.contains("    → WebFetch https://example.com/docs"),
+            "{text}"
+        );
+        assert!(text.contains("    → Read src/agent.rs:175-429"), "{text}");
+        assert!(text.contains("    → Grep SubagentRunner"), "{text}");
+    }
+
+    #[test]
+    fn expanding_a_running_subagent_keeps_the_down_arrow_and_animates_pending_tools() {
+        let session = session_with(Turn {
+            steps: vec![subagent_step(true, false)],
+            ..Default::default()
+        });
+        let lines = build(&session, area(90, 20), &Theme::dark(), Some(1), &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("↓ Exploring:"), "{text}");
+        assert!(text.contains("    ⠙ Read "), "{text}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_stops_all_child_spinners() {
+        let session = session_with(Turn {
+            steps: vec![subagent_step(true, false)],
+            complete: true,
+            ..Default::default()
+        });
+        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("interrupted"), "{text}");
+        assert!(text.contains("    → Read "), "{text}");
+        assert!(!SPINNER.iter().any(|glyph| text.contains(glyph)), "{text}");
+    }
+
+    #[test]
+    fn failed_subagent_titles_keep_the_arrow_and_show_the_error_in_colour() {
+        let mut step = subagent_step(false, false);
+        step.finish(ToolResult::error(&step.call, "child timed out"), 10);
+        let session = session_with(Turn {
+            steps: vec![step],
+            complete: true,
+            ..Default::default()
+        });
+        let theme = Theme::dark();
+        let lines = build(&session, area(90, 20), &theme, None, &welcome());
+        let title = lines
+            .iter()
+            .find(|line| line_text(line).contains("Explored:"))
+            .unwrap();
+        assert!(line_text(title).contains("→ Explored:") && line_text(title).contains("timed out"));
+        assert_eq!(title.spans[0].style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn subagent_summaries_and_details_fit_narrow_terminal_widths() {
+        for width in [8, 12, 24, 40] {
+            let session = session_with(Turn {
+                steps: vec![subagent_step(true, true)],
+                complete: true,
+                ..Default::default()
+            });
+            let lines = build(&session, area(width, 30), &Theme::dark(), None, &welcome());
+            assert!(
+                lines.iter().all(|line| line.width() <= usize::from(width)),
+                "width={width}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_title_hit_targets_follow_expansion_and_never_include_nested_rows() {
+        let mut view = TranscriptView::new();
+        let mut session = session_with(Turn {
+            prompt: "Inspect\nthe project".into(),
+            steps: vec![subagent_step(false, true), subagent_step(false, true)],
+            complete: true,
+            ..Default::default()
+        });
+        view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
+        assert_eq!(view.subagent_at(2), Some((0, 0)));
+        assert_eq!(view.subagent_at(3), Some((0, 1)));
+        session.turns[0].steps[0]
+            .subagent
+            .as_mut()
+            .unwrap()
+            .expanded = true;
+        session.bump();
+        view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
+        assert_eq!(view.subagent_at(2), Some((0, 0)));
+        assert_eq!(view.subagent_at(3), None);
+        assert_eq!(view.subagent_at(6), Some((0, 1)));
     }
 
     #[test]
