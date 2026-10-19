@@ -49,6 +49,7 @@ impl Tool for SubagentTool {
             "type": "object",
             "properties": {
                 "agent": { "type": "string", "enum": ["explore", "general"] },
+                "name": { "type": "string", "description": "Short task name shown in the subagent summary. Describe the task, not its tools." },
                 "prompt": { "type": "string", "description": "Complete task, relevant context, paths, constraints and expected result. The child cannot see the parent conversation." },
                 "background": { "type": "boolean", "default": false, "description": "Return a task ID immediately so you can continue independent work. The final report or failure is delivered automatically; do not poll. Background work is scoped to this turn." }
             },
@@ -59,7 +60,7 @@ impl Tool for SubagentTool {
 
     fn guideline(&self) -> Option<&'static str> {
         Some(
-            "Use explore for focused read-only codebase research, general for a bounded implementation task in Build mode. Supply all relevant context; children see project instructions but not this conversation. Foreground calls wait by default; independent calls in the same round may run in parallel. Set background=true to receive a task ID immediately and continue other work; completion reports arrive automatically as background notifications before a later model round. Do not poll or repeat a task while it runs. If you have no more work, stop calling tools: the runtime waits for pending children and resumes you with their results before ending the turn. Give concurrent writing tasks disjoint files. Children share the workspace, not a filesystem sandbox, and cannot delegate further. Review their results before relying on them. Each child is limited to 20 model requests / 5 minutes; return only a concise final report.",
+            "Use explore for focused read-only codebase research, general for a bounded implementation task in Build mode. Give each task a short name for its summary. Supply all relevant context; children see project instructions but not this conversation. Foreground calls wait by default; independent calls in the same round may run in parallel. Set background=true to receive a task ID immediately and continue other work; completion reports arrive automatically as background notifications before a later model round. Do not poll or repeat a task while it runs. If you have no more work, stop calling tools: the runtime waits for pending children and resumes you with their results before ending the turn. Give concurrent writing tasks disjoint files. Children share the workspace, not a filesystem sandbox, and cannot delegate further. Review their results before relying on them. Each child is limited to 20 model requests / 5 minutes; return only a concise final report.",
         )
     }
 
@@ -79,6 +80,8 @@ enum Kind {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Task {
     agent: Kind,
+    #[serde(default)]
+    name: Option<String>,
     prompt: String,
     #[serde(default)]
     pub background: bool,
@@ -117,7 +120,7 @@ impl From<ToolOutput> for SubagentResult {
 impl SubagentRunner {
     pub fn parse(&self, input: Value) -> Result<Task, ToolOutput> {
         let task: Task = serde_json::from_value(input).map_err(|_| {
-            ToolOutput::error("subagent requires an agent (explore or general), a prompt string and optionally a background boolean, with no other fields")
+            ToolOutput::error("subagent requires an agent (explore or general), a prompt string and optionally a name string and background boolean, with no other fields")
         })?;
         if task.prompt.trim().is_empty() || task.prompt.len() > 64 * 1024 {
             return Err(ToolOutput::error(
@@ -145,6 +148,15 @@ impl SubagentRunner {
 
         let totals = Arc::new(Mutex::new(Totals::default()));
         let label = format!("subagent {call_id} ({:?})", task.agent);
+        let label = match task
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => format!("{label}: {name}"),
+            None => label,
+        };
         let _ = tx.send(AgentEvent::Status(format!("{label}: queued")));
         // The deadline includes waiting for a shared foreground/background slot.
         let output = tokio::select! {
@@ -388,6 +400,7 @@ mod tests {
         for input in [
             json!({"agent":"unknown","prompt":"task"}),
             json!({"agent":"explore","prompt":1}),
+            json!({"agent":"explore","prompt":"task","name":1}),
             json!({"agent":"explore","prompt":"task","background":"true"}),
             json!({"agent":"explore","prompt":"task","model":"other"}),
             json!({"prompt":"task"}),
@@ -395,6 +408,19 @@ mod tests {
             assert!(serde_json::from_value::<Task>(input).is_err());
         }
         assert_eq!(SubagentTool.parameters()["additionalProperties"], false);
+    }
+
+    #[test]
+    fn delegation_accepts_a_task_name_without_requiring_it_for_older_calls() {
+        let task: Task = serde_json::from_value(json!({"agent":"explore","name":"检查路由","prompt":"Inspect routing and report findings"})).unwrap();
+        assert_eq!(task.name.as_deref(), Some("检查路由"));
+        let task: Task =
+            serde_json::from_value(json!({"agent":"explore","prompt":"legacy task"})).unwrap();
+        assert!(task.name.is_none());
+        assert_eq!(
+            SubagentTool.parameters()["properties"]["name"]["type"],
+            "string"
+        );
     }
 
     #[test]

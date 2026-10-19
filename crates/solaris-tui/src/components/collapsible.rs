@@ -16,6 +16,11 @@
 //! assert_eq!(output.lines(60).len(), 2);
 //! output.set_status(CollapsibleStatus::Idle); // stays expanded
 //! assert!(output.state().is_expanded());
+//!
+//! let mut group = Collapsible::new("Tools");
+//! group.push_child(output);
+//! group.set_expanded(true);
+//! assert!(group.lines(60).len() > 2);
 //! ```
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -171,11 +176,12 @@ impl<T: PartialEq> CollapsibleInteraction<T> {
 }
 
 /// Collapsed by default, with `→` when folded and `↓` when expanded, regardless
-/// of execution status. Body lines are caller-supplied, so tools, logs, and other
-/// records share the component without depending on application data types.
+/// of execution status. The body can contain text and nested disclosures;
+/// collapsing an ancestor preserves every descendant's state.
 pub struct Collapsible {
     title: Line<'static>,
     content: Vec<Line<'static>>,
+    children: Vec<Collapsible>,
     state: CollapsibleState,
     status: CollapsibleStatus,
     styles: CollapsibleStyles,
@@ -183,7 +189,8 @@ pub struct Collapsible {
     body_indent: u16,
     revision: u64,
     last_area: Rect,
-    interaction: CollapsibleInteraction,
+    interaction: CollapsibleInteraction<Vec<usize>>,
+    focused: Vec<usize>,
     selection: Option<SelectionHandle>,
 }
 
@@ -192,6 +199,7 @@ impl Collapsible {
         Self {
             title: title.into(),
             content: Vec::new(),
+            children: Vec::new(),
             state: CollapsibleState::default(),
             status: CollapsibleStatus::Idle,
             styles: CollapsibleStyles::default(),
@@ -200,6 +208,7 @@ impl Collapsible {
             revision: 1,
             last_area: Rect::default(),
             interaction: CollapsibleInteraction::default(),
+            focused: Vec::new(),
             selection: None,
         }
     }
@@ -279,6 +288,42 @@ impl Collapsible {
         }
     }
 
+    /// Nested disclosures follow the text body and keep their own expansion state.
+    /// Their indentation is relative to this component's body indentation.
+    pub fn set_children(&mut self, children: Vec<Collapsible>) {
+        self.children = children;
+        self.focused.clear();
+        self.interaction.cancel();
+        self.bump();
+    }
+
+    pub fn push_child(&mut self, child: Collapsible) {
+        self.children.push(child);
+        self.bump();
+    }
+
+    /// Resolve an index path; an empty path addresses this component.
+    pub fn descendant(&self, path: &[usize]) -> Option<&Collapsible> {
+        match path.split_first() {
+            None => Some(self),
+            Some((&index, rest)) => self.children.get(index)?.descendant(rest),
+        }
+    }
+
+    pub fn descendant_mut(&mut self, path: &[usize]) -> Option<&mut Collapsible> {
+        match path.split_first() {
+            None => Some(self),
+            Some((&index, rest)) => {
+                if index >= self.children.len() {
+                    return None;
+                }
+                // Mutable access invalidates every ancestor's render cache.
+                self.bump();
+                self.children.get_mut(index)?.descendant_mut(rest)
+            }
+        }
+    }
+
     pub fn set_status(&mut self, status: CollapsibleStatus) {
         if self.status != status {
             self.status = status;
@@ -293,8 +338,13 @@ impl Collapsible {
     /// Common renderer used by both `Component::render` and transcript adapters.
     /// Lines are clipped in terminal cells while preserving span styles.
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.layout(width).lines
+    }
+
+    /// Render lines and visible header paths using the same recursive layout.
+    pub fn layout(&self, width: u16) -> CollapsibleLayout {
         if width == 0 {
-            return Vec::new();
+            return CollapsibleLayout::default();
         }
         let expanded = self.state.is_expanded();
         let glyph = if expanded { "↓" } else { "→" };
@@ -321,6 +371,7 @@ impl Collapsible {
             ),
         );
         let mut lines = vec![clip_line(title, usize::from(width))];
+        let mut headers = Vec::new();
         if expanded {
             for line in self.content.iter().take(usize::from(u16::MAX) - 1) {
                 let mut line = line.clone();
@@ -330,14 +381,56 @@ impl Collapsible {
                 );
                 lines.push(clip_line(line, usize::from(width)));
             }
+            let indent = self.body_indent.min(width);
+            for (index, child) in self.children.iter().enumerate() {
+                let child_layout = child.layout(width.saturating_sub(indent));
+                let offset = lines.len();
+                for mut header in child_layout.headers {
+                    header.path.insert(0, index);
+                    header.row += offset;
+                    header.marker_offset = header.marker_offset.saturating_add(indent);
+                    headers.push(header);
+                }
+                for mut line in child_layout.lines {
+                    line.spans
+                        .insert(0, Span::raw(" ".repeat(usize::from(indent))));
+                    lines.push(line);
+                }
+            }
         }
-        lines
+        lines.truncate(usize::from(u16::MAX));
+        headers.retain(|header| header.row < lines.len());
+        headers.insert(
+            0,
+            CollapsibleRow {
+                path: Vec::new(),
+                row: 0,
+                marker_offset: self.indent,
+                body_rows: lines.len().saturating_sub(1),
+            },
+        );
+        CollapsibleLayout { lines, headers }
     }
 
     fn bump(&mut self) {
         // Zero means "unknown" to Component caches; an owned component is known.
         self.revision = self.revision.wrapping_add(1).max(1);
     }
+}
+
+/// One visible disclosure header, relative to the root component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollapsibleRow {
+    pub path: Vec<usize>,
+    pub row: usize,
+    pub marker_offset: u16,
+    pub body_rows: usize,
+}
+
+#[derive(Default)]
+pub struct CollapsibleLayout {
+    pub lines: Vec<Line<'static>>,
+    pub headers: Vec<CollapsibleRow>,
 }
 
 impl Component for Collapsible {
@@ -364,47 +457,83 @@ impl Component for Collapsible {
         if key.modifiers != KeyModifiers::empty() {
             return KeyResult::Ignored;
         }
+        let width = if self.last_area.width == 0 {
+            u16::MAX
+        } else {
+            self.last_area.width
+        };
+        let headers = self.layout(width).headers;
+        if !headers.iter().any(|header| header.path == self.focused) {
+            self.focused.clear();
+        }
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            let current = headers
+                .iter()
+                .position(|header| header.path == self.focused)
+                .unwrap_or(0);
+            let next = if key.code == KeyCode::Down {
+                (current + 1).min(headers.len() - 1)
+            } else {
+                current.saturating_sub(1)
+            };
+            self.focused = headers[next].path.clone();
+            return KeyResult::Handled;
+        }
+        let path = self.focused.clone();
+        let Some(node) = self.descendant_mut(&path) else {
+            return KeyResult::Ignored;
+        };
         let expanded = match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => !self.state.is_expanded(),
+            KeyCode::Enter | KeyCode::Char(' ') => !node.state.is_expanded(),
             KeyCode::Left => false,
             KeyCode::Right => true,
             _ => return KeyResult::Ignored,
         };
-        self.set_expanded(expanded);
+        node.set_expanded(expanded);
+        if let Some(selection) = &self.selection {
+            selection.borrow_mut().clear();
+        }
         KeyResult::Handled
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
-        let hit = CollapsibleHit::new(
-            (),
-            Rect {
-                height: self.last_area.height.min(1),
-                ..self.last_area
-            },
-            self.indent,
-        );
+        let hit = self
+            .layout(self.last_area.width)
+            .headers
+            .into_iter()
+            .find(|header| {
+                header.row < usize::from(self.last_area.height)
+                    && event.row == self.last_area.y.saturating_add(header.row as u16)
+            })
+            .map(|header| {
+                CollapsibleHit::new(
+                    header.path,
+                    Rect::new(self.last_area.x, event.row, self.last_area.width, 1),
+                    header.marker_offset,
+                )
+            });
         let selected = self
             .selection
             .as_ref()
             .is_some_and(|selection| selection.borrow().is_active());
-        match self.interaction.handle_mouse(event, Some(hit), selected) {
+        match self.interaction.handle_mouse(event, hit, selected) {
             CollapsibleAction::Ignored => MouseResult::Ignored,
             CollapsibleAction::Handled => MouseResult::Handled,
-            CollapsibleAction::Toggle(()) => {
-                self.set_expanded(!self.state.is_expanded());
+            CollapsibleAction::Toggle(path) => {
+                if let Some(node) = self.descendant_mut(&path) {
+                    node.set_expanded(!node.state.is_expanded());
+                }
+                self.focused = path;
+                if let Some(selection) = &self.selection {
+                    selection.borrow_mut().clear();
+                }
                 MouseResult::Handled
             }
         }
     }
 
     fn desired_height(&mut self, width: u16) -> Option<u16> {
-        Some(if width == 0 {
-            0
-        } else if self.state.is_expanded() {
-            u16::try_from(self.content.len().saturating_add(1)).unwrap_or(u16::MAX)
-        } else {
-            1
-        })
+        Some(u16::try_from(self.lines(width).len()).unwrap_or(u16::MAX))
     }
 
     fn version(&self) -> u64 {
@@ -480,6 +609,107 @@ mod tests {
         let mut output = Collapsible::new("Tool output");
         output.set_content(vec![Line::raw("first result"), Line::raw("second result")]);
         output
+    }
+
+    #[test]
+    fn nested_disclosures_expand_independently_and_keep_state_when_parent_closes() {
+        let mut grandchild = Collapsible::new("Grandchild");
+        grandchild.set_content(vec![Line::raw("deep output")]);
+        let mut child = Collapsible::new("Child");
+        child.set_content(vec![Line::raw("child output")]);
+        child.push_child(grandchild);
+        let mut root = Collapsible::new("Parent");
+        root.push_child(child);
+        root.set_expanded(true);
+        let area = Rect::new(0, 0, 40, 20);
+        let mut buf = Buffer::empty(area);
+        root.render(&mut buf, area);
+        let mut click = |root: &mut Collapsible, column, row| {
+            root.handle_mouse(pointer(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            ));
+            root.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), column, row));
+            root.render(&mut buf, area);
+        };
+        assert_eq!(root.desired_height(40), Some(2));
+        click(&mut root, 2, 1);
+        assert!(root.state().is_expanded());
+        assert!(root.descendant(&[0]).unwrap().state().is_expanded());
+        assert_eq!(root.desired_height(40), Some(4));
+        let version = root.version();
+        click(&mut root, 4, 3);
+        assert!(root.version() > version);
+        assert_eq!(
+            root.lines(40).iter().map(text).collect::<Vec<_>>(),
+            [
+                "↓ Parent",
+                "  ↓ Child",
+                "    child output",
+                "    ↓ Grandchild",
+                "      deep output",
+            ]
+        );
+        click(&mut root, 0, 0);
+        assert_eq!(root.desired_height(40), Some(1));
+        click(&mut root, 0, 0);
+        assert_eq!(root.desired_height(40), Some(5));
+        let layout = root.layout(40);
+        assert_eq!(layout.headers[2].path, [0, 0]);
+        assert_eq!(layout.headers[2].row, 3);
+        assert_eq!(layout.headers[2].marker_offset, 4);
+    }
+
+    #[test]
+    fn keyboard_can_focus_and_toggle_a_child_without_closing_the_parent() {
+        let mut root = Collapsible::new("Parent");
+        root.push_child(output());
+        root.handle_key(key(KeyCode::Right));
+        root.handle_key(key(KeyCode::Down));
+        root.handle_key(key(KeyCode::Right));
+        assert!(root.descendant(&[0]).unwrap().state().is_expanded());
+        root.handle_key(key(KeyCode::Left));
+        assert!(!root.descendant(&[0]).unwrap().state().is_expanded());
+        assert!(root.state().is_expanded());
+    }
+
+    #[test]
+    fn nested_layout_clips_to_width_and_ignores_hidden_or_clipped_headers() {
+        let mut root = Collapsible::new("Parent").indentation(2, 4);
+        root.push_child(output());
+        root.set_expanded(true);
+        for width in [0, 1, 4, 8, 20] {
+            assert!(
+                root.lines(width)
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width))
+            );
+        }
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        root.render(&mut buf, area);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            root.handle_mouse(pointer(kind, 4, 1));
+        }
+        assert!(!root.descendant(&[0]).unwrap().state().is_expanded());
+    }
+
+    #[test]
+    fn dragging_a_nested_header_never_toggles_the_child_or_parent() {
+        let mut root = Collapsible::new("Parent");
+        root.push_child(output());
+        root.set_expanded(true);
+        let area = Rect::new(0, 0, 40, 10);
+        root.render(&mut Buffer::empty(area), area);
+        root.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        root.handle_mouse(pointer(MouseEventKind::Drag(MouseButton::Left), 10, 1));
+        root.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 2, 1));
+        assert!(!root.descendant(&[0]).unwrap().state().is_expanded());
+        assert!(root.state().is_expanded());
     }
 
     #[test]

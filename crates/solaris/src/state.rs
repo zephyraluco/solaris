@@ -21,7 +21,9 @@ pub struct ToolStep {
     /// Reusable disclosure state; the first call also anchors an ordinary tool
     /// group's expansion. Record updates never reset the user's choice.
     pub disclosure: CollapsibleState,
-    /// Child activity belongs to one collapsible row, not top-level tool steps.
+    /// Expansion of this tool's output inside an ordinary tool group.
+    pub detail_disclosure: CollapsibleState,
+    /// Child activity belongs to its own terminal, separate from parent calls.
     pub subagent: Option<Box<SubagentStep>>,
 }
 
@@ -39,7 +41,7 @@ pub struct SubagentStep {
 }
 
 impl SubagentStep {
-    /// Finish without changing whether the user has expanded the row.
+    /// Record completion independently of the launch acknowledgement.
     pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
         self.result = Some(result);
         self.duration_ms = Some(duration_ms);
@@ -55,6 +57,7 @@ impl ToolStep {
             result: None,
             duration_ms: None,
             disclosure: CollapsibleState::default(),
+            detail_disclosure: CollapsibleState::default(),
             subagent,
         }
     }

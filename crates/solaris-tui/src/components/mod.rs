@@ -14,12 +14,13 @@ pub mod panel;
 pub mod scroll_view;
 pub mod select_list;
 pub mod spacer;
+pub mod subagent_summary;
 pub mod text;
 pub mod welcome;
 
 pub use collapsible::{
-    Collapsible, CollapsibleAction, CollapsibleHit, CollapsibleInteraction, CollapsibleState,
-    CollapsibleStatus, CollapsibleStyles,
+    Collapsible, CollapsibleAction, CollapsibleHit, CollapsibleInteraction, CollapsibleLayout,
+    CollapsibleRow, CollapsibleState, CollapsibleStatus, CollapsibleStyles,
 };
 pub use editor::{CommandHint, Editor};
 pub use fuzzy::{fuzzy_match, fuzzy_score};
@@ -30,5 +31,6 @@ pub use panel::Panel;
 pub use scroll_view::ScrollView;
 pub use select_list::{SelectItem, SelectList};
 pub use spacer::Spacer;
+pub use subagent_summary::{SubagentSummary, SubagentSummaryStatus};
 pub use text::Text;
 pub use welcome::{WelcomeData, WelcomeEntry, WelcomeStyles, render_welcome};

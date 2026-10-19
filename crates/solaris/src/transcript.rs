@@ -7,27 +7,42 @@
 
 use std::collections::BTreeMap;
 
+use crossterm::event::MouseEvent;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::welcome::{WelcomeData, WelcomeStyles, render_welcome};
-use solaris_tui::components::{Collapsible, CollapsibleStatus, CollapsibleStyles};
+use solaris_tui::components::{
+    Collapsible, CollapsibleStatus, CollapsibleStyles, SubagentSummary, SubagentSummaryStatus,
+};
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{truncate_to_width, wrap_text};
 
-use crate::state::{SessionState, ToolStep, Turn};
+use crate::state::{SessionState, SteeringNote, ToolStep, Turn};
 
 /// Spinner glyphs shared with the reusable TUI activity indicators.
 pub use solaris_tui::components::loader::SPINNER;
 
-/// A virtual disclosure header; the target identifies an application record.
+/// A tool disclosure header; the target identifies its application record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollapsibleHeader {
     pub row: usize,
     pub target: (usize, usize),
     pub marker_offset: u16,
     pub body_rows: usize,
+    pub detail: bool,
+}
+
+struct SubagentHeader {
+    row: usize,
+    summary: SubagentSummary,
+}
+
+#[derive(Default)]
+struct TranscriptHeaders {
+    tools: Vec<CollapsibleHeader>,
+    subagents: BTreeMap<(usize, usize), SubagentHeader>,
 }
 
 /// Cached transcript lines.
@@ -42,8 +57,8 @@ pub struct TranscriptView {
     /// invalidates them even if the session revision was not bumped.
     cache_empty: bool,
     lines: Vec<Line<'static>>,
-    /// Header geometry for any collapsible record, not just child agents.
-    collapsible_headers: Vec<CollapsibleHeader>,
+    /// Tool disclosures and retained child terminal links have separate handlers.
+    headers: TranscriptHeaders,
     initialized: bool,
 }
 
@@ -81,14 +96,13 @@ impl TranscriptView {
             || self.cache_spinner != spinner_key;
 
         if stale {
-            self.collapsible_headers.clear();
             self.lines = build_with_headers(
                 session,
                 area,
                 theme,
                 spinner_frame,
                 welcome,
-                &mut self.collapsible_headers,
+                &mut self.headers,
             );
             self.cache_width = area.width;
             self.cache_height = area.height;
@@ -104,15 +118,52 @@ impl TranscriptView {
 
     /// Resolve a title in the rendered transcript, before the viewport scroll.
     pub fn collapsible_at(&self, row: usize) -> Option<CollapsibleHeader> {
-        self.collapsible_headers
+        self.headers
+            .tools
             .iter()
             .find(|header| header.row == row)
             .copied()
     }
 
+    /// Deliver pointer events to child links independently of tool disclosures.
+    pub fn handle_subagent_mouse(
+        &mut self,
+        event: MouseEvent,
+        viewport: Rect,
+        scroll: u16,
+        selection_active: bool,
+    ) -> (bool, Option<(usize, usize)>) {
+        let mut handled = false;
+        let mut activated = None;
+        for (&target, header) in &mut self.headers.subagents {
+            let visible_row = header
+                .row
+                .checked_sub(usize::from(scroll))
+                .filter(|row| *row < usize::from(viewport.height));
+            let area = visible_row.map_or(Rect::default(), |row| {
+                Rect::new(viewport.x, viewport.y + row as u16, viewport.width, 1)
+            });
+            handled |= header
+                .summary
+                .on_mouse(event, area, selection_active)
+                .is_handled();
+            if header.summary.take_activated() {
+                activated = Some(target);
+            }
+        }
+        (handled, activated)
+    }
+
+    pub fn cancel_subagent_interaction(&mut self) {
+        for header in self.headers.subagents.values_mut() {
+            header.summary.cancel_interaction();
+        }
+    }
+
     /// Force a rebuild on the next call.
     pub fn invalidate(&mut self) {
         self.initialized = false;
+        self.cancel_subagent_interaction();
     }
 }
 
@@ -133,7 +184,7 @@ pub fn build(
         theme,
         spinner_frame,
         welcome,
-        &mut Vec::new(),
+        &mut TranscriptHeaders::default(),
     )
 }
 
@@ -143,8 +194,16 @@ fn build_with_headers(
     theme: &Theme,
     spinner_frame: Option<u16>,
     welcome: &WelcomeData,
-    headers: &mut Vec<CollapsibleHeader>,
+    headers: &mut TranscriptHeaders,
 ) -> Vec<Line<'static>> {
+    headers.tools.clear();
+    headers.subagents.retain(|&(turn, step), _| {
+        session
+            .turns
+            .get(turn)
+            .and_then(|turn| turn.steps.get(step))
+            .is_some_and(|step| step.subagent.is_some())
+    });
     let width = area.width.max(8) as usize;
     let markdown = MarkdownStyle::from_theme(theme);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -161,7 +220,15 @@ fn build_with_headers(
         }
         push_prompt(&mut out, &turn.prompt, width, theme);
         push_compaction(&mut out, turn, theme);
-        push_steps(&mut out, turn, width, theme, spinner_frame, index, headers);
+        push_steps(
+            &mut out,
+            turn.into(),
+            width,
+            theme,
+            spinner_frame,
+            index,
+            headers,
+        );
         push_thinking(&mut out, turn, width, theme);
         if !turn.reply.trim().is_empty() {
             out.push(Line::default());
@@ -221,16 +288,32 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
     }
 }
 
-/// Consecutive ordinary calls share a disclosure; shell commands and child
-/// agents each own one. Steering notes remain outside the groups they separate.
+/// Consecutive ordinary calls share a disclosure; shell commands own one and
+/// child agents link to a terminal. Steering notes stay outside these groups.
+struct ToolTranscript<'a> {
+    steps: &'a [ToolStep],
+    steering: &'a [SteeringNote],
+    complete: bool,
+}
+
+impl<'a> From<&'a Turn> for ToolTranscript<'a> {
+    fn from(turn: &'a Turn) -> Self {
+        Self {
+            steps: &turn.steps,
+            steering: &turn.steering,
+            complete: turn.complete,
+        }
+    }
+}
+
 fn push_steps(
     out: &mut Vec<Line<'static>>,
-    turn: &Turn,
+    turn: ToolTranscript<'_>,
     width: usize,
     theme: &Theme,
     spinner_frame: Option<u16>,
     turn_index: usize,
-    headers: &mut Vec<CollapsibleHeader>,
+    headers: &mut TranscriptHeaders,
 ) {
     // Messages the user steered in are drawn where they arrived, among the
     // calls they followed: where the correction landed is why the model's next
@@ -245,14 +328,21 @@ fn push_steps(
     while step_index < turn.steps.len() {
         let step = &turn.steps[step_index];
         let mut end = step_index + 1;
-        let (view, body_rows) =
-            if let Some(view) = subagent_view(step, turn.complete, theme, spinner_frame) {
-                let body_rows = step
-                    .subagent
-                    .as_ref()
-                    .map_or(0, |child| child.steps.len().max(1));
-                (view, body_rows)
-            } else if is_shell(step) {
+        if let Some((title, style, status)) = subagent_summary(step, turn.complete, theme) {
+            let header = headers
+                .subagents
+                .entry((turn_index, step_index))
+                .or_insert_with(|| SubagentHeader {
+                    row: out.len(),
+                    summary: SubagentSummary::default(),
+                });
+            header.row = out.len();
+            header.summary.set_title(title, style);
+            header.summary.set_status(status);
+            header.summary.set_spinner_frame(spinner_frame.unwrap_or(0));
+            out.push(header.summary.line(width as u16));
+        } else {
+            let (view, body_rows) = if is_shell(step) {
                 let body_rows = step
                     .result
                     .as_ref()
@@ -280,13 +370,27 @@ fn push_steps(
                     end - step_index,
                 )
             };
-        headers.push(CollapsibleHeader {
-            row: out.len(),
-            target: (turn_index, step_index),
-            marker_offset: view.marker_offset(),
-            body_rows,
-        });
-        out.extend(view.lines(width as u16));
+            let layout = view.layout(width as u16);
+            for header in layout.headers {
+                let detail = !header.path.is_empty();
+                let target_step = step_index + header.path.first().copied().unwrap_or(0);
+                headers.tools.push(CollapsibleHeader {
+                    row: out.len() + header.row,
+                    target: (turn_index, target_step),
+                    marker_offset: header.marker_offset,
+                    body_rows: if detail {
+                        turn.steps[target_step]
+                            .result
+                            .as_ref()
+                            .map_or(1, |result| result.output.lines().count().max(1))
+                    } else {
+                        body_rows
+                    },
+                    detail,
+                });
+            }
+            out.extend(layout.lines);
+        }
 
         finished += turn.steps[step_index..end]
             .iter()
@@ -312,7 +416,7 @@ fn tool_group_view(
     steps: &[ToolStep],
     turn_complete: bool,
     theme: &Theme,
-    spinner_frame: Option<u16>,
+    _spinner_frame: Option<u16>,
 ) -> Collapsible {
     let pending = steps.iter().any(|step| !step.is_done());
     let running = pending && !turn_complete;
@@ -324,11 +428,43 @@ fn tool_group_view(
     // cannot replace the user's disclosure state.
     let mut view = step_view(&steps[0], title, running, failed, theme);
     if steps[0].disclosure.is_expanded() {
-        let mut body = Vec::new();
+        let mut children = Vec::new();
         for step in steps {
-            push_tool_step(&mut body, step, running, theme, spinner_frame);
+            let mut child = Collapsible::new(tool_step_title(step))
+                .with_state(step.detail_disclosure)
+                .styles(CollapsibleStyles::from_theme(theme))
+                .indentation(0, 2);
+            child.set_status(if running && !step.is_done() {
+                CollapsibleStatus::Running
+            } else if step.is_error() || (!step.is_done() && turn_complete) {
+                CollapsibleStatus::Failed
+            } else {
+                CollapsibleStatus::Idle
+            });
+            let output = match &step.result {
+                Some(result) if result.output.is_empty() => "No output.",
+                Some(result) => &result.output,
+                None if running => "Running…",
+                None => "No output.",
+            };
+            child.set_content(
+                output
+                    .lines()
+                    .map(|line| {
+                        Line::styled(
+                            single_line(line),
+                            Style::default().fg(if step.is_error() {
+                                theme.error
+                            } else {
+                                theme.dim
+                            }),
+                        )
+                    })
+                    .collect(),
+            );
+            children.push(child);
         }
-        view.set_content(body);
+        view.set_children(children);
     }
     view
 }
@@ -397,41 +533,100 @@ fn spinner(frame: Option<u16>) -> &'static str {
     SPINNER[usize::from(frame.unwrap_or(0)) % SPINNER.len()]
 }
 
-fn subagent_view(
+fn subagent_summary(
     step: &ToolStep,
     turn_complete: bool,
     theme: &Theme,
-    spinner_frame: Option<u16>,
-) -> Option<Collapsible> {
+) -> Option<(String, Style, SubagentSummaryStatus)> {
     let child = step.subagent.as_ref()?;
     let running = child.result.is_none() && !turn_complete;
-    let interrupted = child.result.is_none() && turn_complete;
-    let failed = !running
-        && (interrupted
-            || child.result.as_ref().is_some_and(|result| result.is_error)
-            || child.steps.iter().any(ToolStep::is_error));
-    let label = match step.call.input["agent"].as_str() {
-        Some("explore") if running => "Exploring",
-        Some("explore") => "Explored",
-        Some("general") => "General",
-        _ => "Subagent",
+    let colour = if running { theme.accent } else { theme.muted };
+    Some((
+        format!("SubAgent: {}", subagent_task_name(step)),
+        Style::default().fg(colour),
+        if running {
+            SubagentSummaryStatus::Running
+        } else {
+            SubagentSummaryStatus::Complete
+        },
+    ))
+}
+
+fn subagent_task_name(step: &ToolStep) -> String {
+    ["name", "prompt"]
+        .into_iter()
+        .filter_map(|key| step.call.input[key].as_str())
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .map(single_line)
+        .unwrap_or_else(|| step.call.id.clone())
+}
+
+/// The dedicated child terminal contains its task, live calls, and final report.
+pub fn subagent_lines(
+    step: &ToolStep,
+    turn_complete: bool,
+    width: u16,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+) -> Vec<Line<'static>> {
+    subagent_layout(step, turn_complete, width, theme, spinner_frame).lines
+}
+
+/// Child tools use the same disclosures and nested hit targets as the main view.
+#[derive(Default)]
+pub struct SubagentTranscript {
+    pub lines: Vec<Line<'static>>,
+    pub headers: Vec<CollapsibleHeader>,
+}
+
+pub fn subagent_layout(
+    step: &ToolStep,
+    turn_complete: bool,
+    width: u16,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+) -> SubagentTranscript {
+    let mut out = Vec::new();
+    let Some(child) = step.subagent.as_ref() else {
+        return SubagentTranscript::default();
     };
-    let detail = format!("{label}: {}", tool_counts(&child.steps, running));
-    let mut view = step_view(step, detail, running, failed, theme);
-    if step.disclosure.is_expanded() {
-        let mut body = Vec::new();
-        for tool in &child.steps {
-            push_tool_step(&mut body, tool, running, theme, spinner_frame);
-        }
-        if child.steps.is_empty() {
-            body.push(Line::styled(
-                "No tool calls.",
-                Style::default().fg(theme.dim),
-            ));
-        }
-        view.set_content(body);
+    let running = child.result.is_none() && !turn_complete;
+    let markdown = MarkdownStyle::from_theme(theme);
+    if let Some(prompt) = step.call.input["prompt"].as_str() {
+        push_prompt(&mut out, prompt, usize::from(width), theme);
+        out.push(Line::default());
     }
-    Some(view)
+    let mut headers = TranscriptHeaders::default();
+    push_steps(
+        &mut out,
+        ToolTranscript {
+            steps: &child.steps,
+            steering: &[],
+            complete: !running,
+        },
+        usize::from(width),
+        theme,
+        spinner_frame,
+        0,
+        &mut headers,
+    );
+    out.push(Line::default());
+    if let Some(result) = &child.result {
+        out.extend(render_markdown(&result.output, width, &markdown));
+    } else {
+        out.push(Line::styled(
+            if running {
+                format!("{} working…", spinner(spinner_frame))
+            } else {
+                "Interrupted".into()
+            },
+            Style::default().fg(if running { theme.accent } else { theme.error }),
+        ));
+    }
+    SubagentTranscript {
+        lines: out,
+        headers: headers.tools,
+    }
 }
 
 fn tool_counts(steps: &[ToolStep], running: bool) -> String {
@@ -466,18 +661,7 @@ fn tool_counts(steps: &[ToolStep], running: bool) -> String {
         .join(", ")
 }
 
-fn push_tool_step(
-    out: &mut Vec<Line<'static>>,
-    step: &ToolStep,
-    running: bool,
-    theme: &Theme,
-    spinner_frame: Option<u16>,
-) {
-    let glyph = if running && !step.is_done() {
-        spinner(spinner_frame)
-    } else {
-        "→"
-    };
+fn tool_step_title(step: &ToolStep) -> String {
     let label = match step.call.name.as_str() {
         "read" => "Read",
         "grep" => "Grep",
@@ -515,15 +699,7 @@ fn push_tool_step(
     if let Some(elapsed) = step.duration_ms() {
         detail.push_str(&format!("  ·  {elapsed}ms"));
     }
-    let colour = if step.is_error() {
-        theme.error
-    } else {
-        theme.muted
-    };
-    out.push(Line::styled(
-        format!("{glyph} {} {}", single_line(label), single_line(&detail)),
-        Style::default().fg(colour),
-    ));
+    format!("{} {}", single_line(label), single_line(&detail))
 }
 
 /// A message the user added while the turn was running.
@@ -712,7 +888,7 @@ mod tests {
             .unwrap();
         assert_eq!(failure.style.fg, Some(theme.error));
         assert!(
-            text.contains("    ⠙ Write b.txt"),
+            text.contains("    → Write b.txt"),
             "a call in flight: {text}"
         );
         assert!(
@@ -910,11 +1086,17 @@ mod tests {
             "{text}"
         );
         assert!(
-            rows[6].contains("General:") && rows[7].contains("1 read"),
+            rows[6].contains("SubAgent:") && rows[7].contains("1 read"),
             "{text}"
         );
         assert_eq!(view.collapsible_at(2), None, "steering is not a disclosure");
-        for (row, step) in [(1, 0), (3, 1), (4, 2), (5, 3), (6, 4), (7, 5)] {
+        assert_eq!(
+            view.collapsible_at(6),
+            None,
+            "a child summary is not a disclosure"
+        );
+        assert_eq!(view.headers.subagents[&(0, 4)].row, 6);
+        for (row, step) in [(1, 0), (3, 1), (4, 2), (5, 3), (7, 5)] {
             assert_eq!(
                 view.collapsible_at(row).map(|header| header.target),
                 Some((0, step))
@@ -1105,194 +1287,187 @@ mod tests {
     }
 
     #[test]
-    fn subagents_default_to_one_collapsed_summary_with_a_right_arrow() {
-        let session = session_with(Turn {
-            steps: vec![subagent_step(false, true)],
-            complete: true,
-            ..Default::default()
-        });
-        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(
-            text.contains("→ Explored: 1 fetch, 1 read, 1 search"),
-            "{text}"
-        );
-        assert!(
-            !text.contains("src/agent.rs") && !text.contains("example.com"),
-            "{text}"
-        );
-        assert!(!text.contains("private tool data"), "{text}");
-    }
-
-    #[test]
-    fn a_running_collapsed_subagent_keeps_the_right_arrow() {
-        let session = session_with(Turn {
-            steps: vec![subagent_step(false, false)],
-            ..Default::default()
-        });
-        for frame in [0, 1] {
-            let lines = build(
-                &session,
-                area(90, 20),
-                &Theme::dark(),
-                Some(frame),
-                &welcome(),
+    fn subagent_summaries_never_expand_in_the_main_transcript() {
+        for expanded in [false, true] {
+            let session = session_with(Turn {
+                steps: vec![subagent_step(expanded, true)],
+                complete: true,
+                ..Default::default()
+            });
+            let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
+            let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert!(
+                text.contains("🤖 SubAgent: Investigate the source"),
+                "{text}"
             );
-            let title = lines
-                .iter()
-                .map(line_text)
-                .find(|line| line.contains("Exploring:"))
-                .unwrap();
-            assert!(title.starts_with("  → Exploring:"), "{title}");
+            assert!(
+                !text.contains("src/agent.rs") && !text.contains("private tool data"),
+                "{text}"
+            );
+            assert_eq!(lines.len(), 2);
         }
     }
 
     #[test]
-    fn expanded_subagents_show_a_down_arrow_and_indented_child_calls() {
-        let session = session_with(Turn {
-            steps: vec![subagent_step(true, true)],
-            complete: true,
-            ..Default::default()
-        });
-        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("↓ Explored:"), "{text}");
-        assert!(
-            text.contains("    → WebFetch https://example.com/docs"),
-            "{text}"
+    fn subagent_summaries_prefer_task_names_and_fall_back_to_the_prompt() {
+        let theme = Theme::dark();
+        let mut step = subagent_step(false, false);
+        step.call.input["name"] = serde_json::json!("检查登录流程");
+        assert_eq!(
+            subagent_summary(&step, false, &theme).unwrap().0,
+            "SubAgent: 检查登录流程"
         );
-        assert!(text.contains("    → Read src/agent.rs:175-429"), "{text}");
-        assert!(text.contains("    → Grep SubagentRunner"), "{text}");
+        step.finish(solaris_agent::ToolResult::ok(&step.call, "done"), 1);
+        assert_eq!(
+            subagent_summary(&step, true, &theme).unwrap().0,
+            "SubAgent: 检查登录流程"
+        );
+        step.call.input["name"] = serde_json::json!("  \n ");
+        step.call.input["prompt"] = serde_json::json!("\n 检查路由配置 \n完整任务说明");
+        assert_eq!(subagent_task_name(&step), "检查路由配置");
+        step.call.input["prompt"] = serde_json::Value::Null;
+        assert_eq!(subagent_task_name(&step), "delegate");
     }
 
     #[test]
-    fn expanding_a_running_subagent_keeps_the_down_arrow_and_animates_pending_tools() {
-        let session = session_with(Turn {
-            steps: vec![subagent_step(true, false)],
-            ..Default::default()
-        });
-        let lines = build(&session, area(90, 20), &Theme::dark(), Some(1), &welcome());
+    fn child_terminal_shows_task_calls_outputs_and_final_report() {
+        let mut step = subagent_step(false, true);
+        let child = step.subagent.as_mut().unwrap();
+        child.steps[0].disclosure.set_expanded(true);
+        child.steps[1].detail_disclosure.set_expanded(true);
+        let layout = subagent_layout(&step, true, 90, &Theme::dark(), None);
+        assert!(
+            layout
+                .headers
+                .iter()
+                .any(|header| header.detail && header.target.1 == 1)
+        );
+        let lines = layout.lines;
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("↓ Exploring:"), "{text}");
-        assert!(text.contains("    ⠙ Read "), "{text}");
+        for expected in [
+            "Investigate the source",
+            "Read src/agent.rs:175-429",
+            "private tool data",
+            "final report",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     #[test]
-    fn an_interrupted_turn_stops_all_child_spinners() {
-        let session = session_with(Turn {
-            steps: vec![subagent_step(true, false)],
-            complete: true,
-            ..Default::default()
-        });
-        let lines = build(&session, area(90, 20), &Theme::dark(), None, &welcome());
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(!text.contains("interrupted"), "{text}");
-        assert_eq!(lines[1].spans[0].style.fg, Some(Theme::dark().error));
-        assert!(text.contains("    → Read "), "{text}");
+    fn child_terminal_animates_running_calls_and_stops_after_interruption() {
+        let step = subagent_step(false, false);
+        let theme = Theme::dark();
+        let running = subagent_lines(&step, false, 90, &theme, Some(1));
+        assert!(
+            running
+                .iter()
+                .any(|line| line_text(line).contains("⠙ working…"))
+        );
+        let interrupted = subagent_lines(&step, true, 90, &theme, Some(1));
+        let text = interrupted
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Interrupted"), "{text}");
         assert!(!SPINNER.iter().any(|glyph| text.contains(glyph)), "{text}");
     }
 
     #[test]
-    fn failed_subagent_titles_only_change_colour_without_adding_messages() {
-        let mut step = subagent_step(false, false);
-        step.finish(ToolResult::error(&step.call, "child timed out"), 10);
-        let session = session_with(Turn {
-            steps: vec![step],
-            complete: true,
-            ..Default::default()
-        });
-        let theme = Theme::dark();
-        let lines = build(&session, area(90, 20), &theme, None, &welcome());
-        let title = lines
-            .iter()
-            .find(|line| line_text(line).contains("Explored:"))
-            .unwrap();
-        assert_eq!(line_text(title), "  → Explored: 1 fetch, 1 read, 1 search");
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line_text(line).contains("timed out"))
+    fn child_terminal_collapses_tool_outputs_and_keeps_its_report_visible() {
+        let mut step = subagent_step(false, true);
+        let call = ToolCall::new(
+            "shell",
+            "shell",
+            serde_json::json!({"command":"cargo test"}),
         );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(title.spans[0].style.fg, Some(theme.error));
+        let mut shell = ToolStep::pending(call.clone());
+        shell.finish(ToolResult::ok(&call, "shell output"), 1);
+        step.subagent.as_mut().unwrap().steps.push(shell);
+        let layout = subagent_layout(&step, true, 90, &Theme::dark(), None);
+        let text = layout
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("→ Explored:") && text.contains("→ Shell: cargo test"),
+            "{text}"
+        );
+        assert!(text.contains("final report"), "{text}");
+        assert!(
+            !text.contains("private tool data") && !text.contains("shell output"),
+            "{text}"
+        );
+        assert_eq!(layout.headers.len(), 2);
+        step.subagent.as_mut().unwrap().steps[3]
+            .disclosure
+            .set_expanded(true);
+        let lines = subagent_lines(&step, true, 90, &Theme::dark(), None);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_text(line).contains("shell output"))
+        );
     }
 
     #[test]
-    fn subagents_only_aggregate_tool_errors_after_the_child_finishes() {
-        for background in [false, true] {
-            for expanded in [false, true] {
-                let theme = Theme::dark();
-                let mut step = subagent_step(expanded, false);
-                step.call.input["background"] = serde_json::json!(background);
-                let child = step.subagent.as_mut().unwrap();
-                for (index, tool) in child.steps.iter_mut().enumerate() {
-                    let result = if index == 0 {
-                        ToolResult::error(&tool.call, "private nested failure")
-                    } else {
-                        ToolResult::ok(&tool.call, "data")
-                    };
-                    tool.finish(result, 1);
-                }
-                if background {
-                    step.finish(
-                        ToolResult::ok(&step.call, r#"{"task_id":"task-1","status":"started"}"#),
-                        1,
-                    );
-                }
-                let view = subagent_view(&step, false, &theme, Some(1)).unwrap();
-                let lines = view.lines(90);
-                let glyph = if expanded { "↓" } else { "→" };
-                assert_eq!(
-                    line_text(&lines[0]),
-                    format!("  {glyph} Exploring: 1 fetch, 1 read, 1 search")
-                );
-                assert_eq!(lines[0].style.fg, Some(theme.muted));
-                assert_eq!(
-                    lines[0].spans[0].style.fg,
-                    Some(if expanded { theme.muted } else { theme.accent })
-                );
-                assert_eq!(view.state().is_expanded(), expanded);
-
-                let result = ToolResult::ok(&step.call, "recovered final report");
-                step.subagent.as_mut().unwrap().finish(result, 10);
-                let view = subagent_view(&step, false, &theme, Some(1)).unwrap();
-                let lines = view.lines(90);
-                let glyph = if expanded { "↓" } else { "→" };
-                assert_eq!(
-                    line_text(&lines[0]),
-                    format!("  {glyph} Explored: 1 fetch, 1 read, 1 search")
-                );
-                assert_eq!(lines[0].style.fg, Some(theme.error));
-                assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
-                assert_eq!(view.state().is_expanded(), expanded);
-                assert_eq!(lines.len(), if expanded { 4 } else { 1 });
-                assert!(
-                    !lines
-                        .iter()
-                        .any(|line| line_text(line).contains("private nested failure"))
-                );
-            }
+    fn subagent_summary_has_only_running_and_complete_states_regardless_of_outcome() {
+        let theme = Theme::dark();
+        let mut step = subagent_step(false, false);
+        let tool = &mut step.subagent.as_mut().unwrap().steps[0];
+        tool.finish(ToolResult::error(&tool.call, "nested failure"), 1);
+        assert_eq!(
+            subagent_summary(&step, false, &theme).unwrap().1.fg,
+            Some(theme.accent)
+        );
+        assert_eq!(
+            subagent_summary(&step, false, &theme).unwrap().2,
+            SubagentSummaryStatus::Running
+        );
+        for failed in [false, true] {
+            let result = if failed {
+                ToolResult::error(&step.call, "failed report")
+            } else {
+                ToolResult::ok(&step.call, "report")
+            };
+            step.finish(result, 10);
+            let (_, style, status) = subagent_summary(&step, false, &theme).unwrap();
+            assert_eq!(style.fg, Some(theme.muted));
+            assert_eq!(status, SubagentSummaryStatus::Complete);
         }
+        let interrupted = subagent_step(false, false);
+        let (_, style, status) = subagent_summary(&interrupted, true, &theme).unwrap();
+        assert_eq!(style.fg, Some(theme.muted));
+        assert_eq!(status, SubagentSummaryStatus::Complete);
     }
 
     #[test]
-    fn subagent_summaries_and_details_fit_narrow_terminal_widths() {
+    fn subagent_summaries_and_terminals_fit_narrow_widths() {
         for width in [8, 12, 24, 40] {
+            let step = subagent_step(true, true);
+            let lines = subagent_lines(&step, true, width, &Theme::dark(), None);
+            assert!(
+                lines.iter().all(|line| line.width() <= usize::from(width)),
+                "{lines:?}"
+            );
             let session = session_with(Turn {
-                steps: vec![subagent_step(true, true)],
+                steps: vec![step],
                 complete: true,
                 ..Default::default()
             });
             let lines = build(&session, area(width, 30), &Theme::dark(), None, &welcome());
             assert!(
                 lines.iter().all(|line| line.width() <= usize::from(width)),
-                "width={width}: {lines:?}"
+                "{lines:?}"
             );
         }
     }
 
     #[test]
-    fn cached_title_hit_targets_follow_expansion_and_never_include_nested_rows() {
+    fn child_summary_hit_targets_do_not_depend_on_disclosure_state() {
         let mut view = TranscriptView::new();
         let mut session = session_with(Turn {
             prompt: "Inspect\nthe project".into(),
@@ -1300,29 +1475,58 @@ mod tests {
             complete: true,
             ..Default::default()
         });
-        view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
-        assert_eq!(
-            view.collapsible_at(2).map(|header| header.target),
-            Some((0, 0))
-        );
-        assert_eq!(
-            view.collapsible_at(3).map(|header| header.target),
-            Some((0, 1))
-        );
-        session.turns[0].steps[0].disclosure.set_expanded(true);
-        session.bump();
-        view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
-        assert_eq!(
-            view.collapsible_at(2).map(|header| header.target),
-            Some((0, 0))
-        );
-        assert_eq!(view.collapsible_at(3), None);
-        assert_eq!(
-            view.collapsible_at(6).map(|header| header.target),
-            Some((0, 1))
-        );
+        for expanded in [false, true] {
+            session.turns[0].steps[0].disclosure.set_expanded(expanded);
+            session.bump();
+            view.lines(&session, area(80, 20), &Theme::dark(), None, &welcome());
+            assert_eq!(view.collapsible_at(2), None);
+            assert_eq!(view.collapsible_at(3), None);
+            assert_eq!(view.headers.subagents[&(0, 0)].row, 2);
+            assert_eq!(view.headers.subagents[&(0, 1)].row, 3);
+            assert_eq!(view.collapsible_at(4), None);
+        }
     }
 
+    #[test]
+    fn child_component_keeps_its_click_through_rebuilds_and_is_removed_on_clear() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut view = TranscriptView::new();
+        let mut session = session_with(Turn {
+            steps: vec![subagent_step(false, false)],
+            ..Default::default()
+        });
+        let viewport = area(80, 20);
+        view.lines(&session, viewport, &Theme::dark(), Some(0), &welcome());
+        let pointer = |kind| MouseEvent {
+            kind,
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            view.handle_subagent_mouse(
+                pointer(MouseEventKind::Down(MouseButton::Left)),
+                viewport,
+                0,
+                false
+            ),
+            (true, None)
+        );
+        session.bump();
+        view.lines(&session, viewport, &Theme::dark(), Some(1), &welcome());
+        assert_eq!(
+            view.handle_subagent_mouse(
+                pointer(MouseEventKind::Up(MouseButton::Left)),
+                viewport,
+                0,
+                false
+            ),
+            (true, Some((0, 0)))
+        );
+        session.turns.clear();
+        view.lines(&session, viewport, &Theme::dark(), None, &welcome());
+        assert!(view.headers.subagents.is_empty());
+    }
     #[test]
     fn a_step_line_longer_than_the_screen_is_cut() {
         let call = ToolCall::new(

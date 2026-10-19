@@ -210,7 +210,7 @@ impl AgentBackend for DelegatingBackend {
             AgentEvent::ToolCall(ToolCall::new(
                 "delegate-1",
                 "subagent",
-                serde_json::json!({"agent":"explore","prompt":"Investigate the task and report.","background":self.background}),
+                serde_json::json!({"agent":"explore","name":"Investigate the task","prompt":"Investigate the task and report.","background":self.background}),
             ))
         };
         Ok(Box::pin(futures::stream::iter(vec![
@@ -238,28 +238,32 @@ async fn a_subagent_task_runs_and_returns_its_result_through_the_tui() {
         text.contains("Parent integrated the subagent result."),
         "{text}"
     );
-    assert!(text.contains("→ Explored:"), "{text}");
-    assert!(text.contains("1 read"), "{text}");
+    assert!(text.contains("SubAgent:"), "{text}");
+    assert!(text.contains("SubAgent: Investigate the task"), "{text}");
     assert!(
         !text.contains("Read "),
-        "child calls are folded by default: {text}"
+        "child calls belong to their own terminal: {text}"
     );
     let row = text
         .lines()
-        .position(|line| line.contains("→ Explored:"))
+        .position(|line| line.contains("SubAgent:"))
         .unwrap() as u16;
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
     harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
-    let expanded = harness.draw();
-    assert!(expanded.contains("↓ Explored: 1 read"), "{expanded}");
+    let terminal = harness.draw();
+    assert!(terminal.contains("Subagent 1/1"), "{terminal}");
+    let expanded = harness.toggle_disclosure("→ Explored:");
+    assert!(expanded.contains("Subagent 1/1"), "{expanded}");
     assert!(
         expanded.contains("→ Read ") && expanded.contains("lib.rs:1-4"),
         "{expanded}"
     );
-    harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
-    harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
+    harness.key(KeyCode::Esc);
     let collapsed = harness.draw();
-    assert!(collapsed.contains("→ Explored: 1 read"), "{collapsed}");
+    assert!(
+        collapsed.contains("SubAgent: Investigate the task"),
+        "{collapsed}"
+    );
     assert!(!collapsed.contains("→ Read "), "{collapsed}");
     assert!(!text.contains("generating"), "{text}");
 }
@@ -276,16 +280,18 @@ async fn a_background_subagent_notifies_and_returns_its_report_through_the_tui()
         text.contains("Parent integrated the background result."),
         "{text}"
     );
-    assert_eq!(text.matches("→ Explored:").count(), 1, "{text}");
-    assert!(text.contains("1 read"), "{text}");
+    assert_eq!(text.matches("SubAgent:").count(), 1, "{text}");
+    assert!(text.contains("SubAgent: Investigate the task"), "{text}");
     let row = text
         .lines()
-        .position(|line| line.contains("→ Explored:"))
+        .position(|line| line.contains("SubAgent:"))
         .unwrap() as u16;
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 2, row);
     harness.mouse(MouseEventKind::Up(MouseButton::Left), 2, row);
-    let expanded = harness.draw();
-    assert_eq!(expanded.matches("↓ Explored:").count(), 1, "{expanded}");
+    let terminal = harness.draw();
+    assert!(terminal.contains("Subagent 1/1"), "{terminal}");
+    let expanded = harness.toggle_disclosure("→ Explored:");
+    assert!(expanded.contains("Subagent 1/1"), "{expanded}");
     assert!(expanded.contains("→ Read "), "{expanded}");
     assert!(!text.contains("generating"), "{text}");
 }
@@ -304,18 +310,18 @@ async fn dragging_and_copying_a_subagent_title_does_not_expand_it() {
         .await;
     let row = text
         .lines()
-        .position(|line| line.contains("→ Explored:"))
+        .position(|line| line.contains("SubAgent:"))
         .unwrap() as u16;
-    harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
-    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 11, row);
-    harness.mouse(MouseEventKind::Up(MouseButton::Left), 11, row);
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 5, row);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 12, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 12, row);
     let selected = harness.draw();
     assert!(
-        selected.contains("→ Explored:") && !selected.contains("↓ Explored:"),
+        selected.contains("SubAgent:") && !selected.contains("→ SubAgent:"),
         "{selected}"
     );
     harness.ctrl('c');
-    assert_eq!(copied.borrow().last().map(String::as_str), Some("Explored"));
+    assert_eq!(copied.borrow().last().map(String::as_str), Some("SubAgent"));
 }
 
 #[tokio::test]
