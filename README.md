@@ -163,8 +163,9 @@ The model can ask solaris to do things. A turn runs what it asks for, hands back
 | `find` | Find paths by glob, respecting `.gitignore` | plan |
 | `bash` | Run a shell command and return what it printed | build (not Windows) |
 | `powershell` | Run a PowerShell command and return what it printed | build (Windows) |
+| `subagent` | Delegate an isolated task to `explore` or `general` | build, plan (`explore` only) |
 
-Plan mode declares only the read-only four, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
+Plan mode declares the four read-only tools plus delegation to read-only `explore` children, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
 
 ```bash
 # read-only for one run, whatever the mode
@@ -183,7 +184,7 @@ Entries are tool names or patterns where `*` matches any run of characters. A li
 
 Every result goes back to the model, failures included: a file that is not there, a command that exited non-zero and a call the model got wrong are all things it can react to, not the end of the turn. Output is cut to keep a turn affordable — the first 2000 lines or 50KB for a read, the last for a command, since that is where a failure prints — and a command whose output was cut has the whole of it written to a file whose path is reported, so the model can read it back in pieces.
 
-Each call appears in the transcript as it happens, with its arguments, how long it took and, when it failed, the first line of what it said.
+Calls appear as they happen, folded by default: consecutive ordinary tools share a summary such as `→ Explored: 8 reads, 3 searches`, while each shell command has its own `→ Shell: cargo test` row. Click a title to expand or collapse it. Tool groups reveal each call's argument summary and duration, with failed calls in red; shell rows reveal their output. Headers always use `→` when folded and `↓` when expanded, with no spinner. Running headers do not turn red. Once execution ends, errors turn the header red without adding messages or changing your expansion choice. Subagents also include errors from their tool calls in this final check.
 
 ## Skills
 
@@ -279,6 +280,33 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 - **Errors.** A rejected key, an unknown model, a rate limit or an empty account is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
 
 ---
+
+## Subagents
+
+The model can call `subagent` to delegate a self-contained task:
+
+```json
+{"agent":"explore","prompt":"Find the authentication entry points. Report the relevant files and how they connect; do not change files."}
+```
+
+- **`explore`** is read-only (read/search/list); **`general`** can implement a task in Build mode. Plan mode rejects `general`.
+- Children use the current provider/model and their own conversation. They inherit project instructions, skills, approval policy, working directory and explicit tool allowlists/exclusions, but do not see the parent's history. Put necessary context and constraints in `prompt`.
+- **Foreground (default):** omit `background` or set it to `false` to wait for the report before continuing. Successive calls are serial; independent calls in one round may run concurrently under the parallel-tool limit (default 4).
+- **Background:** set `"background":true` to immediately receive `{"task_id":"subagent-1","status":"started"}` and continue other work. Completion or failure is reported automatically and the final report is delivered between model rounds; do not poll. Foreground and background children share the active-child limit; excess tasks queue.
+- Background tasks belong to the current turn. When the parent has no other work, it waits for notifications and resumes to integrate the reports before ending the turn. Tasks do not survive the turn or process exit.
+- Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
+- Children cannot delegate recursively. Each is limited to 20 model requests (including compaction), five minutes and a 16 KiB returned report. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
+- Ctrl+C or abandoning the parent stream cancels child work too. Child token usage/cost is included in session totals, but child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
+- Each child defaults to one collapsed activity-summary row: a spinner while running, then `→` when finished. Click the title to expand its nested tool calls (`↓`), and click again to collapse. Foreground and background children use the same display; a background launch acknowledgement does not mark the child complete.
+- Disable delegation with `--exclude-tools subagent`. Library callers may also use `AgentOptions::with_subagents(false)`.
+
+For example, launch a background investigation with:
+
+```json
+{"agent":"explore","prompt":"Find test coverage gaps. Report relevant paths and suggestions; do not change files.","background":true}
+```
+
+Persistent child sessions, resume IDs and per-child model overrides are not supported. The five-minute deadline includes time queued for an execution slot.
 
 # Configuration
 

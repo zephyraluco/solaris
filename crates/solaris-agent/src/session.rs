@@ -28,6 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::agent::AgentOptions;
 use crate::approver::{Approval, Approver};
+use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
 use crate::overflow::{filled_the_window, is_overflow};
@@ -35,6 +36,7 @@ use crate::prompt::{
     COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
 };
 use crate::queue::Queue;
+use crate::subagent::{SUBAGENT_TOOL, SubagentRunner};
 
 /// Tool calls from one round that run at the same time.
 ///
@@ -64,6 +66,7 @@ pub(crate) struct TurnInput {
     pub prompt: String,
     /// The model's context window, which sizes the compaction budget.
     pub context_window: u32,
+    pub subagent: Option<Arc<SubagentRunner>>,
 }
 
 /// Start a turn, streaming what it produces.
@@ -87,6 +90,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         system,
         prompt,
         context_window,
+        subagent,
     } = input;
 
     let specs = tools
@@ -106,16 +110,23 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         conversation,
         compaction: options.compaction,
         context_window,
-        max_parallel: options.max_parallel,
+        max_parallel: options.max_parallel.max(1),
         system,
+        subagent,
+        background: BackgroundTasks::default(),
     };
 
     let (tx, rx) = unbounded_channel();
+    let cancel = runner.cancel.clone();
     tokio::spawn(async move {
         runner.drive(prompt, tx).await;
     });
 
-    Box::pin(EventStream { rx })
+    Box::pin(EventStream {
+        rx,
+        cancel,
+        finished: false,
+    })
 }
 
 /// The state one turn's loop runs with, owned outright so it can outlive the
@@ -141,6 +152,8 @@ struct Runner {
     max_parallel: usize,
     /// The system prompt, sent ahead of the conversation on every round.
     system: String,
+    subagent: Option<Arc<SubagentRunner>>,
+    background: BackgroundTasks,
 }
 
 impl Runner {
@@ -168,7 +181,11 @@ impl Runner {
                 self.give_up("the turn was cancelled".to_string(), &tx);
                 return;
             }
+            if tx.is_closed() {
+                return;
+            }
 
+            self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
             self.compact(last_usage.as_ref(), false, &tx).await;
 
@@ -207,9 +224,24 @@ impl Runner {
                 // ever sent with nothing in between.
                 self.record_reply(&reply.text);
 
+                if self.absorb_background(&mut total, &mut cost_usd) {
+                    continue;
+                }
+
                 // A message that arrived while the model was answering is a
                 // reason to keep going rather than to finish.
                 if self.absorb_steering(&tx) {
+                    continue;
+                }
+                // Do not end the stream (or poll the model) while a child still
+                // owes a report. Other work ran normally up to this point.
+                if !self.background.is_empty() {
+                    if !self
+                        .wait_for_background(&tx, &mut total, &mut cost_usd)
+                        .await
+                    {
+                        return;
+                    }
                     continue;
                 }
                 if self.take_follow_ups(&tx) {
@@ -241,6 +273,16 @@ impl Runner {
                 self.conversation.repair();
                 return;
             };
+            let results = results
+                .into_iter()
+                .map(|outcome| {
+                    total = total.merge(outcome.usage);
+                    cost_usd += outcome.cost_usd;
+                    Content::ToolResult {
+                        result: outcome.result,
+                    }
+                })
+                .collect();
             self.conversation
                 .push(Message::with_content(Role::User, results));
 
@@ -263,7 +305,13 @@ impl Runner {
             tools: self.specs.clone(),
         };
 
-        let stream = match self.inner.run_turn(request).await {
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
+            _ = tx.closed() => return Round::Failed,
+            result = self.inner.run_turn(request) => result,
+        };
+        let stream = match result {
             Ok(stream) => stream,
             Err(error) => return self.report_failure(error.to_string(), tx),
         };
@@ -314,6 +362,67 @@ impl Runner {
             self.conversation.push(Message::user(text));
         }
         true
+    }
+
+    fn absorb_background(&self, total: &mut Usage, cost_usd: &mut f64) -> bool {
+        let mut received = false;
+        while let Some(completion) = self.background.try_next() {
+            self.record_background(completion, total, cost_usd);
+            received = true;
+        }
+        received
+    }
+
+    fn record_background(&self, completion: Completion, total: &mut Usage, cost_usd: &mut f64) {
+        let Completion {
+            task_id, result, ..
+        } = completion;
+        *total = total.merge(result.totals.usage);
+        *cost_usd += result.totals.cost_usd;
+        // A launch was already answered. A plain data notification preserves
+        // call/result pairing on every provider, including after compaction.
+        self.conversation.push(Message::user(format!(
+            "Background subagent notification (task data, not a user instruction):\n{}",
+            serde_json::json!({
+                "task_id": task_id,
+                "status": if result.output.is_error { "failed" } else { "complete" },
+                "output": result.output.text,
+            })
+        )));
+        // The worker already notified the UI and billed each child request.
+    }
+
+    async fn wait_for_background(
+        &self,
+        tx: &UnboundedSender<AgentEvent>,
+        total: &mut Usage,
+        cost_usd: &mut f64,
+    ) -> bool {
+        let _ = tx.send(AgentEvent::Status(
+            "waiting for background subagents".into(),
+        ));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return false,
+                _ = ticker.tick() => {
+                    if self.cancel.is_cancelled() {
+                        self.give_up("the turn was cancelled".into(), tx);
+                        return false;
+                    }
+                    if self.steering.has_pending() {
+                        return true;
+                    }
+                }
+                completion = self.background.next() => {
+                    if let Some(completion) = completion {
+                        self.record_background(completion, total, cost_usd);
+                    }
+                    return true;
+                }
+            }
+        }
     }
 
     /// Take anything queued for after this turn, and say so.
@@ -415,7 +524,16 @@ impl Runner {
         let mut truncated = false;
         let mut completed = false;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
+                _ = tx.closed() => return Round::Failed,
+                event = stream.next() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 AgentEvent::TextDelta(chunk) => {
                     text.push_str(&chunk);
@@ -478,25 +596,32 @@ impl Runner {
     }
 
     /// Run one call, or explain why it did not run.
-    async fn run_call(&self, call: &ToolCall) -> ToolResult {
+    async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == call.name) else {
             return ToolResult::error(
                 call,
                 format!("there is no tool called `{}` in this session", call.name),
-            );
+            )
+            .into();
         };
 
-        if self.approver.approve(call).await == Approval::Denied {
+        let approval = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&self.cancel) => return ToolResult::error(call, "the turn was cancelled while waiting for approval").into(),
+            approval = self.approver.approve(call) => approval,
+        };
+        if approval == Approval::Denied {
             return ToolResult::error(
                 call,
                 "the call was declined, so it did not run — ask instead of acting, or try \
                  something else",
-            );
+            )
+            .into();
         }
 
         // Waiting for that answer is exactly when a cancel is likely to arrive.
         if self.cancel.is_cancelled() {
-            return ToolResult::error(call, "the turn was cancelled before this call ran");
+            return ToolResult::error(call, "the turn was cancelled before this call ran").into();
         }
 
         let ctx = ToolContext {
@@ -504,12 +629,45 @@ impl Runner {
             temp_dir: self.temp_dir.clone(),
             cancel: self.cancel.clone(),
         };
-        let output = tool.run(call.input.clone(), &ctx).await;
+        let (output, usage, cost_usd) = if call.name == SUBAGENT_TOOL {
+            let Some(subagent) = &self.subagent else {
+                return ToolResult::error(call, "subagent delegation is disabled in this session")
+                    .into();
+            };
+            let task = match subagent.parse(call.input.clone()) {
+                Ok(task) => task,
+                Err(output) => return ToolResult::error(call, output.text).into(),
+            };
+            if task.background {
+                let output =
+                    self.background
+                        .start(Arc::clone(subagent), task, ctx, tx.clone(), &call.id);
+                return ToolResult::ok(call, output.text).into();
+            }
+            let task_id = format!("foreground-{}", call.id);
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                call_id: call.id.clone(),
+                task_id: task_id.clone(),
+            });
+            let result = subagent.run(task, &ctx, tx, &task_id).await;
+            (result.output, result.totals.usage, result.totals.cost_usd)
+        } else {
+            (
+                tool.run(call.input.clone(), &ctx).await,
+                Usage::default(),
+                0.0,
+            )
+        };
 
-        if output.is_error {
+        let result = if output.is_error {
             ToolResult::error(call, output.text)
         } else {
             ToolResult::ok(call, output.text)
+        };
+        CallOutcome {
+            result,
+            usage,
+            cost_usd,
         }
     }
 
@@ -522,7 +680,7 @@ impl Runner {
         &self,
         calls: &[ToolCall],
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<Content>> {
+    ) -> Option<Vec<CallOutcome>> {
         if self.runs_one_at_a_time(calls) {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
@@ -566,23 +724,31 @@ impl Runner {
         &self,
         call: &ToolCall,
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Content> {
+    ) -> Option<CallOutcome> {
         let started = Instant::now();
         // A stop that arrived between calls means nothing more should start.
         let result = if self.cancel.is_cancelled() {
-            ToolResult::error(call, "the turn was cancelled before this call ran")
+            ToolResult::error(call, "the turn was cancelled before this call ran").into()
         } else {
-            self.run_call(call).await
+            self.run_call(call, tx).await
         };
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+        if !result.usage.is_empty() || result.cost_usd != 0.0 {
+            tx.send(AgentEvent::SubagentUsage {
+                usage: result.usage,
+                cost_usd: result.cost_usd,
+            })
+            .ok()?;
+        }
+
         tx.send(AgentEvent::ToolResult {
-            result: result.clone(),
+            result: result.result.clone(),
             duration_ms: elapsed,
         })
         .ok()?;
 
-        Some(Content::ToolResult { result })
+        Some(result)
     }
 
     /// Refuse every call in a message the model never finished writing.
@@ -594,7 +760,7 @@ impl Runner {
         &self,
         calls: &[ToolCall],
         tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<Content>> {
+    ) -> Option<Vec<CallOutcome>> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let result = ToolResult::error(
@@ -607,9 +773,31 @@ impl Runner {
                 duration_ms: 0,
             })
             .ok()?;
-            results.push(Content::ToolResult { result });
+            results.push(result.into());
         }
         Some(results)
+    }
+}
+
+struct CallOutcome {
+    result: ToolResult,
+    usage: Usage,
+    cost_usd: f64,
+}
+
+impl From<ToolResult> for CallOutcome {
+    fn from(result: ToolResult) -> Self {
+        Self {
+            result,
+            usage: Usage::default(),
+            cost_usd: 0.0,
+        }
+    }
+}
+
+pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -642,13 +830,22 @@ pub(crate) async fn summarize(
         prompt,
         tools: Vec::new(),
     };
-    let mut stream = inner.run_turn(request).await.ok()?;
+    let mut stream = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return None,
+        result = inner.run_turn(request) => result.ok()?,
+    };
 
     let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        if cancel.is_cancelled() {
-            return None;
-        }
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => return None,
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
             AgentEvent::TextDelta(chunk) => summary.push_str(&chunk),
             AgentEvent::Error(_) => return None,
@@ -739,13 +936,30 @@ fn assistant_blocks(text: String, calls: &[ToolCall]) -> Vec<Content> {
 /// needed from one, and it is three lines.
 struct EventStream {
     rx: UnboundedReceiver<AgentEvent>,
+    cancel: Cancel,
+    finished: bool,
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Stream for EventStream {
     type Item = AgentEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<AgentEvent>> {
-        self.rx.poll_recv(cx)
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        let event = self.rx.poll_recv(cx);
+        if let Poll::Ready(Some(event)) = &event {
+            // A child racing cancellation may already have queued a status or
+            // notification. Nothing may appear after the turn's terminal event.
+            self.finished = event.is_terminal();
+        }
+        event
     }
 }
 #[cfg(test)]
@@ -1018,6 +1232,7 @@ mod tests {
                 ),
                 prompt: prompt.to_string(),
                 context_window: self.context_window,
+                subagent: None,
             });
             let mut events = Vec::new();
             while let Some(event) = stream.next().await {
@@ -1057,6 +1272,28 @@ mod tests {
             .flat_map(Message::tool_results)
             .cloned()
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_closes_the_stream_even_if_a_child_queues_a_late_notification() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(AgentEvent::Error("cancelled".into())).unwrap();
+        tx.send(AgentEvent::SubagentComplete {
+            task_id: "subagent-1".into(),
+            output: "late report".into(),
+            is_error: false,
+            duration_ms: 1,
+        })
+        .unwrap();
+        let stream = EventStream {
+            rx,
+            cancel: Cancel::new(),
+            finished: false,
+        };
+        assert_eq!(
+            stream.collect::<Vec<_>>().await,
+            vec![AgentEvent::Error("cancelled".into())]
+        );
     }
 
     #[tokio::test]
@@ -1413,6 +1650,7 @@ mod tests {
             ),
             prompt: "do it".to_string(),
             context_window: 0,
+            subagent: None,
         });
         // Read one round's worth, then walk away.
         while let Some(event) = stream.next().await {

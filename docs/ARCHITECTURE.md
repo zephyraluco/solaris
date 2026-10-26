@@ -444,7 +444,7 @@ while !quit {
 
 ### 5.5 组件集、主题与终端
 
-- 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
+- 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Collapsible`（折叠内容）、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
 - 列表滚动（[`util::window_start`](../crates/solaris-tui/src/util.rs)）：三处会滚动的列表 —— 编辑器的 `/` 补全弹窗、`/model` 与 `/connect` 用的 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs)、Ctrl+K 面板与 `/theme` 用的 [`SelectList`](../crates/solaris-tui/src/components/select_list.rs) —— 共用这一个窗口函数，所以高亮不可能走出任何一处。差别只在「要不要记住窗口起点」：前两者每次都从高亮重算（`offset = 0`，往上走时窗口立刻跟回），`SelectList` 把上一次的起点传回来，所以窗口在回调路上会先停住。
 - 拖选（[`selection`](../crates/solaris-tui/src/selection.rs)）：`Selection` 记锚点 / 焦点、按 `selection_bg` / `selection_fg` 给单元格上色、抽取文本；`Tui::selection()` 把句柄交给应用层。
 - 主题（[`theme`](../crates/solaris-tui/src/theme.rs)）：`Theme` 含约二十个颜色槽位（含 build / plan 两种强调色），`Theme::NAMES = ["dark", "light"]`，未知名称回退到 dark。
@@ -452,6 +452,16 @@ while !quit {
 - 终端生命周期（[`terminal`](../crates/solaris-tui/src/terminal.rs)）：进入 raw mode + 备用屏幕 + 鼠标捕获（Windows 上**不**开启 bracketed paste，因为 Windows Terminal 的转义序列不会被控制台后端解码为粘贴事件），并安装 panic hook —— 先恢复终端再交给原 hook，保证 panic 不会把用户留在 raw mode。`restore_terminal` 通过原子标志保证幂等。
 
 ---
+
+### 5.6 可复用折叠组件
+
+[`Collapsible`](../crates/solaris-tui/src/components/collapsible.rs) 实现 `Component`：调用方提供带样式的标题与正文行，以及 `Idle` / `Running` / `Failed` 状态。组件负责默认折叠、固定的 `→` / `↓`、缩进、保留样式的终端列宽截断、点击与键盘交互、高度与缓存版本，不认识子代理、工具调用或会话。组件没有转圈动画、帧状态或定时重绘。
+
+保留式布局直接使用组件的 `render` 和 `handle_mouse`。聊天记录这样的逐行视图使用同一个 `lines(width)` 渲染器，将 `CollapsibleState` 留在记录中，再通过 `with_state` 恢复；更新标题、正文或完成状态不会重置展开选择。`CollapsibleInteraction<T>` 为多个虚拟标题提供共用的按下/释放、拖选和选区识别，调用方只映射命中坐标和记录 ID、处理视口滚动。
+
+应用将普通工具组、Shell 命令与子代理都接到这个组件上：连续的普通调用合为 `→ Explored: 8 reads, 3 searches`，展开后显示各次调用的参数摘要与耗时，失败的调用标红；每个 Shell 命令独立显示为 `→ Shell: cargo test`，展开后显示输出。Shell、子代理与 steering 消息都会分隔普通工具组，不改变记录顺序。折叠标题始终显示 `→`，展开后显示 `↓`；不论内部工具是否已经失败，运行中的标题都不会变红。执行结束后才汇总错误：普通工具组检查组内调用，子代理检查最终结果与内部调用，Shell 检查命令结果；中断也视为失败。失败仅将标题标红，不追加错误或中断信息，不改变展开状态，不触发其他行为。
+
+`ToolStep.disclosure` 保存通用展开状态，普通工具组由第一条调用持有；后续调用追加、结果到达、完成状态更新都不会重置展开选择。`SubagentStep` 只保存子任务数据。`transcript` 负责标题、统计、正文与命中几何，`App` 共用折叠手势与展开时的视口调整，不依赖具体工具或子代理执行器。
 
 ## 6. solaris：应用层
 

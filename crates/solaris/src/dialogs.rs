@@ -584,6 +584,11 @@ pub const KEY_HELP: &[(&str, &str)] = &[
     ("ctrl+o", "toggle thinking blocks"),
     ("ctrl+l", "clear the transcript"),
     ("page up / down", "scroll the transcript"),
+    (
+        "← / →",
+        "open / switch subagent terminals (when the prompt is empty)",
+    ),
+    ("esc", "return from a subagent terminal"),
     ("drag", "select any text"),
     ("ctrl+c", "copy the selection, or stop the turn"),
     ("ctrl+c again", "quit"),

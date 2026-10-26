@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use solaris_agent::{ToolCall, ToolResult, Usage, tokens_for_characters};
+use solaris_tui::components::CollapsibleState;
 
 /// One tool call the model made, and what running it produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,20 +18,66 @@ pub struct ToolStep {
     pub result: Option<ToolResult>,
     /// How long the call took, once it has run.
     pub duration_ms: Option<u64>,
+    /// Reusable disclosure state; the first call also anchors an ordinary tool
+    /// group's expansion. Record updates never reset the user's choice.
+    pub disclosure: CollapsibleState,
+    /// Expansion of this tool's output inside an ordinary tool group.
+    pub detail_disclosure: CollapsibleState,
+    /// Child activity belongs to its own terminal, separate from parent calls.
+    pub subagent: Option<Box<SubagentStep>>,
+}
+
+/// Display state for one child, independent of its launch acknowledgement.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubagentStep {
+    /// Runtime identity used to route concurrent child tool events.
+    pub task_id: Option<String>,
+    /// Tool calls inside the child, never mixed into the parent's step list.
+    pub steps: Vec<ToolStep>,
+    /// The child's final report or failure, not the background launch receipt.
+    pub result: Option<ToolResult>,
+    /// Total child duration, including its wait for an execution slot.
+    pub duration_ms: Option<u64>,
+}
+
+impl SubagentStep {
+    /// Record completion independently of the launch acknowledgement.
+    pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
+        self.result = Some(result);
+        self.duration_ms = Some(duration_ms);
+    }
 }
 
 impl ToolStep {
     /// A step whose call has not run yet.
     pub fn pending(call: ToolCall) -> Self {
+        let subagent = (call.name == "subagent").then(Box::default);
         Self {
             call,
             result: None,
             duration_ms: None,
+            disclosure: CollapsibleState::default(),
+            detail_disclosure: CollapsibleState::default(),
+            subagent,
         }
     }
 
     /// Record what the call produced.
     pub fn finish(&mut self, result: ToolResult, duration_ms: u64) {
+        if let Some(child) = &mut self.subagent {
+            let background = self.call.input["background"].as_bool() == Some(true);
+            if background && !result.is_error {
+                // Also accept a launch acknowledgement without a Started event
+                // for callers replaying older transcripts. It is not completion.
+                if child.task_id.is_none() {
+                    child.task_id = serde_json::from_str::<serde_json::Value>(&result.output)
+                        .ok()
+                        .and_then(|value| value["task_id"].as_str().map(str::to_string));
+                }
+            } else {
+                child.finish(result.clone(), duration_ms);
+            }
+        }
         self.result = Some(result);
         self.duration_ms = Some(duration_ms);
     }
@@ -84,6 +131,8 @@ pub struct Turn {
     pub compacted: usize,
     /// Tokens the turn consumed, as the backend reported or estimated them.
     pub usage: Usage,
+    /// Tokens spent in child contexts, already included in `usage` on completion.
+    pub subagent_tokens: u32,
     /// Cost reported for this turn.
     pub cost_usd: f64,
     /// Whether streamed events for this turn finished.
@@ -91,6 +140,15 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Locate child activity by its runtime ID, even after its launch returned.
+    pub fn subagent_mut(&mut self, task_id: &str) -> Option<&mut ToolStep> {
+        self.steps.iter_mut().rev().find(|step| {
+            step.subagent
+                .as_ref()
+                .is_some_and(|child| child.task_id.as_deref() == Some(task_id))
+        })
+    }
+
     /// Every token the turn touched.
     pub fn tokens(&self) -> u32 {
         self.usage.total()
@@ -160,7 +218,7 @@ impl SessionState {
         match self
             .turns
             .iter()
-            .rposition(|turn| turn.complete && turn.tokens() > 0)
+            .rposition(|turn| turn.complete && turn.tokens() > turn.subagent_tokens)
         {
             Some(index) => {
                 let trailing: usize = self.turns[index + 1..]
@@ -169,6 +227,7 @@ impl SessionState {
                     .sum();
                 self.turns[index]
                     .tokens()
+                    .saturating_sub(self.turns[index].subagent_tokens)
                     .saturating_add(tokens_for_characters(trailing))
             }
             // Nothing has been measured yet, so estimate the prompts rather
@@ -323,6 +382,21 @@ impl NotificationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_usage_is_billed_but_does_not_fill_the_parent_context_window() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            usage: Usage::new(120, 30),
+            subagent_tokens: 100,
+            cost_usd: 1.5,
+            complete: true,
+            ..Default::default()
+        });
+        assert_eq!(session.total_tokens(), 150);
+        assert_eq!(session.total_cost(), 1.5);
+        assert_eq!(session.context_tokens(), 50);
+    }
 
     #[test]
     fn streaming_turn_is_the_last_incomplete_one() {

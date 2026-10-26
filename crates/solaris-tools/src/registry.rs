@@ -40,6 +40,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
 pub const SHELL_TOOL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 
 /// The tools a session can declare.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }
@@ -89,7 +90,7 @@ impl ToolRegistry {
     }
 
     /// Put `tool` in, under the name it answers to.
-    fn add(&mut self, tool: Arc<dyn Tool>) {
+    pub fn add(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
 

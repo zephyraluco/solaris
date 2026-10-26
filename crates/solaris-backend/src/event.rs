@@ -24,6 +24,29 @@ pub enum AgentEvent {
         result: ToolResult,
         duration_ms: u64,
     },
+    /// Usage spent in isolated subagent contexts. Included in the eventual
+    /// turn total, but must not be counted as occupying the parent's window.
+    SubagentUsage { usage: Usage, cost_usd: f64 },
+    /// Associates a running child with the parent tool call that launched it.
+    /// Display-only: these events never become parent conversation messages.
+    SubagentStarted { call_id: String, task_id: String },
+    /// A tool requested inside one child, not a top-level parent tool call.
+    SubagentToolCall { task_id: String, call: ToolCall },
+    /// The matching child tool result, kept under that child's transcript row.
+    SubagentToolResult {
+        task_id: String,
+        result: ToolResult,
+        duration_ms: u64,
+    },
+    /// A background child finished. Its launch already has a tool result, so
+    /// this notification is not a second wire-level result for the same call.
+    /// The runtime feeds it to the model between rounds, before ending the turn.
+    SubagentComplete {
+        task_id: String,
+        output: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
     /// A message the user queued for after this turn is now being run as one.
     ///
     /// Not terminal: the turn it arrived during is over, and another has begun in
@@ -134,7 +157,7 @@ mod tests {
         let call = ToolCall::new("call-1", "read", serde_json::json!({}));
         let result = ToolResult::ok(&call, "ok");
 
-        assert!(!AgentEvent::ToolCall(call).is_terminal());
+        assert!(!AgentEvent::ToolCall(call.clone()).is_terminal());
         assert!(
             !AgentEvent::ToolResult {
                 result,
@@ -143,6 +166,39 @@ mod tests {
             .is_terminal()
         );
         assert!(!AgentEvent::TextDelta("hi".to_string()).is_terminal());
+        for event in [
+            AgentEvent::SubagentStarted {
+                call_id: "launch".into(),
+                task_id: "child".into(),
+            },
+            AgentEvent::SubagentToolCall {
+                task_id: "child".into(),
+                call: call.clone(),
+            },
+            AgentEvent::SubagentToolResult {
+                task_id: "child".into(),
+                result: ToolResult::ok(&call, "data"),
+                duration_ms: 1,
+            },
+        ] {
+            assert!(!event.is_terminal());
+        }
+        assert!(
+            !AgentEvent::SubagentUsage {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0
+            }
+            .is_terminal()
+        );
+        assert!(
+            !AgentEvent::SubagentComplete {
+                task_id: "subagent-1".into(),
+                output: "report".into(),
+                is_error: false,
+                duration_ms: 1,
+            }
+            .is_terminal()
+        );
         assert!(
             !AgentEvent::OutputTruncated.is_terminal(),
             "a cut-off message still has a completion after it"

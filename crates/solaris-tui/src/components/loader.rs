@@ -7,9 +7,10 @@ use ratatui::style::Style;
 use crate::component::Component;
 use crate::util::truncate_to_width;
 
-const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Shared animation glyphs for loaders and other activity indicators.
+pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Frames a glyph is held before advancing (~10 fps at a 16 ms tick).
-const FRAMES_PER_STEP: u32 = 6;
+pub(crate) const FRAMES_PER_STEP: u32 = 6;
 
 /// Braille spinner plus a message.
 pub struct Loader {
@@ -73,7 +74,7 @@ impl Component for Loader {
             return;
         }
         let glyph = if self.running {
-            FRAMES[self.index]
+            SPINNER[self.index]
         } else {
             "·"
         };
@@ -93,7 +94,7 @@ impl Component for Loader {
         self.ticks += 1;
         if self.ticks >= FRAMES_PER_STEP {
             self.ticks = 0;
-            self.index = (self.index + 1) % FRAMES.len();
+            self.index = (self.index + 1) % SPINNER.len();
             return true;
         }
         false
