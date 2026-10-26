@@ -547,18 +547,22 @@ impl Tool for ShellTool {
         };
 
         let mut notices = Vec::new();
+        let mut artifact_path = None;
         if truncated || outcome.artifact.is_some() {
             let saved = match outcome.artifact {
                 Some(path) => Ok(path),
                 None => write_full_output(&outcome.output, ctx).await,
             };
             match saved {
-                Ok(path) => notices.push(format!(
-                    "output truncated to the last {} lines / {}; full output at {}",
-                    self.limits.max_lines,
-                    format_size(self.limits.max_bytes),
-                    path.display()
-                )),
+                Ok(path) => {
+                    notices.push(format!(
+                        "output truncated to the last {} lines / {}; full output at {}",
+                        self.limits.max_lines,
+                        format_size(self.limits.max_bytes),
+                        path.display()
+                    ));
+                    artifact_path = Some(path);
+                }
                 Err(error) => notices.push(format!(
                     "output truncated to the last {} lines / {} and could not be saved: {error}",
                     self.limits.max_lines,
@@ -587,7 +591,30 @@ impl Tool for ShellTool {
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
-        ToolOutput::ok(text)
+        let mut output = ToolOutput::ok(text);
+        output.metadata.status = if outcome.cancelled {
+            crate::ToolStatus::Cancelled
+        } else if outcome.timed_out {
+            crate::ToolStatus::TimedOut
+        } else if outcome.code != Some(0) {
+            crate::ToolStatus::Failed
+        } else {
+            crate::ToolStatus::Success
+        };
+        output.is_error = output.metadata.status != crate::ToolStatus::Success;
+        output.metadata.details = json!({"exit_code": outcome.code});
+        if let Some(path) = artifact_path {
+            output.metadata.artifacts.push(crate::Artifact {
+                path,
+                media_type: "text/plain".into(),
+            });
+            output.metadata.truncation = Some(crate::TruncationInfo {
+                max_bytes: self.limits.max_bytes,
+                max_lines: self.limits.max_lines,
+                kept: "tail".into(),
+            });
+        }
+        output
     }
 }
 
@@ -689,7 +716,10 @@ mod tests {
             .run(json!({ "command": "false" }), &context(&dir))
             .await;
 
-        assert!(!output.is_error, "the model can react to a failed command");
+        assert!(
+            output.is_error,
+            "a nonzero exit remains a tool error, not a failed turn"
+        );
         assert!(output.text.contains("exit code 3"), "{}", output.text);
     }
 

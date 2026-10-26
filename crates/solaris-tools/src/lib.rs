@@ -34,3 +34,5 @@ pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput};
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size,
 };
+
+pub use solaris_types::{Artifact, ToolMetadata, ToolStatus, TruncationInfo};

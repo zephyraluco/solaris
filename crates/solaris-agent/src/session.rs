@@ -77,13 +77,13 @@ pub(crate) struct TurnInput {
 pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     // A cancel belongs to one turn. Clearing it here is what keeps a stop that
     // arrived after the last turn from stopping this one.
-    input.cancel.reset();
+    let turn_cancel = input.cancel.begin_turn();
 
     let TurnInput {
         inner,
         tools,
         options,
-        cancel,
+        cancel: _,
         steering,
         follow_up,
         conversation,
@@ -104,7 +104,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         approver: Arc::clone(&options.approver),
         cwd: options.cwd.clone(),
         temp_dir: options.temp_dir.clone(),
-        cancel,
+        cancel: turn_cancel,
         steering,
         follow_up,
         conversation,
@@ -613,6 +613,23 @@ impl Runner {
             .into();
         };
 
+        // External schema retrieval is disabled in the dependency features.
+        // Validate before approvals or side effects, including extension tools.
+        let schema = tool.parameters();
+        let validator = match jsonschema::validator_for(&schema) {
+            Ok(validator) => validator,
+            Err(error) => {
+                return ToolResult::error(call, format!("invalid tool schema: {error}")).into();
+            }
+        };
+        if let Err(error) = validator.validate(&call.input) {
+            return ToolResult::error(
+                call,
+                format!("invalid tool arguments at {}: {error}", error.instance_path),
+            )
+            .into();
+        }
+
         let approval = tokio::select! {
             biased;
             _ = wait_for_cancel(&self.cancel) => return ToolResult::error(call, "the turn was cancelled while waiting for approval").into(),
@@ -677,11 +694,12 @@ impl Runner {
             )
         };
 
-        let result = if output.is_error {
+        let mut result = if output.is_error {
             ToolResult::error(call, output.text)
         } else {
             ToolResult::ok(call, output.text)
         };
+        result.metadata = output.metadata;
         CallOutcome {
             result,
             usage,

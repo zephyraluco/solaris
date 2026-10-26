@@ -24,6 +24,8 @@ pub struct ToolOutput {
     /// Whether the tool failed. A failure is still a result: the turn goes on so
     /// the model can react to it.
     pub is_error: bool,
+    /// Structured display and execution data; never parsed from text.
+    pub metadata: Box<solaris_types::ToolMetadata>,
 }
 
 impl ToolOutput {
@@ -32,6 +34,7 @@ impl ToolOutput {
         Self {
             text: text.into(),
             is_error: false,
+            metadata: Box::default(),
         }
     }
 
@@ -40,6 +43,10 @@ impl ToolOutput {
         Self {
             text: text.into(),
             is_error: true,
+            metadata: Box::new(solaris_types::ToolMetadata {
+                status: solaris_types::ToolStatus::Failed,
+                ..Default::default()
+            }),
         }
     }
 }
@@ -50,7 +57,10 @@ impl ToolOutput {
 /// in flight has to be killed rather than left running for a model that is no
 /// longer listening.
 #[derive(Debug, Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel {
+    current: Arc<std::sync::Mutex<Arc<AtomicBool>>>,
+    token: Option<Arc<AtomicBool>>,
+}
 
 impl Cancel {
     /// A handle that has not been cancelled.
@@ -58,22 +68,37 @@ impl Cancel {
         Self::default()
     }
 
-    /// Ask whatever holds a clone of this to stop.
+    fn token(&self) -> Arc<AtomicBool> {
+        self.token
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.current.lock().unwrap_or_else(|p| p.into_inner())))
+    }
+
+    /// Stop this generation, or the active generation when used as a controller.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.token().store(true, Ordering::Release);
     }
 
-    /// Clear the stop request, so the handle can be used for a later turn.
-    ///
-    /// A session keeps one handle across turns; without this, a cancel that
-    /// ended one turn would end every turn after it.
+    /// Start a new generation without reviving old workers.
+    pub fn begin_turn(&self) -> Self {
+        let token = Arc::new(AtomicBool::new(false));
+        let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        current.store(true, Ordering::Release);
+        *current = Arc::clone(&token);
+        Self {
+            current: Arc::clone(&self.current),
+            token: Some(token),
+        }
+    }
+
+    /// Reset the controller for callers that do not need a generation handle.
     pub fn reset(&self) {
-        self.0.store(false, Ordering::Relaxed);
+        drop(self.begin_turn());
     }
 
-    /// Whether that has happened.
+    /// Whether this generation has been cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.token().load(Ordering::Acquire)
     }
 }
 
@@ -235,6 +260,18 @@ pub fn optional_bool_arg(input: &Value, field: &str) -> Result<Option<bool>, Too
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_new_turn_never_revives_an_old_cancellation_token() {
+        let controller = Cancel::new();
+        let old = controller.begin_turn();
+        old.cancel();
+        let current = controller.begin_turn();
+        assert!(old.is_cancelled());
+        assert!(!current.is_cancelled());
+        controller.cancel();
+        assert!(current.is_cancelled());
+    }
 
     #[test]
     fn arguments_that_are_not_an_object_are_reported_once() {

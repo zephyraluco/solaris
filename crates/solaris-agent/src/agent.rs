@@ -520,6 +520,39 @@ mod tests {
         std::fs::remove_dir_all(path).expect("cleanup");
     }
 
+    #[tokio::test]
+    async fn invalid_arguments_are_rejected_before_a_tool_can_write() {
+        let dir = std::env::temp_dir().join(format!("solaris-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let call = ToolCall::new(
+            "bad-write",
+            "write",
+            json!({"path": "should-not-exist", "content": 42}),
+        );
+        let inner = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(call),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ],
+            vec![AgentEvent::TurnComplete {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0,
+            }],
+        ]);
+        let agent = Agent::new(
+            choice(inner),
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::in_directory(&dir),
+        );
+        let events = drain(agent.run_turn("write", Mode::Build)).await;
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.is_error && result.output.contains("invalid tool arguments"))));
+        assert!(!dir.join("should-not-exist").exists());
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.
     struct Scripted {

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/solaris-types",
 	"crates/solaris-provider",
 	"crates/solaris-backend",
 	"crates/solaris-tools",
@@ -16,6 +17,7 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
+solaris-types = { path = "crates/solaris-types", version = "0.1.0" }
 # Internal crates
 solaris-provider = { path = "crates/solaris-provider", version = "0.1.0" }
 solaris-backend = { path = "crates/solaris-backend", version = "0.1.0" }

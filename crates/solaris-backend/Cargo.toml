@@ -10,6 +10,7 @@ description = "Agent backend abstraction and provider clients for solaris"
 workspace = true
 
 [dependencies]
+solaris-types = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

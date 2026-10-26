@@ -191,6 +191,9 @@ impl SubagentRunner {
         let Ok(_permit) = self.slots.acquire().await else {
             return ToolOutput::error("subagent execution is closed");
         };
+        if ctx.is_cancelled() || tx.is_closed() {
+            return ToolOutput::error("subagent was cancelled before acquiring an execution slot");
+        }
         let _ = tx.send(AgentEvent::Status(format!("subagent {task_id}: running")));
 
         let mode = match task.agent {
