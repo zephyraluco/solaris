@@ -38,6 +38,8 @@ fn calling(name: &str, input: Value) -> Vec<AgentEvent> {
 struct Model {
     seen: Mutex<Vec<TurnRequest>>,
     kind: &'static str,
+    model_override: Option<String>,
+    resume_id: Option<String>,
     child_tool: Option<&'static str>,
     fail: bool,
     endless: bool,
@@ -53,6 +55,8 @@ impl Model {
         Self {
             seen: Mutex::default(),
             kind,
+            model_override: None,
+            resume_id: None,
             child_tool: None,
             fail: false,
             endless: false,
@@ -127,10 +131,14 @@ impl AgentBackend for Model {
                 },
             ]
         } else {
-            calling(
-                "subagent",
-                json!({"agent":self.kind,"prompt":"Investigate the delegated task"}),
-            )
+            let mut input = json!({"agent":self.kind,"prompt":"Investigate the delegated task"});
+            if let Some(model) = &self.model_override {
+                input["model"] = json!(model);
+            }
+            if let Some(id) = &self.resume_id {
+                input["resume_id"] = json!(id);
+            }
+            calling("subagent", input)
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -595,4 +603,53 @@ fn delegation_can_be_disabled_or_excluded_by_tool_selection() {
             })
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store = solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite"))
+        .expect("store");
+    let journal = store
+        .create(directory.path(), "test-model", None)
+        .expect("parent");
+    let parent_id = journal.id().to_string();
+    let mut model = Model::new("explore");
+    model.model_override = Some("child-model".into());
+    let model = Arc::new(model);
+    let child_model = Arc::clone(&model);
+    let factory_called = Arc::new(AtomicUsize::new(0));
+    let called = Arc::clone(&factory_called);
+    let mut options = AgentOptions::in_directory(directory.path());
+    options.child_backend = Some(Arc::new(move |name| {
+        assert_eq!(name, "child-model");
+        called.fetch_add(1, Ordering::SeqCst);
+        Ok(BackendChoice {
+            backend: child_model.clone(),
+            provider_id: None,
+            base_url: None,
+            model: name.into(),
+            source: CredentialSource::None,
+        })
+    }));
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    parent.attach_journal(journal).expect("attach");
+    let events = run(&parent, Mode::Build).await;
+    assert_eq!(factory_called.load(Ordering::SeqCst), 1);
+    let sessions = store.list(directory.path()).expect("list");
+    let child = sessions
+        .iter()
+        .find(|session| session.parent_id.as_deref() == Some(&parent_id))
+        .expect("child session");
+    assert_eq!(child.model, "child-model");
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::SubagentSession { session_id, .. } if session_id == &child.id)));
+    let restored = store.resume(&child.id).expect("child is no longer running");
+    assert!(
+        restored
+            .context()
+            .expect("context")
+            .iter()
+            .any(|message| message.text().starts_with("You are an isolated"))
+    );
+    assert!(parent.active_tasks().is_empty());
 }

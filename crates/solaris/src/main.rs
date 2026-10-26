@@ -417,6 +417,11 @@ fn main() -> Result<()> {
             .with_skills(skills)
             .with_prompt_context(resources.prompt);
         options.execution = execution;
+        let child_auth = auth.clone();
+        let child_options = backend_options.clone();
+        options.child_backend = Some(Arc::new(move |model| {
+            Ok(choose_backend(&child_auth, model, child_options.clone()))
+        }));
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {

@@ -111,6 +111,16 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "Exit solaris",
         args: "",
     },
+    SlashCommandSpec {
+        name: "subagents",
+        description: "List active and queued child task IDs",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "stop",
+        description: "Cancel one child without stopping its parent",
+        args: "<task-id>",
+    },
 ];
 
 // ------------------------------------------------------------ the parsing

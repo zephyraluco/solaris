@@ -231,6 +231,8 @@ fn with_tools(
     cwd: &Path,
     approver: Arc<dyn Approver>,
     execution: &solaris_agent::ExecutionSettings,
+    factory: &BackendFactory,
+    auth: &AuthStore,
 ) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
     let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
@@ -238,6 +240,9 @@ fn with_tools(
         .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     options.execution = execution.clone();
+    let factory = Arc::clone(factory);
+    let auth = auth.clone();
+    options.child_backend = Some(Arc::new(move |model| Ok(factory(&auth, model))));
     let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
         choice, registry, options,
     )));
@@ -411,6 +416,8 @@ impl App {
             &cwd,
             Arc::clone(&approver),
             &execution,
+            &backend_factory,
+            &auth,
         );
 
         if let Some(journal) = &journal {
@@ -570,6 +577,8 @@ impl App {
             &self.cwd,
             Arc::clone(&self.approver),
             &self.execution,
+            &self.backend_factory,
+            &self.auth,
         );
         if let Some(journal) = self.agent.journal() {
             let _ = agent.attach_journal(journal);
@@ -944,6 +953,18 @@ impl App {
                 "a skill is loaded as `{SKILL_PREFIX}<name>` — /skills lists them"
             )),
             "stats" => self.open_stats(),
+            "subagents" => self.notifications.info(format!(
+                "Active tasks: {}",
+                self.agent.active_tasks().join(", ")
+            )),
+            "stop" => {
+                if self.agent.cancel_task(command.args.trim()) {
+                    self.notifications.info("stopping child task");
+                } else {
+                    self.notifications
+                        .warning("no active child with that task ID");
+                }
+            }
             "buddy" => self.open_buddy(args),
             "quit" | "exit" => self.quit.set(true),
             other => self
@@ -1169,6 +1190,18 @@ impl App {
                     // fails. A successful TurnComplete replaces this with totals.
                     turn.usage = turn.usage.merge(usage);
                     turn.cost_usd += cost_usd;
+                }
+            }
+            AgentEvent::SubagentSession {
+                task_id,
+                session_id,
+            } => {
+                if let Some(turn) = self.session.active_turn_mut() {
+                    if let Some(step) = turn.subagent_mut(&task_id) {
+                        if let Some(child) = &mut step.subagent {
+                            child.session_id = Some(session_id);
+                        }
+                    }
                 }
             }
             AgentEvent::SubagentStarted { call_id, task_id } => {

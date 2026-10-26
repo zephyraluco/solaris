@@ -32,6 +32,8 @@ pub struct ToolStep {
 pub struct SubagentStep {
     /// Runtime identity used to route concurrent child tool events.
     pub task_id: Option<String>,
+    /// Saved child context, independent of its transient task ID.
+    pub session_id: Option<String>,
     /// Tool calls inside the child, never mixed into the parent's step list.
     pub steps: Vec<ToolStep>,
     /// The child's final report or failure, not the background launch receipt.

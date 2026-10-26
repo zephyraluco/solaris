@@ -55,6 +55,10 @@ pub struct AgentOptions {
     pub execution: crate::ExecutionSettings,
     /// Existing turn scope when constructing a child; leave None for a root.
     pub shared_budget: Option<Arc<crate::ExecutionBudget>>,
+    /// Optional factory for explicit child model overrides under the current provider.
+    pub child_backend: Option<crate::ChildBackendFactory>,
+    /// Handles for cancelling individual active/queued children.
+    pub tasks: crate::TaskControls,
 }
 
 impl Default for AgentOptions {
@@ -71,6 +75,8 @@ impl Default for AgentOptions {
             subagents: true,
             execution: crate::ExecutionSettings::default(),
             shared_budget: None,
+            child_backend: None,
+            tasks: crate::TaskControls::default(),
         }
     }
 }
@@ -209,6 +215,13 @@ impl Agent {
     /// Attached persistent session, if enabled by the caller.
     pub fn journal(&self) -> Option<Arc<crate::SessionJournal>> {
         self.conversation.journal()
+    }
+
+    pub fn active_tasks(&self) -> Vec<String> {
+        self.options.tasks.active()
+    }
+    pub fn cancel_task(&self, id: &str) -> bool {
+        self.options.tasks.cancel(id)
     }
 
     /// A handle that stops a turn in flight: a running command is killed and no
@@ -414,6 +427,7 @@ impl Agent {
             .then(|| {
                 Arc::new(SubagentRunner {
                     choice: self.choice.clone(),
+                    parent: self.journal(),
                     registry: Arc::clone(&self.registry),
                     options: turn_options.clone(),
                     resources: resources.clone(),

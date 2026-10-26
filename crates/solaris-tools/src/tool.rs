@@ -60,6 +60,7 @@ impl ToolOutput {
 pub struct Cancel {
     current: Arc<std::sync::Mutex<Arc<AtomicBool>>>,
     token: Option<Arc<AtomicBool>>,
+    parents: Arc<Vec<Arc<AtomicBool>>>,
 }
 
 impl Cancel {
@@ -88,6 +89,7 @@ impl Cancel {
         Self {
             current: Arc::clone(&self.current),
             token: Some(token),
+            parents: Arc::clone(&self.parents),
         }
     }
 
@@ -99,6 +101,25 @@ impl Cancel {
     /// Whether this generation has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.token().load(Ordering::Acquire)
+            || self
+                .parents
+                .iter()
+                .any(|parent| parent.load(Ordering::Acquire))
+    }
+
+    /// Independent cancellation that still observes its parent's generation.
+    pub fn child(&self) -> Self {
+        let mut parents = self.parents.as_ref().clone();
+        parents.push(self.token());
+        Self {
+            parents: Arc::new(parents),
+            ..Self::new()
+        }
+    }
+
+    /// Compare generation identities for task-registry cleanup.
+    pub fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.token(), &other.token())
     }
 }
 

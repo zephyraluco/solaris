@@ -31,6 +31,8 @@ pub enum AgentEvent {
     /// Associates a running child with the parent tool call that launched it.
     /// Display-only: these events never become parent conversation messages.
     SubagentStarted { call_id: String, task_id: String },
+    /// Durable session identity associated with a child task.
+    SubagentSession { task_id: String, session_id: String },
     /// A tool requested inside one child, not a top-level parent tool call.
     SubagentToolCall { task_id: String, call: ToolCall },
     /// The matching child tool result, kept under that child's transcript row.
