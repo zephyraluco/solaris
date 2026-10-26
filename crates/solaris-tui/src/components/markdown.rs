@@ -207,10 +207,11 @@ fn bullet_content(line: &str) -> Option<(String, &str)> {
     }
 
     let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if !digits.is_empty() && digits.len() <= 3 {
-        if let Some(rest) = line[digits.len()..].strip_prefix(". ") {
-            return Some((format!("{digits}. "), rest));
-        }
+    if !digits.is_empty()
+        && digits.len() <= 3
+        && let Some(rest) = line[digits.len()..].strip_prefix(". ")
+    {
+        return Some((format!("{digits}. "), rest));
     }
     None
 }
@@ -223,16 +224,16 @@ fn parse_inline(text: &str, base: Style, style: &MarkdownStyle) -> Vec<Styled> {
 
     while index < chars.len() {
         // Inline code: `…`
-        if chars[index] == '`' {
-            if let Some(end) = find_char(&chars, index + 1, '`') {
-                flush(&mut out, &mut buffer, base);
-                out.push(Styled {
-                    text: chars[index + 1..end].iter().collect(),
-                    style: style.code,
-                });
-                index = end + 1;
-                continue;
-            }
+        if chars[index] == '`'
+            && let Some(end) = find_char(&chars, index + 1, '`')
+        {
+            flush(&mut out, &mut buffer, base);
+            out.push(Styled {
+                text: chars[index + 1..end].iter().collect(),
+                style: style.code,
+            });
+            index = end + 1;
+            continue;
         }
 
         // Bold: **…** and italic: *…*

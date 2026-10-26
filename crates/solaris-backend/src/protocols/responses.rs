@@ -172,10 +172,10 @@ impl ResponsesStream {
             // The arguments of a call stream in after the item that announces it.
             "response.function_call_arguments.delta" => {
                 let key = data["item_id"].as_str().unwrap_or_default();
-                if let Some(call) = self.calls.get_mut(key) {
-                    if let Some(delta) = data["delta"].as_str() {
-                        call.arguments.push_str(delta);
-                    }
+                if let Some(call) = self.calls.get_mut(key)
+                    && let Some(delta) = data["delta"].as_str()
+                {
+                    call.arguments.push_str(delta);
                 }
             }
             // A server may send the finished item instead of the deltas.

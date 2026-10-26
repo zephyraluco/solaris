@@ -1,0 +1,18 @@
+[package]
+name = "solaris-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP tools through the Solaris execution contract"
+[lints]
+workspace = true
+[dependencies]
+solaris-tools = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "net"] }
+rmcp = { version = "3.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy", "stream"] }

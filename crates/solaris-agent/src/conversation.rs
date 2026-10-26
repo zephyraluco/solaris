@@ -73,11 +73,11 @@ impl Conversation {
         if self.error().is_some() {
             return false;
         }
-        if let Some(journal) = self.journal() {
-            if let Err(error) = journal.append(&record) {
-                *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
-                return false;
-            }
+        if let Some(journal) = self.journal()
+            && let Err(error) = journal.append(&record)
+        {
+            *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+            return false;
         }
         true
     }

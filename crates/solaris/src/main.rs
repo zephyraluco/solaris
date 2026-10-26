@@ -67,6 +67,14 @@ struct Args {
     #[arg(long, requires = "print")]
     json: bool,
 
+    /// MCP configuration; defaults to mcp.json in the user config directory.
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+
+    /// Connect configured MCP servers, report status, and exit.
+    #[arg(long)]
+    mcp_status: bool,
+
     /// Fork a saved session in this directory before running.
     #[arg(long, conflicts_with_all = ["resume", "continue_session", "ephemeral"])]
     fork: Option<String>,
@@ -144,13 +152,7 @@ fn main() -> Result<()> {
     };
     // A name that matches nothing is almost always a typo, and silently
     // declaring nothing would look like the tool simply refused to run.
-    let registry = solaris_agent::agent_tool_registry();
-    for entry in registry.unmatched(&tools) {
-        eprintln!(
-            "solaris: no tool named `{entry}` on this platform — available: {}",
-            registry.names().join(", ")
-        );
-    }
+    let mut registry = solaris_agent::agent_tool_registry();
 
     let state_dir = config_dir();
     let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
@@ -187,24 +189,24 @@ fn main() -> Result<()> {
     // What the last session left, unless this run overrides it: a flag always
     // wins, so `--plan` in a script keeps meaning plan. The model follows the
     // provider it was chosen for, and is kept in `auth.json` beside it.
-    if args.theme.is_none() {
-        if let Some(theme) = &settings.theme {
-            config.theme = theme.clone();
-        }
+    if args.theme.is_none()
+        && let Some(theme) = &settings.theme
+    {
+        config.theme = theme.clone();
     }
-    if !args.plan {
-        if let Some(mode) = settings.mode {
-            config.mode = mode;
-        }
+    if !args.plan
+        && let Some(mode) = settings.mode
+    {
+        config.mode = mode;
     }
 
     // Without `--model`, a session starts on the model this provider was last
     // used with: the catalogue's first entry is a fallback, not a decision, and
     // reconnecting should not quietly move the user onto it.
-    if args.model.is_none() {
-        if let Some(model) = auth.active_model() {
-            config.model = model.to_string();
-        }
+    if args.model.is_none()
+        && let Some(model) = auth.active_model()
+    {
+        config.model = model.to_string();
     }
 
     let backend_options = BackendOptions::default();
@@ -348,7 +350,7 @@ fn main() -> Result<()> {
             .rules
             .iter()
             .any(|r| r.effect == solaris_agent::PermissionEffect::Ask);
-    let journal = if args.ephemeral {
+    let journal = if args.ephemeral || args.mcp_status {
         None
     } else {
         let directory = config_dir()
@@ -410,6 +412,43 @@ fn main() -> Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new()?;
     let _guard = runtime.enter();
+    let mcp_path = args
+        .mcp_config
+        .clone()
+        .or_else(|| config_dir().map(|dir| dir.join("mcp.json")));
+    let mcp_config = match mcp_path.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => serde_json::from_str(&text)?,
+        Some(Err(error))
+            if args.mcp_config.is_some() || error.kind() != std::io::ErrorKind::NotFound =>
+        {
+            return Err(error.into());
+        }
+        _ => solaris_mcp::McpConfig::default(),
+    };
+    let mcp = runtime.block_on(solaris_mcp::McpManager::connect(
+        mcp_config,
+        &std::env::current_dir()?,
+        &mut registry,
+    ));
+    if args.mcp_status {
+        println!("{}", serde_json::to_string_pretty(&mcp.status)?);
+        if mcp.status.iter().any(|server| !server.connected) {
+            anyhow::bail!("one or more MCP servers failed");
+        }
+        return Ok(());
+    }
+    for server in &mcp.status {
+        if !server.connected {
+            eprintln!("MCP {}: {}", server.name, server.message);
+        }
+    }
+
+    for entry in registry.unmatched(&tools) {
+        eprintln!(
+            "solaris: no tool named `{entry}` on this platform — available: {}",
+            registry.names().join(", ")
+        );
+    }
 
     if let Some(prompt) = &args.print {
         let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
@@ -499,6 +538,7 @@ fn main() -> Result<()> {
         resource_paths: Some(resource_paths),
         ask_approval,
         execution,
+        registry: Some(registry),
         journal,
     });
     tui.set_root(Box::new(app));

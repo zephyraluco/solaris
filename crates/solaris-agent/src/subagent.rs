@@ -217,14 +217,29 @@ impl SubagentRunner {
         };
         // An explicit allowlist/exclusion applies to the child too. Explore can
         // search/list even when Build's default declaration prefers the shell.
+        let mut defaults = default_tool_names(mode).to_vec();
+        let external: Vec<String> = self
+            .registry
+            .names()
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("mcp_")
+                    && self
+                        .registry
+                        .get(name)
+                        .is_some_and(|tool| mode == Mode::Build || tool.is_read_only())
+            })
+            .collect();
+        defaults.extend(external.iter().map(String::as_str));
+        if self.registry.get("tool_search").is_some() {
+            defaults.push("tool_search");
+        }
         let tools = self
             .registry
-            .select(default_tool_names(mode), &self.options.selection)
+            .select(&defaults, &self.options.selection)
             .into_iter()
             .filter(|tool| tool.name() != SUBAGENT_TOOL)
-            .filter(|tool| {
-                mode != Mode::Plan || matches!(tool.name(), "read" | "grep" | "find" | "ls")
-            })
+            .filter(|tool| mode != Mode::Plan || tool.is_read_only())
             .collect();
         let registry = Arc::new(ToolRegistry::with_tools(tools));
         let mut choice = if let Some(model) = &task.model {
@@ -294,10 +309,10 @@ impl SubagentRunner {
             None
         };
         let session_id = journal.as_ref().map(|journal| journal.id().to_string());
-        if let Some(journal) = journal {
-            if let Err(error) = child.attach_journal(journal) {
-                return ToolOutput::error(error.to_string());
-            }
+        if let Some(journal) = journal
+            && let Err(error) = child.attach_journal(journal)
+        {
+            return ToolOutput::error(error.to_string());
         }
         if let Some(session_id) = &session_id {
             let _ = tx.send(AgentEvent::SubagentSession {

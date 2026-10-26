@@ -486,10 +486,10 @@ impl ConnectFlow {
                 if !rect_contains(self.last_area, mouse.column, mouse.row) {
                     return ConnectOutcome::Handled;
                 }
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    if let Some(field) = self.field_at_row(mouse.row) {
-                        self.field = field;
-                    }
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && let Some(field) = self.field_at_row(mouse.row)
+                {
+                    self.field = field;
                 }
                 ConnectOutcome::Handled
             }
@@ -608,24 +608,22 @@ impl ConnectFlow {
 
         let (mut lines, field_rows) = self.field_block(width);
         for &(row, field) in &field_rows {
-            if field == self.field {
-                if let Some(line) = lines.get_mut(row) {
-                    let text: String = line
-                        .spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect();
-                    let clipped = field_tail(&text, usize::from(width));
-                    *line = Line::from(Span::styled(clipped, self.styles.text));
-                    let column = line
-                        .width()
-                        .saturating_sub(1)
-                        .min(usize::from(width.saturating_sub(1)))
-                        as u16;
-                    if row < usize::from(body_area.height) {
-                        self.terminal_cursor =
-                            Some((body_area.x + column, body_area.y + row as u16));
-                    }
+            if field == self.field
+                && let Some(line) = lines.get_mut(row)
+            {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                let clipped = field_tail(&text, usize::from(width));
+                *line = Line::from(Span::styled(clipped, self.styles.text));
+                let column = line
+                    .width()
+                    .saturating_sub(1)
+                    .min(usize::from(width.saturating_sub(1))) as u16;
+                if row < usize::from(body_area.height) {
+                    self.terminal_cursor = Some((body_area.x + column, body_area.y + row as u16));
                 }
             }
         }

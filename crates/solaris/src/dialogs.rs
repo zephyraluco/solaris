@@ -286,17 +286,17 @@ impl Component for SelectDialog {
             }
         }
 
-        if let Some(label) = &self.label {
-            if content.height > 2 {
-                buf.set_string(
-                    content.x,
-                    content.y,
-                    truncate_to_width(label, content.width as usize, "…"),
-                    self.styles.text,
-                );
-                content.y += 2;
-                content.height -= 2;
-            }
+        if let Some(label) = &self.label
+            && content.height > 2
+        {
+            buf.set_string(
+                content.x,
+                content.y,
+                truncate_to_width(label, content.width as usize, "…"),
+                self.styles.text,
+            );
+            content.y += 2;
+            content.height -= 2;
         }
 
         self.list.render(buf, content);

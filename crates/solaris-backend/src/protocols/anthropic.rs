@@ -249,10 +249,10 @@ impl AnthropicStream {
                 }
                 Some("input_json_delta") => {
                     let index = data["index"].as_u64().unwrap_or(0);
-                    if let Some(call) = self.calls.get_mut(&index) {
-                        if let Some(fragment) = data["delta"]["partial_json"].as_str() {
-                            call.arguments.push_str(fragment);
-                        }
+                    if let Some(call) = self.calls.get_mut(&index)
+                        && let Some(fragment) = data["delta"]["partial_json"].as_str()
+                    {
+                        call.arguments.push_str(fragment);
                     }
                 }
                 // Thinking signatures are of no use to a text transcript.

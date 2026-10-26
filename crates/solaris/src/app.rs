@@ -140,6 +140,8 @@ pub struct AppOptions {
     /// Optional persistent transcript and model context.
     pub journal: Option<Arc<solaris_agent::SessionJournal>>,
     pub execution: solaris_agent::ExecutionSettings,
+    /// Optional registry populated with external tools before UI startup.
+    pub registry: Option<ToolRegistry>,
 }
 
 impl AppOptions {
@@ -189,6 +191,7 @@ impl AppOptions {
             ask_approval: false,
             journal: None,
             execution: solaris_agent::ExecutionSettings::default(),
+            registry: None,
         }
     }
 }
@@ -391,11 +394,12 @@ impl App {
             ask_approval,
             journal,
             execution,
+            registry,
         } = options;
 
         let mut config = config;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let registry = Arc::new(ToolRegistry::builtin());
+        let registry = Arc::new(registry.unwrap_or_else(ToolRegistry::builtin));
 
         // A session that asks before acting gets a channel the UI drains; one
         // that does not approves everything, which is what a test wants.
@@ -1102,17 +1106,16 @@ impl App {
             );
             return;
         }
-        if self.auth.active_provider() == Some("openai") {
-            if let Some(credential) = self
+        if self.auth.active_provider() == Some("openai")
+            && let Some(credential) = self
                 .auth
                 .credential("openai")
                 .filter(|c| solaris_provider::oauth::needs_refresh(c))
                 .cloned()
-            {
-                self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
-                self.notifications.info("Refreshing OpenAI authorization…");
-                return;
-            }
+        {
+            self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
+            self.notifications.info("Refreshing OpenAI authorization…");
+            return;
         }
         let prompt = match self.agent.expand_input(&prompt) {
             Ok(prompt) => prompt,
@@ -1196,25 +1199,23 @@ impl App {
                 task_id,
                 session_id,
             } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    if let Some(step) = turn.subagent_mut(&task_id) {
-                        if let Some(child) = &mut step.subagent {
-                            child.session_id = Some(session_id);
-                        }
-                    }
+                if let Some(turn) = self.session.active_turn_mut()
+                    && let Some(step) = turn.subagent_mut(&task_id)
+                    && let Some(child) = &mut step.subagent
+                {
+                    child.session_id = Some(session_id);
                 }
             }
             AgentEvent::SubagentStarted { call_id, task_id } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    if let Some(child) = turn
+                if let Some(turn) = self.session.active_turn_mut()
+                    && let Some(child) = turn
                         .steps
                         .iter_mut()
                         .rev()
                         .find(|step| step.call.id == call_id)
                         .and_then(|step| step.subagent.as_mut())
-                    {
-                        child.task_id = Some(task_id);
-                    }
+                {
+                    child.task_id = Some(task_id);
                 }
             }
             AgentEvent::SubagentToolCall { task_id, call } => {
@@ -1237,15 +1238,13 @@ impl App {
                     .active_turn_mut()
                     .and_then(|turn| turn.subagent_mut(&task_id))
                     .and_then(|step| step.subagent.as_mut())
-                {
-                    if let Some(step) = child
+                    && let Some(step) = child
                         .steps
                         .iter_mut()
                         .rev()
                         .find(|step| step.call.id == result.id && !step.is_done())
-                    {
-                        step.finish(result, duration_ms);
-                    }
+                {
+                    step.finish(result, duration_ms);
                 }
             }
             AgentEvent::SubagentComplete {
@@ -1398,7 +1397,12 @@ impl App {
     fn request_approval(&mut self, request: ApprovalRequest) {
         let ApprovalRequest { call, reply } = request;
 
-        if read_only(&call.name) {
+        if read_only(&call.name)
+            || self
+                .registry
+                .get(&call.name)
+                .is_some_and(|tool| tool.is_read_only())
+        {
             let _ = reply.send(Approval::Approved);
             return;
         }
@@ -1630,19 +1634,14 @@ impl App {
                 self.models_error = None;
                 self.discovered = models;
 
-                if adopt {
-                    if let Some(first) = self.discovered.first().cloned() {
-                        self.config.model = first;
-                        if self.uses_chatgpt() {
-                            let choice = resolve_backend(
-                                &self.backend_factory,
-                                &self.auth,
-                                &mut self.config,
-                            );
-                            self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
-                        } else {
-                            self.rebuild_backend();
-                        }
+                if adopt && let Some(first) = self.discovered.first().cloned() {
+                    self.config.model = first;
+                    if self.uses_chatgpt() {
+                        let choice =
+                            resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+                        self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                    } else {
+                        self.rebuild_backend();
                     }
                 }
                 let count = self.discovered.len();
@@ -2899,7 +2898,7 @@ impl Component for App {
         }
         if self.session.is_streaming() {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
-            if self.spinner_frame % 6 == 0 {
+            if self.spinner_frame.is_multiple_of(6) {
                 dirty = true;
             }
         }

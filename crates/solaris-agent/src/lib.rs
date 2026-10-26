@@ -82,3 +82,5 @@ pub use runtime::{RuntimeCommand, SessionRuntime};
 pub type ChildBackendFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<solaris_provider::BackendChoice, String> + Send + Sync>;
 pub use subagent::TaskControls;
+
+mod tool_search;

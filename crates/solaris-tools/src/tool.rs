@@ -169,6 +169,11 @@ pub enum ExecutionMode {
 /// One thing the model can ask for.
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// Local capability classification; unknown tools are treated as mutating.
+    fn is_read_only(&self) -> bool {
+        matches!(self.name(), "read" | "grep" | "find" | "ls")
+    }
+
     /// Name the model calls it by.
     fn name(&self) -> &str;
 

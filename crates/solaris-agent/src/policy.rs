@@ -33,6 +33,7 @@ pub struct PermissionRule {
 
 pub struct PolicyApprover {
     pub profile: PolicyProfile,
+    pub read_only_tools: std::collections::BTreeSet<String>,
     pub cwd: PathBuf,
     pub rules: Vec<PermissionRule>,
     pub fallback: Arc<dyn Approver>,
@@ -91,7 +92,8 @@ fn normalized(path: &Path) -> Result<PathBuf, std::io::Error> {
 #[async_trait]
 impl Approver for PolicyApprover {
     async fn approve(&self, call: &ToolCall) -> Approval {
-        let read_only = matches!(call.name.as_str(), "read" | "grep" | "find" | "ls")
+        let read_only = call.name == "tool_search"
+            || self.read_only_tools.contains(&call.name)
             || (call.name == "subagent" && call.input["agent"] == "explore");
         // This upper bound cannot be relaxed by a rule inherited by a child.
         if self.profile == PolicyProfile::ReadOnly && !read_only {
@@ -151,6 +153,7 @@ mod tests {
     async fn a_rule_cannot_raise_the_read_only_ceiling() {
         let policy = PolicyApprover {
             profile: PolicyProfile::ReadOnly,
+            read_only_tools: ["read".into()].into_iter().collect(),
             cwd: std::env::current_dir().expect("cwd"),
             rules: vec![PermissionRule {
                 tool: "*".into(),

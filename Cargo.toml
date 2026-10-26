@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/solaris-mcp",
     "crates/solaris-types",
 	"crates/solaris-provider",
 	"crates/solaris-backend",
@@ -13,10 +14,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
+solaris-mcp = { path = "crates/solaris-mcp", version = "0.1.0" }
 solaris-types = { path = "crates/solaris-types", version = "0.1.0" }
 # Internal crates
 solaris-provider = { path = "crates/solaris-provider", version = "0.1.0" }
@@ -46,7 +48,7 @@ clap = { version = "4", features = ["derive"] }
 # --locked` picks all of this up. Anything below is an error, so a new warning
 # cannot land quietly.
 [workspace.lints.rust]
-future-incompatible = "warn"
+future_incompatible = "warn"
 # A group, so it needs a priority below the individual lints it covers.
 nonstandard_style = { level = "deny", priority = -1 }
 

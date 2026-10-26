@@ -101,11 +101,25 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         inner,
         budget: Arc::clone(&budget),
     });
-    let specs = tools
+    let specs: Vec<ToolSpec> = tools
         .iter()
         .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
         .collect();
+    let lazy_tools = specs.iter().any(|spec| spec.name == "tool_search")
+        && specs
+            .iter()
+            .filter(|spec| spec.name.starts_with("mcp_"))
+            .count()
+            > 8;
+    let active_tools = std::sync::Mutex::new(
+        specs
+            .iter()
+            .filter(|spec| !lazy_tools || !spec.name.starts_with("mcp_"))
+            .map(|spec| spec.name.clone())
+            .collect(),
+    );
     let runner = Runner {
+        active_tools,
         inner,
         budget: Arc::clone(&budget),
         tools,
@@ -157,6 +171,7 @@ struct Runner {
     budget: Arc<crate::ExecutionBudget>,
     tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
+    active_tools: std::sync::Mutex<std::collections::BTreeSet<String>>,
     approver: Arc<dyn Approver>,
     cwd: PathBuf,
     temp_dir: PathBuf,
@@ -332,7 +347,14 @@ impl Runner {
             // The prompt is already in the conversation: this loop records it
             // before it asks anything.
             prompt: String::new(),
-            tools: self.specs.clone(),
+            tools: {
+                let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+                self.specs
+                    .iter()
+                    .filter(|spec| active.contains(&spec.name))
+                    .cloned()
+                    .collect()
+            },
         };
 
         let result = tokio::select! {
@@ -677,12 +699,11 @@ impl Runner {
         if let Some(error) = self.conversation.error() {
             return ToolResult::error(call, error).into();
         }
-        if let Some(journal) = self.conversation.journal() {
-            if let Err(error) =
+        if let Some(journal) = self.conversation.journal()
+            && let Err(error) =
                 journal.append(&crate::SessionRecord::ToolIntent { call: call.clone() })
-            {
-                return ToolResult::error(call, error.to_string()).into();
-            }
+        {
+            return ToolResult::error(call, error.to_string()).into();
         }
         let ctx = ToolContext {
             cwd: self.cwd.clone(),
@@ -692,7 +713,44 @@ impl Runner {
             ),
             cancel: self.cancel.clone(),
         };
-        let (output, usage, cost_usd) = if call.name == SUBAGENT_TOOL {
+        let (output, usage, cost_usd) = if call.name == "tool_search" {
+            let query = call.input["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            let terms: Vec<_> = query.split_whitespace().collect();
+            let limit = call.input["limit"].as_u64().unwrap_or(5).min(8) as usize;
+            let mut matches: Vec<_> = self
+                .specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("mcp_"))
+                .filter_map(|spec| {
+                    let text = format!("{} {}", spec.name, spec.description).to_lowercase();
+                    let score = terms.iter().filter(|term| text.contains(**term)).count();
+                    (score > 0).then_some((score, spec))
+                })
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+            let found: Vec<_> = matches
+                .into_iter()
+                .take(limit)
+                .map(|(_, spec)| spec)
+                .collect();
+            {
+                let mut active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+                active.retain(|name| !name.starts_with("mcp_"));
+                for spec in &found {
+                    active.insert(spec.name.clone());
+                }
+            }
+            (
+                solaris_tools::ToolOutput::ok(
+                    serde_json::json!({"tools":found,"available_next_round":true}).to_string(),
+                ),
+                Usage::default(),
+                0.0,
+            )
+        } else if call.name == SUBAGENT_TOOL {
             let Some(subagent) = &self.subagent else {
                 return ToolResult::error(call, "subagent delegation is disabled in this session")
                     .into();
@@ -1068,7 +1126,7 @@ mod tests {
             if self.fail {
                 ToolOutput::error("it went wrong")
             } else {
-                ToolOutput::ok("done")
+                solaris_tools::ToolOutput::ok("done")
             }
         }
     }

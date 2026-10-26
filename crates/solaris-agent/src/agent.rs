@@ -168,6 +168,11 @@ impl Agent {
     ) -> Self {
         options.approver = Arc::new(crate::PolicyApprover {
             profile: options.execution.profile,
+            read_only_tools: registry
+                .names()
+                .into_iter()
+                .filter(|name| registry.get(name).is_some_and(|tool| tool.is_read_only()))
+                .collect(),
             cwd: options.cwd.clone(),
             rules: options.execution.rules.clone(),
             fallback: Arc::clone(&options.approver),
@@ -175,6 +180,19 @@ impl Agent {
         let registry = if options.subagents {
             let mut registry = registry.as_ref().clone();
             registry.add(Arc::new(SubagentTool));
+            Arc::new(registry)
+        } else {
+            registry
+        };
+        let registry = if registry
+            .names()
+            .iter()
+            .filter(|name| name.starts_with("mcp_"))
+            .count()
+            > 8
+        {
+            let mut registry = registry.as_ref().clone();
+            registry.add(Arc::new(crate::tool_search::ToolSearch));
             Arc::new(registry)
         } else {
             registry
@@ -345,10 +363,30 @@ impl Agent {
     }
 
     fn turn_tools(&self, mode: Mode) -> Vec<Arc<dyn solaris_tools::Tool>> {
+        let mut defaults: Vec<&str> = default_tool_names(mode).to_vec();
+        let external: Vec<String> = self
+            .registry
+            .names()
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("mcp_")
+                    && self
+                        .registry
+                        .get(name)
+                        .is_some_and(|tool| mode == Mode::Build || tool.is_read_only())
+            })
+            .collect();
+        defaults.extend(external.iter().map(String::as_str));
+        if self.registry.get("tool_search").is_some() {
+            defaults.push("tool_search");
+        }
         self.registry
-            .select(default_tool_names(mode), &self.options.selection)
+            .select(&defaults, &self.options.selection)
             .into_iter()
             .filter(|tool| self.options.subagents || tool.name() != crate::SUBAGENT_TOOL)
+            .filter(|tool| {
+                mode == Mode::Build || !tool.name().starts_with("mcp_") || tool.is_read_only()
+            })
             .collect()
     }
 
@@ -450,14 +488,14 @@ impl Agent {
         drop(resources);
 
         let journal = self.journal();
-        if let Some(journal) = &journal {
-            if let Err(error) = journal.append(&crate::SessionRecord::Prompt {
+        if let Some(journal) = &journal
+            && let Err(error) = journal.append(&crate::SessionRecord::Prompt {
                 text: prompt.clone(),
-            }) {
-                return Box::pin(futures::stream::once(async move {
-                    crate::AgentEvent::Error(error.to_string())
-                }));
-            }
+            })
+        {
+            return Box::pin(futures::stream::once(async move {
+                crate::AgentEvent::Error(error.to_string())
+            }));
         }
         let stream = session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),
@@ -609,6 +647,68 @@ mod tests {
         assert!(
             matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("request budget"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_large_external_catalog_is_declared_only_after_search() {
+        struct External(String);
+        #[async_trait]
+        impl Tool for External {
+            fn name(&self) -> &str {
+                &self.0
+            }
+            fn description(&self) -> &str {
+                "external fixture tool"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                ToolOutput::ok("external reply")
+            }
+        }
+        let done = || AgentEvent::TurnComplete {
+            usage: Usage::new(1, 1),
+            cost_usd: 0.0,
+        };
+        let inner = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(ToolCall::new(
+                    "search",
+                    "tool_search",
+                    json!({"query":"mcp__fixture__tool_4"}),
+                )),
+                done(),
+            ],
+            vec![
+                AgentEvent::ToolCall(ToolCall::new("external", "mcp__fixture__tool_4", json!({}))),
+                done(),
+            ],
+            vec![done()],
+        ]);
+        let tools = (0..9)
+            .map(|index| Arc::new(External(format!("mcp__fixture__tool_{index}"))) as Arc<dyn Tool>)
+            .collect();
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::with_tools(tools)),
+            AgentOptions::default(),
+        );
+        let events = drain(agent.run_turn("use external tool", Mode::Build)).await;
+        let requests = inner.requests();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_"))
+        );
+        assert!(
+            requests[1]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__fixture__tool_4")
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.output == "external reply")));
     }
 
     /// A backend that plays a scripted list of rounds and records what it was

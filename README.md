@@ -45,7 +45,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Session statistics — turns, tokens by bucket, cost and context usage
 > - Credentials, companion and history persisted under the platform config directory
 >
-> **Not yet:** MCP and a device-code sign-in. Browser-based ChatGPT authorization, persistent sessions, and opt-in tool confirmation are available.
+> **Not yet:** a device-code sign-in. MCP tools, resources and prompts are available. Browser-based ChatGPT authorization, persistent sessions, and opt-in tool confirmation are available.
 
 ---
 
@@ -53,7 +53,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 ## Requirements
 
-- **Rust 1.85 or newer** — the workspace uses the 2024 edition.
+- **Rust 1.88 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
 
@@ -390,3 +390,40 @@ unless an explicit policy rule allows the call; they never wait for an invisible
 `--export-session <SESSION_ID>` prints its journal as JSON; exports contain private
 conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
 execution budgets, tool policy, persistence and cancellation.
+
+## MCP servers
+
+Configure `mcp.json` in the user configuration directory, or pass `--mcp-config <PATH>`.
+For example:
+
+```json
+{
+  "servers": {
+    "local": {
+      "transport": "stdio",
+      "command": "my-mcp-server",
+      "args": [],
+      "read_only_tools": ["lookup"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "auth_env": "MY_MCP_TOKEN"
+    }
+  }
+}
+```
+
+`env` on stdio servers maps target variable names to existing environment-variable
+names. Put no secret values in this file. Remote URLs require HTTPS except on
+loopback. TLS verification and inherited proxy settings remain enabled.
+`--mcp-status` connects and reports server status. Failed connections are reported
+without blocking local tools. Explicitly reconnect by restarting the client;
+mutating tool calls are not automatically retried.
+
+Tools use `mcp__<server>__<tool>` names. Resource/prompt discovery uses a separate
+`mcp_meta__<server>__...` namespace. More than eight external tools are exposed via
+`tool_search`, with up to eight matches activated for the following round. Remote
+read-only annotations are not authority: name tools in `read_only_tools` locally
+to expose them to Plan mode. Unknown/mutating tools follow the normal approval
+policy. MCP servers run with their process permissions; this is not a sandbox.

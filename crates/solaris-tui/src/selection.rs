@@ -249,48 +249,39 @@ impl Selection {
         if matches!(
             event.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
-        ) {
-            if let (Some((area, offset, document)), Some(anchor), Some(focus)) =
-                (&self.document, self.anchor, self.focus)
-            {
-                if rect_contains(*area, anchor.0, anchor.1)
-                    && rect_contains(*area, focus.0, focus.1)
-                {
-                    let hit = |point: Point| {
-                        document.anchor(offset + usize::from(point.1 - area.y), point.0 - area.x)
-                    };
-                    let start = self.semantic_press.or_else(|| hit(anchor));
-                    if let (Some(start), Some(end)) = (start, hit(focus)) {
-                        self.semantic_press = Some(start);
-                        if let Some(text) = document.selected_text(start, end) {
-                            self.semantic = Some((start, end, text));
-                        }
+        ) && let (Some((area, offset, document)), Some(anchor), Some(focus)) =
+            (&self.document, self.anchor, self.focus)
+        {
+            if rect_contains(*area, anchor.0, anchor.1) && rect_contains(*area, focus.0, focus.1) {
+                let hit = |point: Point| {
+                    document.anchor(offset + usize::from(point.1 - area.y), point.0 - area.x)
+                };
+                let start = self.semantic_press.or_else(|| hit(anchor));
+                if let (Some(start), Some(end)) = (start, hit(focus)) {
+                    self.semantic_press = Some(start);
+                    if let Some(text) = document.selected_text(start, end) {
+                        self.semantic = Some((start, end, text));
                     }
-                } else {
-                    self.semantic = None;
                 }
+            } else {
+                self.semantic = None;
             }
         }
         if matches!(
             event.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
-        ) {
-            if let (Some((area, offset, _)), Some(anchor), Some(focus)) =
-                (&self.scroll_content, self.anchor, self.focus)
-            {
-                if rect_contains(*area, anchor.0, anchor.1)
-                    && rect_contains(*area, focus.0, focus.1)
-                {
-                    let logical = |point: Point| (point.0, point.1 - area.y + offset);
-                    if matches!(event.kind, MouseEventKind::Down(_)) || self.content_range.is_none()
-                    {
-                        self.content_range = Some((logical(anchor), logical(focus)));
-                    } else if let Some((_, end)) = self.content_range.as_mut() {
-                        *end = logical(focus);
-                    }
-                } else {
-                    self.content_range = None;
+        ) && let (Some((area, offset, _)), Some(anchor), Some(focus)) =
+            (&self.scroll_content, self.anchor, self.focus)
+        {
+            if rect_contains(*area, anchor.0, anchor.1) && rect_contains(*area, focus.0, focus.1) {
+                let logical = |point: Point| (point.0, point.1 - area.y + offset);
+                if matches!(event.kind, MouseEventKind::Down(_)) || self.content_range.is_none() {
+                    self.content_range = Some((logical(anchor), logical(focus)));
+                } else if let Some((_, end)) = self.content_range.as_mut() {
+                    *end = logical(focus);
                 }
+            } else {
+                self.content_range = None;
             }
         }
         changed

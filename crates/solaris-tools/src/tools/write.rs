@@ -105,13 +105,12 @@ impl Tool for WriteTool {
                 if let Some(parent) = absolute
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
+                    && let Err(error) = tokio::fs::create_dir_all(parent).await
                 {
-                    if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                        return ToolOutput::error(format!(
-                            "could not create {}: {error}",
-                            parent.display()
-                        ));
-                    }
+                    return ToolOutput::error(format!(
+                        "could not create {}: {error}",
+                        parent.display()
+                    ));
                 }
                 if ctx.is_cancelled() {
                     return ToolOutput::error("the write was cancelled before it was written");

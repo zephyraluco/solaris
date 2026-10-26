@@ -266,14 +266,14 @@ impl AgentBackend for HttpBackend {
 
                     // A compatible server that names the field it dislikes is
                     // cheaper to obey than to guess about up front.
-                    if status == StatusCode::BAD_REQUEST && self.endpoint.wire == Wire::OpenAiChat {
-                        if let Some(repair) = openai::repair_for(&text) {
-                            if !repaired.contains(&repair) {
-                                openai::apply(&mut body, repair);
-                                repaired.push(repair);
-                                continue;
-                            }
-                        }
+                    if status == StatusCode::BAD_REQUEST
+                        && self.endpoint.wire == Wire::OpenAiChat
+                        && let Some(repair) = openai::repair_for(&text)
+                        && !repaired.contains(&repair)
+                    {
+                        openai::apply(&mut body, repair);
+                        repaired.push(repair);
+                        continue;
                     }
 
                     if http::is_retryable(status) && attempt < http::max_retries() {

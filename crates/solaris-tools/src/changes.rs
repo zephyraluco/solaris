@@ -203,10 +203,10 @@ pub fn list(directory: &Path) -> io::Result<Vec<FileChange>> {
     let mut changes = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Some(id) = entry.file_name().to_str() {
-                changes.push(load(directory, id)?);
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(id) = entry.file_name().to_str()
+        {
+            changes.push(load(directory, id)?);
         }
     }
     changes.sort_by(|a, b| a.id.cmp(&b.id));

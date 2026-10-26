@@ -66,10 +66,11 @@ impl ExecutionBudget {
         Ok(())
     }
     fn charge(&self, cost: f64) {
-        if let Ok(mut state) = self.state.lock() {
-            if cost.is_finite() && cost > 0.0 {
-                state.1 += cost;
-            }
+        if let Ok(mut state) = self.state.lock()
+            && cost.is_finite()
+            && cost > 0.0
+        {
+            state.1 += cost;
         }
     }
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
