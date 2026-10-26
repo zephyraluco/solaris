@@ -301,6 +301,16 @@ impl Tool for McpTool {
                     }
                     if text.len() > 50 * 1024 { let mut end = 50 * 1024; while !text.is_char_boundary(end) { end -= 1; } text.truncate(end); text.push_str("\n[MCP output truncated]"); }
                     let mut output = if result.is_error == Some(true) { ToolOutput::error(text) } else { ToolOutput::ok(text) };
+                    if ctx.images_enabled
+                        && let Some(content) = encoded["content"].as_array() {
+                            for part in content {
+                                if part["type"] == "image"
+                                    && let (Some(media_type), Some(data)) = (part["mimeType"].as_str(), part["data"].as_str()) {
+                                        if !matches!(media_type, "image/png" | "image/jpeg" | "image/gif" | "image/webp") { continue; }
+                                        output.metadata.images.push(solaris_tools::InlineImage { media_type: media_type.into(), data: data.into() });
+                                    }
+                            }
+                        }
                     output.metadata.details = json!({"mcp":encoded});
                     return output;
                 }

@@ -33,6 +33,9 @@ fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
 #[test]
 fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let directory = tempfile::tempdir().expect("directory");
+    std::fs::write(directory.path().join("models.json"), r#"{"models":[{"provider":"local","id":"test-model","capabilities":{"image_input":"supported"}}]}"#).expect("model metadata");
+    let image_path = directory.path().join("pixel.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npayload").expect("image fixture");
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let endpoint = format!("http://{}/v1", listener.local_addr().expect("address"));
@@ -88,7 +91,13 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let first = run(
         directory.path(),
         &endpoint,
-        &["--print", "first prompt", "--json"],
+        &[
+            "--print",
+            "first prompt",
+            "--json",
+            "--image",
+            image_path.to_str().expect("image path"),
+        ],
     );
     assert!(
         first.status.success(),
@@ -119,6 +128,15 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
         serde_json::from_slice(&exported.stdout).expect("exported journal");
     assert!(records.as_array().expect("records").len() >= 6);
     let requests = server.join().expect("server");
+    assert!(
+        requests[0]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url")))
+    );
     assert!(
         requests[1]["messages"]
             .as_array()

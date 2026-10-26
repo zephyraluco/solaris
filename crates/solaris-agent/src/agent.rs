@@ -235,6 +235,22 @@ impl Agent {
         self.conversation.journal()
     }
 
+    /// Attach an image at an idle boundary. Unsupported/unknown models fail locally.
+    pub fn attach_image(&self, image: solaris_backend::InlineImage) -> Result<(), String> {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("cannot attach an image during a turn".into());
+        }
+        if self.capabilities().image_input != solaris_backend::Support::Supported {
+            return Err("model image support is not confirmed; configure models.json or choose a vision model".into());
+        }
+        self.conversation
+            .push(solaris_backend::Message::with_content(
+                solaris_backend::Role::User,
+                vec![solaris_backend::Content::Image { image }],
+            ));
+        self.conversation.error().map_or(Ok(()), Err)
+    }
+
     pub fn active_tasks(&self) -> Vec<String> {
         self.options.tasks.active()
     }

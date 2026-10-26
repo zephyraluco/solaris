@@ -249,6 +249,9 @@ pub(crate) fn conversation_text(history: &[Message]) -> String {
     for message in history {
         for block in &message.content {
             match block {
+                Content::Image { image } => {
+                    text.push_str(&format!("[{} image attachment; binary content omitted from this textual checkpoint]\n", image.media_type));
+                }
                 Content::Text { text: body } => {
                     let _ = writeln!(text, "{}: {body}", role_label(message.role));
                 }

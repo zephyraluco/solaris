@@ -39,6 +39,8 @@ pub struct ToolMetadata {
     pub details: Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<Artifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<InlineImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
 }
@@ -65,4 +67,16 @@ pub struct ModelCapabilities {
     pub context_window: Option<u32>,
     pub max_output: Option<u32>,
     pub price_known: Option<bool>,
+}
+
+/// An inline image, encoded once by the file/MCP boundary and carried on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineImage {
+    pub media_type: String,
+    pub data: String,
+}
+impl InlineImage {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
 }

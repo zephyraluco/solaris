@@ -459,3 +459,13 @@ Unknown prices display as unknown; `--max-cost` requires known pricing.
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
 cache entries are rejected. This cache stores model IDs, not credentials.
+
+## Images
+
+For a model explicitly marked `image_input: "supported"` in `models.json`,
+`read` can return PNG, JPEG, GIF and WebP images as image content. Headless runs
+can use `--image <PATH>` with `--print` (up to eight images, 8 MiB each). Detection
+uses file signatures. Unknown/unsupported model capabilities fail locally.
+Image blocks are encoded separately for Messages, Chat Completions and Responses;
+they are retained in private session data rather than pasted into model-facing text.
+MCP image content follows the same capability check.

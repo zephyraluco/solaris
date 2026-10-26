@@ -238,6 +238,16 @@ impl AgentBackend for HttpBackend {
         self.capabilities.clone()
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        if self.capabilities.image_input != crate::Support::Supported
+            && request
+                .history
+                .iter()
+                .any(|message| message.images().next().is_some())
+        {
+            return Err(BackendError::new(
+                "image input is not confirmed for this model; configure models.json or choose a vision model",
+            ));
+        }
         if self.capabilities.tool_calling == crate::Support::Unsupported
             && !request.tools.is_empty()
         {

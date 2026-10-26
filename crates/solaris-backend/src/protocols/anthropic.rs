@@ -133,6 +133,7 @@ fn content_blocks(message: &Message) -> Vec<Value> {
         .filter_map(|block| match block {
             Content::Text { text } if text.is_empty() => None,
             Content::Text { text } => Some(json!({ "type": "text", "text": text })),
+            Content::Image { image } => Some(image_block(image)),
             Content::ToolUse { call } => Some(json!({
                 "type": "tool_use",
                 "id": call.id,
@@ -145,6 +146,14 @@ fn content_blocks(message: &Message) -> Vec<Value> {
                     "tool_use_id": result.id,
                     "content": result.output,
                 });
+                if !result.metadata.images.is_empty() {
+                    let mut content = Vec::new();
+                    if !result.output.is_empty() {
+                        content.push(json!({"type":"text","text":result.output}));
+                    }
+                    content.extend(result.metadata.images.iter().map(image_block));
+                    block["content"] = Value::Array(content);
+                }
                 if result.is_error {
                     block["is_error"] = Value::Bool(true);
                 }
@@ -345,6 +354,10 @@ fn error_message(data: &Value) -> String {
         .as_str()
         .unwrap_or("the model rejected the request")
         .to_string()
+}
+
+fn image_block(image: &crate::InlineImage) -> Value {
+    json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}})
 }
 
 #[cfg(test)]

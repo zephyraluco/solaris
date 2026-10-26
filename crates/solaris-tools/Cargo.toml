@@ -10,6 +10,7 @@ description = "Built-in tools for solaris"
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 serde = { workspace = true }
 solaris-types = { workspace = true }
 async-trait = { workspace = true }

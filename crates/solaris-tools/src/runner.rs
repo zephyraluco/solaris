@@ -237,6 +237,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_running_search_observes_cancellation() {
         let ctx = ToolContext {
+            images_enabled: false,
             cwd: Path::new(".").into(),
             temp_dir: std::env::temp_dir(),
             cancel: Cancel::new(),

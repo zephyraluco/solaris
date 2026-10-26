@@ -76,3 +76,8 @@ pub trait AgentBackend: Send + Sync {
 }
 
 pub use solaris_types::{ModelCapabilities, Support};
+
+pub use solaris_types::InlineImage;
+
+#[cfg(test)]
+mod image_tests;

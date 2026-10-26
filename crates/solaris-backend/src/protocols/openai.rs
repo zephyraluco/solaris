@@ -89,6 +89,7 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
     }
 
     let text = message.text();
+    let images: Vec<_> = message.images().collect();
     let calls: Vec<Value> = message
         .tool_calls()
         .map(|call| {
@@ -104,7 +105,7 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
         .collect();
 
     // A message that was nothing but tool results has already been sent above.
-    if calls.is_empty() && text.is_empty() && message.is_tool_results() {
+    if calls.is_empty() && text.is_empty() && images.is_empty() && message.is_tool_results() {
         return;
     }
 
@@ -112,6 +113,18 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
         "role": message.role.as_str(),
         "content": text,
     });
+    if !images.is_empty() {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type":"text","text":text}));
+        }
+        content.extend(
+            images
+                .iter()
+                .map(|image| json!({"type":"image_url","image_url":{"url":image.data_url()}})),
+        );
+        entry["content"] = Value::Array(content);
+    }
     if !calls.is_empty() {
         entry["tool_calls"] = Value::Array(calls);
         // The canonical shape for a pure tool-call assistant turn is a null

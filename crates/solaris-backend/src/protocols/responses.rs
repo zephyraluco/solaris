@@ -105,7 +105,19 @@ fn push_input(out: &mut Vec<Value>, message: &Message) {
     }
 
     let text = message.text();
-    if !text.is_empty() {
+    let images: Vec<_> = message.images().collect();
+    if !images.is_empty() {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type":"input_text","text":text}));
+        }
+        content.extend(
+            images
+                .iter()
+                .map(|image| json!({"type":"input_image","image_url":image.data_url()})),
+        );
+        out.push(json!({"role":message.role.as_str(),"content":content}));
+    } else if !text.is_empty() {
         out.push(json!({ "role": message.role.as_str(), "content": text }));
     }
 }

@@ -706,6 +706,8 @@ impl Runner {
             return ToolResult::error(call, error.to_string()).into();
         }
         let ctx = ToolContext {
+            images_enabled: self.inner.capabilities().image_input
+                == solaris_backend::Support::Supported,
             cwd: self.cwd.clone(),
             temp_dir: self.conversation.journal().map_or_else(
                 || self.temp_dir.clone(),

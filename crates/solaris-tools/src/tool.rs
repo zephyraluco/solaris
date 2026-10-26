@@ -132,6 +132,8 @@ pub struct ToolContext {
     pub temp_dir: PathBuf,
     /// Set when the caller wants a long-running tool to stop.
     pub cancel: Cancel,
+    /// True only when the selected model explicitly accepts image input.
+    pub images_enabled: bool,
 }
 
 impl ToolContext {
@@ -141,6 +143,7 @@ impl ToolContext {
             cwd: cwd.into(),
             temp_dir: temp_dir.into(),
             cancel: Cancel::new(),
+            images_enabled: false,
         }
     }
 

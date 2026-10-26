@@ -63,6 +63,10 @@ struct Args {
     #[arg(long, value_name = "PROMPT")]
     print: Option<String>,
 
+    /// Attach a PNG/JPEG/GIF/WebP image to a headless prompt; repeat for more.
+    #[arg(long, requires = "print", value_name = "PATH")]
+    image: Vec<PathBuf>,
+
     /// Emit versioned JSON events (requires --print).
     #[arg(long, requires = "print")]
     json: bool,
@@ -496,6 +500,14 @@ fn main() -> Result<()> {
         ));
         if let Some(journal) = journal {
             session.attach_journal(journal)?;
+        }
+        if args.image.len() > 8 {
+            anyhow::bail!("at most eight images may be attached to one prompt");
+        }
+        for path in &args.image {
+            let image = solaris_tools::read_image(path)?
+                .ok_or_else(|| anyhow::anyhow!("{} is not a supported image", path.display()))?;
+            session.attach_image(image).map_err(anyhow::Error::msg)?;
         }
         let succeeded = runtime.block_on(async {
             use futures::StreamExt;

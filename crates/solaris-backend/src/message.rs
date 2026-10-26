@@ -41,6 +41,8 @@ impl std::fmt::Display for Role {
 pub enum Content {
     /// Plain text.
     Text { text: String },
+    /// User-provided or tool-read image data.
+    Image { image: solaris_types::InlineImage },
     /// A call the assistant asked for.
     ToolUse { call: ToolCall },
     /// The answer to a call. Carried in a **user** message, which is where the
@@ -124,12 +126,30 @@ impl Message {
             .iter()
             .map(|block| match block {
                 Content::Text { text } => text.chars().count(),
+                Content::Image { image } => image.data.len().min(32768),
                 Content::ToolUse { call } => {
                     call.name.chars().count() + call.input.to_string().chars().count()
                 }
-                Content::ToolResult { result } => result.output.chars().count(),
+                Content::ToolResult { result } => {
+                    result.output.chars().count()
+                        + result
+                            .metadata
+                            .images
+                            .iter()
+                            .map(|image| image.data.len().min(32768))
+                            .sum::<usize>()
+                }
             })
             .sum()
+    }
+
+    /// Images from direct attachments or tool results, in message order.
+    pub fn images(&self) -> impl Iterator<Item = &solaris_types::InlineImage> {
+        self.content.iter().flat_map(|block| match block {
+            Content::Image { image } => std::slice::from_ref(image),
+            Content::ToolResult { result } => result.metadata.images.as_slice(),
+            _ => &[],
+        })
     }
 
     /// The calls this message asks for.
