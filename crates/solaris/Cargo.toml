@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
+tempfile = "3"
 # The test suites implement `AgentBackend` for their own local fake backend.
 async-trait = { workspace = true }
 # A tool call carries JSON arguments, so the tests build them.

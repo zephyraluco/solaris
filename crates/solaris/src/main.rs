@@ -59,6 +59,22 @@ struct Args {
     #[arg(long)]
     print_config: bool,
 
+    /// Run one prompt without starting the terminal UI.
+    #[arg(long, value_name = "PROMPT")]
+    print: Option<String>,
+
+    /// Emit versioned JSON events (requires --print).
+    #[arg(long, requires = "print")]
+    json: bool,
+
+    /// Fork a saved session in this directory before running.
+    #[arg(long, conflicts_with_all = ["resume", "continue_session", "ephemeral"])]
+    fork: Option<String>,
+
+    /// Export a session journal as JSON without running it.
+    #[arg(long, conflicts_with_all = ["print", "resume", "continue_session", "fork", "ephemeral"])]
+    export_session: Option<String>,
+
     /// Confirm a call that changes something before it runs.
     ///
     /// Off by default: a terminal agent is already acting on your behalf. Turn
@@ -339,6 +355,13 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no configuration directory; use --ephemeral"))?;
         let store = solaris_agent::SessionStore::open(&directory.join("sessions/sessions.sqlite"))?;
         let cwd = std::env::current_dir()?.canonicalize()?;
+        if let Some(id) = &args.export_session {
+            if !store.list(&cwd)?.iter().any(|session| session.id == *id) {
+                anyhow::bail!("session not found in this directory");
+            }
+            println!("{}", serde_json::to_string_pretty(&store.records(id)?)?);
+            return Ok(());
+        }
         if args.sessions {
             for session in store.list(&cwd)? {
                 println!("{}  {}  {}", session.id, session.status, session.model);
@@ -367,7 +390,20 @@ fn main() -> Result<()> {
                 }
                 store.resume(id)?
             }
-            None => store.create(&cwd, &choice.model, None)?,
+            None => {
+                if let Some(id) = &args.fork {
+                    let info = sessions.iter().find(|s| s.id == *id).ok_or_else(|| {
+                        anyhow::anyhow!("fork source not found in this directory")
+                    })?;
+                    if args.model.is_none() {
+                        config.model = info.model.clone();
+                    }
+                    let parent = store.resume(id)?;
+                    parent.fork(&cwd, &config.model)?
+                } else {
+                    store.create(&cwd, &choice.model, None)?
+                }
+            }
         };
         let _ = journal.context()?;
         Some(journal)
@@ -375,6 +411,54 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let _guard = runtime.enter();
 
+    if let Some(prompt) = &args.print {
+        let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
+            .with_selection(tools)
+            .with_skills(skills)
+            .with_prompt_context(resources.prompt);
+        options.execution = execution;
+        // Noninteractive runs cannot wait for a UI approval. Explicit rules may
+        // allow a call; anything that needs an answer is refused.
+        if ask_approval {
+            options.approver = Arc::new(solaris_agent::DenyAll);
+        }
+        let choice = choose_backend(&auth, &config.model, backend_options);
+        let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
+            choice,
+            Arc::new(registry),
+            options,
+        ));
+        if let Some(journal) = journal {
+            session.attach_journal(journal)?;
+        }
+        let succeeded = runtime.block_on(async {
+            use futures::StreamExt;
+            use std::io::Write;
+            let mut stream = session.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt.clone(), mode: config.mode });
+            let mut sequence = 0u64;
+            let mut succeeded = false;
+            while let Some(event) = stream.next().await {
+                sequence += 1;
+                if args.json {
+                    println!("{}", serde_json::json!({"version":1,"sequence":sequence,"session_id":session.journal().as_ref().map(|j| j.id().to_string()),"event":event}));
+                } else {
+                    match &event {
+                        solaris_agent::AgentEvent::TextDelta(text) => { print!("{text}"); std::io::stdout().flush()?; },
+                        solaris_agent::AgentEvent::Error(error) => eprintln!("{error}"),
+                        _ => {}
+                    }
+                }
+                if matches!(event, solaris_agent::AgentEvent::TurnComplete { .. }) { succeeded = true; }
+                if matches!(event, solaris_agent::AgentEvent::Error(_)) { succeeded = false; }
+            }
+            if !args.json { println!(); }
+            Ok::<bool, anyhow::Error>(succeeded)
+        })?;
+        if !succeeded {
+            anyhow::bail!("headless turn failed");
+        }
+        return Ok(());
+    }
     solaris_tui::install_panic_hook();
     let mut terminal = solaris_tui::setup_terminal()?;
 

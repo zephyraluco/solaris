@@ -2667,6 +2667,7 @@ dependencies = [
  "solaris-provider",
  "solaris-tools",
  "solaris-tui",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]

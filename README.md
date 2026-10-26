@@ -378,3 +378,15 @@ its children and automatic compaction. `--max-cost <USD>` stops further work whe
 observed model cost reaches the limit; it cannot guarantee a prepaid spending cap,
 and depends on available provider pricing. Child limits cannot reset the parent's
 request counter or deadline.
+
+## Headless automation
+
+`solaris --print "review this project" --plan` runs without a terminal. Add `--json`
+for newline-delimited envelopes containing `version`, `sequence`, `session_id` and
+`event`. A failed turn exits nonzero. Approval requests in headless mode are refused
+unless an explicit policy rule allows the call; they never wait for an invisible UI.
+
+`--fork <SESSION_ID>` copies a saved conversation into a new session.
+`--export-session <SESSION_ID>` prints its journal as JSON; exports contain private
+conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
+execution budgets, tool policy, persistence and cancellation.

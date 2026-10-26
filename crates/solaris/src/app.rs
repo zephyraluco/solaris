@@ -231,14 +231,16 @@ fn with_tools(
     cwd: &Path,
     approver: Arc<dyn Approver>,
     execution: &solaris_agent::ExecutionSettings,
-) -> (Arc<Agent>, Cancel) {
+) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
     let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_skills(skills.clone())
         .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     options.execution = execution.clone();
-    let agent = Arc::new(Agent::new(choice, registry, options));
+    let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
+        choice, registry, options,
+    )));
     let cancel = agent.cancel_handle();
     (agent, cancel)
 }
@@ -246,7 +248,7 @@ fn with_tools(
 /// The solaris application root component.
 pub struct App {
     /// The session every turn goes through, and the backend behind it.
-    pub(crate) agent: Arc<Agent>,
+    pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
     pub(crate) config: Config,
@@ -1115,7 +1117,8 @@ impl App {
         let mode = self.config.mode;
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream = agent.run_turn(prompt, mode);
+            let mut stream =
+                agent.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
             while let Some(event) = stream.next().await {
                 if tx.send(event).is_err() {
                     break;
@@ -3120,8 +3123,8 @@ mod tests {
     ///
     /// The provider id is what the model picker reads its catalogue with, so a
     /// test that needs one has to resolve a backend that carries it.
-    fn fake_session(provider: &'static str) -> Arc<Agent> {
-        Arc::new(Agent::new(
+    fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
+        Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             BackendChoice {
                 backend: fake_backend(),
                 provider_id: Some(provider),
@@ -3131,7 +3134,7 @@ mod tests {
             },
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::default(),
-        ))
+        )))
     }
 
     fn app() -> App {

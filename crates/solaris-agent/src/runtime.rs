@@ -85,3 +85,49 @@ impl Drop for LeasedStream {
         drop(self.stream.take());
     }
 }
+
+/// Client-independent runtime. UI code owns rendering; this owns session commands.
+pub struct SessionRuntime {
+    agent: crate::Agent,
+}
+impl SessionRuntime {
+    pub fn new(agent: crate::Agent) -> Self {
+        Self { agent }
+    }
+    pub fn with_refreshed_backend(&self, choice: solaris_provider::BackendChoice) -> Self {
+        Self::new(self.agent.with_refreshed_backend(choice))
+    }
+    pub fn dispatch(&self, command: RuntimeCommand) -> AgentEventStream {
+        match command {
+            RuntimeCommand::Prompt { text, mode } => self.agent.run_turn(text, mode),
+            RuntimeCommand::Cancel => {
+                self.agent.cancel_handle().cancel();
+                Box::pin(futures::stream::empty())
+            }
+            RuntimeCommand::Steer { text } => {
+                self.agent.steering_handle().push(text);
+                Box::pin(futures::stream::empty())
+            }
+            RuntimeCommand::Queue { text } => {
+                self.agent.follow_up_handle().push(text);
+                Box::pin(futures::stream::empty())
+            }
+        }
+    }
+}
+impl std::ops::Deref for SessionRuntime {
+    type Target = crate::Agent;
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
+/// Commands accepted by both interactive clients and external integrations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeCommand {
+    Prompt { text: String, mode: crate::Mode },
+    Cancel,
+    Steer { text: String },
+    Queue { text: String },
+}
