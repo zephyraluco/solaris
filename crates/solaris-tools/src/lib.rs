@@ -18,6 +18,7 @@
 
 mod diff;
 mod mutation_queue;
+mod output;
 mod path_utils;
 mod registry;
 mod runner;

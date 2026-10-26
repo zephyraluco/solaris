@@ -100,7 +100,7 @@ impl Tool for FindTool {
         }
 
         let args = fd_args(&pattern, &search_path);
-        let output = match self.runner.run("fd", &args, &ctx.cwd).await {
+        let output = match self.runner.run_with_context("fd", &args, ctx).await {
             Ok(output) => output,
             Err(error) => return ToolOutput::error(error),
         };

@@ -80,6 +80,8 @@ pub struct ShellOutcome {
     pub timed_out: bool,
     /// Whether the caller asked to stop and the command was killed.
     pub cancelled: bool,
+    /// Private full-output artifact when capture exceeded the memory budget.
+    pub artifact: Option<std::path::PathBuf>,
 }
 
 /// Runs one shell command.
@@ -129,7 +131,8 @@ impl ShellRunner for LocalShell {
                 // Both streams are piped and merged here instead. What the shell
                 // itself reports about the command only ever reaches its stderr,
                 // so a redirect written into the command cannot carry it.
-                .stderr(Stdio::piped());
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
 
             #[cfg(windows)]
             builder.creation_flags(CREATE_NO_WINDOW);
@@ -151,7 +154,7 @@ impl ShellRunner for LocalShell {
             // One reader per pipe, both feeding one channel, so what is reported
             // keeps the order the bytes arrived in rather than every line of
             // stdout followed by every line of stderr.
-            let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(16);
             let mut readers = Vec::new();
             if let Some(pipe) = child.stdout.take() {
                 readers.push(spawn_reader(pipe, chunk_tx.clone()));
@@ -161,7 +164,9 @@ impl ShellRunner for LocalShell {
             }
             drop(chunk_tx);
 
-            let mut buffer = Vec::new();
+            let mut buffer = crate::output::OutputAccumulator::new(&ctx.temp_dir);
+            let mut capture_error = None;
+            let pid = child.id();
             let mut timed_out = false;
             let mut cancelled = false;
             let mut status = None;
@@ -185,7 +190,10 @@ impl ShellRunner for LocalShell {
                     chunk = chunk_rx.recv(), if pipes_open => match chunk {
                         // Both pipes are closed, so no more output can arrive.
                         None => pipes_open = false,
-                        Some(bytes) => buffer.extend_from_slice(&bytes),
+                        Some(bytes) => if let Err(error) = buffer.append(&bytes).await {
+                            capture_error = Some(error);
+                            break;
+                        },
                     },
                     // Waiting on the process rather than on its pipes is what
                     // keeps a descendant that inherited them from holding the
@@ -210,8 +218,8 @@ impl ShellRunner for LocalShell {
                 }
             }
 
-            if timed_out || cancelled {
-                kill_tree(child.id()).await;
+            if timed_out || cancelled || capture_error.is_some() {
+                kill_tree(pid).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
@@ -219,9 +227,12 @@ impl ShellRunner for LocalShell {
             // Take what the readers already hold, then let them go: the last
             // words of a command that has ended are worth having, but a pipe an
             // escaped grandchild still holds must not keep the turn running.
-            collect_pending(&mut chunk_rx, &mut buffer).await;
+            if let Err(error) = collect_pending(&mut chunk_rx, &mut buffer).await {
+                capture_error = Some(error);
+            }
             for reader in readers {
                 reader.abort();
+                let _ = reader.await;
             }
 
             if let Some(error) = wait_error {
@@ -233,8 +244,13 @@ impl ShellRunner for LocalShell {
                 return Err(format!("could not wait for {program}: {error}"));
             }
 
+            if let Some(error) = capture_error {
+                return Err(error.to_string());
+            }
+            let (output, artifact) = buffer.finish().await.map_err(|error| error.to_string())?;
             return Ok(ShellOutcome {
-                output: sanitize(&String::from_utf8_lossy(&buffer)),
+                output: sanitize(&output),
+                artifact,
                 code: exit_code(status),
                 timed_out,
                 cancelled,
@@ -248,7 +264,7 @@ impl ShellRunner for LocalShell {
 /// Read one of a command's pipes to its end, forwarding what it yields.
 fn spawn_reader(
     mut pipe: impl AsyncRead + Unpin + Send + 'static,
-    chunks: mpsc::UnboundedSender<Vec<u8>>,
+    chunks: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut block = [0u8; 8 * 1024];
@@ -256,7 +272,7 @@ fn spawn_reader(
             match pipe.read(&mut block).await {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    if chunks.send(block[..read].to_vec()).is_err() {
+                    if chunks.send(block[..read].to_vec()).await.is_err() {
                         break;
                     }
                 }
@@ -270,20 +286,26 @@ fn spawn_reader(
 /// Called once the command has ended. Both pipes close with it, so this usually
 /// returns straight away; the wait is capped so that a descendant which
 /// inherited them cannot hold the turn open.
-async fn collect_pending(chunks: &mut mpsc::UnboundedReceiver<Vec<u8>>, buffer: &mut Vec<u8>) {
+async fn collect_pending(
+    chunks: &mut mpsc::Receiver<Vec<u8>>,
+    buffer: &mut crate::output::OutputAccumulator,
+) -> std::io::Result<()> {
     let drain = async {
         while let Some(bytes) = chunks.recv().await {
-            buffer.extend_from_slice(&bytes);
+            buffer.append(&bytes).await?;
         }
+        Ok(())
     };
-    let _ = tokio::time::timeout(Duration::from_millis(50), drain).await;
+    tokio::time::timeout(Duration::from_millis(250), drain)
+        .await
+        .unwrap_or(Ok(()))
 }
 
 /// Kill a command and everything it started.
 ///
 /// `child.kill()` reaches the shell itself; a command that spawned something
 /// would leave it running.
-async fn kill_tree(pid: Option<u32>) {
+pub(crate) async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
@@ -525,8 +547,12 @@ impl Tool for ShellTool {
         };
 
         let mut notices = Vec::new();
-        if truncated {
-            match write_full_output(&outcome.output, ctx).await {
+        if truncated || outcome.artifact.is_some() {
+            let saved = match outcome.artifact {
+                Some(path) => Ok(path),
+                None => write_full_output(&outcome.output, ctx).await,
+            };
+            match saved {
                 Ok(path) => notices.push(format!(
                     "output truncated to the last {} lines / {}; full output at {}",
                     self.limits.max_lines,
@@ -675,6 +701,7 @@ mod tests {
             code: None,
             timed_out: true,
             cancelled: false,
+            artifact: None,
         });
 
         let output = ShellTool::bash(runner.clone())
@@ -697,6 +724,7 @@ mod tests {
             code: None,
             timed_out: false,
             cancelled: true,
+            artifact: None,
         });
 
         let output = ShellTool::bash(runner)
