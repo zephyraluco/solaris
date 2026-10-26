@@ -222,11 +222,10 @@ impl Agent {
         &self,
         journal: Arc<crate::SessionJournal>,
     ) -> Result<(), crate::StoreError> {
-        if self.active.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(crate::StoreError::Invalid(
-                "cannot attach a journal during a turn".into(),
-            ));
-        }
+        let _lease =
+            crate::runtime::TurnLease::acquire(Arc::clone(&self.active)).ok_or_else(|| {
+                crate::StoreError::Invalid("cannot attach a journal during a turn".into())
+            })?;
         self.conversation.attach(journal)
     }
 
@@ -237,9 +236,8 @@ impl Agent {
 
     /// Attach an image at an idle boundary. Unsupported/unknown models fail locally.
     pub fn attach_image(&self, image: solaris_backend::InlineImage) -> Result<(), String> {
-        if self.active.load(std::sync::atomic::Ordering::Acquire) {
-            return Err("cannot attach an image during a turn".into());
-        }
+        let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))
+            .ok_or_else(|| "cannot attach an image during a turn".to_string())?;
         if self.capabilities().image_input != solaris_backend::Support::Supported {
             return Err("model image support is not confirmed; configure models.json or choose a vision model".into());
         }
@@ -281,6 +279,12 @@ impl Agent {
             follow_up: self.follow_up.clone(),
             resources: Arc::clone(&self.resources),
         }
+    }
+
+    /// Replace the factory used by subsequent child model overrides.
+    pub fn with_child_backend(mut self, factory: crate::ChildBackendFactory) -> Self {
+        self.options.child_backend = Some(factory);
+        self
     }
 
     /// A handle for messages that correct the turn that is running.
@@ -856,6 +860,54 @@ mod tests {
         assert_eq!(refreshed.conversation_len(), 1);
         assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
         assert!(Arc::ptr_eq(&original.resources, &refreshed.resources));
+    }
+
+    #[test]
+    fn refreshing_child_factory_replaces_credentials_without_resetting_the_session() {
+        let original = agent(Scripted::new(Vec::new()))
+            .with_child_backend(Arc::new(|_| Err("expired credential".into())));
+        original
+            .conversation
+            .push(crate::Message::user("remember this"));
+        let refreshed = original
+            .with_refreshed_backend(choice(Scripted::new(Vec::new())))
+            .with_child_backend(Arc::new(|model| {
+                let mut next = choice(Scripted::new(Vec::new()));
+                next.model = model.into();
+                Ok(next)
+            }));
+        assert_eq!(
+            refreshed.options.child_backend.as_ref().expect("factory")("child-model")
+                .expect("fresh credential")
+                .model,
+            "child-model"
+        );
+        assert!(
+            original
+                .options
+                .child_backend
+                .as_ref()
+                .expect("old factory")("child-model")
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
+    }
+
+    #[test]
+    fn attachment_boundaries_take_the_same_lease_as_a_turn() {
+        let original = agent(Scripted::new(Vec::new()));
+        let lease =
+            crate::runtime::TurnLease::acquire(Arc::clone(&original.active)).expect("lease");
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        assert!(original.attach_journal(Arc::clone(&journal)).is_err());
+        drop(lease);
+        original.attach_journal(journal).expect("idle attach");
+        assert!(!original.active.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// A tool as the registry and the loop want it.

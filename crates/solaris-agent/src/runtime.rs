@@ -97,6 +97,9 @@ impl SessionRuntime {
     pub fn with_refreshed_backend(&self, choice: solaris_provider::BackendChoice) -> Self {
         Self::new(self.agent.with_refreshed_backend(choice))
     }
+    pub fn with_child_backend(self, factory: crate::ChildBackendFactory) -> Self {
+        Self::new(self.agent.with_child_backend(factory))
+    }
     pub fn dispatch(&self, command: RuntimeCommand) -> AgentEventStream {
         match command {
             RuntimeCommand::Prompt { text, mode } => self.agent.run_turn(text, mode),

@@ -1805,6 +1805,16 @@ impl App {
         });
     }
 
+    fn refresh_transport(&mut self, choice: BackendChoice) {
+        let factory = Arc::clone(&self.backend_factory);
+        let auth = self.auth.clone();
+        self.agent = Arc::new(
+            self.agent
+                .with_refreshed_backend(choice)
+                .with_child_backend(Arc::new(move |model| Ok(factory(&auth, model)))),
+        );
+    }
+
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
         let catalog_notice = self.agent.model_catalog_notice();
@@ -1823,7 +1833,7 @@ impl App {
                     if self.uses_chatgpt() {
                         let choice =
                             resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-                        self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                        self.refresh_transport(choice);
                     } else {
                         self.rebuild_backend();
                     }
@@ -2092,7 +2102,7 @@ impl App {
                     self.persist_auth();
                     let choice =
                         resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-                    self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                    self.refresh_transport(choice);
                     match action {
                         OAuthAction::Turn(submitted, prompt) => self.start_turn(submitted, prompt),
                         OAuthAction::Models => self.refresh_models(),
