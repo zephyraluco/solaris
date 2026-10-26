@@ -352,3 +352,13 @@ The journal retains prompts, tool calls/results, model context, compaction check
 child activity. Interrupted tool calls are never automatically executed again: verify their
 side effects before retrying. The journal contains conversation and tool data; treat it as
 private. Credentials and authentication headers are not intentionally recorded.
+
+## Review and undo file changes
+
+`write` and `edit` use atomic replacement and record before/after hashes and a
+unified patch. Expand the tool result to review its patch. Run `solaris --changes`
+to list recorded file changes, and `solaris --undo <CHANGE_ID>` to restore one.
+Undo refuses a file whose current bytes differ from the recorded after-image.
+Shell commands and external side effects are not covered. Files above 16 MiB are
+rejected by the mutation tools. Backups live alongside session artifacts and contain
+private file data. Ephemeral runs keep their artifacts in the temporary directory.

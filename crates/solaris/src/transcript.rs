@@ -346,7 +346,7 @@ fn push_steps(
                 let body_rows = step
                     .result
                     .as_ref()
-                    .map_or(1, |result| result.output.lines().count().max(1));
+                    .map_or(1, |result| tool_display_text(result).lines().count().max(1));
                 (shell_view(step, turn.complete, theme), body_rows)
             } else {
                 let mut group_finished = finished + usize::from(step.is_done());
@@ -382,7 +382,7 @@ fn push_steps(
                         turn.steps[target_step]
                             .result
                             .as_ref()
-                            .map_or(1, |result| result.output.lines().count().max(1))
+                            .map_or(1, |result| tool_display_text(result).lines().count().max(1))
                     } else {
                         body_rows
                     },
@@ -442,10 +442,10 @@ fn tool_group_view(
                 CollapsibleStatus::Idle
             });
             let output = match &step.result {
-                Some(result) if result.output.is_empty() => "No output.",
-                Some(result) => &result.output,
-                None if running => "Running…",
-                None => "No output.",
+                Some(result) if result.output.is_empty() => "No output.".to_string(),
+                Some(result) => tool_display_text(result),
+                None if running => "Running…".to_string(),
+                None => "No output.".to_string(),
             };
             child.set_content(
                 output
@@ -484,10 +484,10 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
     let mut view = step_view(step, title, running, failed, theme);
     if step.disclosure.is_expanded() {
         let output = match &step.result {
-            Some(result) if result.output.is_empty() => "No output.",
-            Some(result) => &result.output,
-            None if running => "Running…",
-            None => "No output.",
+            Some(result) if result.output.is_empty() => "No output.".to_string(),
+            Some(result) => tool_display_text(result),
+            None if running => "Running…".to_string(),
+            None => "No output.".to_string(),
         };
         let style = Style::default().fg(if failed { theme.error } else { theme.muted });
         view.set_content(
@@ -498,6 +498,18 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
         );
     }
     view
+}
+
+fn tool_display_text(result: &solaris_agent::ToolResult) -> String {
+    let mut output = result.output.clone();
+    if let Some(patch) = result.metadata.details["change"]["patch"].as_str() {
+        output.push_str("\n\n");
+        output.push_str(patch);
+        if let Some(id) = result.metadata.details["change"]["id"].as_str() {
+            output.push_str(&format!("\nChange: {id} (solaris --undo {id})"));
+        }
+    }
+    output
 }
 
 fn step_view(

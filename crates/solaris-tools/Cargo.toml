@@ -10,6 +10,7 @@ description = "Built-in tools for solaris"
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
 solaris-types = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -17,6 +18,9 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "fs"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = "0.10"
+tempfile = "3"
+similar = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Signalling a command's whole process group needs the call itself on Unix; the

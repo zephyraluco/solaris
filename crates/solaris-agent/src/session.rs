@@ -661,7 +661,10 @@ impl Runner {
         }
         let ctx = ToolContext {
             cwd: self.cwd.clone(),
-            temp_dir: self.temp_dir.clone(),
+            temp_dir: self.conversation.journal().map_or_else(
+                || self.temp_dir.clone(),
+                |journal| journal.store().artifact_dir(),
+            ),
             cancel: self.cancel.clone(),
         };
         let (output, usage, cost_usd) = if call.name == SUBAGENT_TOOL {

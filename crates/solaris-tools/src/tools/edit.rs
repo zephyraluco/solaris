@@ -101,8 +101,11 @@ impl Tool for EditTool {
 
         self.queue
             .with_lock(&absolute, || async {
-                let raw = match tokio::fs::read(&absolute).await {
-                    Ok(raw) => raw,
+                let raw = match crate::changes::read_optional(&absolute) {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => {
+                        return ToolOutput::error(format!("could not read {path}: file not found"));
+                    }
                     Err(error) => {
                         return ToolOutput::error(format!("could not read {path}: {error}"));
                     }
@@ -133,8 +136,18 @@ impl Tool for EditTool {
                 }
 
                 let final_text = format!("{bom}{}", restore_line_endings(&updated, ending));
-                match tokio::fs::write(&absolute, final_text.as_bytes()).await {
-                    Ok(()) => ToolOutput::ok(format!("Replaced {edit_count} block(s) in {path}.")),
+                match crate::changes::commit(
+                    &absolute,
+                    Some(text.as_bytes()),
+                    final_text.as_bytes(),
+                    ctx,
+                ) {
+                    Ok(metadata) => {
+                        let mut output =
+                            ToolOutput::ok(format!("Replaced {edit_count} block(s) in {path}."));
+                        output.metadata = Box::new(metadata);
+                        output
+                    }
                     Err(error) => ToolOutput::error(format!("could not write {path}: {error}")),
                 }
             })

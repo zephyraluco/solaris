@@ -16,6 +16,7 @@
 //!   running a round of what it asks for and asking again is `solaris-agent`'s
 //!   business.
 
+pub mod changes;
 mod diff;
 mod mutation_queue;
 mod output;

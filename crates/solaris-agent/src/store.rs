@@ -151,6 +151,11 @@ impl SessionStore {
         Ok(journal)
     }
 
+    /// Durable location for command output and file before-images.
+    pub fn artifact_dir(&self) -> PathBuf {
+        self.directory.join("artifacts")
+    }
+
     /// Most recently used sessions for this project, newest first.
     pub fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, StoreError> {
         let connection = self.lock()?;

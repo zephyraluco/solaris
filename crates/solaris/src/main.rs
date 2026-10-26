@@ -81,6 +81,14 @@ struct Args {
     /// Keep this run entirely in memory.
     #[arg(long, conflicts_with_all = ["resume", "continue_session", "sessions"])]
     ephemeral: bool,
+
+    /// List recorded file changes and patches; shell side effects are not included.
+    #[arg(long, conflicts_with = "undo")]
+    changes: bool,
+
+    /// Undo a recorded file change only if its after-image still matches.
+    #[arg(long, value_name = "CHANGE_ID", conflicts_with = "changes")]
+    undo: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -261,6 +269,20 @@ fn main() -> Result<()> {
 
     // The backend runs on a runtime; the UI loop stays on the main thread and
     // only ever drains a channel, so nothing blocks the terminal.
+    if args.changes || args.undo.is_some() {
+        let directory = config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no configuration directory"))?
+            .join("sessions/artifacts");
+        if let Some(id) = &args.undo {
+            let change = solaris_tools::changes::undo(&directory, id)?;
+            println!("Restored {} ({})", change.path.display(), change.id);
+        } else {
+            for change in solaris_tools::changes::list(&directory)? {
+                println!("{}  {}\n{}", change.id, change.path.display(), change.patch);
+            }
+        }
+        return Ok(());
+    }
     let journal = if args.ephemeral {
         None
     } else {
