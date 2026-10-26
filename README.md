@@ -485,3 +485,10 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
+
+Inside the TUI, `/sessions` or `/resume` opens the existing selection dialog.
+`/resume <ID>` switches directly, `/fork` copies the current saved conversation,
+and `/tree` shows parent/child relationships in the same picker. Switching waits
+until the current operation has ended and only replays saved events; it never
+re-executes tool calls. Fork copies the complete conversation at the current
+boundary; arbitrary message-level rewinding is not implemented.

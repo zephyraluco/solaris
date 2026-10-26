@@ -503,25 +503,184 @@ impl App {
 
         if let Some(journal) = journal {
             match journal.store().records(journal.id()) {
-                Ok(records) => {
-                    for record in records {
-                        match record {
-                        solaris_agent::SessionRecord::Prompt { text } => {
-                            app.session.turns.push(Turn { prompt: text, ..Default::default() });
-                        }
-                        solaris_agent::SessionRecord::Event { event } => app.apply_event(event),
-                        solaris_agent::SessionRecord::Interrupted => app.apply_event(AgentEvent::Error("session interrupted; unfinished tool outcomes must be checked before retrying".into())),
-                        solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => app.session.turns.clear(),
-                        _ => {}
-                    }
-                    }
-                }
+                Ok(records) => app.restore_records(records),
                 Err(error) => app.notifications.error(error.to_string()),
             }
-            app.session.bump();
         }
         app.refresh_models();
         app
+    }
+
+    fn restore_records(&mut self, records: Vec<solaris_agent::SessionRecord>) {
+        self.session = SessionState::new();
+        for record in records {
+            match record {
+                solaris_agent::SessionRecord::Prompt { text } => self.session.turns.push(Turn {
+                    prompt: text,
+                    ..Default::default()
+                }),
+                solaris_agent::SessionRecord::Event { event } => self.apply_event(event),
+                solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
+                    "session interrupted; verify unfinished tool outcomes before retrying".into(),
+                )),
+                solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => {
+                    self.session.turns.clear()
+                }
+                _ => {}
+            }
+        }
+        self.session.bump();
+        self.transcript.invalidate();
+    }
+
+    fn open_sessions(&mut self, tree: bool) {
+        let Some(journal) = self.agent.journal() else {
+            self.notifications
+                .warning("session navigation is unavailable in ephemeral mode");
+            return;
+        };
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        let sessions = match journal.store().list(&cwd) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let current = journal.id();
+        let items = sessions
+            .into_iter()
+            .map(|session| {
+                let title = session
+                    .title
+                    .as_deref()
+                    .unwrap_or("New session")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = format!(
+                    "{}{}",
+                    if session.id == current {
+                        "● "
+                    } else if session.parent_id.is_some() {
+                        "↳ "
+                    } else {
+                        "  "
+                    },
+                    title
+                );
+                let description = format!(
+                    "{}{}",
+                    session.status,
+                    session
+                        .parent_id
+                        .map(|parent| format!(" · parent {parent}"))
+                        .unwrap_or_default()
+                );
+                solaris_tui::components::select_list::SelectItem::new(session.id, label)
+                    .description(description)
+            })
+            .collect();
+        let dialog = SelectDialog::new(
+            if tree { "Session tree" } else { "Sessions" },
+            HINT_SELECT,
+            items,
+            &self.theme,
+            self.dialog_tx.clone(),
+            |id| DialogMessage::Session(id.to_string()),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered().width(SizeValue::Percent(85)),
+        );
+    }
+
+    fn switch_session(&mut self, id: &str, fork: bool) {
+        if self.events_rx.is_some() || self.compact_rx.is_some() || self.oauth.is_some() {
+            self.notifications
+                .warning("finish or cancel the active operation before changing sessions");
+            return;
+        }
+        let Some(current) = self.agent.journal() else {
+            self.notifications
+                .warning("resume requires a saved session");
+            return;
+        };
+        if current.id() == id && !fork {
+            self.notifications.info("this session is already open");
+            return;
+        }
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        let info = match current.store().list(&cwd) {
+            Ok(sessions) => sessions.into_iter().find(|session| session.id == id),
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let Some(info) = info else {
+            self.notifications
+                .error("session not found in this directory");
+            return;
+        };
+        let journal = if fork {
+            current.fork(&cwd, &self.config.model)
+        } else {
+            current.store().resume(id)
+        };
+        let journal = match journal {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let records = match journal.store().records(journal.id()) {
+            Ok(records) => records,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let mut config = self.config.clone();
+        let mut auth = self.auth.clone();
+        if !fork {
+            config.model = info.model;
+            if let Some(provider) = info.provider {
+                auth.activate(provider);
+            }
+        }
+        let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
+        let (agent, cancel) = with_tools(
+            choice,
+            Arc::clone(&self.registry),
+            &self.tools,
+            &self.skills,
+            &self.agent.prompt_context(),
+            &cwd,
+            Arc::clone(&self.approver),
+            &self.execution,
+            &self.backend_factory,
+            &auth,
+        );
+        if let Err(error) = agent.attach_journal(Arc::clone(&journal)) {
+            self.notifications.error(error.to_string());
+            return;
+        }
+        self.agent = agent;
+        self.tool_cancel = cancel;
+        self.config = config;
+        self.auth = auth;
+        self.subagent_terminal = None;
+        self.selection.borrow_mut().clear();
+        self.notifications.clear();
+        self.restore_records(records);
+        self.refresh_models();
+        self.notifications.info(format!(
+            "{} session {}",
+            if fork { "forked" } else { "resumed" },
+            journal.id()
+        ));
     }
 
     /// The active provider, once one has been connected.
@@ -956,6 +1115,22 @@ impl App {
             "compact" => self.compact_now(),
             "queue" => self.queue_follow_up(args),
             "skills" => self.open_skills(),
+            "sessions" => self.open_sessions(false),
+            "tree" => self.open_sessions(true),
+            "resume" => {
+                if args.is_empty() {
+                    self.open_sessions(false);
+                } else {
+                    self.switch_session(args, false);
+                }
+            }
+            "fork" => {
+                if let Some(journal) = self.agent.journal() {
+                    self.switch_session(journal.id(), true);
+                } else {
+                    self.notifications.warning("fork requires a saved session");
+                }
+            }
             "reload" => self.reload_resources(),
             // A skill's name is taken on the colon rather than after a space; a
             // reminder that says so is worth more than "unknown command".
@@ -1351,6 +1526,7 @@ impl App {
         match message {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
+            DialogMessage::Session(id) => self.switch_session(&id, false),
             DialogMessage::Command(text) => self.submit(text),
             DialogMessage::Confirm {
                 action: ConfirmAction::RunTool,
@@ -3087,6 +3263,55 @@ mod tests {
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn switching_and_forking_sessions_replays_saved_turns_without_running_tools() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite"))
+            .expect("store");
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonical cwd");
+        let first = store.create(&cwd, "one", None).expect("first");
+        let second = store.create(&cwd, "two", None).expect("second");
+        let id = second.id().to_string();
+        second
+            .append(&solaris_agent::SessionRecord::Prompt {
+                text: "saved question".into(),
+            })
+            .expect("prompt");
+        second
+            .append(&solaris_agent::SessionRecord::Event {
+                event: AgentEvent::TextDelta("saved answer".into()),
+            })
+            .expect("text");
+        second
+            .append(&solaris_agent::SessionRecord::Event {
+                event: AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            })
+            .expect("complete");
+        drop(second);
+        let mut app = app();
+        app.agent.attach_journal(first).expect("attach");
+        app.switch_session(&id, false);
+        assert_eq!(app.agent.journal().expect("journal").id(), id);
+        assert_eq!(app.session.turns[0].reply, "saved answer");
+        app.switch_session(&id, true);
+        let fork = app.agent.journal().expect("fork");
+        assert_ne!(fork.id(), id);
+        assert_eq!(app.session.turns[0].reply, "saved answer");
+        assert!(
+            store
+                .list(&cwd)
+                .expect("sessions")
+                .iter()
+                .any(|info| info.id == fork.id() && info.parent_id.as_deref() == Some(id.as_str()))
+        );
+    }
 
     /// The prompt a request asks about, wherever the loop put it.
     ///

@@ -121,6 +121,26 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "Cancel one child without stopping its parent",
         args: "<task-id>",
     },
+    SlashCommandSpec {
+        name: "sessions",
+        description: "Choose a saved session",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "resume",
+        description: "Resume a saved session",
+        args: "[session-id]",
+    },
+    SlashCommandSpec {
+        name: "fork",
+        description: "Fork the current saved conversation",
+        args: "",
+    },
+    SlashCommandSpec {
+        name: "tree",
+        description: "Show session and child relationships",
+        args: "",
+    },
 ];
 
 // ------------------------------------------------------------ the parsing

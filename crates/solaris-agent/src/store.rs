@@ -33,6 +33,8 @@ pub struct SessionInfo {
     pub provider: Option<String>,
     pub status: String,
     pub updated_at: i64,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One durable, ordered state transition.
@@ -182,7 +184,7 @@ impl SessionStore {
     /// Most recently used sessions for this project, newest first.
     pub fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, StoreError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at,provider FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
+        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at,provider,(SELECT substr(json_extract(data,'$.text'),1,80) FROM records WHERE session_id=sessions.id AND json_extract(data,'$.type')='prompt' ORDER BY seq LIMIT 1) FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
         let rows = statement.query_map([cwd.to_string_lossy()], |row| {
             Ok(SessionInfo {
                 id: row.get(0)?,
@@ -192,6 +194,7 @@ impl SessionStore {
                 status: row.get(4)?,
                 updated_at: row.get(5)?,
                 provider: row.get(6)?,
+                title: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -298,12 +301,23 @@ impl SessionJournal {
     /// Fork without copying credentials or sharing the execution lease.
     pub fn fork(&self, cwd: &Path, model: &str) -> Result<Arc<SessionJournal>, StoreError> {
         let child = self.store.create(cwd, model, Some(&self.id))?;
-        for record in self.store.records(&self.id)? {
-            child.append(&record)?;
+        {
+            let mut connection = self.store.lock()?;
+            let transaction = connection.transaction()?;
+            transaction.execute("INSERT INTO records(session_id,data) SELECT ?1,data FROM records WHERE session_id=?2 ORDER BY seq", params![child.id, self.id])?;
+            transaction.execute("INSERT INTO contexts(session_id,data) SELECT ?1,data FROM contexts WHERE session_id=?2", params![child.id, self.id])?;
+            transaction.commit()?;
         }
-        child.append(&SessionRecord::Context {
-            messages: self.context()?,
+        let provider: Option<String> = self.store.lock()?.query_row(
+            "SELECT provider FROM sessions WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        child.append(&SessionRecord::Model {
+            provider,
+            model: model.to_string(),
         })?;
+
         Ok(child)
     }
 }
