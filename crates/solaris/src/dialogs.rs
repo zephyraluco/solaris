@@ -1114,7 +1114,8 @@ mod tests {
         assert!(text.contains("secret"), "{text}");
         assert!(text.contains("Only on request."), "{text}");
         assert!(text.contains("project"), "{text}");
-        assert!(text.contains("/skill:<name> only"), "{text}");
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("/skill:<name> only"), "{text}");
 
         // The file is wrapped, so it is compared with the wrapping taken out.
         let file = skills
