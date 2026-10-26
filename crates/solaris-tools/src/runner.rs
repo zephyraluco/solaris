@@ -148,9 +148,23 @@ async fn run_local(
         crate::tools::shell::kill_tree(pid).await;
         let _ = child.kill().await;
     }
-    let status = tokio::select! {
-        status = child.wait() => status.map_err(|error| error.to_string())?,
-        _ = &mut deadline => { crate::tools::shell::kill_tree(pid).await; let _ = child.kill().await; let _ = child.wait().await; return Err("search exceeded 60 seconds".into()); }
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.map_err(|error| error.to_string())?,
+            _ = ticker.tick(), if failure.is_none() => {
+                if cancel.is_cancelled() {
+                    failure = Some("search cancelled".into());
+                    crate::tools::shell::kill_tree(pid).await;
+                    let _ = child.kill().await;
+                }
+            },
+            _ = &mut deadline => {
+                crate::tools::shell::kill_tree(pid).await;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err("search exceeded 60 seconds".into());
+            }
+        }
     };
     if let Some(error) = failure {
         return Err(error);
@@ -236,6 +250,17 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_running_search_observes_cancellation() {
+        assert_search_cancellation("sleep 30").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_still_works_after_both_output_pipes_close() {
+        assert_search_cancellation("exec 1>&- 2>&-; sleep 30").await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_search_cancellation(command: &str) {
         let ctx = ToolContext {
             images_enabled: false,
             cwd: Path::new(".").into(),
@@ -243,9 +268,10 @@ pub(crate) mod tests {
             cancel: Cancel::new(),
         };
         let cancel = ctx.cancel.clone();
+        let command = command.to_owned();
         let work = tokio::spawn(async move {
             LocalRunner
-                .run_with_context("bash", &["-c".into(), "sleep 30".into()], &ctx)
+                .run_with_context("bash", &["-c".into(), command], &ctx)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
