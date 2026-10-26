@@ -93,12 +93,21 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         subagent,
     } = input;
 
+    let budget = options
+        .shared_budget
+        .clone()
+        .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
+    let inner: Arc<dyn AgentBackend> = Arc::new(crate::budget::BudgetedBackend {
+        inner,
+        budget: Arc::clone(&budget),
+    });
     let specs = tools
         .iter()
         .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
         .collect();
     let runner = Runner {
         inner,
+        budget: Arc::clone(&budget),
         tools,
         specs,
         approver: Arc::clone(&options.approver),
@@ -119,7 +128,19 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     let (tx, rx) = unbounded_channel();
     let cancel = runner.cancel.clone();
     tokio::spawn(async move {
-        runner.drive(prompt, tx).await;
+        let sender = tx.clone();
+        let drive = runner.drive(prompt, tx);
+        tokio::pin!(drive);
+        tokio::select! {
+            _ = &mut drive => {},
+            _ = tokio::time::sleep_until(budget.deadline()) => {
+                runner.cancel.cancel();
+                let _ = sender.send(AgentEvent::Status("execution deadline exceeded; stopping active work".into()));
+                if tokio::time::timeout(std::time::Duration::from_secs(2), &mut drive).await.is_err() {
+                    let _ = sender.send(AgentEvent::Error("execution deadline exceeded".into()));
+                }
+            }
+        }
     });
 
     Box::pin(EventStream {
@@ -133,6 +154,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 /// call that started it.
 struct Runner {
     inner: Arc<dyn AgentBackend>,
+    budget: Arc<crate::ExecutionBudget>,
     tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
     approver: Arc<dyn Approver>,
@@ -605,6 +627,9 @@ impl Runner {
 
     /// Run one call, or explain why it did not run.
     async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
+        if let Err(error) = self.budget.check() {
+            return ToolResult::error(call, error).into();
+        }
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == call.name) else {
             return ToolResult::error(
                 call,

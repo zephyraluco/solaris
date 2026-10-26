@@ -51,6 +51,10 @@ pub struct AgentOptions {
     pub prompt_context: PromptContext,
     /// Whether this agent may delegate. Children always disable delegation.
     pub subagents: bool,
+    /// Permission profile and aggregate request/time/cost limits.
+    pub execution: crate::ExecutionSettings,
+    /// Existing turn scope when constructing a child; leave None for a root.
+    pub shared_budget: Option<Arc<crate::ExecutionBudget>>,
 }
 
 impl Default for AgentOptions {
@@ -65,6 +69,8 @@ impl Default for AgentOptions {
             skills: Skills::empty(),
             prompt_context: PromptContext::default(),
             subagents: true,
+            execution: crate::ExecutionSettings::default(),
+            shared_budget: None,
         }
     }
 }
@@ -149,7 +155,17 @@ pub struct Agent {
 
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
-    pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self {
+    pub fn new(
+        choice: BackendChoice,
+        registry: Arc<ToolRegistry>,
+        mut options: AgentOptions,
+    ) -> Self {
+        options.approver = Arc::new(crate::PolicyApprover {
+            profile: options.execution.profile,
+            cwd: options.cwd.clone(),
+            rules: options.execution.rules.clone(),
+            fallback: Arc::clone(&options.approver),
+        });
         let registry = if options.subagents {
             let mut registry = registry.as_ref().clone();
             registry.add(Arc::new(SubagentTool));
@@ -386,6 +402,11 @@ impl Agent {
                 }));
             }
         };
+        let mut turn_options = self.options.clone();
+        turn_options.shared_budget =
+            Some(self.options.shared_budget.clone().unwrap_or_else(|| {
+                crate::ExecutionBudget::new(self.options.execution.budget.clone())
+            }));
         let tools = self.turn_tools(mode);
         let subagent = tools
             .iter()
@@ -394,7 +415,7 @@ impl Agent {
                 Arc::new(SubagentRunner {
                     choice: self.choice.clone(),
                     registry: Arc::clone(&self.registry),
-                    options: self.options.clone(),
+                    options: turn_options.clone(),
                     resources: resources.clone(),
                     mode,
                     slots: tokio::sync::Semaphore::new(self.options.max_parallel.max(1)),
@@ -427,7 +448,7 @@ impl Agent {
         let stream = session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),
             tools,
-            options: self.options.clone(),
+            options: turn_options,
             cancel: self.cancel.clone(),
             steering: self.steering.clone(),
             follow_up: self.follow_up.clone(),
@@ -551,6 +572,29 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.is_error && result.output.contains("invalid tool arguments"))));
         assert!(!dir.join("should-not-exist").exists());
         std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn request_budget_stops_a_tool_loop_before_another_model_call() {
+        let inner = Scripted::new(vec![vec![
+            AgentEvent::ToolCall(ToolCall::new("read", "read", json!({"path":"Cargo.toml"}))),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0,
+            },
+        ]]);
+        let mut options = AgentOptions::default();
+        options.execution.budget.max_requests = 1;
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::builtin()),
+            options,
+        );
+        let events = drain(agent.run_turn("read", Mode::Plan)).await;
+        assert_eq!(inner.requests().len(), 1);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("request budget"))
+        );
     }
 
     /// A backend that plays a scripted list of rounds and records what it was

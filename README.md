@@ -362,3 +362,19 @@ Undo refuses a file whose current bytes differ from the recorded after-image.
 Shell commands and external side effects are not covered. Files above 16 MiB are
 rejected by the mutation tools. Backups live alongside session artifacts and contain
 private file data. Ephemeral runs keep their artifacts in the temporary directory.
+
+## Execution policy and budgets
+
+`--policy trusted` retains the usual approval hook. `--policy ask` confirms
+mutating/unknown tools; `--policy read-only` refuses them even when a rule allows
+them. `--confirm-tools` remains supported. Optional `permissions.json` in the config
+directory contains an array of `{ "tool": "write", "resource": "/absolute/path/*",
+"effect": "ask" }` rules (`allow`, `ask`, `deny`; last match wins). Paths resolve
+existing symlink ancestors before matching. Shell resource patterns match command
+text, not its actual side effects; these rules are not an OS sandbox.
+
+`--max-requests` (default 100) and `--max-seconds` (default 1800) apply across a turn,
+its children and automatic compaction. `--max-cost <USD>` stops further work when
+observed model cost reaches the limit; it cannot guarantee a prepaid spending cap,
+and depends on available provider pricing. Child limits cannot reset the parent's
+request counter or deadline.

@@ -66,6 +66,22 @@ struct Args {
     #[arg(long)]
     confirm_tools: bool,
 
+    /// Execution profile. Tool policy does not provide an OS sandbox.
+    #[arg(long, value_parser = ["trusted", "ask", "read-only"], default_value = "trusted")]
+    policy: String,
+
+    /// Shared model request limit across the parent, compaction and all children.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+    max_requests: u32,
+
+    /// Whole-turn deadline, including child tasks and tools.
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=604800))]
+    max_seconds: u64,
+
+    /// Stop further work once observed model cost reaches this amount (USD).
+    #[arg(long)]
+    max_cost: Option<f64>,
+
     /// Resume a saved session by ID. Interrupted tools are never automatically rerun.
     #[arg(long, conflicts_with = "continue_session")]
     resume: Option<String>,
@@ -283,6 +299,39 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if args
+        .max_cost
+        .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+    {
+        anyhow::bail!("--max-cost must be finite and positive");
+    }
+    let rules_path = config_dir().map(|dir| dir.join("permissions.json"));
+    let rules = match rules_path.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => serde_json::from_str(&text)?,
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error.into());
+        }
+        _ => Vec::new(),
+    };
+    let execution = solaris_agent::ExecutionSettings {
+        profile: match args.policy.as_str() {
+            "ask" => solaris_agent::PolicyProfile::Ask,
+            "read-only" => solaris_agent::PolicyProfile::ReadOnly,
+            _ => solaris_agent::PolicyProfile::Trusted,
+        },
+        rules,
+        budget: solaris_agent::BudgetLimits {
+            max_requests: args.max_requests as usize,
+            max_seconds: args.max_seconds,
+            max_cost_usd: args.max_cost,
+        },
+    };
+    let ask_approval = args.confirm_tools
+        || args.policy == "ask"
+        || execution
+            .rules
+            .iter()
+            .any(|r| r.effect == solaris_agent::PermissionEffect::Ask);
     let journal = if args.ephemeral {
         None
     } else {
@@ -359,7 +408,8 @@ fn main() -> Result<()> {
         skills,
         prompt_context: resources.prompt,
         resource_paths: Some(resource_paths),
-        ask_approval: args.confirm_tools,
+        ask_approval,
+        execution,
         journal,
     });
     tui.set_root(Box::new(app));

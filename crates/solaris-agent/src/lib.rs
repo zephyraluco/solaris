@@ -60,3 +60,19 @@ mod store;
 pub use store::{SessionInfo, SessionJournal, SessionRecord, SessionStore, StoreError};
 
 mod runtime;
+
+mod budget;
+mod policy;
+pub use budget::{BudgetLimits, ExecutionBudget};
+pub use policy::{PermissionEffect, PermissionRule, PolicyApprover, PolicyProfile};
+
+/// Per-session execution settings; children inherit these ceilings.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionSettings {
+    #[serde(default)]
+    pub profile: PolicyProfile,
+    #[serde(default)]
+    pub rules: Vec<PermissionRule>,
+    #[serde(default)]
+    pub budget: BudgetLimits,
+}

@@ -139,6 +139,7 @@ pub struct AppOptions {
     pub ask_approval: bool,
     /// Optional persistent transcript and model context.
     pub journal: Option<Arc<solaris_agent::SessionJournal>>,
+    pub execution: solaris_agent::ExecutionSettings,
 }
 
 impl AppOptions {
@@ -187,6 +188,7 @@ impl AppOptions {
             resource_paths: None,
             ask_approval: false,
             journal: None,
+            execution: solaris_agent::ExecutionSettings::default(),
         }
     }
 }
@@ -219,6 +221,7 @@ fn resolve_backend(
 /// nothing is connected — because the session is transparent until the model
 /// asks for a tool: with none declared it is exactly one model call, forwarded
 /// unchanged. The returned handle stops whichever turn the session is running.
+#[expect(clippy::too_many_arguments, reason = "application assembly boundary")]
 fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
@@ -227,12 +230,14 @@ fn with_tools(
     prompt_context: &PromptContext,
     cwd: &Path,
     approver: Arc<dyn Approver>,
+    execution: &solaris_agent::ExecutionSettings,
 ) -> (Arc<Agent>, Cancel) {
-    let options = AgentOptions::in_directory(cwd)
+    let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_skills(skills.clone())
         .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
+    options.execution = execution.clone();
     let agent = Arc::new(Agent::new(choice, registry, options));
     let cancel = agent.cancel_handle();
     (agent, cancel)
@@ -321,6 +326,7 @@ pub struct App {
     cwd: PathBuf,
     /// The approver every rebuilt loop is wired with.
     approver: Arc<dyn Approver>,
+    execution: solaris_agent::ExecutionSettings,
     /// Stops the turn in flight, tools included.
     tool_cancel: Cancel,
     /// Calls waiting for the user's answer; `None` when the session approves
@@ -377,6 +383,7 @@ impl App {
             resource_paths,
             ask_approval,
             journal,
+            execution,
         } = options;
 
         let mut config = config;
@@ -401,6 +408,7 @@ impl App {
             &prompt_context,
             &cwd,
             Arc::clone(&approver),
+            &execution,
         );
 
         if let Some(journal) = &journal {
@@ -468,6 +476,7 @@ impl App {
             registry,
             cwd,
             approver,
+            execution,
             tool_cancel,
             approval_rx,
             pending_approvals: VecDeque::new(),
@@ -558,6 +567,7 @@ impl App {
             &self.agent.prompt_context(),
             &self.cwd,
             Arc::clone(&self.approver),
+            &self.execution,
         );
         if let Some(journal) = self.agent.journal() {
             let _ = agent.attach_journal(journal);
