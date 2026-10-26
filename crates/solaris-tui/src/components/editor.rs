@@ -113,6 +113,7 @@ pub struct Editor {
     last_text_area: Rect,
     last_display: Vec<DisplayLine>,
     last_scroll: u16,
+    terminal_cursor: Option<(u16, u16)>,
 }
 
 impl Default for Editor {
@@ -148,6 +149,7 @@ impl Editor {
             last_text_area: Rect::default(),
             last_display: Vec::new(),
             last_scroll: 0,
+            terminal_cursor: None,
         }
     }
 
@@ -743,6 +745,7 @@ impl Editor {
 
 impl Component for Editor {
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
+        self.terminal_cursor = None;
         self.last_area = area;
         if area.width < 6 || area.height < 3 {
             return;
@@ -857,6 +860,7 @@ impl Component for Editor {
                     let y = text_area.y + (index - self.scroll_row as usize) as u16;
                     let x = text_area.x + 2 + cell_col as u16;
                     if x < text_area.x + text_area.width && y < text_area.y + text_area.height {
+                        self.terminal_cursor = Some((x, y));
                         let style = buf[(x, y)].style().patch(self.styles.cursor);
                         buf[(x, y)].set_style(style);
                     }
@@ -865,6 +869,10 @@ impl Component for Editor {
         }
 
         self.last_display = display;
+    }
+
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        self.terminal_cursor
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
@@ -1161,6 +1169,24 @@ mod tests {
             CommandHint::new("stats", "show stats", ""),
             CommandHint::new("quit", "exit", ""),
         ]
+    }
+
+    #[test]
+    fn ime_cursor_tracks_wide_text_and_disappears_without_focus() {
+        let mut editor = Editor::new();
+        editor.set_focused(true);
+        let area = Rect::new(2, 5, 30, 5);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 15));
+        editor.set_text("中文");
+        editor.render(&mut buf, area);
+        let end = editor.cursor_position().expect("focused caret");
+        editor.set_text("");
+        editor.render(&mut buf, area);
+        let start = editor.cursor_position().expect("empty caret");
+        assert_eq!(end, (start.0 + 4, start.1));
+        editor.set_focused(false);
+        editor.render(&mut buf, area);
+        assert_eq!(editor.cursor_position(), None);
     }
 
     #[test]

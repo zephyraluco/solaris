@@ -46,6 +46,11 @@ pub trait Component {
     /// Draw into `buf` within `area`.
     fn render(&mut self, buf: &mut Buffer, area: Rect);
 
+    /// Terminal cursor position after rendering, for IME candidate placement.
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
+
     /// Handle a key event when this component owns focus.
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
         let _ = key;

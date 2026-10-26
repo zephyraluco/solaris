@@ -2241,6 +2241,20 @@ impl App {
             self.session.follow_end = true;
         }
 
+        self.selection.borrow_mut().set_scroll_content(
+            area,
+            self.session.scroll,
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect(),
+        );
+
         for (row, line) in lines
             .iter()
             .skip(self.session.scroll as usize)
@@ -2587,6 +2601,12 @@ impl App {
 }
 
 impl Component for App {
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        if self.inline.is_some() {
+            return None;
+        }
+        self.editor.cursor_position()
+    }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.frame = self.frame.wrapping_add(1);
         if self.subagent_terminal.is_some() {

@@ -166,6 +166,20 @@ impl Tui {
                 terminal.draw(|frame| {
                     let area = frame.area();
                     self.render(frame.buffer_mut(), area);
+                    let cursor = self
+                        .overlays
+                        .last()
+                        .and_then(|entry| entry.component.cursor_position())
+                        .or_else(|| {
+                            if self.overlays.is_empty() {
+                                self.root.as_ref().and_then(|root| root.cursor_position())
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(position) = cursor {
+                        frame.set_cursor_position(position);
+                    }
                 })?;
             }
         }

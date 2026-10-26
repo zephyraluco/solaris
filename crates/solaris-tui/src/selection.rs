@@ -55,6 +55,8 @@ pub struct Selection {
     click_cell: Option<Point>,
     click_at: Option<Instant>,
     click_count: u8,
+    scroll_content: Option<(Rect, u16, Vec<String>)>,
+    content_range: Option<(Point, Point)>,
 }
 
 impl Default for Selection {
@@ -76,6 +78,8 @@ impl Selection {
             click_cell: None,
             click_at: None,
             click_count: 0,
+            scroll_content: None,
+            content_range: None,
         }
     }
 
@@ -105,11 +109,33 @@ impl Selection {
         }
     }
 
+    /// Register transcript rows and their viewport, keeping selection in content coordinates.
+    pub fn set_scroll_content(&mut self, area: Rect, offset: u16, mut rows: Vec<String>) {
+        if self
+            .scroll_content
+            .as_ref()
+            .is_some_and(|(old, _, _)| *old != area)
+        {
+            self.clear();
+        }
+        rows.resize_with(
+            rows.len().max(offset as usize + area.height as usize),
+            String::new,
+        );
+        for row in &mut rows {
+            row.push_str(&" ".repeat(
+                (area.width as usize).saturating_sub(UnicodeWidthStr::width(row.as_str())),
+            ));
+        }
+        self.scroll_content = Some((area, offset, rows));
+    }
+
     /// Drop the highlight.
     ///
     /// The click sequence survives, so the second press of a double click still
     /// resolves to a word even though the first one cleared the range.
     pub fn clear(&mut self) {
+        self.content_range = None;
         self.anchor = None;
         self.focus = None;
         self.marked = false;
@@ -121,7 +147,8 @@ impl Selection {
     /// press is a click — it only moves the editor's caret — which is also the
     /// press claurst throws away.
     pub fn is_active(&self) -> bool {
-        self.bounds()
+        self.content_range
+            .or_else(|| self.bounds())
             .is_some_and(|(start, end)| start != end || self.marked)
     }
 
@@ -135,6 +162,22 @@ impl Selection {
     /// nothing *but* blanks keeps them: it is still a range the user drew, and
     /// an indentation block is worth copying.
     pub fn selected_text(&self) -> String {
+        if let (Some((area, _, rows)), Some((anchor, focus))) =
+            (&self.scroll_content, self.content_range)
+        {
+            let mut content = Self::new();
+            content.area = Rect::new(
+                area.x,
+                0,
+                area.width,
+                rows.len().min(u16::MAX as usize) as u16,
+            );
+            content.rows = rows.clone();
+            content.anchor = Some(anchor);
+            content.focus = Some(focus);
+            content.marked = self.marked;
+            return content.selected_text();
+        }
         let Some((start, end)) = self.bounds() else {
             return String::new();
         };
@@ -169,6 +212,33 @@ impl Selection {
     /// reacts to it too: a press both moves the editor's caret and starts a
     /// range, and only a drag turns the range into a selection.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        let changed = self.handle_mouse_screen(event);
+        if matches!(
+            event.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) {
+            if let (Some((area, offset, _)), Some(anchor), Some(focus)) =
+                (&self.scroll_content, self.anchor, self.focus)
+            {
+                if rect_contains(*area, anchor.0, anchor.1)
+                    && rect_contains(*area, focus.0, focus.1)
+                {
+                    let logical = |point: Point| (point.0, point.1 - area.y + offset);
+                    if matches!(event.kind, MouseEventKind::Down(_)) || self.content_range.is_none()
+                    {
+                        self.content_range = Some((logical(anchor), logical(focus)));
+                    } else if let Some((_, end)) = self.content_range.as_mut() {
+                        *end = logical(focus);
+                    }
+                } else {
+                    self.content_range = None;
+                }
+            }
+        }
+        changed
+    }
+
+    fn handle_mouse_screen(&mut self, event: MouseEvent) -> bool {
         if self.area.width == 0 || self.area.height == 0 {
             return false;
         }
@@ -261,6 +331,30 @@ impl Selection {
     fn bounds(&self) -> Option<(Point, Point)> {
         if self.area.width == 0 || self.area.height == 0 {
             return None;
+        }
+        if let (Some((area, offset, _)), Some((anchor, focus))) =
+            (&self.scroll_content, self.content_range)
+        {
+            let (start, end) = if (anchor.1, anchor.0) <= (focus.1, focus.0) {
+                (anchor, focus)
+            } else {
+                (focus, anchor)
+            };
+            let bottom = offset.saturating_add(area.height);
+            if end.1 < *offset || start.1 >= bottom {
+                return None;
+            }
+            let start = if start.1 < *offset {
+                (area.x, area.y)
+            } else {
+                (start.0, area.y + start.1 - offset)
+            };
+            let end = if end.1 >= bottom {
+                (area.right() - 1, area.bottom() - 1)
+            } else {
+                (end.0, area.y + end.1 - offset)
+            };
+            return Some((start, end));
         }
         let anchor = self.clamp(self.anchor?);
         let focus = self.clamp(self.focus?);
@@ -504,6 +598,23 @@ mod tests {
         selection.handle_mouse(down(from.0, from.1));
         selection.handle_mouse(drag_to(to.0, to.1));
         selection.handle_mouse(up(to.0, to.1));
+    }
+
+    #[test]
+    fn transcript_selection_follows_scroll_and_copies_offscreen_text() {
+        let (mut selection, _) = selection_with(&["zero", "one", "two", "three"]);
+        let rows = ["zero", "one", "two", "three", "four", "five"];
+        selection.set_scroll_content(AREA, 0, rows.iter().map(|s| s.to_string()).collect());
+        swipe(&mut selection, (0, 1), (2, 1));
+        selection.set_scroll_content(AREA, 1, rows.iter().map(|s| s.to_string()).collect());
+        assert_eq!(selection.bounds(), Some(((0, 0), (2, 0))));
+        assert_eq!(selection.selected_text(), "one");
+        selection.set_scroll_content(AREA, 2, rows.iter().map(|s| s.to_string()).collect());
+        assert_eq!(selection.bounds(), None);
+        assert!(selection.is_active());
+        assert_eq!(selection.selected_text(), "one");
+        selection.set_scroll_content(AREA, 0, rows.iter().map(|s| s.to_string()).collect());
+        assert_eq!(selection.bounds(), Some(((0, 1), (2, 1))));
     }
 
     #[test]
