@@ -137,6 +137,8 @@ pub struct AppOptions {
     /// Off in tests, which drive the loop themselves and have nobody to ask; on
     /// in the binary, where a prompt is the point.
     pub ask_approval: bool,
+    /// Optional persistent transcript and model context.
+    pub journal: Option<Arc<solaris_agent::SessionJournal>>,
 }
 
 impl AppOptions {
@@ -184,6 +186,7 @@ impl AppOptions {
             prompt_context: PromptContext::default(),
             resource_paths: None,
             ask_approval: false,
+            journal: None,
         }
     }
 }
@@ -373,6 +376,7 @@ impl App {
             prompt_context,
             resource_paths,
             ask_approval,
+            journal,
         } = options;
 
         let mut config = config;
@@ -399,6 +403,10 @@ impl App {
             Arc::clone(&approver),
         );
 
+        if let Some(journal) = &journal {
+            // Attach errors are retained by the agent and prevent tool execution.
+            let _ = agent.attach_journal(Arc::clone(journal));
+        }
         let theme = Theme::by_name(&config.theme);
         selection
             .borrow_mut()
@@ -465,6 +473,25 @@ impl App {
             pending_approvals: VecDeque::new(),
         };
 
+        if let Some(journal) = journal {
+            match journal.store().records(journal.id()) {
+                Ok(records) => {
+                    for record in records {
+                        match record {
+                        solaris_agent::SessionRecord::Prompt { text } => {
+                            app.session.turns.push(Turn { prompt: text, ..Default::default() });
+                        }
+                        solaris_agent::SessionRecord::Event { event } => app.apply_event(event),
+                        solaris_agent::SessionRecord::Interrupted => app.apply_event(AgentEvent::Error("session interrupted; unfinished tool outcomes must be checked before retrying".into())),
+                        solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => app.session.turns.clear(),
+                        _ => {}
+                    }
+                    }
+                }
+                Err(error) => app.notifications.error(error.to_string()),
+            }
+            app.session.bump();
+        }
         app.refresh_models();
         app
     }
@@ -532,6 +559,9 @@ impl App {
             &self.cwd,
             Arc::clone(&self.approver),
         );
+        if let Some(journal) = self.agent.journal() {
+            let _ = agent.attach_journal(journal);
+        }
         self.agent = agent;
         self.tool_cancel = cancel;
         self.agent.source()

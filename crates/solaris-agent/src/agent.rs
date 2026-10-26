@@ -131,6 +131,7 @@ impl AgentOptions {
 pub struct Agent {
     /// The backend the credentials resolved to, and how it was chosen.
     choice: BackendChoice,
+    active: Arc<std::sync::atomic::AtomicBool>,
     /// Every tool this platform has, built once so `edit` and `write` keep
     /// serialising against the same per-file locks for the whole session.
     registry: Arc<ToolRegistry>,
@@ -165,6 +166,7 @@ impl Agent {
         let follow_up = Queue::for_resources(Arc::clone(&resources));
         Self {
             choice,
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
             options,
             cancel: Cancel::new(),
@@ -173,6 +175,24 @@ impl Agent {
             follow_up,
             resources,
         }
+    }
+
+    /// Attach a persistent session at an idle boundary and restore its context.
+    pub fn attach_journal(
+        &self,
+        journal: Arc<crate::SessionJournal>,
+    ) -> Result<(), crate::StoreError> {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::StoreError::Invalid(
+                "cannot attach a journal during a turn".into(),
+            ));
+        }
+        self.conversation.attach(journal)
+    }
+
+    /// Attached persistent session, if enabled by the caller.
+    pub fn journal(&self) -> Option<Arc<crate::SessionJournal>> {
+        self.conversation.journal()
     }
 
     /// A handle that stops a turn in flight: a running command is killed and no
@@ -189,6 +209,7 @@ impl Agent {
     pub fn with_refreshed_backend(&self, choice: BackendChoice) -> Self {
         Self {
             choice,
+            active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
             cancel: self.cancel.clone(),
@@ -348,6 +369,11 @@ impl Agent {
     /// The prompt is recorded in the conversation before anything is asked, so a
     /// turn that is abandoned still leaves what the user said.
     pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
+        let Some(lease) = crate::runtime::TurnLease::acquire(Arc::clone(&self.active)) else {
+            return Box::pin(futures::stream::once(async {
+                crate::AgentEvent::Error("session already has an active turn".into())
+            }));
+        };
         let resources = self
             .resources
             .read()
@@ -388,7 +414,17 @@ impl Agent {
         );
         drop(resources);
 
-        session::start(TurnInput {
+        let journal = self.journal();
+        if let Some(journal) = &journal {
+            if let Err(error) = journal.append(&crate::SessionRecord::Prompt {
+                text: prompt.clone(),
+            }) {
+                return Box::pin(futures::stream::once(async move {
+                    crate::AgentEvent::Error(error.to_string())
+                }));
+            }
+        }
+        let stream = session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),
             tools,
             options: self.options.clone(),
@@ -400,7 +436,8 @@ impl Agent {
             prompt,
             context_window: self.context_window(),
             subagent,
-        })
+        });
+        crate::runtime::leased_stream(crate::runtime::journal_stream(stream, journal), lease)
     }
 }
 
@@ -428,6 +465,60 @@ mod tests {
         AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
     };
     use solaris_tools::{SHELL_TOOL, Tool, ToolContext, ToolOutput};
+
+    #[tokio::test]
+    async fn saved_context_is_restored_and_transcript_events_survive_restart() {
+        let path =
+            std::env::temp_dir().join(format!("solaris-agent-resume-{}", std::process::id()));
+        let store = crate::SessionStore::open(&path.join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(std::path::Path::new("/project"), "model", None)
+            .expect("session");
+        let id = journal.id().to_string();
+        let complete = || {
+            vec![
+                AgentEvent::TextDelta("answer".into()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![complete(), complete()]);
+        let first = agent(inner.clone());
+        first.attach_journal(journal).expect("attach");
+        let events = drain(first.run_turn("remember this", Mode::Plan)).await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        drop(first);
+        let second = agent(inner.clone());
+        second
+            .attach_journal(store.resume(&id).expect("resume"))
+            .expect("attach again");
+        drain(second.run_turn("continue", Mode::Plan)).await;
+        let requests = inner.requests();
+        assert!(
+            requests[1]
+                .history
+                .iter()
+                .any(|m| m.text() == "remember this")
+        );
+        assert!(requests[1].history.iter().any(|m| m.text() == "answer"));
+        assert_eq!(
+            store
+                .records(&id)
+                .expect("records")
+                .iter()
+                .filter(|r| matches!(r, crate::SessionRecord::Prompt { .. }))
+                .count(),
+            2
+        );
+        drop(second);
+        drop(store);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
 
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.

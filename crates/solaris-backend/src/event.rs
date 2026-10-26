@@ -3,10 +3,11 @@
 use crate::message::Message;
 use crate::tool::{ToolCall, ToolResult, ToolSpec};
 use crate::usage::Usage;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A single incremental event produced while answering a turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
     /// Extended-thinking token chunk.
     ThinkingDelta(String),

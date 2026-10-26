@@ -65,6 +65,22 @@ struct Args {
     /// it on to be asked before a write, an edit or a command runs.
     #[arg(long)]
     confirm_tools: bool,
+
+    /// Resume a saved session by ID. Interrupted tools are never automatically rerun.
+    #[arg(long, conflicts_with = "continue_session")]
+    resume: Option<String>,
+
+    /// Resume the most recent session in this directory.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// List saved sessions in this directory and exit.
+    #[arg(long)]
+    sessions: bool,
+
+    /// Keep this run entirely in memory.
+    #[arg(long, conflicts_with_all = ["resume", "continue_session", "sessions"])]
+    ephemeral: bool,
 }
 
 fn main() -> Result<()> {
@@ -245,6 +261,46 @@ fn main() -> Result<()> {
 
     // The backend runs on a runtime; the UI loop stays on the main thread and
     // only ever drains a channel, so nothing blocks the terminal.
+    let journal = if args.ephemeral {
+        None
+    } else {
+        let directory = config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no configuration directory; use --ephemeral"))?;
+        let store = solaris_agent::SessionStore::open(&directory.join("sessions/sessions.sqlite"))?;
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        if args.sessions {
+            for session in store.list(&cwd)? {
+                println!("{}  {}  {}", session.id, session.status, session.model);
+            }
+            return Ok(());
+        }
+        let sessions = store.list(&cwd)?;
+        let resume = args.resume.as_deref().or_else(|| {
+            if args.continue_session {
+                sessions.first().map(|s| s.id.as_str())
+            } else {
+                None
+            }
+        });
+        if args.continue_session && resume.is_none() {
+            anyhow::bail!("no saved session in this directory");
+        }
+        let journal = match resume {
+            Some(id) => {
+                let info = sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("session not found in this directory"))?;
+                if args.model.is_none() {
+                    config.model = info.model.clone();
+                }
+                store.resume(id)?
+            }
+            None => store.create(&cwd, &choice.model, None)?,
+        };
+        let _ = journal.context()?;
+        Some(journal)
+    };
     let runtime = tokio::runtime::Runtime::new()?;
     let _guard = runtime.enter();
 
@@ -282,6 +338,7 @@ fn main() -> Result<()> {
         prompt_context: resources.prompt,
         resource_paths: Some(resource_paths),
         ask_approval: args.confirm_tools,
+        journal,
     });
     tui.set_root(Box::new(app));
 

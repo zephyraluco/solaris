@@ -45,7 +45,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Session statistics — turns, tokens by bucket, cost and context usage
 > - Credentials, companion and history persisted under the platform config directory
 >
-> **Not yet:** MCP, session files on disk, a real device-code sign-in, and an interactive confirmation before a tool runs.
+> **Not yet:** MCP and a device-code sign-in. Browser-based ChatGPT authorization, persistent sessions, and opt-in tool confirmation are available.
 
 ---
 
@@ -340,3 +340,15 @@ solaris is a Rust port of ideas from two projects, and the source says so where 
 
 - [**claurst**](https://github.com/Kuberwastaken/claurst) — the terminal companion, the two-column welcome box, the inline `/connect` flow and the shape of the provider catalogue all follow its design.
 - **`@earendil-works/pi-tui`** — the retained-component-tree TUI design, with application-owned focus and overlays and flex-like layout stacks, follows that library's approach; each `solaris-tui` module ported from it says so in its header.
+
+## Persistent sessions
+
+Sessions are saved to `sessions/sessions.sqlite` under the resolved configuration directory.
+Use `solaris --sessions` to list sessions for the current directory, `solaris --continue`
+to restore the latest, or `solaris --resume <ID>` to restore one explicitly.
+`--ephemeral` keeps a run in memory. A session can only be opened by one process at a time.
+
+The journal retains prompts, tool calls/results, model context, compaction checkpoints and
+child activity. Interrupted tool calls are never automatically executed again: verify their
+side effects before retrying. The journal contains conversation and tool data; treat it as
+private. Credentials and authentication headers are not intentionally recorded.

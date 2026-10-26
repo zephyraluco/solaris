@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 serde_yaml_ng = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+fs2 = "0.4"
 
 [dev-dependencies]
 # The unit tests build tool-call arguments, and the loopback test binds a real

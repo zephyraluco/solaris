@@ -177,6 +177,10 @@ impl Runner {
         let mut last_usage: Option<Usage> = None;
 
         loop {
+            if let Some(error) = self.conversation.error() {
+                let _ = tx.send(AgentEvent::Error(error));
+                return;
+            }
             if self.cancel.is_cancelled() {
                 self.give_up("the turn was cancelled".to_string(), &tx);
                 return;
@@ -246,6 +250,10 @@ impl Runner {
                 }
                 if self.take_follow_ups(&tx) {
                     continue;
+                }
+                if let Some(error) = self.conversation.error() {
+                    let _ = tx.send(AgentEvent::Error(error));
+                    return;
                 }
                 let _ = tx.send(AgentEvent::TurnComplete {
                     usage: total,
@@ -624,6 +632,16 @@ impl Runner {
             return ToolResult::error(call, "the turn was cancelled before this call ran").into();
         }
 
+        if let Some(error) = self.conversation.error() {
+            return ToolResult::error(call, error).into();
+        }
+        if let Some(journal) = self.conversation.journal() {
+            if let Err(error) =
+                journal.append(&crate::SessionRecord::ToolIntent { call: call.clone() })
+            {
+                return ToolResult::error(call, error.to_string()).into();
+            }
+        }
         let ctx = ToolContext {
             cwd: self.cwd.clone(),
             temp_dir: self.temp_dir.clone(),

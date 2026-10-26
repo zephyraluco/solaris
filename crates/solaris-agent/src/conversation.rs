@@ -16,20 +16,70 @@
 //! each step it takes, so a turn abandoned halfway leaves the conversation with
 //! exactly the parts that really happened.
 
-use std::sync::{Mutex, MutexGuard};
+use crate::{SessionJournal, SessionRecord, StoreError};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use solaris_backend::{Message, Role, tokens_for_characters};
 
 /// The messages a turn is built from and appends to.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Conversation {
     messages: Mutex<Vec<Message>>,
+    journal: RwLock<Option<Arc<SessionJournal>>>,
+    failure: Mutex<Option<String>>,
 }
 
 impl Conversation {
     /// An empty conversation.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn attach(&self, journal: Arc<SessionJournal>) -> Result<(), StoreError> {
+        let context = match journal.context() {
+            Ok(context) => context,
+            Err(error) => {
+                *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        *self.lock() = context;
+        *self
+            .journal
+            .write()
+            .map_err(|_| StoreError::Invalid("journal lock poisoned".into()))? = Some(journal);
+        self.repair();
+        if let Some(error) = self.error() {
+            return Err(StoreError::Invalid(error));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn journal(&self) -> Option<Arc<SessionJournal>> {
+        self.journal
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn persist(&self, record: SessionRecord) -> bool {
+        if self.error().is_some() {
+            return false;
+        }
+        if let Some(journal) = self.journal() {
+            if let Err(error) = journal.append(&record) {
+                *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+                return false;
+            }
+        }
+        true
     }
 
     /// The messages as they are now, for building one request.
@@ -48,12 +98,22 @@ impl Conversation {
 
     /// Append one message.
     pub(crate) fn push(&self, message: Message) {
-        self.lock().push(message);
+        let mut messages = self.lock();
+        if self.persist(SessionRecord::Message {
+            message: message.clone(),
+        }) {
+            messages.push(message);
+        }
     }
 
     /// Replace everything, which is what compaction does.
     pub(crate) fn replace_with(&self, messages: Vec<Message>) {
-        *self.lock() = messages;
+        let mut current = self.lock();
+        if self.persist(SessionRecord::Context {
+            messages: messages.clone(),
+        }) {
+            *current = messages;
+        }
     }
 
     /// Forget the conversation, for `/clear`.
@@ -61,7 +121,7 @@ impl Conversation {
     /// The next turn starts with nothing but its own prompt and a fresh system
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
-        self.lock().clear();
+        self.replace_with(Vec::new());
     }
 
     /// Drop a trailing request for calls that never got answers.
@@ -73,11 +133,33 @@ impl Conversation {
     /// request always has its answers.
     pub(crate) fn repair(&self) {
         let mut messages = self.lock();
-        let unanswered = messages
-            .last()
-            .is_some_and(|last| last.role == Role::Assistant && last.tool_calls().next().is_some());
-        if unanswered {
-            messages.pop();
+        let calls: Vec<_> = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .into_iter()
+            .flat_map(|m| m.tool_calls())
+            .cloned()
+            .collect();
+        let answered: std::collections::HashSet<_> = messages
+            .iter()
+            .flat_map(|m| m.tool_results())
+            .map(|r| r.id.as_str())
+            .collect();
+        let missing: Vec<_> = calls
+            .into_iter()
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .collect();
+        for call in missing {
+            let message = Message::tool_result(solaris_backend::ToolResult::error(
+                &call,
+                "interrupted; execution outcome is unknown; verify side effects before retrying",
+            ));
+            if self.persist(SessionRecord::Message {
+                message: message.clone(),
+            }) {
+                messages.push(message);
+            }
         }
     }
 
@@ -135,16 +217,21 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_calls_whose_answers_never_came_is_taken_back() {
+    fn unanswered_calls_get_explicit_interruption_results() {
         let conversation = Conversation::new();
         conversation.push(Message::user("read it"));
         conversation.push(Message::tool_use(call("call-1")));
 
         conversation.repair();
 
-        // The prompt stays — it really was said — and the unanswered call goes,
-        // because every wire rejects a call with no result.
-        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation.len(), 3);
+        assert!(
+            conversation.snapshot()[2]
+                .tool_results()
+                .next()
+                .expect("result")
+                .is_error
+        );
         assert_eq!(conversation.snapshot()[0].text(), "read it");
     }
 
