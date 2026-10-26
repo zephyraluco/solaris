@@ -469,3 +469,19 @@ uses file signatures. Unknown/unsupported model capabilities fail locally.
 Image blocks are encoded separately for Messages, Chat Completions and Responses;
 they are retained in private session data rather than pasted into model-facing text.
 MCP image content follows the same capability check.
+
+## Toolchain and validation
+
+Development uses the Rust 1.99.1 toolchain pinned in `rust-toolchain.toml`; the
+minimum supported Rust version is 1.88. CI checks formatting, strict Clippy and
+tests on Linux, macOS and Windows, plus a separate MSRV compilation check. Tags
+and manually dispatched CI runs build downloadable release artifacts without
+automatically publishing a GitHub release.
+
+Local checks:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```

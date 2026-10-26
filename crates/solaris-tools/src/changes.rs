@@ -229,7 +229,9 @@ pub fn undo(directory: &Path, id: &str) -> io::Result<FileChange> {
         if hash(&before) != *expected {
             return Err(io::Error::other("undo backup checksum mismatch"));
         }
-        let mut permissions = std::fs::metadata(&change.path)?.permissions();
+        let permissions = std::fs::metadata(&change.path)?.permissions();
+        #[cfg(unix)]
+        let mut permissions = permissions;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
