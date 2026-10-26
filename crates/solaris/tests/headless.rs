@@ -145,3 +145,38 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
             .any(|message| message["content"] == "first prompt")
     );
 }
+
+#[test]
+fn rpc_binary_accepts_commands_without_initializing_a_terminal() {
+    use std::process::Stdio;
+    let directory = tempfile::tempdir().expect("directory");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_solaris"))
+        .env("SOLARIS_CONFIG_DIR", directory.path())
+        .args(["--rpc", "--ephemeral", "--provider", "local"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("RPC binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"not json\n{\"id\":\"cancel\",\"command\":{\"type\":\"cancel\"}}\n")
+        .expect("requests");
+    let output = child.wait_with_output().expect("EOF exits");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .expect("UTF8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON response"))
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["ok"], false);
+    assert_eq!(responses[1]["id"], "cancel");
+    assert_eq!(responses[1]["ok"], true);
+}

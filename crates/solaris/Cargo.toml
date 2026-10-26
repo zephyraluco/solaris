@@ -25,7 +25,8 @@ crossterm = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

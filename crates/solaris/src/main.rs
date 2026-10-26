@@ -5,6 +5,8 @@
 //! terminal, and hands control to [`solaris_tui::Tui::run`], which owns the event
 //! loop.
 
+mod automation;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,6 +72,10 @@ struct Args {
     /// Emit versioned JSON events (requires --print).
     #[arg(long, requires = "print")]
     json: bool,
+
+    /// Serve newline-delimited session commands and events over stdin/stdout.
+    #[arg(long, conflicts_with_all = ["print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status"])]
+    rpc: bool,
 
     /// MCP configuration; defaults to mcp.json in the user config directory.
     #[arg(long)]
@@ -476,7 +482,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if let Some(prompt) = &args.print {
+    if args.print.is_some() || args.rpc {
         let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
             .with_selection(tools)
             .with_skills(skills)
@@ -509,31 +515,23 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{} is not a supported image", path.display()))?;
             session.attach_image(image).map_err(anyhow::Error::msg)?;
         }
-        let succeeded = runtime.block_on(async {
-            use futures::StreamExt;
-            use std::io::Write;
-            let mut stream = session.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt.clone(), mode: config.mode });
-            let mut sequence = 0u64;
-            let mut succeeded = false;
-            while let Some(event) = stream.next().await {
-                sequence += 1;
-                if args.json {
-                    println!("{}", serde_json::json!({"version":1,"sequence":sequence,"session_id":session.journal().as_ref().map(|j| j.id().to_string()),"event":event}));
-                } else {
-                    match &event {
-                        solaris_agent::AgentEvent::TextDelta(text) => { print!("{text}"); std::io::stdout().flush()?; },
-                        solaris_agent::AgentEvent::Error(error) => eprintln!("{error}"),
-                        _ => {}
-                    }
-                }
-                if matches!(event, solaris_agent::AgentEvent::TurnComplete { .. }) { succeeded = true; }
-                if matches!(event, solaris_agent::AgentEvent::Error(_)) { succeeded = false; }
+        if args.rpc {
+            runtime.block_on(automation::serve_rpc(
+                &session,
+                config.mode,
+                tokio::io::stdin(),
+                std::io::stdout().lock(),
+            ))?;
+        } else if let Some(prompt) = &args.print {
+            let succeeded = runtime.block_on(automation::print_turn(
+                &session,
+                prompt,
+                config.mode,
+                args.json,
+            ))?;
+            if !succeeded {
+                anyhow::bail!("headless turn failed");
             }
-            if !args.json { println!(); }
-            Ok::<bool, anyhow::Error>(succeeded)
-        })?;
-        if !succeeded {
-            anyhow::bail!("headless turn failed");
         }
         return Ok(());
     }

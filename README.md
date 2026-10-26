@@ -391,6 +391,22 @@ unless an explicit policy rule allows the call; they never wait for an invisible
 conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
 execution budgets, tool policy, persistence and cancellation.
 
+`solaris --rpc` provides the same session over stdin/stdout, without a network
+server. Send one JSON request per line; `id` is a string. For example:
+
+```json
+{"id":"turn-1","command":{"type":"prompt","text":"review this project","mode":"plan"}}
+{"id":"stop-1","command":{"type":"cancel"}}
+```
+
+Commands are `prompt`, `cancel`, `steer` and `queue` (the last two take `text`).
+An omitted prompt mode uses the CLI mode. Responses carry `type: "response"`,
+`id`, `ok` and an optional error. Events carry `type: "event"`, `request_id`,
+`version: 1`, `sequence`, `session_id` and `event`. An `end` envelope marks stream
+completion; inspect the events for turn success or failure. One prompt runs at a
+time; a second prompt is rejected while controls remain available. Requests are
+limited to 1 MiB per line. Closing stdin cancels the current turn and exits.
+
 ## MCP servers
 
 Configure `mcp.json` in the user configuration directory, or pass `--mcp-config <PATH>`.
