@@ -84,7 +84,18 @@ pub(crate) struct BudgetedBackend {
 }
 #[async_trait]
 impl AgentBackend for BudgetedBackend {
+    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        if self.budget.limits.max_cost_usd.is_some()
+            && self.inner.capabilities().price_known == Some(false)
+        {
+            return Err(BackendError::new(
+                "cost budget requires known model pricing; configure models.json or omit --max-cost",
+            ));
+        }
         self.budget.request()?;
         let stream = tokio::time::timeout_at(self.budget.deadline, self.inner.run_turn(request))
             .await

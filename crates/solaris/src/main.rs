@@ -209,7 +209,20 @@ fn main() -> Result<()> {
         config.model = model.to_string();
     }
 
-    let backend_options = BackendOptions::default();
+    let mut backend_options = BackendOptions::default();
+    if let Some(directory) = config_dir() {
+        let path = directory.join("models.json");
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                backend_options.catalog = Arc::new(
+                    solaris_provider::ModelCatalog::from_json(&text).map_err(anyhow::Error::msg)?,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        backend_options.model_cache_dir = Some(directory.join("model-cache"));
+    }
     // Resolved here for reporting, and again by the app whenever the
     // credentials or the model change.
     let choice = choose_backend(&auth, &config.model, backend_options.clone());
@@ -223,6 +236,10 @@ fn main() -> Result<()> {
 
     if args.print_config {
         println!("backend: {}", choice.backend.label());
+        println!(
+            "capabilities: {}",
+            serde_json::to_string(&choice.backend.capabilities())?
+        );
         println!("model: {}", describe_model(&choice.model));
         println!("theme: {}", config.theme);
         println!("mode: {}", config.mode.label());
@@ -389,6 +406,11 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("session not found in this directory"))?;
                 if args.model.is_none() {
                     config.model = info.model.clone();
+                }
+                if args.provider.is_none()
+                    && let Some(provider) = &info.provider
+                {
+                    auth.activate(provider.clone());
                 }
                 store.resume(id)?
             }

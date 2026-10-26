@@ -313,13 +313,14 @@ impl Agent {
     /// Returns how many messages the summary replaced, or `None` when there was
     /// nothing worth summarizing or the model would not produce one.
     pub async fn compact(&self) -> Option<usize> {
-        session::compact_now(
-            &self.choice.backend,
-            &self.conversation,
-            self.options.compaction,
-            &self.cancel,
-        )
-        .await
+        let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))?;
+        let cancel = self.cancel.begin_turn();
+        let inner: Arc<dyn solaris_backend::AgentBackend> =
+            Arc::new(crate::budget::BudgetedBackend {
+                inner: Arc::clone(&self.choice.backend),
+                budget: crate::ExecutionBudget::new(self.options.execution.budget.clone()),
+            });
+        session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel).await
     }
 
     /// Short human-readable label shown in the status bar.
@@ -344,6 +345,13 @@ impl Agent {
         self.choice.source
     }
 
+    pub fn capabilities(&self) -> solaris_backend::ModelCapabilities {
+        self.choice.backend.capabilities()
+    }
+    pub fn model_catalog_notice(&self) -> Option<String> {
+        self.choice.backend.model_catalog_notice()
+    }
+
     /// The models the endpoint offers, for the picker to choose from.
     pub async fn models(&self) -> Result<Vec<String>, BackendError> {
         self.choice.backend.models().await
@@ -351,7 +359,9 @@ impl Agent {
 
     /// The context window of the model this session will ask.
     fn context_window(&self) -> u32 {
-        context_window_for(&self.choice.model)
+        self.capabilities()
+            .context_window
+            .unwrap_or_else(|| context_window_for(&self.choice.model))
     }
 
     /// The tools a turn in `mode` would declare.
@@ -363,6 +373,9 @@ impl Agent {
     }
 
     fn turn_tools(&self, mode: Mode) -> Vec<Arc<dyn solaris_tools::Tool>> {
+        if self.capabilities().tool_calling == solaris_backend::Support::Unsupported {
+            return Vec::new();
+        }
         let mut defaults: Vec<&str> = default_tool_names(mode).to_vec();
         let external: Vec<String> = self
             .registry

@@ -10,6 +10,8 @@ description = "Provider catalogue, credentials and platform resolution for solar
 workspace = true
 
 [dependencies]
+solaris-types = { workspace = true }
+tempfile = "3"
 solaris-backend = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

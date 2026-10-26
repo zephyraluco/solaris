@@ -118,6 +118,7 @@ pub struct HttpBackend {
     price: Option<Price>,
     prompt_cache_key: Option<&'static str>,
     chatgpt: Option<(String, u64)>,
+    capabilities: crate::ModelCapabilities,
 }
 
 impl HttpBackend {
@@ -131,7 +132,14 @@ impl HttpBackend {
             price: plan.price,
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
+            capabilities: crate::ModelCapabilities::default(),
         })
+    }
+
+    /// Attach explicit catalog metadata without inferring features from model names.
+    pub fn with_capabilities(mut self, capabilities: crate::ModelCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Use the ChatGPT/Codex request profile rather than the public API profile.
@@ -226,7 +234,17 @@ impl HttpBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for HttpBackend {
+    fn capabilities(&self) -> crate::ModelCapabilities {
+        self.capabilities.clone()
+    }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        if self.capabilities.tool_calling == crate::Support::Unsupported
+            && !request.tools.is_empty()
+        {
+            return Err(BackendError::new(
+                "this model does not support tool calling; choose another model or disable tools",
+            ));
+        }
         if let Some((_, expires_at)) = &self.chatgpt {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -245,6 +263,7 @@ impl AgentBackend for HttpBackend {
             self.max_tokens,
             self.prompt_cache_key,
         );
+        apply_capabilities(&mut body, &self.capabilities);
         let mut repaired: Vec<Repair> = Vec::new();
         if self.chatgpt.is_some() {
             body.as_object_mut()
@@ -950,5 +969,105 @@ mod tests {
         assert_eq!(backend.model(), "auto");
         assert_eq!(backend.max_tokens, 8_192);
         assert!(backend.price.is_none());
+    }
+}
+
+fn strict_schema(schema: &Value) -> bool {
+    if schema["type"] != "object" {
+        return false;
+    }
+    let Some(properties) = schema["properties"].as_object() else {
+        return false;
+    };
+    let Some(required) = schema["required"].as_array() else {
+        return false;
+    };
+    schema["additionalProperties"] == false
+        && properties
+            .keys()
+            .all(|name| required.iter().any(|value| value.as_str() == Some(name)))
+        && properties.values().all(strict_member)
+}
+fn strict_member(schema: &Value) -> bool {
+    if schema.get("$ref").is_some() || schema.get("oneOf").is_some() {
+        return false;
+    }
+    if let Some(variants) = schema["anyOf"].as_array() {
+        return variants.iter().all(strict_member);
+    }
+    match schema["type"].as_str() {
+        Some("object") => strict_schema(schema),
+        Some("array") => schema.get("items").is_some_and(strict_member),
+        Some("string" | "number" | "integer" | "boolean" | "null") => true,
+        _ => false,
+    }
+}
+
+fn apply_capabilities(body: &mut Value, capabilities: &crate::ModelCapabilities) {
+    if capabilities.streaming_usage == crate::Support::Unsupported
+        && let Some(body) = body.as_object_mut()
+    {
+        body.remove("stream_options");
+    }
+    if capabilities.prompt_caching == crate::Support::Unsupported {
+        if let Some(body) = body.as_object_mut() {
+            body.remove("prompt_cache_key");
+        }
+        if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut) {
+            for block in system {
+                if let Some(block) = block.as_object_mut() {
+                    block.remove("cache_control");
+                }
+            }
+        }
+        if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                if let Some(blocks) = message["content"].as_array_mut() {
+                    for block in blocks {
+                        if let Some(block) = block.as_object_mut() {
+                            block.remove("cache_control");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if capabilities.structured_output == crate::Support::Supported
+        && let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut)
+    {
+        for tool in tools {
+            let definition = if tool.get("function").is_some() {
+                &mut tool["function"]
+            } else {
+                tool
+            };
+            let schema = definition
+                .get("parameters")
+                .or_else(|| definition.get("input_schema"));
+            if schema.is_some_and(strict_schema) {
+                definition["strict"] = Value::Bool(true);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    #[test]
+    fn strict_sampling_is_only_enabled_for_explicit_support_and_compatible_schemas() {
+        let mut body = serde_json::json!({"tools":[{"type":"function","function":{"name":"test","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}}}],"stream_options":{"include_usage":true}});
+        apply_capabilities(&mut body, &crate::ModelCapabilities::default());
+        assert!(body["tools"][0]["function"].get("strict").is_none());
+        apply_capabilities(
+            &mut body,
+            &crate::ModelCapabilities {
+                structured_output: crate::Support::Supported,
+                streaming_usage: crate::Support::Unsupported,
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["tools"][0]["function"]["strict"], true);
+        assert!(body.get("stream_options").is_none());
     }
 }

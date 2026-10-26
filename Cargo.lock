@@ -2834,6 +2834,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "solaris-backend",
+ "solaris-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "url",

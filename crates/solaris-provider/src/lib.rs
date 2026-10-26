@@ -416,3 +416,6 @@ mod tests {
         );
     }
 }
+
+mod catalog;
+pub use catalog::{ModelCatalog, ModelOverride};

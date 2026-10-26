@@ -105,7 +105,7 @@ pub fn tokens_for_characters(characters: usize) -> u32 {
 }
 
 /// List price for one model, in USD per million tokens.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price {
     /// Rate for input tokens.
     pub input: f64,

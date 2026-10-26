@@ -272,7 +272,7 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 
 - **Streaming.** Text and thinking arrive as the model produces them; `Ctrl+C` mid-stream cancels the request by dropping the connection.
 - **Retries.** A `429`, a `5xx` or a dropped connection is retried up to three times with backoff, but only *before* the first token — after that a retry would duplicate text, so the failure is reported instead.
-- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model the catalogue does not know is reported as free. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
+- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
 - **Prompt caching.** solaris asks for it rather than hoping: an Anthropic `cache_control` breakpoint on the last message, and an OpenAI `prompt_cache_key` when the endpoint is OpenAI's own. That is what makes the cache rows in `/stats` move, and why a long conversation gets cheaper per turn as the unchanged prefix starts coming back as cache reads.
 - **Context.** `/stats` reports `session tokens` (everything the session has spent) and `context used` separately. Only the second says how full the window is: it is the last turn's reported usage plus a size estimate for anything submitted since, because summing a session's turns would grow without bound and say nothing about a per-request window.
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
@@ -427,3 +427,35 @@ Tools use `mcp__<server>__<tool>` names. Resource/prompt discovery uses a separa
 read-only annotations are not authority: name tools in `read_only_tools` locally
 to expose them to Plan mode. Unknown/mutating tools follow the normal approval
 policy. MCP servers run with their process permissions; this is not a sandbox.
+
+## Model capabilities and offline model lists
+
+`models.json` in the user configuration directory provides explicit, provider-scoped
+overrides. For example:
+
+```json
+{
+  "models": [{
+    "provider": "local",
+    "id": "my-model",
+    "capabilities": {
+      "tool_calling": "supported",
+      "image_input": "unsupported",
+      "structured_output": "unknown",
+      "context_window": 32768,
+      "max_output": 4096
+    }
+  }]
+}
+```
+
+Feature values are `supported`, `unsupported`, or `unknown`; unknown features are
+not inferred from model names. A model that explicitly lacks tool calling receives
+no tools. Strict schema sampling is enabled only for explicit support and compatible
+schemas. `--print-config` reports resolved capabilities. Optional `price` uses
+`input`, `output`, `cache_read`, and `cache_write` USD-per-million-token rates.
+Unknown prices display as unknown; `--max-cost` requires known pricing.
+
+Successful remote model discovery is cached by endpoint with a content checksum.
+An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
+cache entries are rejected. This cache stores model IDs, not credentials.

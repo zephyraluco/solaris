@@ -214,7 +214,13 @@ fn resolve_backend(
     if choice.provider_id.is_some() {
         config.model = choice.model.clone();
     }
-    config.context_window = u64::from(context_window_for(&config.model));
+    config.context_window = u64::from(
+        choice
+            .backend
+            .capabilities()
+            .context_window
+            .unwrap_or_else(|| context_window_for(&config.model)),
+    );
     choice
 }
 
@@ -1476,6 +1482,7 @@ impl App {
             &backend,
             self.config.mode,
             self.config.context_window,
+            self.agent.capabilities().price_known,
         );
         let dialog = TextDialog::new(
             "Stats",
@@ -1624,6 +1631,7 @@ impl App {
 
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
+        let catalog_notice = self.agent.model_catalog_notice();
         match answer {
             Ok(models) if !models.is_empty() => {
                 // The provider's own list is the one that knows which models
@@ -1691,6 +1699,9 @@ impl App {
         }
 
         self.fill_in_models();
+        if let Some(notice) = catalog_notice {
+            self.notifications.warning(notice);
+        }
     }
 
     /// Whether `/connect` is sitting on the step that picks a model.
@@ -2467,7 +2478,11 @@ impl App {
         }
         facts.push(self.config.mode.label().to_string());
         facts.push(format!("{} tok", self.session.total_tokens()));
-        facts.push(format!("${:.4}", self.session.total_cost()));
+        facts.push(if self.agent.capabilities().price_known == Some(false) {
+            "$?".into()
+        } else {
+            format!("${:.4}", self.session.total_cost())
+        });
         let left = format!(" {} ", facts.join(" · "));
         buf.set_string(
             area.x,
@@ -3321,6 +3336,7 @@ mod tests {
                 model,
                 BackendOptions {
                     environment: solaris_provider::empty_environment(),
+                    ..Default::default()
                 },
             )
         });

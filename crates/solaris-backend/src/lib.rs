@@ -46,6 +46,15 @@ pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
 /// platform into one of these, and the UI only ever sees this.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
+    /// Explicit model metadata, with unknown values kept distinct from refusal.
+    fn capabilities(&self) -> solaris_types::ModelCapabilities {
+        solaris_types::ModelCapabilities::default()
+    }
+    /// Explains a stale/offline model-list fallback to the caller.
+    fn model_catalog_notice(&self) -> Option<String> {
+        None
+    }
+
     /// Start a turn.
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError>;
 
@@ -65,3 +74,5 @@ pub trait AgentBackend: Send + Sync {
         ))
     }
 }
+
+pub use solaris_types::{ModelCapabilities, Support};

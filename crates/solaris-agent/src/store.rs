@@ -29,6 +29,8 @@ pub struct SessionInfo {
     pub cwd: PathBuf,
     pub parent_id: Option<String>,
     pub model: String,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub status: String,
     pub updated_at: i64,
 }
@@ -37,11 +39,25 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionRecord {
-    Prompt { text: String },
-    Event { event: AgentEvent },
-    Context { messages: Vec<Message> },
-    Message { message: Message },
-    ToolIntent { call: solaris_backend::ToolCall },
+    Model {
+        provider: Option<String>,
+        model: String,
+    },
+    Prompt {
+        text: String,
+    },
+    Event {
+        event: AgentEvent,
+    },
+    Context {
+        messages: Vec<Message>,
+    },
+    Message {
+        message: Message,
+    },
+    ToolIntent {
+        call: solaris_backend::ToolCall,
+    },
     Interrupted,
 }
 
@@ -61,26 +77,33 @@ impl SessionStore {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 1 {
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+        )?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > 2 {
             return Err(StoreError::Invalid(format!(
                 "unsupported session schema version {version}"
             )));
         }
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS sessions (
+        transaction.execute_batch("CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY, cwd TEXT NOT NULL, parent_id TEXT REFERENCES sessions(id),
                 model TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'idle',
                 updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
             CREATE TABLE IF NOT EXISTS records (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id),
-                data TEXT NOT NULL);
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS records_session ON records(session_id, seq);
-            CREATE TABLE IF NOT EXISTS contexts (session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);
-            PRAGMA user_version=1; COMMIT;")?;
+            CREATE TABLE IF NOT EXISTS contexts (session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);")?;
+        if version < 2 {
+            transaction.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
+        }
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -159,7 +182,7 @@ impl SessionStore {
     /// Most recently used sessions for this project, newest first.
     pub fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, StoreError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
+        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at,provider FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
         let rows = statement.query_map([cwd.to_string_lossy()], |row| {
             Ok(SessionInfo {
                 id: row.get(0)?,
@@ -168,6 +191,7 @@ impl SessionStore {
                 model: row.get(3)?,
                 status: row.get(4)?,
                 updated_at: row.get(5)?,
+                provider: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -229,6 +253,12 @@ impl SessionJournal {
             messages.push(message.clone());
             transaction.execute("INSERT INTO contexts(session_id,data) VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET data=excluded.data", params![self.id, serde_json::to_string(&messages)?])?;
         }
+        if let SessionRecord::Model { provider, model } = record {
+            transaction.execute(
+                "UPDATE sessions SET provider=?2,model=?3 WHERE id=?1",
+                params![self.id, provider, model],
+            )?;
+        }
         let status = match record {
             SessionRecord::Prompt { .. } => Some("running"),
             SessionRecord::Interrupted => Some("interrupted"),
@@ -283,6 +313,38 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn version_one_is_migrated_without_losing_existing_context() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("sessions.sqlite");
+        let store = SessionStore::open(&path).expect("store");
+        let journal = store
+            .create(Path::new("/project"), "model", None)
+            .expect("session");
+        let id = journal.id().to_string();
+        journal
+            .append(&SessionRecord::Message {
+                message: Message::user("preserve"),
+            })
+            .expect("message");
+        drop(journal);
+        drop(store);
+        let connection = Connection::open(&path).expect("old schema");
+        connection
+            .execute_batch("ALTER TABLE sessions DROP COLUMN provider; PRAGMA user_version=1;")
+            .expect("simulate version one");
+        drop(connection);
+        let migrated = SessionStore::open(&path).expect("migrate");
+        assert_eq!(
+            migrated
+                .resume(&id)
+                .expect("resume")
+                .context()
+                .expect("context"),
+            vec![Message::user("preserve")]
+        );
+    }
 
     #[test]
     fn crash_recovery_keeps_history_and_never_replays_tools() {

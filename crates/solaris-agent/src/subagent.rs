@@ -419,6 +419,10 @@ struct BoundedBackend {
 
 #[async_trait]
 impl AgentBackend for BoundedBackend {
+    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         if self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
             return Err(BackendError::new(

@@ -15,9 +15,7 @@ use solaris_backend::{
     AgentBackend, AgentEventStream, BackendError, Endpoint, HttpBackend, TurnPlan, TurnRequest,
 };
 
-use crate::providers::{
-    AuthKind, PROVIDERS, ProviderSpec, max_output_for, price_for, provider_spec,
-};
+use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, max_output_for, provider_spec};
 use crate::{AuthStore, Credential};
 
 /// The backend that stands in while nothing is connected.
@@ -78,12 +76,16 @@ pub fn empty_environment() -> Environment {
 pub struct BackendOptions {
     /// Where provider keys are looked up.
     pub environment: Environment,
+    pub catalog: Arc<crate::ModelCatalog>,
+    pub model_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for BackendOptions {
     fn default() -> Self {
         Self {
             environment: process_environment(),
+            catalog: Arc::new(crate::ModelCatalog::default()),
+            model_cache_dir: None,
         }
     }
 }
@@ -202,12 +204,18 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     // Everything platform-specific is decided here, so the backend can stay a
     // transport: which model, how long a reply, what it costs, and whether a
     // prompt-cache key rides along.
+    let mut capabilities = options.catalog.capabilities(spec.id, &model);
+    if chatgpt.is_some() {
+        capabilities.price_known = Some(false);
+    }
     let plan = TurnPlan {
-        max_tokens: max_output_for(&model),
+        max_tokens: capabilities
+            .max_output
+            .unwrap_or_else(|| max_output_for(&model)),
         price: if chatgpt.is_some() {
             None
         } else {
-            price_for(&model)
+            options.catalog.price(spec.id, &model)
         },
         prompt_cache_key,
         model: model.clone(),
@@ -216,6 +224,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     match HttpBackend::new(plan) {
         Ok(backend) => {
+            let backend = backend.with_capabilities(capabilities.clone());
             let backend = match chatgpt {
                 Some((account, expiry)) => backend.with_chatgpt(account, expiry),
                 None => backend,
@@ -243,7 +252,13 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             }
 
             BackendChoice {
-                backend: Arc::new(backend),
+                backend: Arc::new(crate::catalog::CatalogBackend {
+                    inner: Arc::new(backend),
+                    capabilities,
+                    cache_dir: options.model_cache_dir.clone(),
+                    endpoint: format!("{}:{base_url}", spec.id),
+                    notice: std::sync::Mutex::new(None),
+                }),
                 provider_id: Some(spec.id),
                 base_url: Some(base_url),
                 model,
@@ -470,6 +485,7 @@ mod tests {
                         .map(|(key, value)| (*key, (*value).to_string()))
                 })
             }),
+            ..Default::default()
         }
     }
 

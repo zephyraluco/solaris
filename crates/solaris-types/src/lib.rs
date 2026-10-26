@@ -42,3 +42,27 @@ pub struct ToolMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
 }
+
+/// Capability knowledge distinguishes an explicit refusal from missing metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Support {
+    Supported,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelCapabilities {
+    pub tool_calling: Support,
+    pub structured_output: Support,
+    pub image_input: Support,
+    pub reasoning: Support,
+    pub streaming_usage: Support,
+    pub prompt_caching: Support,
+    pub context_window: Option<u32>,
+    pub max_output: Option<u32>,
+    pub price_known: Option<bool>,
+}
