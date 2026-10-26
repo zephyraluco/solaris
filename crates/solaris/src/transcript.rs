@@ -90,6 +90,28 @@ impl TranscriptView {
     ) -> &[Line<'static>] {
         let spinner_key = spinner_frame.unwrap_or(u16::MAX);
         let empty = session.turns.is_empty();
+        let animation_only = self.initialized
+            && !empty
+            && self.cache_version == session.version
+            && self.cache_width == area.width
+            && self.cache_height == area.height
+            && self.cache_theme == theme.name
+            && self.cache_spinner != u16::MAX
+            && spinner_frame.is_some()
+            && self.headers.subagents.is_empty();
+        if animation_only {
+            let glyph = SPINNER[usize::from(spinner_key) % SPINNER.len()];
+            for (row, line) in self.lines.iter_mut().enumerate() {
+                if self.headers.parts.get(row) == Some(&u64::MAX)
+                    && line.spans.len() == 2
+                    && line.spans[1].content == "generating…"
+                {
+                    line.spans[0].content = format!("{glyph} ").into();
+                }
+            }
+            self.cache_spinner = spinner_key;
+            return &self.lines;
+        }
         let stale = !self.initialized
             || empty
             || self.cache_empty != empty
@@ -848,6 +870,28 @@ mod tests {
 
     fn area(width: u16, height: u16) -> Rect {
         Rect::new(0, 0, width, height)
+    }
+
+    #[test]
+    fn animation_reuses_the_existing_document_and_markdown_layout() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "question".into(),
+            reply: "long response ".repeat(1000),
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let theme = Theme::dark();
+        view.lines(&session, area, &theme, Some(0), &welcome());
+        let document = view.document();
+        view.lines(&session, area, &theme, Some(1), &welcome());
+        assert!(Arc::ptr_eq(&document, &view.document()));
+        assert!(view.lines.iter().any(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.content == format!("{} ", SPINNER[1]))
+        }));
     }
 
     #[test]

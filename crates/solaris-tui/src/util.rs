@@ -4,7 +4,8 @@
 //! Widths are measured in terminal cells via `unicode-width`, so CJK and
 //! emoji-containing text wraps correctly.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Terminal-cell width of `text`.
 pub fn display_width(text: &str) -> usize {
@@ -16,12 +17,12 @@ pub fn display_width(text: &str) -> usize {
 fn split_at_width(text: &str, width: usize) -> (String, String) {
     let mut head = String::new();
     let mut used = 0usize;
-    for (idx, ch) in text.char_indices() {
-        let ch_width = ch.width().unwrap_or(0);
+    for (idx, grapheme) in text.grapheme_indices(true) {
+        let ch_width = display_width(grapheme);
         if used + ch_width > width && !head.is_empty() {
             return (head, text[idx..].to_string());
         }
-        head.push(ch);
+        head.push_str(grapheme);
         used += ch_width;
     }
     (head, String::new())
@@ -102,12 +103,12 @@ pub fn truncate_to_width(text: &str, width: usize, ellipsis: &str) -> String {
     let budget = width - ellipsis_width;
     let mut head = String::new();
     let mut used = 0usize;
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let ch_width = display_width(grapheme);
         if used + ch_width > budget {
             break;
         }
-        head.push(ch);
+        head.push_str(grapheme);
         used += ch_width;
     }
     head.push_str(ellipsis);
@@ -174,6 +175,14 @@ pub fn rect_contains(rect: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapping_and_truncation_keep_joined_emoji_and_combining_marks_whole() {
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(wrap_text(&format!("{family}x"), 2), vec![family, "x"]);
+        assert_eq!(truncate_to_width(&format!("{family}x"), 2, ""), family);
+        assert_eq!(truncate_to_width("e\u{301}xy", 1, ""), "e\u{301}");
+    }
 
     #[test]
     fn a_window_keeps_the_highlight_on_screen() {

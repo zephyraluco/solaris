@@ -12,7 +12,7 @@ pub struct DocumentRow {
 
 /// A position within a part's visible graphemes. Spaces retain an affinity to
 /// the preceding content so indentation and line wrapping can change safely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextAnchor {
     pub part: u64,
     pub grapheme: usize,
@@ -32,12 +32,14 @@ pub struct TextDocument {
     rows: Vec<DocumentRow>,
     glyphs: Vec<Vec<Glyph>>,
     positions: HashMap<(u64, usize), (usize, u16, u16)>,
+    whitespace_positions: HashMap<TextAnchor, (usize, u16, u16)>,
 }
 
 impl TextDocument {
     pub fn new(rows: Vec<DocumentRow>) -> Self {
         let mut counts = HashMap::<u64, usize>::new();
         let mut positions = HashMap::new();
+        let mut whitespace_positions = HashMap::new();
         let mut glyphs = Vec::with_capacity(rows.len());
         for (row, line) in rows.iter().enumerate() {
             let mut column = 0u16;
@@ -74,12 +76,22 @@ impl TextDocument {
                 }
                 column = column.saturating_add(width);
             }
+            for glyph in &cells {
+                if glyph.anchor.whitespace != 0 {
+                    whitespace_positions.entry(glyph.anchor).or_insert((
+                        row,
+                        glyph.column,
+                        glyph.width,
+                    ));
+                }
+            }
             glyphs.push(cells);
         }
         Self {
             rows,
             glyphs,
             positions,
+            whitespace_positions,
         }
     }
 
@@ -112,10 +124,8 @@ impl TextDocument {
         }
         // Match whitespace explicitly when possible; the fallback keeps padding
         // after the previous content when wrapping inserted or removed it.
-        for (row, glyphs) in self.glyphs.iter().enumerate() {
-            if let Some(glyph) = glyphs.iter().find(|glyph| glyph.anchor == anchor) {
-                return Some((row, glyph.column, glyph.width));
-            }
+        if let Some(position) = self.whitespace_positions.get(&anchor) {
+            return Some(*position);
         }
         let previous = anchor
             .grapheme
