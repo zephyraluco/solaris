@@ -36,6 +36,13 @@ pub(crate) enum InlineOutcome {
 }
 
 impl Inline {
+    pub(crate) fn cursor_position(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::Connect(flow) => flow.cursor_position(),
+            Self::Model(_) => None,
+        }
+    }
+
     pub(crate) fn is_connect(&self) -> bool {
         matches!(self, Self::Connect(_))
     }

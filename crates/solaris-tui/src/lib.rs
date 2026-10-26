@@ -33,3 +33,5 @@ pub use terminal::{PiTerminal, install_panic_hook, restore_terminal, setup_termi
 pub use theme::Theme;
 pub use tui::{OverlayQueue, QuitFlag, Tui};
 pub use util::{display_width, truncate_to_width, wrap_text};
+
+pub mod document;

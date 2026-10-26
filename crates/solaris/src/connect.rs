@@ -114,6 +114,7 @@ pub struct ConnectFlow {
 
     // render state
     last_area: Rect,
+    terminal_cursor: Option<(u16, u16)>,
     field_rows: Vec<(u16, usize)>,
 }
 
@@ -150,6 +151,7 @@ impl ConnectFlow {
             field: 0,
             seeded: [false, false],
             last_area: Rect::default(),
+            terminal_cursor: None,
             field_rows: Vec::new(),
         }
     }
@@ -566,7 +568,12 @@ impl ConnectFlow {
         Line::from(spans)
     }
     /// Draw the wizard into `area` (the prompt region of the layout).
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        self.terminal_cursor
+    }
+
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
+        self.terminal_cursor = None;
         self.last_area = area;
         self.field_rows.clear();
 
@@ -599,7 +606,29 @@ impl ConnectFlow {
             ..area
         };
 
-        let (lines, field_rows) = self.field_block(width);
+        let (mut lines, field_rows) = self.field_block(width);
+        for &(row, field) in &field_rows {
+            if field == self.field {
+                if let Some(line) = lines.get_mut(row) {
+                    let text: String = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    let clipped = field_tail(&text, usize::from(width));
+                    *line = Line::from(Span::styled(clipped, self.styles.text));
+                    let column = line
+                        .width()
+                        .saturating_sub(1)
+                        .min(usize::from(width.saturating_sub(1)))
+                        as u16;
+                    if row < usize::from(body_area.height) {
+                        self.terminal_cursor =
+                            Some((body_area.x + column, body_area.y + row as u16));
+                    }
+                }
+            }
+        }
         for (row, line) in lines.iter().take(body_area.height as usize).enumerate() {
             buf.set_line(body_area.x, body_area.y + row as u16, line, body_area.width);
         }
@@ -717,6 +746,26 @@ impl ConnectFlow {
     }
 }
 
+fn field_tail(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if solaris_tui::util::display_width(text) <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let cells = solaris_tui::util::display_width(grapheme);
+        if used + cells > budget {
+            break;
+        }
+        used += cells;
+        kept.push(grapheme);
+    }
+    kept.reverse();
+    format!("…{}", kept.concat())
+}
+
 /// Whether a key press is plain typing (Shift allowed) rather than a shortcut,
 /// so Ctrl/Alt combinations are never inserted as literal characters.
 fn plain_text_key(key: &KeyEvent) -> bool {
@@ -731,6 +780,14 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_tail_keeps_the_cursor_and_whole_graphemes_in_a_narrow_window() {
+        let text = field_tail("  https://example.com/中文🙂_", 12);
+        assert!(text.ends_with('_'));
+        assert!(solaris_tui::util::display_width(&text) <= 12);
+        assert!(text.starts_with('…'));
+    }
 
     #[test]
     fn browser_step_copies_complete_url_and_never_collects_an_api_key() {

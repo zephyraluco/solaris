@@ -22,7 +22,9 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::document::{TextAnchor, TextDocument};
 use crate::util::rect_contains;
+use std::sync::Arc;
 
 /// A screen cell: column, row.
 pub type Point = (u16, u16);
@@ -57,6 +59,9 @@ pub struct Selection {
     click_count: u8,
     scroll_content: Option<(Rect, u16, Vec<String>)>,
     content_range: Option<(Point, Point)>,
+    document: Option<(Rect, usize, Arc<TextDocument>)>,
+    semantic: Option<(TextAnchor, TextAnchor, String)>,
+    semantic_press: Option<TextAnchor>,
 }
 
 impl Default for Selection {
@@ -80,6 +85,9 @@ impl Selection {
             click_count: 0,
             scroll_content: None,
             content_range: None,
+            document: None,
+            semantic: None,
+            semantic_press: None,
         }
     }
 
@@ -105,8 +113,17 @@ impl Selection {
     pub fn set_area(&mut self, area: Rect) {
         if area != self.area {
             self.area = area;
-            self.clear();
+            if self.semantic.is_none() {
+                self.clear();
+            }
         }
+    }
+
+    /// Register an immutable layout shared by the application cache.
+    pub fn set_document(&mut self, area: Rect, offset: usize, document: Arc<TextDocument>) {
+        self.document = Some((area, offset, document));
+        self.scroll_content = None;
+        self.content_range = None;
     }
 
     /// Register transcript rows and their viewport, keeping selection in content coordinates.
@@ -135,6 +152,8 @@ impl Selection {
     /// The click sequence survives, so the second press of a double click still
     /// resolves to a word even though the first one cleared the range.
     pub fn clear(&mut self) {
+        self.semantic = None;
+        self.semantic_press = None;
         self.content_range = None;
         self.anchor = None;
         self.focus = None;
@@ -147,6 +166,9 @@ impl Selection {
     /// press is a click — it only moves the editor's caret — which is also the
     /// press claurst throws away.
     pub fn is_active(&self) -> bool {
+        if self.semantic.is_some() {
+            return self.marked || self.anchor != self.focus;
+        }
         self.content_range
             .or_else(|| self.bounds())
             .is_some_and(|(start, end)| start != end || self.marked)
@@ -162,6 +184,13 @@ impl Selection {
     /// nothing *but* blanks keeps them: it is still a range the user drew, and
     /// an indentation block is worth copying.
     pub fn selected_text(&self) -> String {
+        if let Some((_, _, text)) = &self.semantic {
+            return if self.is_active() {
+                text.clone()
+            } else {
+                String::new()
+            };
+        }
         if let (Some((area, _, rows)), Some((anchor, focus))) =
             (&self.scroll_content, self.content_range)
         {
@@ -212,7 +241,36 @@ impl Selection {
     /// reacts to it too: a press both moves the editor's caret and starts a
     /// range, and only a drag turns the range into a selection.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.semantic = None;
+            self.semantic_press = None;
+        }
         let changed = self.handle_mouse_screen(event);
+        if matches!(
+            event.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) {
+            if let (Some((area, offset, document)), Some(anchor), Some(focus)) =
+                (&self.document, self.anchor, self.focus)
+            {
+                if rect_contains(*area, anchor.0, anchor.1)
+                    && rect_contains(*area, focus.0, focus.1)
+                {
+                    let hit = |point: Point| {
+                        document.anchor(offset + usize::from(point.1 - area.y), point.0 - area.x)
+                    };
+                    let start = self.semantic_press.or_else(|| hit(anchor));
+                    if let (Some(start), Some(end)) = (start, hit(focus)) {
+                        self.semantic_press = Some(start);
+                        if let Some(text) = document.selected_text(start, end) {
+                            self.semantic = Some((start, end, text));
+                        }
+                    }
+                } else {
+                    self.semantic = None;
+                }
+            }
+        }
         if matches!(
             event.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
@@ -331,6 +389,41 @@ impl Selection {
     fn bounds(&self) -> Option<(Point, Point)> {
         if self.area.width == 0 || self.area.height == 0 {
             return None;
+        }
+        if let (Some((area, offset, document)), Some((anchor, focus, _))) =
+            (&self.document, &self.semantic)
+        {
+            let a = document.locate(*anchor)?;
+            let b = document.locate(*focus)?;
+            let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let bottom = offset.saturating_add(usize::from(area.height));
+            if end.0 < *offset || start.0 >= bottom || area.width == 0 || area.height == 0 {
+                return None;
+            }
+            let from = if start.0 < *offset {
+                (area.x, area.y)
+            } else {
+                (
+                    area.x.saturating_add(start.1).min(area.right() - 1),
+                    area.y + (start.0 - offset) as u16,
+                )
+            };
+            let to = if end.0 >= bottom {
+                (area.right() - 1, area.bottom() - 1)
+            } else {
+                (
+                    area.x
+                        .saturating_add(end.1)
+                        .saturating_add(end.2.saturating_sub(1))
+                        .min(area.right() - 1),
+                    area.y + (end.0 - offset) as u16,
+                )
+            };
+            return Some((from, to));
         }
         if let (Some((area, offset, _)), Some((anchor, focus))) =
             (&self.scroll_content, self.content_range)
@@ -598,6 +691,37 @@ mod tests {
         selection.handle_mouse(down(from.0, from.1));
         selection.handle_mouse(drag_to(to.0, to.1));
         selection.handle_mouse(up(to.0, to.1));
+    }
+
+    #[test]
+    fn semantic_selection_survives_resize_and_collapsing_its_part() {
+        use crate::document::DocumentRow;
+        let (mut selection, _) = selection_with(&["hello 中文"]);
+        let document = Arc::new(TextDocument::new(vec![DocumentRow {
+            part: 7,
+            text: "hello 中文".into(),
+        }]));
+        selection.set_document(AREA, 0, document);
+        swipe(&mut selection, (6, 0), (9, 0));
+        assert_eq!(selection.selected_text(), "中文");
+        selection.set_area(Rect::new(0, 0, 8, 4));
+        let wrapped = Arc::new(TextDocument::new(vec![
+            DocumentRow {
+                part: 7,
+                text: "hello".into(),
+            },
+            DocumentRow {
+                part: 7,
+                text: "中文".into(),
+            },
+        ]));
+        selection.set_document(Rect::new(0, 0, 8, 4), 0, Arc::clone(&wrapped));
+        assert_eq!(selection.bounds(), Some(((0, 1), (3, 1))));
+        selection.set_document(Rect::new(0, 0, 8, 4), 0, Arc::new(TextDocument::default()));
+        assert_eq!(selection.bounds(), None);
+        assert_eq!(selection.selected_text(), "中文");
+        selection.set_document(Rect::new(0, 0, 8, 4), 0, wrapped);
+        assert_eq!(selection.bounds(), Some(((0, 1), (3, 1))));
     }
 
     #[test]

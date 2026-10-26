@@ -163,7 +163,7 @@ pub struct SessionState {
     /// Transient status line shown while working.
     pub status: Option<String>,
     /// Scroll offset in transcript lines.
-    pub scroll: u16,
+    pub scroll: usize,
     /// Whether the transcript should stay pinned to the newest line.
     pub follow_end: bool,
     /// Monotonic revision, used to invalidate the rendered transcript.

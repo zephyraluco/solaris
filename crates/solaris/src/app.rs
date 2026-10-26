@@ -660,7 +660,7 @@ impl App {
     }
 
     fn scroll_transcript(&mut self, delta: i32) {
-        self.session.scroll = (self.session.scroll as i32 + delta).max(0) as u16;
+        self.session.scroll = self.session.scroll.saturating_add_signed(delta as isize);
         self.session.follow_end = false;
     }
 
@@ -2273,7 +2273,7 @@ impl App {
             .lines(&self.session, area, &self.theme, spinner, &welcome);
 
         let visible = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(visible) as u16;
+        let max_scroll = lines.len().saturating_sub(visible);
 
         if self.session.follow_end {
             self.session.scroll = max_scroll;
@@ -2284,28 +2284,19 @@ impl App {
             self.session.follow_end = true;
         }
 
-        self.selection.borrow_mut().set_scroll_content(
-            area,
-            self.session.scroll,
-            lines
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect()
-                })
-                .collect(),
-        );
-
         for (row, line) in lines
             .iter()
-            .skip(self.session.scroll as usize)
+            .skip(self.session.scroll)
             .take(visible)
             .enumerate()
         {
             buf.set_line(area.x, area.y + row as u16, line, area.width);
         }
+        self.selection.borrow_mut().set_document(
+            area,
+            self.session.scroll,
+            self.transcript.document(),
+        );
     }
 
     fn handle_collapsible_mouse(&mut self, event: MouseEvent) -> bool {
@@ -2313,7 +2304,7 @@ impl App {
         let scroll = self
             .subagent_terminal
             .as_ref()
-            .map_or(usize::from(self.session.scroll), |view| view.scroll);
+            .map_or(self.session.scroll, |view| view.scroll);
         let row = scroll + usize::from(event.row.saturating_sub(self.last_transcript.y));
         let header = over_transcript
             .then(|| match &self.subagent_terminal {
@@ -2372,10 +2363,7 @@ impl App {
                         if let Some(view) = &mut self.subagent_terminal {
                             view.scroll = view.scroll.saturating_add(shift);
                         } else {
-                            self.session.scroll = self
-                                .session
-                                .scroll
-                                .saturating_add(u16::try_from(shift).unwrap_or(u16::MAX));
+                            self.session.scroll = self.session.scroll.saturating_add(shift);
                         }
                     }
                     // Keep the title in view instead of jumping to the tail
@@ -2386,7 +2374,6 @@ impl App {
                         self.session.follow_end = false;
                     }
                     self.session.bump();
-                    self.selection.borrow_mut().clear();
                 }
                 true
             }
@@ -2645,10 +2632,13 @@ impl App {
 
 impl Component for App {
     fn cursor_position(&self) -> Option<(u16, u16)> {
-        if self.inline.is_some() {
+        if self.overlay_open() || self.subagent_terminal.is_some() {
             return None;
         }
-        self.editor.cursor_position()
+        match &self.inline {
+            Some(inline) => inline.cursor_position(),
+            None => self.editor.cursor_position(),
+        }
     }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.frame = self.frame.wrapping_add(1);

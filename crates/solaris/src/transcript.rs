@@ -5,7 +5,9 @@
 //! except while it is empty, when the welcome box's animated companion needs a
 //! fresh frame every tick.
 
+use solaris_tui::document::{DocumentRow, TextDocument};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crossterm::event::MouseEvent;
 use ratatui::layout::Rect;
@@ -41,6 +43,7 @@ struct SubagentHeader {
 
 #[derive(Default)]
 struct TranscriptHeaders {
+    parts: Vec<u64>,
     tools: Vec<CollapsibleHeader>,
     subagents: BTreeMap<(usize, usize), SubagentHeader>,
 }
@@ -60,6 +63,7 @@ pub struct TranscriptView {
     /// Tool disclosures and retained child terminal links have separate handlers.
     headers: TranscriptHeaders,
     initialized: bool,
+    document: Arc<TextDocument>,
 }
 
 impl TranscriptView {
@@ -104,6 +108,20 @@ impl TranscriptView {
                 welcome,
                 &mut self.headers,
             );
+            self.document = Arc::new(TextDocument::new(
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| DocumentRow {
+                        part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
+                        text: line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect(),
+                    })
+                    .collect(),
+            ));
             self.cache_width = area.width;
             self.cache_height = area.height;
             self.cache_version = session.version;
@@ -114,6 +132,10 @@ impl TranscriptView {
         }
 
         &self.lines
+    }
+
+    pub fn document(&self) -> Arc<TextDocument> {
+        Arc::clone(&self.document)
     }
 
     /// Resolve a title in the rendered transcript, before the viewport scroll.
@@ -130,7 +152,7 @@ impl TranscriptView {
         &mut self,
         event: MouseEvent,
         viewport: Rect,
-        scroll: u16,
+        scroll: usize,
         selection_active: bool,
     ) -> (bool, Option<(usize, usize)>) {
         let mut handled = false;
@@ -138,7 +160,7 @@ impl TranscriptView {
         for (&target, header) in &mut self.headers.subagents {
             let visible_row = header
                 .row
-                .checked_sub(usize::from(scroll))
+                .checked_sub(scroll)
                 .filter(|row| *row < usize::from(viewport.height));
             let area = visible_row.map_or(Rect::default(), |row| {
                 Rect::new(viewport.x, viewport.y + row as u16, viewport.width, 1)
@@ -196,6 +218,7 @@ fn build_with_headers(
     welcome: &WelcomeData,
     headers: &mut TranscriptHeaders,
 ) -> Vec<Line<'static>> {
+    headers.parts.clear();
     headers.tools.clear();
     headers.subagents.retain(|&(turn, step), _| {
         session
@@ -218,8 +241,13 @@ fn build_with_headers(
         if index > 0 {
             out.push(Line::default());
         }
+        let part = ((index as u64) + 1) << 32;
+        headers.parts.resize(out.len(), part);
         push_prompt(&mut out, &turn.prompt, width, theme);
+        headers.parts.resize(out.len(), part + 1);
         push_compaction(&mut out, turn, theme);
+        headers.parts.resize(out.len(), part + 2);
+        let steps_start = out.len();
         push_steps(
             &mut out,
             turn.into(),
@@ -229,12 +257,30 @@ fn build_with_headers(
             index,
             headers,
         );
+        headers.parts.resize(out.len(), part + 3);
+        let steps_end = out.len();
+        let mut section = part + 4;
+        for row in steps_start..steps_end {
+            if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
+                section = part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
+                headers.parts[row] = section;
+                section += 1;
+            } else {
+                headers.parts[row] = section;
+            }
+        }
+        let thinking_start = out.len();
         push_thinking(&mut out, turn, width, theme);
+        headers.parts.resize(out.len(), part + 5);
+        if out.len() > thinking_start {
+            headers.parts[thinking_start] = part + 6;
+        }
         if !turn.reply.trim().is_empty() {
             out.push(Line::default());
             out.extend(render_markdown(&turn.reply, width as u16, &markdown));
         }
 
+        headers.parts.resize(out.len(), part + 7);
         if !turn.complete {
             let glyph = spinner_frame
                 .map(|frame| SPINNER[frame as usize % SPINNER.len()])
@@ -247,6 +293,7 @@ fn build_with_headers(
         }
     }
 
+    headers.parts.resize(out.len(), u64::MAX);
     out
 }
 
