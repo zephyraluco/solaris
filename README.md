@@ -306,7 +306,7 @@ For example, launch a background investigation with:
 {"agent":"explore","prompt":"Find test coverage gaps. Report relevant paths and suggestions; do not change files.","background":true}
 ```
 
-Children have persistent session IDs when the parent is saved. Use the `subagent` tool’s `resume_id` to continue a child explicitly, or `model` to override its model under the current provider. `/subagents` lists active/queued task IDs and `/stop <task-id>` cancels one. The five-minute child deadline includes time queued for an execution slot; parent policy and aggregate budgets still apply.
+Children have persistent session IDs when the parent is saved. Use the `subagent` tool’s `resume_id` to continue a child explicitly, or `model` to override its model under the current provider. Omitted or blank `model` inherits the parent model; omitted or blank `resume_id` starts a new child. Surrounding whitespace is trimmed, and invalid non-empty model IDs fail with a specific error. `/subagents` lists active/queued task IDs and `/stop <task-id>` cancels one. The five-minute child deadline includes time queued for an execution slot; parent policy and aggregate budgets still apply.
 
 # Configuration
 

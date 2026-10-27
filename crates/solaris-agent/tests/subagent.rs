@@ -653,3 +653,108 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     );
     assert!(parent.active_tasks().is_empty());
 }
+
+#[tokio::test]
+async fn blank_child_selectors_inherit_the_parent_without_a_factory_or_saved_session() {
+    for blank in ["", " \t\r\n "] {
+        let mut model = Model::new("explore");
+        model.model_override = Some(blank.into());
+        model.resume_id = Some(blank.into());
+        let model = Arc::new(model);
+        let parent = agent(
+            Arc::clone(&model),
+            AgentOptions::default(),
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        let events = run(&parent, Mode::Build).await;
+        let output = result(&events);
+        assert!(!output.is_error, "{}", output.output);
+        assert_eq!(output.output, "child final report");
+        assert!(model.requests().iter().any(is_child));
+    }
+}
+
+#[tokio::test]
+async fn blank_child_model_does_not_invoke_the_override_factory() {
+    let mut model = Model::new("explore");
+    model.model_override = Some(String::new());
+    let options = AgentOptions {
+        child_backend: Some(Arc::new(|_| {
+            panic!("blank override must inherit parent backend")
+        })),
+        ..AgentOptions::default()
+    };
+    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)));
+    let events = run(&parent, Mode::Build).await;
+    assert!(!result(&events).is_error, "{}", result(&events).output);
+}
+
+#[tokio::test]
+async fn child_model_override_is_trimmed_before_resolving_the_backend() {
+    let mut model = Model::new("explore");
+    model.model_override = Some(" \tchild-model\r\n ".into());
+    let model = Arc::new(model);
+    let child_backend = Arc::clone(&model);
+    let options = AgentOptions {
+        child_backend: Some(Arc::new(move |name| {
+            assert_eq!(name, "child-model");
+            Ok(BackendChoice {
+                backend: Arc::clone(&child_backend) as Arc<dyn AgentBackend>,
+                provider_id: None,
+                base_url: None,
+                model: name.into(),
+                source: CredentialSource::None,
+            })
+        })),
+        ..AgentOptions::default()
+    };
+    let parent = agent(model, options, &Arc::new(AtomicUsize::new(0)));
+    let events = run(&parent, Mode::Build).await;
+    assert!(!result(&events).is_error, "{}", result(&events).output);
+}
+
+#[tokio::test]
+async fn invalid_child_model_is_rejected_before_resolving_or_running_a_child() {
+    for (invalid, message) in [
+        ("x".repeat(513), "at most 512 bytes"),
+        ("child\nmodel".into(), "control characters"),
+    ] {
+        let mut model = Model::new("explore");
+        model.model_override = Some(invalid);
+        let model = Arc::new(model);
+        let options = AgentOptions {
+            child_backend: Some(Arc::new(|_| {
+                panic!("invalid model must not reach the factory")
+            })),
+            ..AgentOptions::default()
+        };
+        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+        let events = run(&parent, Mode::Build).await;
+        let output = result(&events);
+        assert!(output.is_error);
+        assert!(output.output.contains(message), "{}", output.output);
+        assert!(!model.requests().iter().any(is_child));
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
+    let mut model = Model::new("explore");
+    model.model_override = Some("missing-model".into());
+    let model = Arc::new(model);
+    let options = AgentOptions {
+        child_backend: Some(Arc::new(|_| {
+            Err("requested child model is unavailable".into())
+        })),
+        ..AgentOptions::default()
+    };
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    let events = run(&parent, Mode::Build).await;
+    assert!(result(&events).is_error);
+    assert!(
+        result(&events)
+            .output
+            .contains("requested child model is unavailable")
+    );
+    assert!(!model.requests().iter().any(is_child));
+}

@@ -52,8 +52,8 @@ impl Tool for SubagentTool {
                 "agent": { "type": "string", "enum": ["explore", "general"] },
                 "name": { "type": "string", "description": "Short task name shown in the subagent summary. Describe the task, not its tools." },
                 "prompt": { "type": "string", "description": "Complete task, relevant context, paths, constraints and expected result. The child cannot see the parent conversation." },
-                "model": { "type": "string", "description": "Optional child model under the current provider; inherits parent policy and budget." },
-                "resume_id": { "type": "string", "description": "Resume one of this parent's saved child sessions. Never automatically reruns interrupted tools." },
+                "model": { "type": "string", "description": "Optional child model ID under the current provider. Omit or leave blank to use the parent's current model. Inherits parent policy and budget." },
+                "resume_id": { "type": "string", "description": "Resume one of this parent's saved child sessions. Omit or leave blank for a new child. Never automatically reruns interrupted tools." },
                 "background": { "type": "boolean", "default": false, "description": "Return a task ID immediately so you can continue independent work. The final report or failure is delivered automatically; do not poll. Background work is scoped to this turn." }
             },
             "required": ["agent", "prompt"],
@@ -127,9 +127,25 @@ impl From<ToolOutput> for SubagentResult {
 
 impl SubagentRunner {
     pub fn parse(&self, input: Value) -> Result<Task, ToolOutput> {
-        let task: Task = serde_json::from_value(input).map_err(|_| {
-            ToolOutput::error("subagent requires an agent (explore or general), a prompt string and optionally a name string and background boolean, with no other fields")
+        let mut task: Task = serde_json::from_value(input).map_err(|_| {
+            ToolOutput::error("subagent requires agent (explore or general) and prompt (string); optional fields are name, model, resume_id (strings) and background (boolean), with no other fields")
         })?;
+        // Models sometimes fill optional string fields with empty placeholders.
+        // Those carry the same meaning as omission, never a model override or resume.
+        task.model = non_blank(task.model);
+        task.resume_id = non_blank(task.resume_id);
+        if let Some(model) = &task.model {
+            if model.len() > 512 {
+                return Err(ToolOutput::error(
+                    "invalid child model: model ID must be at most 512 bytes; omit model to inherit the parent model",
+                ));
+            }
+            if model.chars().any(char::is_control) {
+                return Err(ToolOutput::error(
+                    "invalid child model: model ID must not contain control characters; omit model to inherit the parent model",
+                ));
+            }
+        }
         if task.prompt.trim().is_empty() || task.prompt.len() > 64 * 1024 {
             return Err(ToolOutput::error(
                 "subagent prompt must be non-empty and at most 64 KiB",
@@ -248,9 +264,6 @@ impl SubagentRunner {
                     "child model overrides are not configured for this runtime",
                 );
             };
-            if model.is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
-                return ToolOutput::error("invalid child model");
-            }
             match factory(model) {
                 Ok(choice) => choice,
                 Err(error) => return ToolOutput::error(error),
@@ -336,6 +349,12 @@ impl SubagentRunner {
         }
         output
     }
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 struct CancelOnDrop(Cancel);
