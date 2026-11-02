@@ -2,7 +2,6 @@
 name = "solaris-agent"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "The agent session for solaris: tools declared to a model and run for it"
 
