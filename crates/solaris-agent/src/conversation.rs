@@ -69,6 +69,13 @@ impl Conversation {
             .clone()
     }
 
+    pub(crate) fn record_model(&self, provider: Option<&str>, model: &str) {
+        self.persist(SessionRecord::Model {
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+        });
+    }
+
     fn persist(&self, record: SessionRecord) -> bool {
         if self.error().is_some() {
             return false;

@@ -226,7 +226,12 @@ impl Agent {
             crate::runtime::TurnLease::acquire(Arc::clone(&self.active)).ok_or_else(|| {
                 crate::StoreError::Invalid("cannot attach a journal during a turn".into())
             })?;
-        self.conversation.attach(journal)
+        self.conversation.attach(journal)?;
+        self.conversation
+            .record_model(self.choice.provider_id, &self.choice.model);
+        self.conversation
+            .error()
+            .map_or(Ok(()), |error| Err(crate::StoreError::Invalid(error)))
     }
 
     /// Attached persistent session, if enabled by the caller.
@@ -268,6 +273,10 @@ impl Agent {
     /// Replace transport credentials at an idle boundary without losing the
     /// conversation, queued input, resources, tools or cancellation handle.
     pub fn with_refreshed_backend(&self, choice: BackendChoice) -> Self {
+        // Persistence failures are retained by the conversation and block the
+        // next request, including callers whose refresh API cannot return errors.
+        self.conversation
+            .record_model(choice.provider_id, &choice.model);
         Self {
             choice,
             active: Arc::clone(&self.active),
@@ -860,6 +869,73 @@ mod tests {
         assert_eq!(refreshed.conversation_len(), 1);
         assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
         assert!(Arc::ptr_eq(&original.resources, &refreshed.resources));
+    }
+
+    #[test]
+    fn session_metadata_tracks_the_resolved_backend_on_attach_and_refresh() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("sessions.sqlite");
+        let store = crate::SessionStore::open(&database).expect("store");
+        let journal = store
+            .create(directory.path(), "unresolved-model", None)
+            .expect("session");
+        let original = agent(Scripted::new(Vec::new()));
+        original.attach_journal(journal).expect("attach");
+        let first = store.list(directory.path()).expect("sessions").remove(0);
+        assert_eq!(first.provider.as_deref(), Some("anthropic"));
+        assert_eq!(first.model, "claude-sonnet-4-5");
+        original
+            .conversation
+            .push(crate::Message::user("remember this"));
+
+        let mut next = choice(Scripted::new(Vec::new()));
+        next.provider_id = Some("openai");
+        next.model = "next-model".into();
+        let refreshed = original.with_refreshed_backend(next);
+        assert_eq!(refreshed.conversation_len(), 1);
+        drop(original);
+        drop(refreshed);
+        drop(store);
+
+        let store = crate::SessionStore::open(&database).expect("reopen store");
+        let saved = store.list(directory.path()).expect("sessions").remove(0);
+        assert_eq!(saved.provider.as_deref(), Some("openai"));
+        assert_eq!(saved.model, "next-model");
+        let resumed = store.resume(&saved.id).expect("resume");
+        assert_eq!(
+            resumed.context().expect("context")[0].text(),
+            "remember this"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_backend_metadata_update_prevents_sending_history() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("sessions.sqlite");
+        let store = crate::SessionStore::open(&database).expect("store");
+        let journal = store
+            .create(directory.path(), "initial", None)
+            .expect("session");
+        let original = agent(Scripted::new(Vec::new()));
+        original.attach_journal(journal).expect("attach");
+        original
+            .conversation
+            .push(crate::Message::user("private history"));
+        rusqlite::Connection::open(&database)
+            .expect("connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_model BEFORE UPDATE OF provider,model ON sessions
+             BEGIN SELECT RAISE(ABORT, 'model persistence unavailable'); END;",
+            )
+            .expect("inject write failure");
+        let backend = Scripted::new(Vec::new());
+        let refreshed = original.with_refreshed_backend(choice(backend.clone()));
+        let events = drain(refreshed.run_turn("next prompt", Mode::Build)).await;
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Error(error) if error.contains("model persistence unavailable"))));
+        assert!(
+            backend.requests().is_empty(),
+            "history must not reach a backend whose identity could not be persisted"
+        );
     }
 
     #[test]

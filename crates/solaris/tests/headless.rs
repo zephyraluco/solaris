@@ -9,14 +9,7 @@ fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
     command
         .env("SOLARIS_CONFIG_DIR", directory)
         .env("SOLARIS_LOCAL_BASE_URL", endpoint)
-        .args([
-            "--provider",
-            "local",
-            "--model",
-            "test-model",
-            "--max-seconds",
-            "5",
-        ])
+        .args(["--max-seconds", "5"])
         .args(args);
     for name in [
         "ANTHROPIC_API_KEY",
@@ -95,6 +88,10 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
         directory.path(),
         &endpoint,
         &[
+            "--provider",
+            "local",
+            "--model",
+            "test-model",
             "--print",
             "first prompt",
             "--json",
