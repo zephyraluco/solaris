@@ -100,7 +100,9 @@ impl Approver for PolicyApprover {
             return Approval::Denied;
         }
         if self.rules.is_empty() {
-            return if !read_only {
+            return if self.profile == PolicyProfile::Trusted
+                || (self.profile == PolicyProfile::Ask && !read_only)
+            {
                 self.fallback.approve(call).await
             } else {
                 Approval::Approved
@@ -126,11 +128,15 @@ impl Approver for PolicyApprover {
             .rev()
             .find(|rule| matches(&rule.tool, &call.name) && matches(&rule.resource, &resource))
             .map(|r| r.effect)
-            .unwrap_or(if !read_only {
-                PermissionEffect::Ask
-            } else {
-                PermissionEffect::Allow
-            });
+            .unwrap_or(
+                if self.profile == PolicyProfile::Trusted
+                    || (self.profile == PolicyProfile::Ask && !read_only)
+                {
+                    PermissionEffect::Ask
+                } else {
+                    PermissionEffect::Allow
+                },
+            );
         match effect {
             PermissionEffect::Allow => Approval::Approved,
             PermissionEffect::Deny => Approval::Denied,
@@ -185,11 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_without_matching_ask_rules_remain_automatic() {
-        for profile in [
-            PolicyProfile::Trusted,
-            PolicyProfile::Ask,
-            PolicyProfile::ReadOnly,
-        ] {
+        for profile in [PolicyProfile::Ask, PolicyProfile::ReadOnly] {
             for rules in [
                 vec![],
                 vec![PermissionRule {
@@ -217,5 +219,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn trusted_custom_approvers_can_still_refuse_reads() {
+        let policy = PolicyApprover {
+            profile: PolicyProfile::Trusted,
+            rules: Vec::new(),
+            read_only_tools: ["read".into()].into_iter().collect(),
+            cwd: std::env::current_dir().expect("cwd"),
+            fallback: Arc::new(crate::DenyAll),
+        };
+        assert_eq!(
+            policy
+                .approve(&ToolCall::new(
+                    "read",
+                    "read",
+                    serde_json::json!({"path":"Cargo.toml"})
+                ))
+                .await,
+            Approval::Denied
+        );
     }
 }

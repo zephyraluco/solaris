@@ -404,6 +404,13 @@ impl App {
         } = options;
 
         let mut config = config;
+        // Enabling the TUI confirmation hook selects Ask semantics for default
+        // reads. Explicit rules still reach the hook; Trusted library callers
+        // retain their custom approver's decisions for every tool.
+        let mut execution = execution;
+        if ask_approval && execution.profile == solaris_agent::PolicyProfile::Trusted {
+            execution.profile = solaris_agent::PolicyProfile::Ask;
+        }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let registry = Arc::new(registry.unwrap_or_else(ToolRegistry::builtin));
 
@@ -4042,6 +4049,28 @@ mod tests {
                 accepted: false,
             });
             assert_eq!(answer.await.expect("approval task"), Approval::Denied);
+        }
+    }
+
+    #[test]
+    fn interactive_confirmation_uses_ask_semantics_without_raising_read_only_limits() {
+        use solaris_agent::PolicyProfile;
+        for (profile, expected) in [
+            (PolicyProfile::Trusted, PolicyProfile::Ask),
+            (PolicyProfile::Ask, PolicyProfile::Ask),
+            (PolicyProfile::ReadOnly, PolicyProfile::ReadOnly),
+        ] {
+            let mut options = AppOptions::new(
+                fake_backend(),
+                Config::default(),
+                Rc::new(Cell::new(false)),
+                Rc::new(RefCell::new(Vec::new())),
+                Rc::new(Cell::new(false)),
+            );
+            options.ask_approval = true;
+            options.execution.profile = profile;
+            let app = App::new(options);
+            assert_eq!(app.execution.profile, expected);
         }
     }
 
