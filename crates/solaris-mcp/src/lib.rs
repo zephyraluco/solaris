@@ -290,33 +290,93 @@ impl Tool for McpTool {
                 _ = &mut deadline => return ToolOutput::error("MCP call timed out after 120 seconds"),
                 result = &mut call => {
                     let result = match result { Ok(result) => result, Err(_) => return ToolOutput::error("MCP call failed; inspect server configuration or reconnect") };
-                    let encoded = match serde_json::to_value(&result) { Ok(value) => value, Err(_) => return ToolOutput::error("invalid MCP result") };
-                    if encoded.to_string().len() > 2 * 1024 * 1024 { return ToolOutput::error("MCP result exceeds the 2 MiB result limit; narrow the request"); }
-                    let mut text = String::new();
-                    if let Some(content) = encoded["content"].as_array() {
-                        for part in content {
-                            if let Some(chunk) = part["text"].as_str() { if !text.is_empty() { text.push('\n'); } text.push_str(chunk); }
-                            else { text.push_str("\n[non-text MCP content retained in structured result]"); }
-                        }
-                    }
-                    if text.len() > 50 * 1024 { let mut end = 50 * 1024; while !text.is_char_boundary(end) { end -= 1; } text.truncate(end); text.push_str("\n[MCP output truncated]"); }
-                    let mut output = if result.is_error == Some(true) { ToolOutput::error(text) } else { ToolOutput::ok(text) };
-                    if ctx.images_enabled
-                        && let Some(content) = encoded["content"].as_array() {
-                            for part in content {
-                                if part["type"] == "image"
-                                    && let (Some(media_type), Some(data)) = (part["mimeType"].as_str(), part["data"].as_str()) {
-                                        if !matches!(media_type, "image/png" | "image/jpeg" | "image/gif" | "image/webp") { continue; }
-                                        output.metadata.images.push(solaris_tools::InlineImage { media_type: media_type.into(), data: data.into() });
-                                    }
-                            }
-                        }
-                    output.metadata.details = json!({"mcp":encoded});
-                    return output;
+                    return tool_output(result, ctx);
                 }
             }
         }
     }
+}
+
+fn tool_output(result: rmcp::model::CallToolResult, ctx: &ToolContext) -> ToolOutput {
+    let encoded = match serde_json::to_value(&result) {
+        Ok(value) => value,
+        Err(_) => return ToolOutput::error("invalid MCP result"),
+    };
+    if encoded.to_string().len() > 2 * 1024 * 1024 {
+        return ToolOutput::error("MCP result exceeds the 2 MiB result limit; narrow the request");
+    }
+    let mut text = String::new();
+    if let Some(content) = encoded["content"].as_array() {
+        for part in content {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            if let Some(chunk) = part["text"].as_str() {
+                text.push_str(chunk);
+            } else if part["type"] == "resource"
+                && let Some(chunk) = part["resource"]["text"].as_str()
+            {
+                if let Some(uri) = part["resource"]["uri"].as_str() {
+                    text.push_str("[resource ");
+                    text.push_str(uri);
+                    text.push_str("]\n");
+                }
+                text.push_str(chunk);
+            } else {
+                text.push_str("[non-text MCP content retained in structured result]");
+            }
+        }
+    }
+    if let Some(data) = encoded
+        .get("structuredContent")
+        .filter(|value| !value.is_null())
+    {
+        let structured = data.to_string();
+        // Many servers also return the exact same JSON as a text block.
+        if text.trim() != structured {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[structured content]\n");
+            text.push_str(&structured);
+        }
+    }
+    if text.len() > 50 * 1024 {
+        let mut end = 50 * 1024;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[MCP output truncated]");
+    }
+    let mut output = if result.is_error == Some(true) {
+        ToolOutput::error(text)
+    } else {
+        ToolOutput::ok(text)
+    };
+    if ctx.images_enabled
+        && let Some(content) = encoded["content"].as_array()
+    {
+        for part in content {
+            if part["type"] == "image"
+                && let (Some(media_type), Some(data)) =
+                    (part["mimeType"].as_str(), part["data"].as_str())
+            {
+                if !matches!(
+                    media_type,
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    continue;
+                }
+                output.metadata.images.push(solaris_tools::InlineImage {
+                    media_type: media_type.into(),
+                    data: data.into(),
+                });
+            }
+        }
+    }
+    output.metadata.details = json!({"mcp":encoded});
+    output
 }
 
 async fn discover_tools(
@@ -482,6 +542,97 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    fn output(value: Value, images_enabled: bool) -> ToolOutput {
+        let mut ctx = ToolContext::new(".", std::env::temp_dir());
+        ctx.images_enabled = images_enabled;
+        tool_output(
+            serde_json::from_value(value).expect("MCP result fixture"),
+            &ctx,
+        )
+    }
+
+    #[test]
+    fn structured_only_results_reach_model_facing_text() {
+        let result = output(
+            json!({"content":[],"structuredContent":{"answer":42,"items":["中文"]}}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.text.contains("\"answer\":42"), "{}", result.text);
+        assert!(result.text.contains("中文"));
+        assert_eq!(
+            result.metadata.details["mcp"]["structuredContent"]["answer"],
+            42
+        );
+    }
+
+    #[test]
+    fn embedded_text_resources_reach_model_facing_text() {
+        let result = output(
+            json!({"content":[
+                {"type":"text","text":"resource result"},
+                {"type":"resource","resource":{"uri":"test://notes","mimeType":"text/plain","text":"embedded resource body 中文"}}
+            ]}),
+            false,
+        );
+        assert!(result.text.contains("resource result"));
+        assert!(
+            result.text.contains("embedded resource body 中文"),
+            "{}",
+            result.text
+        );
+        assert!(result.text.contains("test://notes"));
+    }
+
+    #[test]
+    fn structured_results_keep_error_status_and_image_capability_gates() {
+        let value = json!({"isError":true,"structuredContent":{"reason":"failed"},"content":[
+            {"type":"image","mimeType":"image/png","data":"YWJj"}
+        ]});
+        for enabled in [false, true] {
+            let result = output(value.clone(), enabled);
+            assert!(result.is_error);
+            assert!(result.text.contains("failed"));
+            assert_eq!(result.metadata.images.len(), usize::from(enabled));
+            assert_eq!(result.metadata.details["mcp"]["content"][0]["data"], "YWJj");
+        }
+    }
+
+    #[test]
+    fn structured_text_is_bounded_without_discarding_full_metadata() {
+        let text = "中".repeat(30_000);
+        let result = output(
+            json!({"content":[],"structuredContent":{"text":text}}),
+            false,
+        );
+        assert!(!result.is_error);
+        assert!(result.text.ends_with("[MCP output truncated]"));
+        assert!(result.text.len() <= 50 * 1024 + 32);
+        assert_eq!(
+            result.metadata.details["mcp"]["structuredContent"]["text"],
+            text
+        );
+    }
+
+    #[test]
+    fn oversized_mcp_results_are_refused_before_formatting() {
+        let result = output(
+            json!({"content":[],"structuredContent":{"text":"x".repeat(2 * 1024 * 1024)}}),
+            false,
+        );
+        assert!(result.is_error);
+        assert!(result.text.contains("2 MiB result limit"));
+    }
+
+    #[test]
+    fn a_matching_json_text_block_is_not_duplicated() {
+        let result = output(
+            json!({"content":[{"type":"text","text":"{\"answer\":42}"}],"structuredContent":{"answer":42}}),
+            false,
+        );
+        assert_eq!(result.text, "{\"answer\":42}");
+    }
+
     #[tokio::test]
     async fn official_client_discovers_and_calls_tools_over_json_rpc() {
         let (client, server) = tokio::io::duplex(65536);
@@ -500,9 +651,17 @@ mod tests {
                     "tools/list" => {
                         json!({"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]})
                     }
-                    "tools/call" => {
-                        json!({"content":[{"type":"text","text":request["params"]["arguments"]["text"]}]})
-                    }
+                    "tools/call" => match request["params"]["arguments"]["format"].as_str() {
+                        Some("structured") => {
+                            json!({"content":[],"structuredContent":{"answer":42}})
+                        }
+                        Some("resource") => {
+                            json!({"content":[{"type":"resource","resource":{"uri":"test://notes","text":"resource body","mimeType":"text/plain"}}]})
+                        }
+                        _ => {
+                            json!({"content":[{"type":"text","text":request["params"]["arguments"]["text"]}]})
+                        }
+                    },
                     _ => json!({}),
                 };
                 let response = json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
@@ -536,6 +695,19 @@ mod tests {
             output.metadata.details["mcp"]["content"][0]["text"],
             "中文 echo"
         );
+        for (format, expected) in [
+            ("structured", "\"answer\":42"),
+            ("resource", "resource body"),
+        ] {
+            let output = tool
+                .run(
+                    json!({"format":format}),
+                    &ToolContext::new(".", std::env::temp_dir()),
+                )
+                .await;
+            assert!(!output.is_error);
+            assert!(output.text.contains(expected), "{}", output.text);
+        }
         drop(tool);
         server.abort();
     }

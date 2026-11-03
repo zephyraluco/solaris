@@ -376,7 +376,7 @@ directory contains an array of `{ "tool": "write", "resource": "/absolute/path/*
 existing symlink ancestors before matching. Shell resource patterns match command
 text, not its actual side effects; these rules are not an OS sandbox.
 An explicit `ask` rule also prompts for read-only tools, including locally trusted
-MCP reads. In the TUI, reads without a matching ask/deny rule remain automatic.
+MCP reads. With confirmation enabled, reads without a matching ask/deny rule remain automatic.
 
 `--max-requests` (default 100) and `--max-seconds` (default 1800) apply across a turn,
 its children and automatic compaction. `--max-cost <USD>` stops further work when
@@ -452,6 +452,8 @@ Tools use `mcp__<server>__<tool>` names. Resource/prompt discovery uses a separa
 read-only annotations are not authority: name tools in `read_only_tools` locally
 to expose them to Plan mode. Unknown/mutating tools follow the normal approval
 policy. MCP servers run with their process permissions; this is not a sandbox.
+Structured tool payloads and embedded text resources are included in bounded
+model-facing text. The complete accepted result remains in session metadata.
 
 ## Model capabilities and offline model lists
 
