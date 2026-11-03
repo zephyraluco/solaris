@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use solaris_agent::{
     Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
     Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
-    ToolRegistry, ToolSelection, default_tool_names,
+    ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -1574,20 +1574,10 @@ impl App {
 
     /// Answer a call the loop is waiting on.
     ///
-    /// Reading the session changes nothing, so it is approved silently; anything
-    /// else is put to the user, and the loop waits for their answer.
+    /// The policy layer has already decided this call needs confirmation,
+    /// including read-only calls covered by an explicit ask rule.
     fn request_approval(&mut self, request: ApprovalRequest) {
         let ApprovalRequest { call, reply } = request;
-
-        if read_only(&call.name)
-            || self
-                .registry
-                .get(&call.name)
-                .is_some_and(|tool| tool.is_read_only())
-        {
-            let _ = reply.send(Approval::Approved);
-            return;
-        }
 
         self.pending_approvals.push_back(reply);
         let dialog = ConfirmDialog::new(
@@ -3118,14 +3108,6 @@ impl Component for App {
     }
 }
 
-/// Whether calling `name` only looks at the session.
-///
-/// This is the set Plan mode declares, which is exactly the set that cannot
-/// change anything — prompting for a read would be noise.
-fn read_only(name: &str) -> bool {
-    default_tool_names(Mode::Plan).contains(&name)
-}
-
 /// The arguments of a call, as the confirmation prompt shows them.
 fn describe_call(call: &ToolCall) -> String {
     // `Value`'s own display is the compact JSON the model sent, which is what
@@ -4062,16 +4044,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_only_call_is_approved_without_asking() {
-        let mut app = app();
-        let (reply, answer) = oneshot::channel();
-        app.request_approval(ApprovalRequest {
-            call: ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" })),
-            reply,
-        });
-
-        assert!(app.pending_approvals.is_empty(), "nothing to ask about");
-        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+    async fn explicit_ask_rules_for_read_only_tools_wait_for_user_confirmation() {
+        for name in ["read", "mcp__server__lookup"] {
+            let mut app = app();
+            let (tx, mut rx) = unbounded_channel();
+            let policy = solaris_agent::PolicyApprover {
+                profile: solaris_agent::PolicyProfile::Trusted,
+                read_only_tools: [name.to_owned()].into_iter().collect(),
+                cwd: app.cwd.clone(),
+                rules: vec![solaris_agent::PermissionRule {
+                    tool: name.into(),
+                    resource: "*".into(),
+                    effect: solaris_agent::PermissionEffect::Ask,
+                }],
+                fallback: Arc::new(ChannelApprover::new(tx)),
+            };
+            let answer = tokio::spawn(async move {
+                policy
+                    .approve(&ToolCall::new(
+                        "call-1",
+                        name,
+                        serde_json::json!({"path":"a.txt"}),
+                    ))
+                    .await
+            });
+            app.request_approval(rx.recv().await.expect("policy requested confirmation"));
+            assert_eq!(app.pending_approvals.len(), 1);
+            assert!(!answer.is_finished(), "read must wait for the user");
+            app.on_dialog_message(DialogMessage::Confirm {
+                action: ConfirmAction::RunTool,
+                accepted: false,
+            });
+            assert_eq!(answer.await.expect("approval task"), Approval::Denied);
+        }
     }
 
     #[tokio::test]
