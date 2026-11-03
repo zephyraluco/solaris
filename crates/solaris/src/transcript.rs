@@ -5,7 +5,9 @@
 //! except while it is empty, when the welcome box's animated companion needs a
 //! fresh frame every tick.
 
+use solaris_tui::document::{DocumentRow, TextDocument};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crossterm::event::MouseEvent;
 use ratatui::layout::Rect;
@@ -41,6 +43,7 @@ struct SubagentHeader {
 
 #[derive(Default)]
 struct TranscriptHeaders {
+    parts: Vec<u64>,
     tools: Vec<CollapsibleHeader>,
     subagents: BTreeMap<(usize, usize), SubagentHeader>,
 }
@@ -60,6 +63,7 @@ pub struct TranscriptView {
     /// Tool disclosures and retained child terminal links have separate handlers.
     headers: TranscriptHeaders,
     initialized: bool,
+    document: Arc<TextDocument>,
 }
 
 impl TranscriptView {
@@ -86,6 +90,28 @@ impl TranscriptView {
     ) -> &[Line<'static>] {
         let spinner_key = spinner_frame.unwrap_or(u16::MAX);
         let empty = session.turns.is_empty();
+        let animation_only = self.initialized
+            && !empty
+            && self.cache_version == session.version
+            && self.cache_width == area.width
+            && self.cache_height == area.height
+            && self.cache_theme == theme.name
+            && self.cache_spinner != u16::MAX
+            && spinner_frame.is_some()
+            && self.headers.subagents.is_empty();
+        if animation_only {
+            let glyph = SPINNER[usize::from(spinner_key) % SPINNER.len()];
+            for (row, line) in self.lines.iter_mut().enumerate() {
+                if self.headers.parts.get(row) == Some(&u64::MAX)
+                    && line.spans.len() == 2
+                    && line.spans[1].content == "generating…"
+                {
+                    line.spans[0].content = format!("{glyph} ").into();
+                }
+            }
+            self.cache_spinner = spinner_key;
+            return &self.lines;
+        }
         let stale = !self.initialized
             || empty
             || self.cache_empty != empty
@@ -104,6 +130,20 @@ impl TranscriptView {
                 welcome,
                 &mut self.headers,
             );
+            self.document = Arc::new(TextDocument::new(
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| DocumentRow {
+                        part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
+                        text: line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect(),
+                    })
+                    .collect(),
+            ));
             self.cache_width = area.width;
             self.cache_height = area.height;
             self.cache_version = session.version;
@@ -114,6 +154,10 @@ impl TranscriptView {
         }
 
         &self.lines
+    }
+
+    pub fn document(&self) -> Arc<TextDocument> {
+        Arc::clone(&self.document)
     }
 
     /// Resolve a title in the rendered transcript, before the viewport scroll.
@@ -130,7 +174,7 @@ impl TranscriptView {
         &mut self,
         event: MouseEvent,
         viewport: Rect,
-        scroll: u16,
+        scroll: usize,
         selection_active: bool,
     ) -> (bool, Option<(usize, usize)>) {
         let mut handled = false;
@@ -138,7 +182,7 @@ impl TranscriptView {
         for (&target, header) in &mut self.headers.subagents {
             let visible_row = header
                 .row
-                .checked_sub(usize::from(scroll))
+                .checked_sub(scroll)
                 .filter(|row| *row < usize::from(viewport.height));
             let area = visible_row.map_or(Rect::default(), |row| {
                 Rect::new(viewport.x, viewport.y + row as u16, viewport.width, 1)
@@ -196,6 +240,7 @@ fn build_with_headers(
     welcome: &WelcomeData,
     headers: &mut TranscriptHeaders,
 ) -> Vec<Line<'static>> {
+    headers.parts.clear();
     headers.tools.clear();
     headers.subagents.retain(|&(turn, step), _| {
         session
@@ -218,8 +263,13 @@ fn build_with_headers(
         if index > 0 {
             out.push(Line::default());
         }
+        let part = ((index as u64) + 1) << 32;
+        headers.parts.resize(out.len(), part);
         push_prompt(&mut out, &turn.prompt, width, theme);
+        headers.parts.resize(out.len(), part + 1);
         push_compaction(&mut out, turn, theme);
+        headers.parts.resize(out.len(), part + 2);
+        let steps_start = out.len();
         push_steps(
             &mut out,
             turn.into(),
@@ -229,12 +279,30 @@ fn build_with_headers(
             index,
             headers,
         );
+        headers.parts.resize(out.len(), part + 3);
+        let steps_end = out.len();
+        let mut section = part + 4;
+        for row in steps_start..steps_end {
+            if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
+                section = part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
+                headers.parts[row] = section;
+                section += 1;
+            } else {
+                headers.parts[row] = section;
+            }
+        }
+        let thinking_start = out.len();
         push_thinking(&mut out, turn, width, theme);
+        headers.parts.resize(out.len(), part + 5);
+        if out.len() > thinking_start {
+            headers.parts[thinking_start] = part + 6;
+        }
         if !turn.reply.trim().is_empty() {
             out.push(Line::default());
             out.extend(render_markdown(&turn.reply, width as u16, &markdown));
         }
 
+        headers.parts.resize(out.len(), part + 7);
         if !turn.complete {
             let glyph = spinner_frame
                 .map(|frame| SPINNER[frame as usize % SPINNER.len()])
@@ -247,6 +315,7 @@ fn build_with_headers(
         }
     }
 
+    headers.parts.resize(out.len(), u64::MAX);
     out
 }
 
@@ -346,7 +415,7 @@ fn push_steps(
                 let body_rows = step
                     .result
                     .as_ref()
-                    .map_or(1, |result| result.output.lines().count().max(1));
+                    .map_or(1, |result| tool_display_text(result).lines().count().max(1));
                 (shell_view(step, turn.complete, theme), body_rows)
             } else {
                 let mut group_finished = finished + usize::from(step.is_done());
@@ -382,7 +451,7 @@ fn push_steps(
                         turn.steps[target_step]
                             .result
                             .as_ref()
-                            .map_or(1, |result| result.output.lines().count().max(1))
+                            .map_or(1, |result| tool_display_text(result).lines().count().max(1))
                     } else {
                         body_rows
                     },
@@ -442,10 +511,10 @@ fn tool_group_view(
                 CollapsibleStatus::Idle
             });
             let output = match &step.result {
-                Some(result) if result.output.is_empty() => "No output.",
-                Some(result) => &result.output,
-                None if running => "Running…",
-                None => "No output.",
+                Some(result) if result.output.is_empty() => "No output.".to_string(),
+                Some(result) => tool_display_text(result),
+                None if running => "Running…".to_string(),
+                None => "No output.".to_string(),
             };
             child.set_content(
                 output
@@ -484,10 +553,10 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
     let mut view = step_view(step, title, running, failed, theme);
     if step.disclosure.is_expanded() {
         let output = match &step.result {
-            Some(result) if result.output.is_empty() => "No output.",
-            Some(result) => &result.output,
-            None if running => "Running…",
-            None => "No output.",
+            Some(result) if result.output.is_empty() => "No output.".to_string(),
+            Some(result) => tool_display_text(result),
+            None if running => "Running…".to_string(),
+            None => "No output.".to_string(),
         };
         let style = Style::default().fg(if failed { theme.error } else { theme.muted });
         view.set_content(
@@ -498,6 +567,18 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
         );
     }
     view
+}
+
+fn tool_display_text(result: &solaris_agent::ToolResult) -> String {
+    let mut output = result.output.clone();
+    if let Some(patch) = result.metadata.details["change"]["patch"].as_str() {
+        output.push_str("\n\n");
+        output.push_str(patch);
+        if let Some(id) = result.metadata.details["change"]["id"].as_str() {
+            output.push_str(&format!("\nChange: {id} (solaris --undo {id})"));
+        }
+    }
+    output
 }
 
 fn step_view(
@@ -789,6 +870,28 @@ mod tests {
 
     fn area(width: u16, height: u16) -> Rect {
         Rect::new(0, 0, width, height)
+    }
+
+    #[test]
+    fn animation_reuses_the_existing_document_and_markdown_layout() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "question".into(),
+            reply: "long response ".repeat(1000),
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let theme = Theme::dark();
+        view.lines(&session, area, &theme, Some(0), &welcome());
+        let document = view.document();
+        view.lines(&session, area, &theme, Some(1), &welcome());
+        assert!(Arc::ptr_eq(&document, &view.document()));
+        assert!(view.lines.iter().any(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.content == format!("{} ", SPINNER[1]))
+        }));
     }
 
     #[test]

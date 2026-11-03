@@ -2,7 +2,6 @@
 name = "solaris-provider"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "Provider catalogue, credentials and platform resolution for solaris"
 
@@ -10,6 +9,8 @@ description = "Provider catalogue, credentials and platform resolution for solar
 workspace = true
 
 [dependencies]
+solaris-types = { workspace = true }
+tempfile = "3"
 solaris-backend = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -23,5 +24,6 @@ getrandom = "0.3"
 url = "2"
 
 [dev-dependencies]
+futures = { workspace = true }
 # The resolution tests drive the async entry point.
 tokio = { workspace = true }

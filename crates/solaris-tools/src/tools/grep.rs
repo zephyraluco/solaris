@@ -141,7 +141,7 @@ impl Tool for GrepTool {
             literal,
             context,
         );
-        let output = match self.runner.run("rg", &args, &ctx.cwd).await {
+        let output = match self.runner.run_with_context("rg", &args, ctx).await {
             Ok(output) => output,
             Err(error) => return ToolOutput::error(error),
         };

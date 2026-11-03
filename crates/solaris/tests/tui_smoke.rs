@@ -463,6 +463,7 @@ impl Harness {
                 model,
                 BackendOptions {
                     environment: solaris_provider::empty_environment(),
+                    ..Default::default()
                 },
             );
             if choice.provider_id.is_none() {

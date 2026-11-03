@@ -16,20 +16,77 @@
 //! each step it takes, so a turn abandoned halfway leaves the conversation with
 //! exactly the parts that really happened.
 
-use std::sync::{Mutex, MutexGuard};
+use crate::{SessionJournal, SessionRecord, StoreError};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use solaris_backend::{Message, Role, tokens_for_characters};
 
 /// The messages a turn is built from and appends to.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Conversation {
     messages: Mutex<Vec<Message>>,
+    journal: RwLock<Option<Arc<SessionJournal>>>,
+    failure: Mutex<Option<String>>,
 }
 
 impl Conversation {
     /// An empty conversation.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn attach(&self, journal: Arc<SessionJournal>) -> Result<(), StoreError> {
+        let context = match journal.context() {
+            Ok(context) => context,
+            Err(error) => {
+                *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        *self.lock() = context;
+        *self
+            .journal
+            .write()
+            .map_err(|_| StoreError::Invalid("journal lock poisoned".into()))? = Some(journal);
+        self.repair();
+        if let Some(error) = self.error() {
+            return Err(StoreError::Invalid(error));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn journal(&self) -> Option<Arc<SessionJournal>> {
+        self.journal
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_model(&self, provider: Option<&str>, model: &str) {
+        self.persist(SessionRecord::Model {
+            provider: provider.map(str::to_owned),
+            model: model.to_owned(),
+        });
+    }
+
+    fn persist(&self, record: SessionRecord) -> bool {
+        if self.error().is_some() {
+            return false;
+        }
+        if let Some(journal) = self.journal()
+            && let Err(error) = journal.append(&record)
+        {
+            *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+            return false;
+        }
+        true
     }
 
     /// The messages as they are now, for building one request.
@@ -48,12 +105,22 @@ impl Conversation {
 
     /// Append one message.
     pub(crate) fn push(&self, message: Message) {
-        self.lock().push(message);
+        let mut messages = self.lock();
+        if self.persist(SessionRecord::Message {
+            message: message.clone(),
+        }) {
+            messages.push(message);
+        }
     }
 
     /// Replace everything, which is what compaction does.
     pub(crate) fn replace_with(&self, messages: Vec<Message>) {
-        *self.lock() = messages;
+        let mut current = self.lock();
+        if self.persist(SessionRecord::Context {
+            messages: messages.clone(),
+        }) {
+            *current = messages;
+        }
     }
 
     /// Forget the conversation, for `/clear`.
@@ -61,23 +128,37 @@ impl Conversation {
     /// The next turn starts with nothing but its own prompt and a fresh system
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
-        self.lock().clear();
+        self.replace_with(Vec::new());
     }
 
-    /// Drop a trailing request for calls that never got answers.
-    ///
-    /// A turn that is cancelled or fails can leave the conversation ending on an
-    /// assistant message that asked for tools whose results never arrived, and
-    /// every wire rejects a call with no result. Removing that one message is
-    /// enough: results are appended immediately after the request, so an earlier
-    /// request always has its answers.
+    /// Complete missing results in the latest assistant round without replaying
+    /// tools. Older rounds may reuse the same call IDs, so only results after
+    /// this assistant message count as answers.
     pub(crate) fn repair(&self) {
         let mut messages = self.lock();
-        let unanswered = messages
-            .last()
-            .is_some_and(|last| last.role == Role::Assistant && last.tool_calls().next().is_some());
-        if unanswered {
-            messages.pop();
+        let Some(round) = messages.iter().rposition(|m| m.role == Role::Assistant) else {
+            return;
+        };
+        let calls: Vec<_> = messages[round].tool_calls().cloned().collect();
+        let answered: std::collections::HashSet<_> = messages[round + 1..]
+            .iter()
+            .flat_map(|m| m.tool_results())
+            .map(|r| r.id.as_str())
+            .collect();
+        let missing: Vec<_> = calls
+            .into_iter()
+            .filter(|call| !answered.contains(call.id.as_str()))
+            .collect();
+        for call in missing {
+            let message = Message::tool_result(solaris_backend::ToolResult::error(
+                &call,
+                "interrupted; execution outcome is unknown; verify side effects before retrying",
+            ));
+            if self.persist(SessionRecord::Message {
+                message: message.clone(),
+            }) {
+                messages.push(message);
+            }
         }
     }
 
@@ -135,17 +216,124 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_calls_whose_answers_never_came_is_taken_back() {
+    fn unanswered_calls_get_explicit_interruption_results() {
         let conversation = Conversation::new();
         conversation.push(Message::user("read it"));
         conversation.push(Message::tool_use(call("call-1")));
 
         conversation.repair();
 
-        // The prompt stays — it really was said — and the unanswered call goes,
-        // because every wire rejects a call with no result.
-        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation.len(), 3);
+        assert!(
+            conversation.snapshot()[2]
+                .tool_results()
+                .next()
+                .expect("result")
+                .is_error
+        );
         assert_eq!(conversation.snapshot()[0].text(), "read it");
+    }
+
+    fn interrupted_reused_id_history() -> Vec<Message> {
+        vec![
+            Message::user("old round"),
+            Message::tool_use(call("reused")),
+            Message::tool_result(ToolResult::ok(&call("reused"), "old result")),
+            Message::user("new round"),
+            Message::with_content(
+                Role::Assistant,
+                vec![
+                    solaris_backend::Content::ToolUse {
+                        call: call("reused"),
+                    },
+                    solaris_backend::Content::ToolUse {
+                        call: call("other"),
+                    },
+                ],
+            ),
+            Message::tool_result(ToolResult::ok(&call("other"), "current partial result")),
+        ]
+    }
+
+    #[test]
+    fn a_reused_id_is_repaired_without_changing_older_or_current_results() {
+        let conversation = Conversation::new();
+        let before = interrupted_reused_id_history();
+        conversation.replace_with(before.clone());
+        conversation.repair();
+        let after = conversation.snapshot();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(&after[..before.len()], before.as_slice());
+        let repaired = after
+            .last()
+            .expect("repair")
+            .tool_results()
+            .next()
+            .expect("result");
+        assert_eq!(repaired.id, "reused");
+        assert!(repaired.is_error);
+        conversation.repair();
+        assert_eq!(conversation.snapshot(), after, "repair must be idempotent");
+    }
+
+    #[test]
+    fn a_reused_id_with_a_current_result_is_not_repaired() {
+        let conversation = Conversation::new();
+        let mut complete = interrupted_reused_id_history();
+        complete.push(Message::tool_result(ToolResult::ok(
+            &call("reused"),
+            "current result",
+        )));
+        conversation.replace_with(complete.clone());
+        conversation.repair();
+        assert_eq!(conversation.snapshot(), complete);
+    }
+
+    #[test]
+    fn reopening_a_session_repairs_and_persists_the_latest_reused_id_once() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("session");
+        let id = journal.id().to_owned();
+        let before = interrupted_reused_id_history();
+        journal
+            .append(&SessionRecord::Context {
+                messages: before.clone(),
+            })
+            .expect("interrupted context");
+        drop(journal);
+        let conversation = Conversation::new();
+        conversation
+            .attach(store.resume(&id).expect("resume"))
+            .expect("attach");
+        let repaired = conversation.snapshot();
+        assert_eq!(repaired.len(), before.len() + 1);
+        assert_eq!(&repaired[..before.len()], before.as_slice());
+        assert!(
+            repaired
+                .last()
+                .expect("repair")
+                .tool_results()
+                .next()
+                .expect("result")
+                .is_error
+        );
+        drop(conversation);
+
+        let count = store.records(&id).expect("records").len();
+        let reopened = Conversation::new();
+        reopened
+            .attach(store.resume(&id).expect("resume again"))
+            .expect("attach again");
+        assert_eq!(reopened.snapshot(), repaired);
+        assert_eq!(
+            store.records(&id).expect("records").len(),
+            count,
+            "resume must not append a duplicate repair"
+        );
     }
 
     #[test]

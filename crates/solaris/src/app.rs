@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use solaris_agent::{
     Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
     Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
-    ToolRegistry, ToolSelection, default_tool_names,
+    ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
@@ -137,6 +137,11 @@ pub struct AppOptions {
     /// Off in tests, which drive the loop themselves and have nobody to ask; on
     /// in the binary, where a prompt is the point.
     pub ask_approval: bool,
+    /// Optional persistent transcript and model context.
+    pub journal: Option<Arc<solaris_agent::SessionJournal>>,
+    pub execution: solaris_agent::ExecutionSettings,
+    /// Optional registry populated with external tools before UI startup.
+    pub registry: Option<ToolRegistry>,
 }
 
 impl AppOptions {
@@ -184,6 +189,9 @@ impl AppOptions {
             prompt_context: PromptContext::default(),
             resource_paths: None,
             ask_approval: false,
+            journal: None,
+            execution: solaris_agent::ExecutionSettings::default(),
+            registry: None,
         }
     }
 }
@@ -206,7 +214,13 @@ fn resolve_backend(
     if choice.provider_id.is_some() {
         config.model = choice.model.clone();
     }
-    config.context_window = u64::from(context_window_for(&config.model));
+    config.context_window = u64::from(
+        choice
+            .backend
+            .capabilities()
+            .context_window
+            .unwrap_or_else(|| context_window_for(&config.model)),
+    );
     choice
 }
 
@@ -216,6 +230,7 @@ fn resolve_backend(
 /// nothing is connected — because the session is transparent until the model
 /// asks for a tool: with none declared it is exactly one model call, forwarded
 /// unchanged. The returned handle stops whichever turn the session is running.
+#[expect(clippy::too_many_arguments, reason = "application assembly boundary")]
 fn with_tools(
     choice: BackendChoice,
     registry: Arc<ToolRegistry>,
@@ -224,13 +239,22 @@ fn with_tools(
     prompt_context: &PromptContext,
     cwd: &Path,
     approver: Arc<dyn Approver>,
-) -> (Arc<Agent>, Cancel) {
-    let options = AgentOptions::in_directory(cwd)
+    execution: &solaris_agent::ExecutionSettings,
+    factory: &BackendFactory,
+    auth: &AuthStore,
+) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
+    let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_skills(skills.clone())
         .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
-    let agent = Arc::new(Agent::new(choice, registry, options));
+    options.execution = execution.clone();
+    let factory = Arc::clone(factory);
+    let auth = auth.clone();
+    options.child_backend = Some(Arc::new(move |model| Ok(factory(&auth, model))));
+    let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
+        choice, registry, options,
+    )));
     let cancel = agent.cancel_handle();
     (agent, cancel)
 }
@@ -238,7 +262,7 @@ fn with_tools(
 /// The solaris application root component.
 pub struct App {
     /// The session every turn goes through, and the backend behind it.
-    pub(crate) agent: Arc<Agent>,
+    pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
     pub(crate) config: Config,
@@ -318,6 +342,7 @@ pub struct App {
     cwd: PathBuf,
     /// The approver every rebuilt loop is wired with.
     approver: Arc<dyn Approver>,
+    execution: solaris_agent::ExecutionSettings,
     /// Stops the turn in flight, tools included.
     tool_cancel: Cancel,
     /// Calls waiting for the user's answer; `None` when the session approves
@@ -373,11 +398,21 @@ impl App {
             prompt_context,
             resource_paths,
             ask_approval,
+            journal,
+            execution,
+            registry,
         } = options;
 
         let mut config = config;
+        // Enabling the TUI confirmation hook selects Ask semantics for default
+        // reads. Explicit rules still reach the hook; Trusted library callers
+        // retain their custom approver's decisions for every tool.
+        let mut execution = execution;
+        if ask_approval && execution.profile == solaris_agent::PolicyProfile::Trusted {
+            execution.profile = solaris_agent::PolicyProfile::Ask;
+        }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let registry = Arc::new(ToolRegistry::builtin());
+        let registry = Arc::new(registry.unwrap_or_else(ToolRegistry::builtin));
 
         // A session that asks before acting gets a channel the UI drains; one
         // that does not approves everything, which is what a test wants.
@@ -397,8 +432,15 @@ impl App {
             &prompt_context,
             &cwd,
             Arc::clone(&approver),
+            &execution,
+            &backend_factory,
+            &auth,
         );
 
+        if let Some(journal) = &journal {
+            // Attach errors are retained by the agent and prevent tool execution.
+            let _ = agent.attach_journal(Arc::clone(journal));
+        }
         let theme = Theme::by_name(&config.theme);
         selection
             .borrow_mut()
@@ -460,13 +502,192 @@ impl App {
             registry,
             cwd,
             approver,
+            execution,
             tool_cancel,
             approval_rx,
             pending_approvals: VecDeque::new(),
         };
 
+        if let Some(journal) = journal {
+            match journal.store().records(journal.id()) {
+                Ok(records) => app.restore_records(records),
+                Err(error) => app.notifications.error(error.to_string()),
+            }
+        }
         app.refresh_models();
         app
+    }
+
+    fn restore_records(&mut self, records: Vec<solaris_agent::SessionRecord>) {
+        self.session = SessionState::new();
+        for record in records {
+            match record {
+                solaris_agent::SessionRecord::Prompt { text } => self.session.turns.push(Turn {
+                    prompt: text,
+                    ..Default::default()
+                }),
+                solaris_agent::SessionRecord::Event { event } => self.apply_event(event),
+                solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
+                    "session interrupted; verify unfinished tool outcomes before retrying".into(),
+                )),
+                solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => {
+                    self.session.turns.clear()
+                }
+                _ => {}
+            }
+        }
+        self.session.bump();
+        self.transcript.invalidate();
+    }
+
+    fn open_sessions(&mut self, tree: bool) {
+        let Some(journal) = self.agent.journal() else {
+            self.notifications
+                .warning("session navigation is unavailable in ephemeral mode");
+            return;
+        };
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        let sessions = match journal.store().list(&cwd) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let current = journal.id();
+        let items = sessions
+            .into_iter()
+            .map(|session| {
+                let title = session
+                    .title
+                    .as_deref()
+                    .unwrap_or("New session")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = format!(
+                    "{}{}",
+                    if session.id == current {
+                        "● "
+                    } else if session.parent_id.is_some() {
+                        "↳ "
+                    } else {
+                        "  "
+                    },
+                    title
+                );
+                let description = format!(
+                    "{}{}",
+                    session.status,
+                    session
+                        .parent_id
+                        .map(|parent| format!(" · parent {parent}"))
+                        .unwrap_or_default()
+                );
+                solaris_tui::components::select_list::SelectItem::new(session.id, label)
+                    .description(description)
+            })
+            .collect();
+        let dialog = SelectDialog::new(
+            if tree { "Session tree" } else { "Sessions" },
+            HINT_SELECT,
+            items,
+            &self.theme,
+            self.dialog_tx.clone(),
+            |id| DialogMessage::Session(id.to_string()),
+        );
+        self.push_overlay(
+            Box::new(dialog),
+            OverlayOptions::centered().width(SizeValue::Percent(85)),
+        );
+    }
+
+    fn switch_session(&mut self, id: &str, fork: bool) {
+        if self.events_rx.is_some() || self.compact_rx.is_some() || self.oauth.is_some() {
+            self.notifications
+                .warning("finish or cancel the active operation before changing sessions");
+            return;
+        }
+        let Some(current) = self.agent.journal() else {
+            self.notifications
+                .warning("resume requires a saved session");
+            return;
+        };
+        if current.id() == id && !fork {
+            self.notifications.info("this session is already open");
+            return;
+        }
+        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        let info = match current.store().list(&cwd) {
+            Ok(sessions) => sessions.into_iter().find(|session| session.id == id),
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let Some(info) = info else {
+            self.notifications
+                .error("session not found in this directory");
+            return;
+        };
+        let journal = if fork {
+            current.fork(&cwd, &self.config.model)
+        } else {
+            current.store().resume(id)
+        };
+        let journal = match journal {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let records = match journal.store().records(journal.id()) {
+            Ok(records) => records,
+            Err(error) => {
+                self.notifications.error(error.to_string());
+                return;
+            }
+        };
+        let mut config = self.config.clone();
+        let mut auth = self.auth.clone();
+        if !fork {
+            config.model = info.model;
+            if let Some(provider) = info.provider {
+                auth.activate(provider);
+            }
+        }
+        let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
+        let (agent, cancel) = with_tools(
+            choice,
+            Arc::clone(&self.registry),
+            &self.tools,
+            &self.skills,
+            &self.agent.prompt_context(),
+            &cwd,
+            Arc::clone(&self.approver),
+            &self.execution,
+            &self.backend_factory,
+            &auth,
+        );
+        if let Err(error) = agent.attach_journal(Arc::clone(&journal)) {
+            self.notifications.error(error.to_string());
+            return;
+        }
+        self.agent = agent;
+        self.tool_cancel = cancel;
+        self.config = config;
+        self.auth = auth;
+        self.subagent_terminal = None;
+        self.selection.borrow_mut().clear();
+        self.notifications.clear();
+        self.restore_records(records);
+        self.refresh_models();
+        self.notifications.info(format!(
+            "{} session {}",
+            if fork { "forked" } else { "resumed" },
+            journal.id()
+        ));
     }
 
     /// The active provider, once one has been connected.
@@ -531,7 +752,13 @@ impl App {
             &self.agent.prompt_context(),
             &self.cwd,
             Arc::clone(&self.approver),
+            &self.execution,
+            &self.backend_factory,
+            &self.auth,
         );
+        if let Some(journal) = self.agent.journal() {
+            let _ = agent.attach_journal(journal);
+        }
         self.agent = agent;
         self.tool_cancel = cancel;
         self.agent.source()
@@ -618,7 +845,7 @@ impl App {
     }
 
     fn scroll_transcript(&mut self, delta: i32) {
-        self.session.scroll = (self.session.scroll as i32 + delta).max(0) as u16;
+        self.session.scroll = self.session.scroll.saturating_add_signed(delta as isize);
         self.session.follow_end = false;
     }
 
@@ -895,6 +1122,22 @@ impl App {
             "compact" => self.compact_now(),
             "queue" => self.queue_follow_up(args),
             "skills" => self.open_skills(),
+            "sessions" => self.open_sessions(false),
+            "tree" => self.open_sessions(true),
+            "resume" => {
+                if args.is_empty() {
+                    self.open_sessions(false);
+                } else {
+                    self.switch_session(args, false);
+                }
+            }
+            "fork" => {
+                if let Some(journal) = self.agent.journal() {
+                    self.switch_session(journal.id(), true);
+                } else {
+                    self.notifications.warning("fork requires a saved session");
+                }
+            }
             "reload" => self.reload_resources(),
             // A skill's name is taken on the colon rather than after a space; a
             // reminder that says so is worth more than "unknown command".
@@ -902,6 +1145,18 @@ impl App {
                 "a skill is loaded as `{SKILL_PREFIX}<name>` — /skills lists them"
             )),
             "stats" => self.open_stats(),
+            "subagents" => self.notifications.info(format!(
+                "Active tasks: {}",
+                self.agent.active_tasks().join(", ")
+            )),
+            "stop" => {
+                if self.agent.cancel_task(command.args.trim()) {
+                    self.notifications.info("stopping child task");
+                } else {
+                    self.notifications
+                        .warning("no active child with that task ID");
+                }
+            }
             "buddy" => self.open_buddy(args),
             "quit" | "exit" => self.quit.set(true),
             other => self
@@ -1039,17 +1294,16 @@ impl App {
             );
             return;
         }
-        if self.auth.active_provider() == Some("openai") {
-            if let Some(credential) = self
+        if self.auth.active_provider() == Some("openai")
+            && let Some(credential) = self
                 .auth
                 .credential("openai")
                 .filter(|c| solaris_provider::oauth::needs_refresh(c))
                 .cloned()
-            {
-                self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
-                self.notifications.info("Refreshing OpenAI authorization…");
-                return;
-            }
+        {
+            self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
+            self.notifications.info("Refreshing OpenAI authorization…");
+            return;
         }
         let prompt = match self.agent.expand_input(&prompt) {
             Ok(prompt) => prompt,
@@ -1075,7 +1329,8 @@ impl App {
         let mode = self.config.mode;
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream = agent.run_turn(prompt, mode);
+            let mut stream =
+                agent.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
             while let Some(event) = stream.next().await {
                 if tx.send(event).is_err() {
                     break;
@@ -1128,17 +1383,27 @@ impl App {
                     turn.cost_usd += cost_usd;
                 }
             }
+            AgentEvent::SubagentSession {
+                task_id,
+                session_id,
+            } => {
+                if let Some(turn) = self.session.active_turn_mut()
+                    && let Some(step) = turn.subagent_mut(&task_id)
+                    && let Some(child) = &mut step.subagent
+                {
+                    child.session_id = Some(session_id);
+                }
+            }
             AgentEvent::SubagentStarted { call_id, task_id } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    if let Some(child) = turn
+                if let Some(turn) = self.session.active_turn_mut()
+                    && let Some(child) = turn
                         .steps
                         .iter_mut()
                         .rev()
                         .find(|step| step.call.id == call_id)
                         .and_then(|step| step.subagent.as_mut())
-                    {
-                        child.task_id = Some(task_id);
-                    }
+                {
+                    child.task_id = Some(task_id);
                 }
             }
             AgentEvent::SubagentToolCall { task_id, call } => {
@@ -1161,15 +1426,13 @@ impl App {
                     .active_turn_mut()
                     .and_then(|turn| turn.subagent_mut(&task_id))
                     .and_then(|step| step.subagent.as_mut())
-                {
-                    if let Some(step) = child
+                    && let Some(step) = child
                         .steps
                         .iter_mut()
                         .rev()
                         .find(|step| step.call.id == result.id && !step.is_done())
-                    {
-                        step.finish(result, duration_ms);
-                    }
+                {
+                    step.finish(result, duration_ms);
                 }
             }
             AgentEvent::SubagentComplete {
@@ -1270,6 +1533,7 @@ impl App {
         match message {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
+            DialogMessage::Session(id) => self.switch_session(&id, false),
             DialogMessage::Command(text) => self.submit(text),
             DialogMessage::Confirm {
                 action: ConfirmAction::RunTool,
@@ -1317,15 +1581,10 @@ impl App {
 
     /// Answer a call the loop is waiting on.
     ///
-    /// Reading the session changes nothing, so it is approved silently; anything
-    /// else is put to the user, and the loop waits for their answer.
+    /// The policy layer has already decided this call needs confirmation,
+    /// including read-only calls covered by an explicit ask rule.
     fn request_approval(&mut self, request: ApprovalRequest) {
         let ApprovalRequest { call, reply } = request;
-
-        if read_only(&call.name) {
-            let _ = reply.send(Approval::Approved);
-            return;
-        }
 
         self.pending_approvals.push_back(reply);
         let dialog = ConfirmDialog::new(
@@ -1396,6 +1655,7 @@ impl App {
             &backend,
             self.config.mode,
             self.config.context_window,
+            self.agent.capabilities().price_known,
         );
         let dialog = TextDialog::new(
             "Stats",
@@ -1542,8 +1802,19 @@ impl App {
         });
     }
 
+    fn refresh_transport(&mut self, choice: BackendChoice) {
+        let factory = Arc::clone(&self.backend_factory);
+        let auth = self.auth.clone();
+        self.agent = Arc::new(
+            self.agent
+                .with_refreshed_backend(choice)
+                .with_child_backend(Arc::new(move |model| Ok(factory(&auth, model)))),
+        );
+    }
+
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
+        let catalog_notice = self.agent.model_catalog_notice();
         match answer {
             Ok(models) if !models.is_empty() => {
                 // The provider's own list is the one that knows which models
@@ -1554,19 +1825,14 @@ impl App {
                 self.models_error = None;
                 self.discovered = models;
 
-                if adopt {
-                    if let Some(first) = self.discovered.first().cloned() {
-                        self.config.model = first;
-                        if self.uses_chatgpt() {
-                            let choice = resolve_backend(
-                                &self.backend_factory,
-                                &self.auth,
-                                &mut self.config,
-                            );
-                            self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
-                        } else {
-                            self.rebuild_backend();
-                        }
+                if adopt && let Some(first) = self.discovered.first().cloned() {
+                    self.config.model = first;
+                    if self.uses_chatgpt() {
+                        let choice =
+                            resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+                        self.refresh_transport(choice);
+                    } else {
+                        self.rebuild_backend();
                     }
                 }
                 let count = self.discovered.len();
@@ -1616,6 +1882,9 @@ impl App {
         }
 
         self.fill_in_models();
+        if let Some(notice) = catalog_notice {
+            self.notifications.warning(notice);
+        }
     }
 
     /// Whether `/connect` is sitting on the step that picks a model.
@@ -1830,7 +2099,7 @@ impl App {
                     self.persist_auth();
                     let choice =
                         resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-                    self.agent = Arc::new(self.agent.with_refreshed_backend(choice));
+                    self.refresh_transport(choice);
                     match action {
                         OAuthAction::Turn(submitted, prompt) => self.start_turn(submitted, prompt),
                         OAuthAction::Models => self.refresh_models(),
@@ -2076,11 +2345,7 @@ impl App {
             return;
         };
 
-        let written = self
-            .auth
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_credentials(&path, &json).map_err(|error| error.to_string()));
+        let written = self.auth.save(&path);
 
         if let Err(error) = written {
             self.notifications
@@ -2230,7 +2495,7 @@ impl App {
             .lines(&self.session, area, &self.theme, spinner, &welcome);
 
         let visible = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(visible) as u16;
+        let max_scroll = lines.len().saturating_sub(visible);
 
         if self.session.follow_end {
             self.session.scroll = max_scroll;
@@ -2241,28 +2506,19 @@ impl App {
             self.session.follow_end = true;
         }
 
-        self.selection.borrow_mut().set_scroll_content(
-            area,
-            self.session.scroll,
-            lines
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect()
-                })
-                .collect(),
-        );
-
         for (row, line) in lines
             .iter()
-            .skip(self.session.scroll as usize)
+            .skip(self.session.scroll)
             .take(visible)
             .enumerate()
         {
             buf.set_line(area.x, area.y + row as u16, line, area.width);
         }
+        self.selection.borrow_mut().set_document(
+            area,
+            self.session.scroll,
+            self.transcript.document(),
+        );
     }
 
     fn handle_collapsible_mouse(&mut self, event: MouseEvent) -> bool {
@@ -2270,7 +2526,7 @@ impl App {
         let scroll = self
             .subagent_terminal
             .as_ref()
-            .map_or(usize::from(self.session.scroll), |view| view.scroll);
+            .map_or(self.session.scroll, |view| view.scroll);
         let row = scroll + usize::from(event.row.saturating_sub(self.last_transcript.y));
         let header = over_transcript
             .then(|| match &self.subagent_terminal {
@@ -2329,10 +2585,7 @@ impl App {
                         if let Some(view) = &mut self.subagent_terminal {
                             view.scroll = view.scroll.saturating_add(shift);
                         } else {
-                            self.session.scroll = self
-                                .session
-                                .scroll
-                                .saturating_add(u16::try_from(shift).unwrap_or(u16::MAX));
+                            self.session.scroll = self.session.scroll.saturating_add(shift);
                         }
                     }
                     // Keep the title in view instead of jumping to the tail
@@ -2343,7 +2596,6 @@ impl App {
                         self.session.follow_end = false;
                     }
                     self.session.bump();
-                    self.selection.borrow_mut().clear();
                 }
                 true
             }
@@ -2405,7 +2657,11 @@ impl App {
         }
         facts.push(self.config.mode.label().to_string());
         facts.push(format!("{} tok", self.session.total_tokens()));
-        facts.push(format!("${:.4}", self.session.total_cost()));
+        facts.push(if self.agent.capabilities().price_known == Some(false) {
+            "$?".into()
+        } else {
+            format!("${:.4}", self.session.total_cost())
+        });
         let left = format!(" {} ", facts.join(" · "));
         buf.set_string(
             area.x,
@@ -2602,10 +2858,13 @@ impl App {
 
 impl Component for App {
     fn cursor_position(&self) -> Option<(u16, u16)> {
-        if self.inline.is_some() {
+        if self.overlay_open() || self.subagent_terminal.is_some() {
             return None;
         }
-        self.editor.cursor_position()
+        match &self.inline {
+            Some(inline) => inline.cursor_position(),
+            None => self.editor.cursor_position(),
+        }
     }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
         self.frame = self.frame.wrapping_add(1);
@@ -2833,7 +3092,7 @@ impl Component for App {
         }
         if self.session.is_streaming() {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
-            if self.spinner_frame % 6 == 0 {
+            if self.spinner_frame.is_multiple_of(6) {
                 dirty = true;
             }
         }
@@ -2852,49 +3111,11 @@ impl Component for App {
     }
 }
 
-/// Whether calling `name` only looks at the session.
-///
-/// This is the set Plan mode declares, which is exactly the set that cannot
-/// change anything — prompting for a read would be noise.
-fn read_only(name: &str) -> bool {
-    default_tool_names(Mode::Plan).contains(&name)
-}
-
 /// The arguments of a call, as the confirmation prompt shows them.
 fn describe_call(call: &ToolCall) -> String {
     // `Value`'s own display is the compact JSON the model sent, which is what
     // the user needs to judge the call by.
     truncate_to_width(&call.input.to_string(), 400, "…")
-}
-
-/// Replace credentials atomically so a crash cannot truncate a rotating token.
-fn write_credentials(path: &Path, json: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| time.as_nanos());
-    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), suffix));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    let result = (|| {
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
 }
 
 /// Write `json` to `path`, creating the directory when needed.
@@ -3008,6 +3229,55 @@ mod tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn switching_and_forking_sessions_replays_saved_turns_without_running_tools() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite"))
+            .expect("store");
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonical cwd");
+        let first = store.create(&cwd, "one", None).expect("first");
+        let second = store.create(&cwd, "two", None).expect("second");
+        let id = second.id().to_string();
+        second
+            .append(&solaris_agent::SessionRecord::Prompt {
+                text: "saved question".into(),
+            })
+            .expect("prompt");
+        second
+            .append(&solaris_agent::SessionRecord::Event {
+                event: AgentEvent::TextDelta("saved answer".into()),
+            })
+            .expect("text");
+        second
+            .append(&solaris_agent::SessionRecord::Event {
+                event: AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            })
+            .expect("complete");
+        drop(second);
+        let mut app = app();
+        app.agent.attach_journal(first).expect("attach");
+        app.switch_session(&id, false);
+        assert_eq!(app.agent.journal().expect("journal").id(), id);
+        assert_eq!(app.session.turns[0].reply, "saved answer");
+        app.switch_session(&id, true);
+        let fork = app.agent.journal().expect("fork");
+        assert_ne!(fork.id(), id);
+        assert_eq!(app.session.turns[0].reply, "saved answer");
+        assert!(
+            store
+                .list(&cwd)
+                .expect("sessions")
+                .iter()
+                .any(|info| info.id == fork.id() && info.parent_id.as_deref() == Some(id.as_str()))
+        );
+    }
+
     /// The prompt a request asks about, wherever the loop put it.
     ///
     /// The agent records the prompt in the conversation before it asks anything,
@@ -3080,8 +3350,8 @@ mod tests {
     ///
     /// The provider id is what the model picker reads its catalogue with, so a
     /// test that needs one has to resolve a backend that carries it.
-    fn fake_session(provider: &'static str) -> Arc<Agent> {
-        Arc::new(Agent::new(
+    fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
+        Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             BackendChoice {
                 backend: fake_backend(),
                 provider_id: Some(provider),
@@ -3091,7 +3361,7 @@ mod tests {
             },
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::default(),
-        ))
+        )))
     }
 
     fn app() -> App {
@@ -3256,6 +3526,7 @@ mod tests {
                 model,
                 BackendOptions {
                     environment: solaris_provider::empty_environment(),
+                    ..Default::default()
                 },
             )
         });
@@ -3746,16 +4017,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_only_call_is_approved_without_asking() {
-        let mut app = app();
-        let (reply, answer) = oneshot::channel();
-        app.request_approval(ApprovalRequest {
-            call: ToolCall::new("call-1", "read", serde_json::json!({ "path": "a.txt" })),
-            reply,
-        });
+    async fn explicit_ask_rules_for_read_only_tools_wait_for_user_confirmation() {
+        for name in ["read", "mcp__server__lookup"] {
+            let mut app = app();
+            let (tx, mut rx) = unbounded_channel();
+            let policy = solaris_agent::PolicyApprover {
+                profile: solaris_agent::PolicyProfile::Trusted,
+                read_only_tools: [name.to_owned()].into_iter().collect(),
+                cwd: app.cwd.clone(),
+                rules: vec![solaris_agent::PermissionRule {
+                    tool: name.into(),
+                    resource: "*".into(),
+                    effect: solaris_agent::PermissionEffect::Ask,
+                }],
+                fallback: Arc::new(ChannelApprover::new(tx)),
+            };
+            let answer = tokio::spawn(async move {
+                policy
+                    .approve(&ToolCall::new(
+                        "call-1",
+                        name,
+                        serde_json::json!({"path":"a.txt"}),
+                    ))
+                    .await
+            });
+            app.request_approval(rx.recv().await.expect("policy requested confirmation"));
+            assert_eq!(app.pending_approvals.len(), 1);
+            assert!(!answer.is_finished(), "read must wait for the user");
+            app.on_dialog_message(DialogMessage::Confirm {
+                action: ConfirmAction::RunTool,
+                accepted: false,
+            });
+            assert_eq!(answer.await.expect("approval task"), Approval::Denied);
+        }
+    }
 
-        assert!(app.pending_approvals.is_empty(), "nothing to ask about");
-        assert_eq!(answer.await.expect("an answer"), Approval::Approved);
+    #[test]
+    fn interactive_confirmation_uses_ask_semantics_without_raising_read_only_limits() {
+        use solaris_agent::PolicyProfile;
+        for (profile, expected) in [
+            (PolicyProfile::Trusted, PolicyProfile::Ask),
+            (PolicyProfile::Ask, PolicyProfile::Ask),
+            (PolicyProfile::ReadOnly, PolicyProfile::ReadOnly),
+        ] {
+            let mut options = AppOptions::new(
+                fake_backend(),
+                Config::default(),
+                Rc::new(Cell::new(false)),
+                Rc::new(RefCell::new(Vec::new())),
+                Rc::new(Cell::new(false)),
+            );
+            options.ask_approval = true;
+            options.execution.profile = profile;
+            let app = App::new(options);
+            assert_eq!(app.execution.profile, expected);
+        }
     }
 
     #[tokio::test]

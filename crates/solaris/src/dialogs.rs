@@ -24,6 +24,8 @@ pub enum DialogMessage {
     Cancelled,
     /// A theme was chosen.
     Theme(String),
+    /// A saved session was chosen.
+    Session(String),
     /// A slash command should be executed (from the palette).
     Command(String),
     /// A confirmation was answered.
@@ -286,17 +288,17 @@ impl Component for SelectDialog {
             }
         }
 
-        if let Some(label) = &self.label {
-            if content.height > 2 {
-                buf.set_string(
-                    content.x,
-                    content.y,
-                    truncate_to_width(label, content.width as usize, "…"),
-                    self.styles.text,
-                );
-                content.y += 2;
-                content.height -= 2;
-            }
+        if let Some(label) = &self.label
+            && content.height > 2
+        {
+            buf.set_string(
+                content.x,
+                content.y,
+                truncate_to_width(label, content.width as usize, "…"),
+                self.styles.text,
+            );
+            content.y += 2;
+            content.height -= 2;
         }
 
         self.list.render(buf, content);
@@ -714,6 +716,7 @@ pub fn stats_lines(
     backend: &str,
     mode: solaris_agent::Mode,
     context_window: u64,
+    price_known: Option<bool>,
 ) -> Vec<Line<'static>> {
     let heading = Style::default()
         .fg(theme.heading)
@@ -749,7 +752,14 @@ pub fn stats_lines(
         row("output", usage.output_tokens.to_string()),
         row("cache read", usage.cache_read_tokens.to_string()),
         row("cache write", usage.cache_write_tokens.to_string()),
-        row("cost", format!("${:.4}", session.total_cost())),
+        row(
+            "cost",
+            if price_known == Some(false) {
+                "unknown (pricing unavailable)".to_string()
+            } else {
+                format!("${:.4}", session.total_cost())
+            },
+        ),
         row("context window", context_window.to_string()),
         row(
             "context used",
@@ -1114,7 +1124,8 @@ mod tests {
         assert!(text.contains("secret"), "{text}");
         assert!(text.contains("Only on request."), "{text}");
         assert!(text.contains("project"), "{text}");
-        assert!(text.contains("/skill:<name> only"), "{text}");
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("/skill:<name> only"), "{text}");
 
         // The file is wrapped, so it is compared with the wrapping taken out.
         let file = skills
@@ -1146,6 +1157,7 @@ mod tests {
             "anthropic",
             solaris_agent::Mode::Build,
             1000,
+            None,
         );
         let text: String = lines
             .iter()
@@ -1191,6 +1203,7 @@ mod tests {
             "anthropic",
             solaris_agent::Mode::Build,
             1000,
+            None,
         ));
 
         // 450 tokens went by in total, but only the last turn describes what is
@@ -1216,6 +1229,7 @@ mod tests {
             "local",
             solaris_agent::Mode::Plan,
             1000,
+            None,
         );
         let text: String = lines
             .iter()

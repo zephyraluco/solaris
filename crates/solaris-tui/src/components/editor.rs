@@ -854,17 +854,17 @@ impl Component for Editor {
             buf.set_string(text_area.x + 2, y, text, self.styles.text);
         }
 
-        if self.focused {
-            if let Some((index, cell_col)) = cursor {
-                if index >= self.scroll_row as usize && index < self.scroll_row as usize + visible {
-                    let y = text_area.y + (index - self.scroll_row as usize) as u16;
-                    let x = text_area.x + 2 + cell_col as u16;
-                    if x < text_area.x + text_area.width && y < text_area.y + text_area.height {
-                        self.terminal_cursor = Some((x, y));
-                        let style = buf[(x, y)].style().patch(self.styles.cursor);
-                        buf[(x, y)].set_style(style);
-                    }
-                }
+        if self.focused
+            && let Some((index, cell_col)) = cursor
+            && index >= self.scroll_row as usize
+            && index < self.scroll_row as usize + visible
+        {
+            let y = text_area.y + (index - self.scroll_row as usize) as u16;
+            let x = text_area.x + 2 + cell_col as u16;
+            if x < text_area.x + text_area.width && y < text_area.y + text_area.height {
+                self.terminal_cursor = Some((x, y));
+                let style = buf[(x, y)].style().patch(self.styles.cursor);
+                buf[(x, y)].set_style(style);
             }
         }
 

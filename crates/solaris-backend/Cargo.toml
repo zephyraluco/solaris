@@ -2,7 +2,6 @@
 name = "solaris-backend"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "Agent backend abstraction and provider clients for solaris"
 
@@ -10,6 +9,7 @@ description = "Agent backend abstraction and provider clients for solaris"
 workspace = true
 
 [dependencies]
+solaris-types = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

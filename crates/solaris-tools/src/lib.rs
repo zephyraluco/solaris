@@ -16,8 +16,10 @@
 //!   running a round of what it asks for and asking again is `solaris-agent`'s
 //!   business.
 
+pub mod changes;
 mod diff;
 mod mutation_queue;
+mod output;
 mod path_utils;
 mod registry;
 mod runner;
@@ -29,7 +31,13 @@ pub use diff::{Edit, EditError};
 pub use mutation_queue::FileMutationQueue;
 pub use registry::{BUILTIN_TOOLS, SHELL_TOOL, ToolRegistry, ToolSelection};
 pub use runner::{CommandOutput, CommandRunner, LocalRunner};
-pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput};
+pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput, optional_string_arg};
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size,
 };
+
+pub use solaris_types::{Artifact, ToolMetadata, ToolStatus, TruncationInfo};
+
+mod image;
+pub use image::{MAX_IMAGE_BYTES, read_image};
+pub use solaris_types::InlineImage;

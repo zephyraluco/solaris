@@ -55,3 +55,32 @@ pub use solaris_tools::{
     BUILTIN_TOOLS, Cancel, CommandOutput, CommandRunner, LocalRunner, SHELL_TOOL, Tool,
     ToolContext, ToolOutput, ToolRegistry, ToolSelection,
 };
+
+mod store;
+pub use store::{SessionInfo, SessionJournal, SessionRecord, SessionStore, StoreError};
+
+mod runtime;
+
+mod budget;
+mod policy;
+pub use budget::{BudgetLimits, ExecutionBudget};
+pub use policy::{PermissionEffect, PermissionRule, PolicyApprover, PolicyProfile};
+
+/// Per-session execution settings; children inherit these ceilings.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionSettings {
+    #[serde(default)]
+    pub profile: PolicyProfile,
+    #[serde(default)]
+    pub rules: Vec<PermissionRule>,
+    #[serde(default)]
+    pub budget: BudgetLimits,
+}
+
+pub use runtime::{RuntimeCommand, SessionRuntime};
+
+pub type ChildBackendFactory =
+    std::sync::Arc<dyn Fn(&str) -> Result<solaris_provider::BackendChoice, String> + Send + Sync>;
+pub use subagent::TaskControls;
+
+mod tool_search;

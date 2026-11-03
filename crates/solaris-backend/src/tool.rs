@@ -70,6 +70,9 @@ pub struct ToolResult {
     /// Whether the tool failed. A failure is still a result: the turn continues
     /// so the model can react to it.
     pub is_error: bool,
+    /// Display metadata excluded from provider request bodies.
+    #[serde(default)]
+    pub metadata: Box<solaris_types::ToolMetadata>,
 }
 
 impl ToolResult {
@@ -80,6 +83,7 @@ impl ToolResult {
             name: call.name.clone(),
             output: output.into(),
             is_error: false,
+            metadata: Box::default(),
         }
     }
 
@@ -90,6 +94,10 @@ impl ToolResult {
             name: call.name.clone(),
             output: output.into(),
             is_error: true,
+            metadata: Box::new(solaris_types::ToolMetadata {
+                status: solaris_types::ToolStatus::Failed,
+                ..Default::default()
+            }),
         }
     }
 }

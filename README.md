@@ -45,7 +45,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 > - Session statistics — turns, tokens by bucket, cost and context usage
 > - Credentials, companion and history persisted under the platform config directory
 >
-> **Not yet:** MCP, session files on disk, a real device-code sign-in, and an interactive confirmation before a tool runs.
+> **Not yet:** a device-code sign-in. MCP tools, resources and prompts are available. Browser-based ChatGPT authorization, persistent sessions, and opt-in tool confirmation are available.
 
 ---
 
@@ -53,7 +53,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 ## Requirements
 
-- **Rust 1.85 or newer** — the workspace uses the 2024 edition.
+- **Rust 1.88 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
 
@@ -272,7 +272,7 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 
 - **Streaming.** Text and thinking arrive as the model produces them; `Ctrl+C` mid-stream cancels the request by dropping the connection.
 - **Retries.** A `429`, a `5xx` or a dropped connection is retried up to three times with backoff, but only *before* the first token — after that a retry would duplicate text, so the failure is reported instead.
-- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model the catalogue does not know is reported as free. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
+- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
 - **Prompt caching.** solaris asks for it rather than hoping: an Anthropic `cache_control` breakpoint on the last message, and an OpenAI `prompt_cache_key` when the endpoint is OpenAI's own. That is what makes the cache rows in `/stats` move, and why a long conversation gets cheaper per turn as the unchanged prefix starts coming back as cache reads.
 - **Context.** `/stats` reports `session tokens` (everything the session has spent) and `context used` separately. Only the second says how full the window is: it is the last turn's reported usage plus a size estimate for anything submitted since, because summing a session's turns would grow without bound and say nothing about a per-request window.
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
@@ -306,7 +306,7 @@ For example, launch a background investigation with:
 {"agent":"explore","prompt":"Find test coverage gaps. Report relevant paths and suggestions; do not change files.","background":true}
 ```
 
-Persistent child sessions, resume IDs and per-child model overrides are not supported. The five-minute deadline includes time queued for an execution slot.
+Children have persistent session IDs when the parent is saved. Use the `subagent` tool’s `resume_id` to continue a child explicitly, or `model` to override its model under the current provider. Omitted or blank `model` inherits the parent model; omitted or blank `resume_id` starts a new child. Surrounding whitespace is trimmed, and invalid non-empty model IDs fail with a specific error. `/subagents` lists active/queued task IDs and `/stop <task-id>` cancels one. The five-minute child deadline includes time queued for an execution slot; parent policy and aggregate budgets still apply.
 
 # Configuration
 
@@ -340,3 +340,185 @@ solaris is a Rust port of ideas from two projects, and the source says so where 
 
 - [**claurst**](https://github.com/Kuberwastaken/claurst) — the terminal companion, the two-column welcome box, the inline `/connect` flow and the shape of the provider catalogue all follow its design.
 - **`@earendil-works/pi-tui`** — the retained-component-tree TUI design, with application-owned focus and overlays and flex-like layout stacks, follows that library's approach; each `solaris-tui` module ported from it says so in its header.
+
+## Persistent sessions
+
+Sessions are saved to `sessions/sessions.sqlite` under the resolved configuration directory.
+Use `solaris --sessions` to list sessions for the current directory, `solaris --continue`
+to restore the latest user conversation (including user forks, excluding delegated
+subagent sessions), or `solaris --resume <ID>` to restore one explicitly.
+`--ephemeral` keeps a run in memory. A session can only be opened by one process at a time.
+The journal records the resolved provider and model on attachment and backend
+changes so subsequent resume restores that choice unless explicitly overridden.
+
+The journal retains prompts, tool calls/results, model context, compaction checkpoints and
+child activity. Interrupted tool calls are never automatically executed again: verify their
+side effects before retrying. The journal contains conversation and tool data; treat it as
+private. Credentials and authentication headers are not intentionally recorded.
+
+## Review and undo file changes
+
+`write` and `edit` use atomic replacement and record before/after hashes and a
+unified patch. Expand the tool result to review its patch. Run `solaris --changes`
+to list recorded file changes, and `solaris --undo <CHANGE_ID>` to restore one.
+Undo refuses a file whose current bytes differ from the recorded after-image.
+Shell commands and external side effects are not covered. Files above 16 MiB are
+rejected by the mutation tools. Backups live alongside session artifacts and contain
+private file data. Ephemeral runs keep their artifacts in the temporary directory.
+
+## Execution policy and budgets
+
+`--policy trusted` retains the usual approval hook. `--policy ask` confirms
+mutating/unknown tools; `--policy read-only` refuses them even when a rule allows
+them. `--confirm-tools` remains supported. Optional `permissions.json` in the config
+directory contains an array of `{ "tool": "write", "resource": "/absolute/path/*",
+"effect": "ask" }` rules (`allow`, `ask`, `deny`; last match wins). Paths resolve
+existing symlink ancestors before matching. Shell resource patterns match command
+text, not its actual side effects; these rules are not an OS sandbox.
+An explicit `ask` rule also prompts for read-only tools, including locally trusted
+MCP reads. With confirmation enabled, reads without a matching ask/deny rule remain automatic.
+
+`--max-requests` (default 100) and `--max-seconds` (default 1800) apply across a turn,
+its children and automatic compaction. `--max-cost <USD>` stops further work when
+observed model cost reaches the limit; it cannot guarantee a prepaid spending cap,
+and depends on available provider pricing. Child limits cannot reset the parent's
+request counter or deadline.
+
+## Headless automation
+
+`solaris --print "review this project" --plan` runs without a terminal. Add `--json`
+for newline-delimited envelopes containing `version`, `sequence`, `session_id` and
+`event`. A failed turn exits nonzero. Approval requests in headless mode are refused
+unless an explicit policy rule allows the call; they never wait for an invisible UI.
+Saved ChatGPT OAuth credentials refresh before model requests, including later
+prompts in long-lived RPC sessions and child requests. Refreshes are shared across
+models and rotating tokens are saved atomically before requests proceed. Refresh
+or persistence failures stop the request; model requests are not automatically retried.
+
+`--fork <SESSION_ID>` copies a saved conversation into a new session.
+`--export-session <SESSION_ID>` prints its journal as JSON; exports contain private
+conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
+execution budgets, tool policy, persistence and cancellation.
+
+`solaris --rpc` provides the same session over stdin/stdout, without a network
+server. Send one JSON request per line; `id` is a string. For example:
+
+```json
+{"id":"turn-1","command":{"type":"prompt","text":"review this project","mode":"plan"}}
+{"id":"stop-1","command":{"type":"cancel"}}
+```
+
+Commands are `prompt`, `cancel`, `steer` and `queue` (the last two take `text`).
+An omitted prompt mode uses the CLI mode. Responses carry `type: "response"`,
+`id`, `ok` and an optional error. Events carry `type: "event"`, `request_id`,
+`version: 1`, `sequence`, `session_id` and `event`. An `end` envelope marks stream
+completion; inspect the events for turn success or failure. One prompt runs at a
+time; a second prompt is rejected while controls remain available. Requests are
+limited to 1 MiB per line. Closing stdin cancels the current turn and exits.
+
+## MCP servers
+
+Configure `mcp.json` in the user configuration directory, or pass `--mcp-config <PATH>`.
+For example:
+
+```json
+{
+  "servers": {
+    "local": {
+      "transport": "stdio",
+      "command": "my-mcp-server",
+      "args": [],
+      "read_only_tools": ["lookup"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "auth_env": "MY_MCP_TOKEN"
+    }
+  }
+}
+```
+
+`env` on stdio servers maps target variable names to existing environment-variable
+names. Put no secret values in this file. Remote URLs require HTTPS except on
+loopback. TLS verification and inherited proxy settings remain enabled.
+`--mcp-status` connects and reports server status. Failed connections are reported
+without blocking local tools. Explicitly reconnect by restarting the client;
+mutating tool calls are not automatically retried.
+
+Tools use `mcp__<server>__<tool>` names. Resource/prompt discovery uses a separate
+`mcp_meta__<server>__...` namespace. More than eight external tools are exposed via
+`tool_search`, with up to eight matches activated for the following round. Remote
+read-only annotations are not authority: name tools in `read_only_tools` locally
+to expose them to Plan mode. Unknown/mutating tools follow the normal approval
+policy. MCP servers run with their process permissions; this is not a sandbox.
+Structured tool payloads and embedded text resources are included in bounded
+model-facing text. The complete accepted result remains in session metadata.
+Resource, resource-template and prompt listings accept an optional `cursor`.
+Pass the returned `nextCursor` unchanged to fetch the next page; each call remains
+bounded independently.
+
+## Model capabilities and offline model lists
+
+`models.json` in the user configuration directory provides explicit, provider-scoped
+overrides. For example:
+
+```json
+{
+  "models": [{
+    "provider": "local",
+    "id": "my-model",
+    "capabilities": {
+      "tool_calling": "supported",
+      "image_input": "unsupported",
+      "structured_output": "unknown",
+      "context_window": 32768,
+      "max_output": 4096
+    }
+  }]
+}
+```
+
+Feature values are `supported`, `unsupported`, or `unknown`; unknown features are
+not inferred from model names. A model that explicitly lacks tool calling receives
+no tools. Strict schema sampling is enabled only for explicit support and compatible
+schemas. `--print-config` reports resolved capabilities. Optional `price` uses
+`input`, `output`, `cache_read`, and `cache_write` USD-per-million-token rates.
+Unknown prices display as unknown; `--max-cost` requires known pricing.
+
+Successful remote model discovery is cached by endpoint with a content checksum.
+An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
+cache entries are rejected. This cache stores model IDs, not credentials.
+
+## Images
+
+For a model explicitly marked `image_input: "supported"` in `models.json`,
+`read` can return PNG, JPEG, GIF and WebP images as image content. Headless runs
+can use `--image <PATH>` with `--print` (up to eight images, 8 MiB each). Detection
+uses file signatures. Unknown/unsupported model capabilities fail locally.
+Image blocks are encoded separately for Messages, Chat Completions and Responses;
+they are retained in private session data rather than pasted into model-facing text.
+MCP image content follows the same capability check.
+
+## Toolchain and validation
+
+Development uses the Rust 1.99.1 toolchain pinned in `rust-toolchain.toml`; the
+minimum supported Rust version is 1.88. CI checks formatting, strict Clippy and
+tests on Linux, macOS and Windows, plus a separate MSRV compilation check. Tags
+and manually dispatched CI runs build downloadable release artifacts without
+automatically publishing a GitHub release.
+
+Local checks:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
+
+Inside the TUI, `/sessions` or `/resume` opens the existing selection dialog.
+`/resume <ID>` switches directly, `/fork` copies the current saved conversation,
+and `/tree` shows parent/child relationships in the same picker. Switching waits
+until the current operation has ended and only replays saved events; it never
+re-executes tool calls. Fork copies the complete conversation at the current
+boundary; arbitrary message-level rewinding is not implemented.

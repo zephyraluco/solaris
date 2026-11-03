@@ -5,6 +5,8 @@
 //! terminal, and hands control to [`solaris_tui::Tui::run`], which owns the event
 //! loop.
 
+mod automation;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -59,12 +61,84 @@ struct Args {
     #[arg(long)]
     print_config: bool,
 
+    /// Run one prompt without starting the terminal UI.
+    #[arg(long, value_name = "PROMPT")]
+    print: Option<String>,
+
+    /// Attach a PNG/JPEG/GIF/WebP image to a headless prompt; repeat for more.
+    #[arg(long, requires = "print", value_name = "PATH")]
+    image: Vec<PathBuf>,
+
+    /// Emit versioned JSON events (requires --print).
+    #[arg(long, requires = "print")]
+    json: bool,
+
+    /// Serve newline-delimited session commands and events over stdin/stdout.
+    #[arg(long, conflicts_with_all = ["print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status"])]
+    rpc: bool,
+
+    /// MCP configuration; defaults to mcp.json in the user config directory.
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+
+    /// Connect configured MCP servers, report status, and exit.
+    #[arg(long)]
+    mcp_status: bool,
+
+    /// Fork a saved session in this directory before running.
+    #[arg(long, conflicts_with_all = ["resume", "continue_session", "ephemeral"])]
+    fork: Option<String>,
+
+    /// Export a session journal as JSON without running it.
+    #[arg(long, conflicts_with_all = ["print", "resume", "continue_session", "fork", "ephemeral"])]
+    export_session: Option<String>,
+
     /// Confirm a call that changes something before it runs.
     ///
     /// Off by default: a terminal agent is already acting on your behalf. Turn
     /// it on to be asked before a write, an edit or a command runs.
     #[arg(long)]
     confirm_tools: bool,
+
+    /// Execution profile. Tool policy does not provide an OS sandbox.
+    #[arg(long, value_parser = ["trusted", "ask", "read-only"], default_value = "trusted")]
+    policy: String,
+
+    /// Shared model request limit across the parent, compaction and all children.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+    max_requests: u32,
+
+    /// Whole-turn deadline, including child tasks and tools.
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=604800))]
+    max_seconds: u64,
+
+    /// Stop further work once observed model cost reaches this amount (USD).
+    #[arg(long)]
+    max_cost: Option<f64>,
+
+    /// Resume a saved session by ID. Interrupted tools are never automatically rerun.
+    #[arg(long, conflicts_with = "continue_session")]
+    resume: Option<String>,
+
+    /// Resume the most recent session in this directory.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// List saved sessions in this directory and exit.
+    #[arg(long)]
+    sessions: bool,
+
+    /// Keep this run entirely in memory.
+    #[arg(long, conflicts_with_all = ["resume", "continue_session", "sessions"])]
+    ephemeral: bool,
+
+    /// List recorded file changes and patches; shell side effects are not included.
+    #[arg(long, conflicts_with = "undo")]
+    changes: bool,
+
+    /// Undo a recorded file change only if its after-image still matches.
+    #[arg(long, value_name = "CHANGE_ID", conflicts_with = "changes")]
+    undo: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -88,13 +162,7 @@ fn main() -> Result<()> {
     };
     // A name that matches nothing is almost always a typo, and silently
     // declaring nothing would look like the tool simply refused to run.
-    let registry = solaris_agent::agent_tool_registry();
-    for entry in registry.unmatched(&tools) {
-        eprintln!(
-            "solaris: no tool named `{entry}` on this platform — available: {}",
-            registry.names().join(", ")
-        );
-    }
+    let mut registry = solaris_agent::agent_tool_registry();
 
     let state_dir = config_dir();
     let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
@@ -131,27 +199,40 @@ fn main() -> Result<()> {
     // What the last session left, unless this run overrides it: a flag always
     // wins, so `--plan` in a script keeps meaning plan. The model follows the
     // provider it was chosen for, and is kept in `auth.json` beside it.
-    if args.theme.is_none() {
-        if let Some(theme) = &settings.theme {
-            config.theme = theme.clone();
-        }
+    if args.theme.is_none()
+        && let Some(theme) = &settings.theme
+    {
+        config.theme = theme.clone();
     }
-    if !args.plan {
-        if let Some(mode) = settings.mode {
-            config.mode = mode;
-        }
+    if !args.plan
+        && let Some(mode) = settings.mode
+    {
+        config.mode = mode;
     }
 
     // Without `--model`, a session starts on the model this provider was last
     // used with: the catalogue's first entry is a fallback, not a decision, and
     // reconnecting should not quietly move the user onto it.
-    if args.model.is_none() {
-        if let Some(model) = auth.active_model() {
-            config.model = model.to_string();
-        }
+    if args.model.is_none()
+        && let Some(model) = auth.active_model()
+    {
+        config.model = model.to_string();
     }
 
-    let backend_options = BackendOptions::default();
+    let mut backend_options = BackendOptions::default();
+    if let Some(directory) = config_dir() {
+        let path = directory.join("models.json");
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                backend_options.catalog = Arc::new(
+                    solaris_provider::ModelCatalog::from_json(&text).map_err(anyhow::Error::msg)?,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        backend_options.model_cache_dir = Some(directory.join("model-cache"));
+    }
     // Resolved here for reporting, and again by the app whenever the
     // credentials or the model change.
     let choice = choose_backend(&auth, &config.model, backend_options.clone());
@@ -165,6 +246,10 @@ fn main() -> Result<()> {
 
     if args.print_config {
         println!("backend: {}", choice.backend.label());
+        println!(
+            "capabilities: {}",
+            serde_json::to_string(&choice.backend.capabilities())?
+        );
         println!("model: {}", describe_model(&choice.model));
         println!("theme: {}", config.theme);
         println!("mode: {}", config.mode.label());
@@ -245,9 +330,225 @@ fn main() -> Result<()> {
 
     // The backend runs on a runtime; the UI loop stays on the main thread and
     // only ever drains a channel, so nothing blocks the terminal.
+    if args.changes || args.undo.is_some() {
+        let directory = config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no configuration directory"))?
+            .join("sessions/artifacts");
+        if let Some(id) = &args.undo {
+            let change = solaris_tools::changes::undo(&directory, id)?;
+            println!("Restored {} ({})", change.path.display(), change.id);
+        } else {
+            for change in solaris_tools::changes::list(&directory)? {
+                println!("{}  {}\n{}", change.id, change.path.display(), change.patch);
+            }
+        }
+        return Ok(());
+    }
+    if args
+        .max_cost
+        .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+    {
+        anyhow::bail!("--max-cost must be finite and positive");
+    }
+    let rules_path = config_dir().map(|dir| dir.join("permissions.json"));
+    let rules = match rules_path.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => serde_json::from_str(&text)?,
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error.into());
+        }
+        _ => Vec::new(),
+    };
+    let execution = solaris_agent::ExecutionSettings {
+        profile: match args.policy.as_str() {
+            "ask" => solaris_agent::PolicyProfile::Ask,
+            "read-only" => solaris_agent::PolicyProfile::ReadOnly,
+            _ => solaris_agent::PolicyProfile::Trusted,
+        },
+        rules,
+        budget: solaris_agent::BudgetLimits {
+            max_requests: args.max_requests as usize,
+            max_seconds: args.max_seconds,
+            max_cost_usd: args.max_cost,
+        },
+    };
+    let ask_approval = args.confirm_tools
+        || args.policy == "ask"
+        || execution
+            .rules
+            .iter()
+            .any(|r| r.effect == solaris_agent::PermissionEffect::Ask);
+    let journal = if args.ephemeral || args.mcp_status {
+        None
+    } else {
+        let directory = config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no configuration directory; use --ephemeral"))?;
+        let store = solaris_agent::SessionStore::open(&directory.join("sessions/sessions.sqlite"))?;
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        if let Some(id) = &args.export_session {
+            if !store.list(&cwd)?.iter().any(|session| session.id == *id) {
+                anyhow::bail!("session not found in this directory");
+            }
+            println!("{}", serde_json::to_string_pretty(&store.records(id)?)?);
+            return Ok(());
+        }
+        if args.sessions {
+            for session in store.list(&cwd)? {
+                println!("{}  {}  {}", session.id, session.status, session.model);
+            }
+            return Ok(());
+        }
+        let sessions = store.list(&cwd)?;
+        let resume = args.resume.as_deref().or_else(|| {
+            if args.continue_session {
+                sessions
+                    .iter()
+                    .find(|s| !s.is_subagent)
+                    .map(|s| s.id.as_str())
+            } else {
+                None
+            }
+        });
+        if args.continue_session && resume.is_none() {
+            anyhow::bail!("no saved user session in this directory");
+        }
+        let journal = match resume {
+            Some(id) => {
+                let info = sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("session not found in this directory"))?;
+                if args.model.is_none() {
+                    config.model = info.model.clone();
+                }
+                if args.provider.is_none()
+                    && let Some(provider) = &info.provider
+                {
+                    auth.activate(provider.clone());
+                }
+                store.resume(id)?
+            }
+            None => {
+                if let Some(id) = &args.fork {
+                    let info = sessions.iter().find(|s| s.id == *id).ok_or_else(|| {
+                        anyhow::anyhow!("fork source not found in this directory")
+                    })?;
+                    if args.model.is_none() {
+                        config.model = info.model.clone();
+                    }
+                    if args.provider.is_none()
+                        && let Some(provider) = &info.provider
+                    {
+                        auth.activate(provider.clone());
+                    }
+                    let parent = store.resume(id)?;
+                    parent.fork(&cwd, &config.model)?
+                } else {
+                    store.create(&cwd, &choice.model, None)?
+                }
+            }
+        };
+        let _ = journal.context()?;
+        Some(journal)
+    };
     let runtime = tokio::runtime::Runtime::new()?;
     let _guard = runtime.enter();
+    let mcp_path = args
+        .mcp_config
+        .clone()
+        .or_else(|| config_dir().map(|dir| dir.join("mcp.json")));
+    let mcp_config = match mcp_path.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => serde_json::from_str(&text)?,
+        Some(Err(error))
+            if args.mcp_config.is_some() || error.kind() != std::io::ErrorKind::NotFound =>
+        {
+            return Err(error.into());
+        }
+        _ => solaris_mcp::McpConfig::default(),
+    };
+    let mcp = runtime.block_on(solaris_mcp::McpManager::connect(
+        mcp_config,
+        &std::env::current_dir()?,
+        &mut registry,
+    ));
+    if args.mcp_status {
+        println!("{}", serde_json::to_string_pretty(&mcp.status)?);
+        if mcp.status.iter().any(|server| !server.connected) {
+            anyhow::bail!("one or more MCP servers failed");
+        }
+        return Ok(());
+    }
+    for server in &mcp.status {
+        if !server.connected {
+            eprintln!("MCP {}: {}", server.name, server.message);
+        }
+    }
 
+    for entry in registry.unmatched(&tools) {
+        eprintln!(
+            "solaris: no tool named `{entry}` on this platform — available: {}",
+            registry.names().join(", ")
+        );
+    }
+
+    if args.print.is_some() || args.rpc {
+        let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
+            .with_selection(tools)
+            .with_skills(skills)
+            .with_prompt_context(resources.prompt);
+        options.execution = execution;
+        let factory = Arc::new(solaris_provider::refreshing_backend_factory(
+            auth,
+            auth_path,
+            backend_options,
+        ));
+        let choice = factory(&config.model);
+        options.child_backend = Some(Arc::new(move |model| Ok(factory(model))));
+        // Noninteractive runs cannot wait for a UI approval. Explicit rules may
+        // allow a call; anything that needs an answer is refused.
+        if ask_approval {
+            // Match the TUI: ordinary reads remain automatic, while explicit
+            // ask rules and mutations reach the noninteractive refusal hook.
+            if options.execution.profile == solaris_agent::PolicyProfile::Trusted {
+                options.execution.profile = solaris_agent::PolicyProfile::Ask;
+            }
+            options.approver = Arc::new(solaris_agent::DenyAll);
+        }
+        let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
+            choice,
+            Arc::new(registry),
+            options,
+        ));
+        if let Some(journal) = journal {
+            session.attach_journal(journal)?;
+        }
+        if args.image.len() > 8 {
+            anyhow::bail!("at most eight images may be attached to one prompt");
+        }
+        for path in &args.image {
+            let image = solaris_tools::read_image(path)?
+                .ok_or_else(|| anyhow::anyhow!("{} is not a supported image", path.display()))?;
+            session.attach_image(image).map_err(anyhow::Error::msg)?;
+        }
+        if args.rpc {
+            runtime.block_on(automation::serve_rpc(
+                &session,
+                config.mode,
+                tokio::io::stdin(),
+                std::io::stdout().lock(),
+            ))?;
+        } else if let Some(prompt) = &args.print {
+            let succeeded = runtime.block_on(automation::print_turn(
+                &session,
+                prompt,
+                config.mode,
+                args.json,
+            ))?;
+            if !succeeded {
+                anyhow::bail!("headless turn failed");
+            }
+        }
+        return Ok(());
+    }
     solaris_tui::install_panic_hook();
     let mut terminal = solaris_tui::setup_terminal()?;
 
@@ -281,7 +582,10 @@ fn main() -> Result<()> {
         skills,
         prompt_context: resources.prompt,
         resource_paths: Some(resource_paths),
-        ask_approval: args.confirm_tools,
+        ask_approval,
+        execution,
+        registry: Some(registry),
+        journal,
     });
     tui.set_root(Box::new(app));
 

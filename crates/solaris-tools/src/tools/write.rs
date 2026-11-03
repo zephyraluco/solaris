@@ -94,24 +94,34 @@ impl Tool for WriteTool {
                     return ToolOutput::error("the write was cancelled before it started");
                 }
 
-                let existed = path_utils::exists(&absolute).await;
+                let before = match crate::changes::read_optional(&absolute) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return ToolOutput::error(format!("could not read {path}: {error}"));
+                    }
+                };
+                let existed = before.is_some();
 
                 if let Some(parent) = absolute
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
+                    && let Err(error) = tokio::fs::create_dir_all(parent).await
                 {
-                    if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                        return ToolOutput::error(format!(
-                            "could not create {}: {error}",
-                            parent.display()
-                        ));
-                    }
+                    return ToolOutput::error(format!(
+                        "could not create {}: {error}",
+                        parent.display()
+                    ));
                 }
                 if ctx.is_cancelled() {
                     return ToolOutput::error("the write was cancelled before it was written");
                 }
-                match tokio::fs::write(&absolute, content.as_bytes()).await {
-                    Ok(()) => ToolOutput::ok(describe(&path, bytes, existed)),
+                match crate::changes::commit(&absolute, before.as_deref(), content.as_bytes(), ctx)
+                {
+                    Ok(metadata) => {
+                        let mut output = ToolOutput::ok(describe(&path, bytes, existed));
+                        output.metadata = Box::new(metadata);
+                        output
+                    }
                     Err(error) => ToolOutput::error(format!("could not write {path}: {error}")),
                 }
             })

@@ -51,6 +51,14 @@ pub struct AgentOptions {
     pub prompt_context: PromptContext,
     /// Whether this agent may delegate. Children always disable delegation.
     pub subagents: bool,
+    /// Permission profile and aggregate request/time/cost limits.
+    pub execution: crate::ExecutionSettings,
+    /// Existing turn scope when constructing a child; leave None for a root.
+    pub shared_budget: Option<Arc<crate::ExecutionBudget>>,
+    /// Optional factory for explicit child model overrides under the current provider.
+    pub child_backend: Option<crate::ChildBackendFactory>,
+    /// Handles for cancelling individual active/queued children.
+    pub tasks: crate::TaskControls,
 }
 
 impl Default for AgentOptions {
@@ -65,6 +73,10 @@ impl Default for AgentOptions {
             skills: Skills::empty(),
             prompt_context: PromptContext::default(),
             subagents: true,
+            execution: crate::ExecutionSettings::default(),
+            shared_budget: None,
+            child_backend: None,
+            tasks: crate::TaskControls::default(),
         }
     }
 }
@@ -131,6 +143,7 @@ impl AgentOptions {
 pub struct Agent {
     /// The backend the credentials resolved to, and how it was chosen.
     choice: BackendChoice,
+    active: Arc<std::sync::atomic::AtomicBool>,
     /// Every tool this platform has, built once so `edit` and `write` keep
     /// serialising against the same per-file locks for the whole session.
     registry: Arc<ToolRegistry>,
@@ -148,10 +161,38 @@ pub struct Agent {
 
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
-    pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self {
+    pub fn new(
+        choice: BackendChoice,
+        registry: Arc<ToolRegistry>,
+        mut options: AgentOptions,
+    ) -> Self {
+        options.approver = Arc::new(crate::PolicyApprover {
+            profile: options.execution.profile,
+            read_only_tools: registry
+                .names()
+                .into_iter()
+                .filter(|name| registry.get(name).is_some_and(|tool| tool.is_read_only()))
+                .collect(),
+            cwd: options.cwd.clone(),
+            rules: options.execution.rules.clone(),
+            fallback: Arc::clone(&options.approver),
+        });
         let registry = if options.subagents {
             let mut registry = registry.as_ref().clone();
             registry.add(Arc::new(SubagentTool));
+            Arc::new(registry)
+        } else {
+            registry
+        };
+        let registry = if registry
+            .names()
+            .iter()
+            .filter(|name| name.starts_with("mcp_"))
+            .count()
+            > 8
+        {
+            let mut registry = registry.as_ref().clone();
+            registry.add(Arc::new(crate::tool_search::ToolSearch));
             Arc::new(registry)
         } else {
             registry
@@ -165,6 +206,7 @@ impl Agent {
         let follow_up = Queue::for_resources(Arc::clone(&resources));
         Self {
             choice,
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
             options,
             cancel: Cancel::new(),
@@ -173,6 +215,50 @@ impl Agent {
             follow_up,
             resources,
         }
+    }
+
+    /// Attach a persistent session at an idle boundary and restore its context.
+    pub fn attach_journal(
+        &self,
+        journal: Arc<crate::SessionJournal>,
+    ) -> Result<(), crate::StoreError> {
+        let _lease =
+            crate::runtime::TurnLease::acquire(Arc::clone(&self.active)).ok_or_else(|| {
+                crate::StoreError::Invalid("cannot attach a journal during a turn".into())
+            })?;
+        self.conversation.attach(journal)?;
+        self.conversation
+            .record_model(self.choice.provider_id, &self.choice.model);
+        self.conversation
+            .error()
+            .map_or(Ok(()), |error| Err(crate::StoreError::Invalid(error)))
+    }
+
+    /// Attached persistent session, if enabled by the caller.
+    pub fn journal(&self) -> Option<Arc<crate::SessionJournal>> {
+        self.conversation.journal()
+    }
+
+    /// Attach an image at an idle boundary. Unsupported/unknown models fail locally.
+    pub fn attach_image(&self, image: solaris_backend::InlineImage) -> Result<(), String> {
+        let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))
+            .ok_or_else(|| "cannot attach an image during a turn".to_string())?;
+        if self.capabilities().image_input != solaris_backend::Support::Supported {
+            return Err("model image support is not confirmed; configure models.json or choose a vision model".into());
+        }
+        self.conversation
+            .push(solaris_backend::Message::with_content(
+                solaris_backend::Role::User,
+                vec![solaris_backend::Content::Image { image }],
+            ));
+        self.conversation.error().map_or(Ok(()), Err)
+    }
+
+    pub fn active_tasks(&self) -> Vec<String> {
+        self.options.tasks.active()
+    }
+    pub fn cancel_task(&self, id: &str) -> bool {
+        self.options.tasks.cancel(id)
     }
 
     /// A handle that stops a turn in flight: a running command is killed and no
@@ -187,8 +273,13 @@ impl Agent {
     /// Replace transport credentials at an idle boundary without losing the
     /// conversation, queued input, resources, tools or cancellation handle.
     pub fn with_refreshed_backend(&self, choice: BackendChoice) -> Self {
+        // Persistence failures are retained by the conversation and block the
+        // next request, including callers whose refresh API cannot return errors.
+        self.conversation
+            .record_model(choice.provider_id, &choice.model);
         Self {
             choice,
+            active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
             cancel: self.cancel.clone(),
@@ -197,6 +288,12 @@ impl Agent {
             follow_up: self.follow_up.clone(),
             resources: Arc::clone(&self.resources),
         }
+    }
+
+    /// Replace the factory used by subsequent child model overrides.
+    pub fn with_child_backend(mut self, factory: crate::ChildBackendFactory) -> Self {
+        self.options.child_backend = Some(factory);
+        self
     }
 
     /// A handle for messages that correct the turn that is running.
@@ -245,13 +342,14 @@ impl Agent {
     /// Returns how many messages the summary replaced, or `None` when there was
     /// nothing worth summarizing or the model would not produce one.
     pub async fn compact(&self) -> Option<usize> {
-        session::compact_now(
-            &self.choice.backend,
-            &self.conversation,
-            self.options.compaction,
-            &self.cancel,
-        )
-        .await
+        let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))?;
+        let cancel = self.cancel.begin_turn();
+        let inner: Arc<dyn solaris_backend::AgentBackend> =
+            Arc::new(crate::budget::BudgetedBackend {
+                inner: Arc::clone(&self.choice.backend),
+                budget: crate::ExecutionBudget::new(self.options.execution.budget.clone()),
+            });
+        session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel).await
     }
 
     /// Short human-readable label shown in the status bar.
@@ -276,6 +374,13 @@ impl Agent {
         self.choice.source
     }
 
+    pub fn capabilities(&self) -> solaris_backend::ModelCapabilities {
+        self.choice.backend.capabilities()
+    }
+    pub fn model_catalog_notice(&self) -> Option<String> {
+        self.choice.backend.model_catalog_notice()
+    }
+
     /// The models the endpoint offers, for the picker to choose from.
     pub async fn models(&self) -> Result<Vec<String>, BackendError> {
         self.choice.backend.models().await
@@ -283,7 +388,9 @@ impl Agent {
 
     /// The context window of the model this session will ask.
     fn context_window(&self) -> u32 {
-        context_window_for(&self.choice.model)
+        self.capabilities()
+            .context_window
+            .unwrap_or_else(|| context_window_for(&self.choice.model))
     }
 
     /// The tools a turn in `mode` would declare.
@@ -295,10 +402,33 @@ impl Agent {
     }
 
     fn turn_tools(&self, mode: Mode) -> Vec<Arc<dyn solaris_tools::Tool>> {
+        if self.capabilities().tool_calling == solaris_backend::Support::Unsupported {
+            return Vec::new();
+        }
+        let mut defaults: Vec<&str> = default_tool_names(mode).to_vec();
+        let external: Vec<String> = self
+            .registry
+            .names()
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("mcp_")
+                    && self
+                        .registry
+                        .get(name)
+                        .is_some_and(|tool| mode == Mode::Build || tool.is_read_only())
+            })
+            .collect();
+        defaults.extend(external.iter().map(String::as_str));
+        if self.registry.get("tool_search").is_some() {
+            defaults.push("tool_search");
+        }
         self.registry
-            .select(default_tool_names(mode), &self.options.selection)
+            .select(&defaults, &self.options.selection)
             .into_iter()
             .filter(|tool| self.options.subagents || tool.name() != crate::SUBAGENT_TOOL)
+            .filter(|tool| {
+                mode == Mode::Build || !tool.name().starts_with("mcp_") || tool.is_read_only()
+            })
             .collect()
     }
 
@@ -348,6 +478,11 @@ impl Agent {
     /// The prompt is recorded in the conversation before anything is asked, so a
     /// turn that is abandoned still leaves what the user said.
     pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
+        let Some(lease) = crate::runtime::TurnLease::acquire(Arc::clone(&self.active)) else {
+            return Box::pin(futures::stream::once(async {
+                crate::AgentEvent::Error("session already has an active turn".into())
+            }));
+        };
         let resources = self
             .resources
             .read()
@@ -360,6 +495,11 @@ impl Agent {
                 }));
             }
         };
+        let mut turn_options = self.options.clone();
+        turn_options.shared_budget =
+            Some(self.options.shared_budget.clone().unwrap_or_else(|| {
+                crate::ExecutionBudget::new(self.options.execution.budget.clone())
+            }));
         let tools = self.turn_tools(mode);
         let subagent = tools
             .iter()
@@ -367,8 +507,9 @@ impl Agent {
             .then(|| {
                 Arc::new(SubagentRunner {
                     choice: self.choice.clone(),
+                    parent: self.journal(),
                     registry: Arc::clone(&self.registry),
-                    options: self.options.clone(),
+                    options: turn_options.clone(),
                     resources: resources.clone(),
                     mode,
                     slots: tokio::sync::Semaphore::new(self.options.max_parallel.max(1)),
@@ -388,10 +529,20 @@ impl Agent {
         );
         drop(resources);
 
-        session::start(TurnInput {
+        let journal = self.journal();
+        if let Some(journal) = &journal
+            && let Err(error) = journal.append(&crate::SessionRecord::Prompt {
+                text: prompt.clone(),
+            })
+        {
+            return Box::pin(futures::stream::once(async move {
+                crate::AgentEvent::Error(error.to_string())
+            }));
+        }
+        let stream = session::start(TurnInput {
             inner: Arc::clone(&self.choice.backend),
             tools,
-            options: self.options.clone(),
+            options: turn_options,
             cancel: self.cancel.clone(),
             steering: self.steering.clone(),
             follow_up: self.follow_up.clone(),
@@ -400,7 +551,8 @@ impl Agent {
             prompt,
             context_window: self.context_window(),
             subagent,
-        })
+        });
+        crate::runtime::leased_stream(crate::runtime::journal_stream(stream, journal), lease)
     }
 }
 
@@ -428,6 +580,178 @@ mod tests {
         AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
     };
     use solaris_tools::{SHELL_TOOL, Tool, ToolContext, ToolOutput};
+
+    #[tokio::test]
+    async fn saved_context_is_restored_and_transcript_events_survive_restart() {
+        let path =
+            std::env::temp_dir().join(format!("solaris-agent-resume-{}", std::process::id()));
+        let store = crate::SessionStore::open(&path.join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(std::path::Path::new("/project"), "model", None)
+            .expect("session");
+        let id = journal.id().to_string();
+        let complete = || {
+            vec![
+                AgentEvent::TextDelta("answer".into()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ]
+        };
+        let inner = Scripted::new(vec![complete(), complete()]);
+        let first = agent(inner.clone());
+        first.attach_journal(journal).expect("attach");
+        let events = drain(first.run_turn("remember this", Mode::Plan)).await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        drop(first);
+        let second = agent(inner.clone());
+        second
+            .attach_journal(store.resume(&id).expect("resume"))
+            .expect("attach again");
+        drain(second.run_turn("continue", Mode::Plan)).await;
+        let requests = inner.requests();
+        assert!(
+            requests[1]
+                .history
+                .iter()
+                .any(|m| m.text() == "remember this")
+        );
+        assert!(requests[1].history.iter().any(|m| m.text() == "answer"));
+        assert_eq!(
+            store
+                .records(&id)
+                .expect("records")
+                .iter()
+                .filter(|r| matches!(r, crate::SessionRecord::Prompt { .. }))
+                .count(),
+            2
+        );
+        drop(second);
+        drop(store);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_are_rejected_before_a_tool_can_write() {
+        let dir = std::env::temp_dir().join(format!("solaris-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let call = ToolCall::new(
+            "bad-write",
+            "write",
+            json!({"path": "should-not-exist", "content": 42}),
+        );
+        let inner = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(call),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(1, 1),
+                    cost_usd: 0.0,
+                },
+            ],
+            vec![AgentEvent::TurnComplete {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0,
+            }],
+        ]);
+        let agent = Agent::new(
+            choice(inner),
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::in_directory(&dir),
+        );
+        let events = drain(agent.run_turn("write", Mode::Build)).await;
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.is_error && result.output.contains("invalid tool arguments"))));
+        assert!(!dir.join("should-not-exist").exists());
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn request_budget_stops_a_tool_loop_before_another_model_call() {
+        let inner = Scripted::new(vec![vec![
+            AgentEvent::ToolCall(ToolCall::new("read", "read", json!({"path":"Cargo.toml"}))),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0,
+            },
+        ]]);
+        let mut options = AgentOptions::default();
+        options.execution.budget.max_requests = 1;
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::builtin()),
+            options,
+        );
+        let events = drain(agent.run_turn("read", Mode::Plan)).await;
+        assert_eq!(inner.requests().len(), 1);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("request budget"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_external_catalog_is_declared_only_after_search() {
+        struct External(String);
+        #[async_trait]
+        impl Tool for External {
+            fn name(&self) -> &str {
+                &self.0
+            }
+            fn description(&self) -> &str {
+                "external fixture tool"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                ToolOutput::ok("external reply")
+            }
+        }
+        let done = || AgentEvent::TurnComplete {
+            usage: Usage::new(1, 1),
+            cost_usd: 0.0,
+        };
+        let inner = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(ToolCall::new(
+                    "search",
+                    "tool_search",
+                    json!({"query":"mcp__fixture__tool_4"}),
+                )),
+                done(),
+            ],
+            vec![
+                AgentEvent::ToolCall(ToolCall::new("external", "mcp__fixture__tool_4", json!({}))),
+                done(),
+            ],
+            vec![done()],
+        ]);
+        let tools = (0..9)
+            .map(|index| Arc::new(External(format!("mcp__fixture__tool_{index}"))) as Arc<dyn Tool>)
+            .collect();
+        let agent = Agent::new(
+            choice(inner.clone()),
+            Arc::new(ToolRegistry::with_tools(tools)),
+            AgentOptions::default(),
+        );
+        let events = drain(agent.run_turn("use external tool", Mode::Build)).await;
+        let requests = inner.requests();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_"))
+        );
+        assert!(
+            requests[1]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__fixture__tool_4")
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.output == "external reply")));
+    }
 
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.
@@ -545,6 +869,121 @@ mod tests {
         assert_eq!(refreshed.conversation_len(), 1);
         assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
         assert!(Arc::ptr_eq(&original.resources, &refreshed.resources));
+    }
+
+    #[test]
+    fn session_metadata_tracks_the_resolved_backend_on_attach_and_refresh() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("sessions.sqlite");
+        let store = crate::SessionStore::open(&database).expect("store");
+        let journal = store
+            .create(directory.path(), "unresolved-model", None)
+            .expect("session");
+        let original = agent(Scripted::new(Vec::new()));
+        original.attach_journal(journal).expect("attach");
+        let first = store.list(directory.path()).expect("sessions").remove(0);
+        assert_eq!(first.provider.as_deref(), Some("anthropic"));
+        assert_eq!(first.model, "claude-sonnet-4-5");
+        original
+            .conversation
+            .push(crate::Message::user("remember this"));
+
+        let mut next = choice(Scripted::new(Vec::new()));
+        next.provider_id = Some("openai");
+        next.model = "next-model".into();
+        let refreshed = original.with_refreshed_backend(next);
+        assert_eq!(refreshed.conversation_len(), 1);
+        drop(original);
+        drop(refreshed);
+        drop(store);
+
+        let store = crate::SessionStore::open(&database).expect("reopen store");
+        let saved = store.list(directory.path()).expect("sessions").remove(0);
+        assert_eq!(saved.provider.as_deref(), Some("openai"));
+        assert_eq!(saved.model, "next-model");
+        let resumed = store.resume(&saved.id).expect("resume");
+        assert_eq!(
+            resumed.context().expect("context")[0].text(),
+            "remember this"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_backend_metadata_update_prevents_sending_history() {
+        let directory = tempfile::tempdir().expect("directory");
+        let database = directory.path().join("sessions.sqlite");
+        let store = crate::SessionStore::open(&database).expect("store");
+        let journal = store
+            .create(directory.path(), "initial", None)
+            .expect("session");
+        let original = agent(Scripted::new(Vec::new()));
+        original.attach_journal(journal).expect("attach");
+        original
+            .conversation
+            .push(crate::Message::user("private history"));
+        rusqlite::Connection::open(&database)
+            .expect("connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_model BEFORE UPDATE OF provider,model ON sessions
+             BEGIN SELECT RAISE(ABORT, 'model persistence unavailable'); END;",
+            )
+            .expect("inject write failure");
+        let backend = Scripted::new(Vec::new());
+        let refreshed = original.with_refreshed_backend(choice(backend.clone()));
+        let events = drain(refreshed.run_turn("next prompt", Mode::Build)).await;
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Error(error) if error.contains("model persistence unavailable"))));
+        assert!(
+            backend.requests().is_empty(),
+            "history must not reach a backend whose identity could not be persisted"
+        );
+    }
+
+    #[test]
+    fn refreshing_child_factory_replaces_credentials_without_resetting_the_session() {
+        let original = agent(Scripted::new(Vec::new()))
+            .with_child_backend(Arc::new(|_| Err("expired credential".into())));
+        original
+            .conversation
+            .push(crate::Message::user("remember this"));
+        let refreshed = original
+            .with_refreshed_backend(choice(Scripted::new(Vec::new())))
+            .with_child_backend(Arc::new(|model| {
+                let mut next = choice(Scripted::new(Vec::new()));
+                next.model = model.into();
+                Ok(next)
+            }));
+        assert_eq!(
+            refreshed.options.child_backend.as_ref().expect("factory")("child-model")
+                .expect("fresh credential")
+                .model,
+            "child-model"
+        );
+        assert!(
+            original
+                .options
+                .child_backend
+                .as_ref()
+                .expect("old factory")("child-model")
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
+    }
+
+    #[test]
+    fn attachment_boundaries_take_the_same_lease_as_a_turn() {
+        let original = agent(Scripted::new(Vec::new()));
+        let lease =
+            crate::runtime::TurnLease::acquire(Arc::clone(&original.active)).expect("lease");
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        assert!(original.attach_journal(Arc::clone(&journal)).is_err());
+        drop(lease);
+        original.attach_journal(journal).expect("idle attach");
+        assert!(!original.active.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// A tool as the registry and the loop want it.

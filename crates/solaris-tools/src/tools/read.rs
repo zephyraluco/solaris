@@ -8,7 +8,7 @@ use crate::tool::{Tool, ToolContext, ToolOutput, optional_count_arg, string_arg}
 use crate::truncate::{Limits, head};
 
 /// How much of a file one call returns.
-const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB \
+const DESCRIPTION: &str = "Read a text file or a PNG/JPEG/GIF/WebP image when the model supports images. Output is truncated to 2000 lines or 50KB \
      (whichever comes first). Use offset/limit for large files, and continue with offset until \
      the whole file has been read.";
 
@@ -95,6 +95,22 @@ impl Tool for ReadTool {
             return ToolOutput::error(format!("{path} is a directory — use `ls` to list it"));
         }
 
+        match crate::read_image(&absolute) {
+            Ok(Some(image)) => {
+                if !ctx.images_enabled {
+                    return ToolOutput::error(
+                        "this model has no confirmed image input support; choose a vision model or configure models.json",
+                    );
+                }
+                let mut output =
+                    ToolOutput::ok(format!("Read image {path} ({})", image.media_type));
+                output.metadata.images.push(image);
+                return output;
+            }
+            Ok(None) => {}
+            Err(error) => return ToolOutput::error(format!("could not read {path}: {error}")),
+        }
+
         let bytes = match tokio::fs::read(&absolute).await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -161,6 +177,20 @@ mod tests {
         tokio::fs::write(dir.join(name), contents)
             .await
             .expect("fixture");
+    }
+
+    #[tokio::test]
+    async fn image_reads_require_explicit_model_support() {
+        let dir = crate::tools::test_dir("read-image");
+        let path = dir.join("image");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\npayload").expect("image");
+        let mut ctx = ToolContext::new(&dir, &dir);
+        let tool = ReadTool::new();
+        assert!(tool.run(json!({"path":"image"}), &ctx).await.is_error);
+        ctx.images_enabled = true;
+        let result = tool.run(json!({"path":"image"}), &ctx).await;
+        assert!(!result.is_error);
+        assert_eq!(result.metadata.images.len(), 1);
     }
 
     #[tokio::test]

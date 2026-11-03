@@ -1,5 +1,6 @@
 //! Bounded delegation with isolated conversations and inherited policy.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +42,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a self-contained task to an isolated subagent using the current model: explore (read-only) or general (Build mode only). Waits by default; background=true returns a task ID immediately and notifies you when it finishes."
+        "Delegate a self-contained task to an isolated subagent using the current model or an explicit model override: explore (read-only) or general (Build mode only). Waits by default; background=true returns a task ID immediately and notifies you when it finishes."
     }
 
     fn parameters(&self) -> Value {
@@ -51,6 +52,8 @@ impl Tool for SubagentTool {
                 "agent": { "type": "string", "enum": ["explore", "general"] },
                 "name": { "type": "string", "description": "Short task name shown in the subagent summary. Describe the task, not its tools." },
                 "prompt": { "type": "string", "description": "Complete task, relevant context, paths, constraints and expected result. The child cannot see the parent conversation." },
+                "model": { "type": "string", "description": "Optional child model ID under the current provider. Omit or leave blank to use the parent's current model. Inherits parent policy and budget." },
+                "resume_id": { "type": "string", "description": "Resume one of this parent's saved child sessions. Omit or leave blank for a new child. Never automatically reruns interrupted tools." },
                 "background": { "type": "boolean", "default": false, "description": "Return a task ID immediately so you can continue independent work. The final report or failure is delivered automatically; do not poll. Background work is scoped to this turn." }
             },
             "required": ["agent", "prompt"],
@@ -85,11 +88,16 @@ pub(crate) struct Task {
     prompt: String,
     #[serde(default)]
     pub background: bool,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    resume_id: Option<String>,
 }
 
 /// Snapshot captured at the parent's turn boundary, not a reference to its history.
 pub(crate) struct SubagentRunner {
     pub choice: BackendChoice,
+    pub parent: Option<Arc<crate::SessionJournal>>,
     pub registry: Arc<ToolRegistry>,
     pub options: AgentOptions,
     pub resources: ResourceSnapshot,
@@ -119,9 +127,25 @@ impl From<ToolOutput> for SubagentResult {
 
 impl SubagentRunner {
     pub fn parse(&self, input: Value) -> Result<Task, ToolOutput> {
-        let task: Task = serde_json::from_value(input).map_err(|_| {
-            ToolOutput::error("subagent requires an agent (explore or general), a prompt string and optionally a name string and background boolean, with no other fields")
+        let mut task: Task = serde_json::from_value(input).map_err(|_| {
+            ToolOutput::error("subagent requires agent (explore or general) and prompt (string); optional fields are name, model, resume_id (strings) and background (boolean), with no other fields")
         })?;
+        // Models sometimes fill optional string fields with empty placeholders.
+        // Those carry the same meaning as omission, never a model override or resume.
+        task.model = non_blank(task.model);
+        task.resume_id = non_blank(task.resume_id);
+        if let Some(model) = &task.model {
+            if model.len() > 512 {
+                return Err(ToolOutput::error(
+                    "invalid child model: model ID must be at most 512 bytes; omit model to inherit the parent model",
+                ));
+            }
+            if model.chars().any(char::is_control) {
+                return Err(ToolOutput::error(
+                    "invalid child model: model ID must not contain control characters; omit model to inherit the parent model",
+                ));
+            }
+        }
         if task.prompt.trim().is_empty() || task.prompt.len() > 64 * 1024 {
             return Err(ToolOutput::error(
                 "subagent prompt must be non-empty and at most 64 KiB",
@@ -146,6 +170,13 @@ impl SubagentRunner {
             return ToolOutput::error("subagent was cancelled before it started").into();
         }
 
+        let mut local_ctx = ctx.clone();
+        local_ctx.cancel = ctx.cancel.child();
+        let _task_guard = self
+            .options
+            .tasks
+            .register(call_id, local_ctx.cancel.clone());
+        let ctx = &local_ctx;
         let totals = Arc::new(Mutex::new(Totals::default()));
         let label = format!("subagent {call_id} ({:?})", task.agent);
         let label = match task
@@ -191,6 +222,9 @@ impl SubagentRunner {
         let Ok(_permit) = self.slots.acquire().await else {
             return ToolOutput::error("subagent execution is closed");
         };
+        if ctx.is_cancelled() || tx.is_closed() {
+            return ToolOutput::error("subagent was cancelled before acquiring an execution slot");
+        }
         let _ = tx.send(AgentEvent::Status(format!("subagent {task_id}: running")));
 
         let mode = match task.agent {
@@ -199,25 +233,51 @@ impl SubagentRunner {
         };
         // An explicit allowlist/exclusion applies to the child too. Explore can
         // search/list even when Build's default declaration prefers the shell.
-        let tools = self
+        let mut defaults = default_tool_names(mode).to_vec();
+        let external: Vec<String> = self
             .registry
-            .select(default_tool_names(mode), &self.options.selection)
+            .names()
             .into_iter()
-            .filter(|tool| tool.name() != SUBAGENT_TOOL)
-            .filter(|tool| {
-                mode != Mode::Plan || matches!(tool.name(), "read" | "grep" | "find" | "ls")
+            .filter(|name| {
+                name.starts_with("mcp_")
+                    && self
+                        .registry
+                        .get(name)
+                        .is_some_and(|tool| mode == Mode::Build || tool.is_read_only())
             })
             .collect();
+        defaults.extend(external.iter().map(String::as_str));
+        if self.registry.get("tool_search").is_some() {
+            defaults.push("tool_search");
+        }
+        let tools = self
+            .registry
+            .select(&defaults, &self.options.selection)
+            .into_iter()
+            .filter(|tool| tool.name() != SUBAGENT_TOOL)
+            .filter(|tool| mode != Mode::Plan || tool.is_read_only())
+            .collect();
         let registry = Arc::new(ToolRegistry::with_tools(tools));
+        let mut choice = if let Some(model) = &task.model {
+            let Some(factory) = &self.options.child_backend else {
+                return ToolOutput::error(
+                    "child model overrides are not configured for this runtime",
+                );
+            };
+            match factory(model) {
+                Ok(choice) => choice,
+                Err(error) => return ToolOutput::error(error),
+            }
+        } else {
+            self.choice.clone()
+        };
+        // Each child retains its own request ceiling while sharing the parent's budget.
         let backend = Arc::new(BoundedBackend {
-            inner: Arc::clone(&self.choice.backend),
+            inner: Arc::clone(&choice.backend),
             requests: AtomicUsize::new(0),
             totals: Arc::clone(&totals),
-            // Background work may outlive the parent's next request, which can
-            // fail or be cancelled. Bill each completed child request at once.
             usage_tx: task.background.then(|| tx.clone()),
         });
-        let mut choice = self.choice.clone();
         choice.backend = backend;
         let mut options = self.options.clone().with_subagents(false);
         options.cwd = ctx.cwd.clone();
@@ -230,7 +290,51 @@ impl SubagentRunner {
         };
         options.skills = self.resources.skills.clone();
         options.prompt_context = self.resources.prompt.clone();
+        let child_model = choice.model.clone();
         let child = Agent::new(choice, registry, options);
+        let journal = if let Some(parent) = &self.parent {
+            let result = if let Some(id) = &task.resume_id {
+                match parent.store().list(&ctx.cwd) {
+                    Ok(sessions)
+                        if sessions.iter().any(|session| {
+                            session.id == *id
+                                && session.is_subagent
+                                && session.parent_id.as_deref() == Some(parent.id())
+                        }) =>
+                    {
+                        parent.store().resume(id)
+                    }
+                    _ => {
+                        return ToolOutput::error("resume_id is not a saved child of this session");
+                    }
+                }
+            } else {
+                parent
+                    .store()
+                    .create_subagent(&ctx.cwd, &child_model, parent.id())
+            };
+            match result {
+                Ok(journal) => Some(journal),
+                Err(error) => return ToolOutput::error(error.to_string()),
+            }
+        } else {
+            if task.resume_id.is_some() {
+                return ToolOutput::error("child resume requires a persistent parent session");
+            }
+            None
+        };
+        let session_id = journal.as_ref().map(|journal| journal.id().to_string());
+        if let Some(journal) = journal
+            && let Err(error) = child.attach_journal(journal)
+        {
+            return ToolOutput::error(error.to_string());
+        }
+        if let Some(session_id) = &session_id {
+            let _ = tx.send(AgentEvent::SubagentSession {
+                task_id: task_id.to_string(),
+                session_id: session_id.clone(),
+            });
+        }
         let cancel = child.cancel_handle();
         let mut stream = child.run_turn(format!(
             "You are an isolated {:?} subagent. Complete only the task below and return a concise final report with findings, changed files, verification and limitations. You cannot delegate.\n\n{}",
@@ -238,8 +342,21 @@ impl SubagentRunner {
         // A dropped parent future must also stop its child, including when the
         // child is waiting on network IO or on an approval.
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
-        collect(&mut stream, ctx, tx, task_id).await
+        let mut output = collect(&mut stream, ctx, tx, task_id).await;
+        if let Some(session_id) = session_id {
+            output.metadata.details = json!({"session_id":session_id,"model":child_model});
+            output.text.push_str(&format!(
+                "\n\n[subagent session: {session_id}; use resume_id to continue it explicitly]"
+            ));
+        }
+        output
     }
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 struct CancelOnDrop(Cancel);
@@ -323,6 +440,10 @@ struct BoundedBackend {
 
 #[async_trait]
 impl AgentBackend for BoundedBackend {
+    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         if self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
             return Err(BackendError::new(
@@ -402,7 +523,9 @@ mod tests {
             json!({"agent":"explore","prompt":1}),
             json!({"agent":"explore","prompt":"task","name":1}),
             json!({"agent":"explore","prompt":"task","background":"true"}),
-            json!({"agent":"explore","prompt":"task","model":"other"}),
+            json!({"agent":"explore","prompt":"task","model":42}),
+            json!({"agent":"explore","prompt":"task","resume_id":42}),
+            json!({"agent":"explore","prompt":"task","unknown":true}),
             json!({"prompt":"task"}),
         ] {
             assert!(serde_json::from_value::<Task>(input).is_err());
@@ -441,5 +564,78 @@ mod tests {
                 background
             );
         }
+    }
+}
+
+/// Controls are scoped to a parent runtime and include queued tasks.
+#[derive(Clone, Default)]
+pub struct TaskControls(Arc<Mutex<HashMap<String, Cancel>>>);
+impl TaskControls {
+    pub fn active(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+    pub fn cancel(&self, id: &str) -> bool {
+        if let Some(cancel) = self.0.lock().unwrap_or_else(|p| p.into_inner()).get(id) {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+    fn register(&self, id: &str, cancel: Cancel) -> TaskGuard {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string(), cancel.clone());
+        TaskGuard {
+            controls: self.clone(),
+            id: id.to_string(),
+            cancel,
+        }
+    }
+}
+struct TaskGuard {
+    controls: TaskControls,
+    id: String,
+    cancel: Cancel,
+}
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let mut tasks = self.controls.0.lock().unwrap_or_else(|p| p.into_inner());
+        if tasks
+            .get(&self.id)
+            .is_some_and(|current| current.same_generation(&self.cancel))
+        {
+            tasks.remove(&self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    #[test]
+    fn cancelling_one_task_preserves_the_parent_and_its_sibling() {
+        let parent = Cancel::new().begin_turn();
+        let one = parent.child();
+        let two = parent.child();
+        let tasks = TaskControls::default();
+        let _first = tasks.register("one", one.clone());
+        let _second = tasks.register("two", two.clone());
+        assert!(tasks.cancel("one"));
+        assert!(one.is_cancelled());
+        assert!(!parent.is_cancelled());
+        assert!(!two.is_cancelled());
+        parent.cancel();
+        assert!(two.is_cancelled());
     }
 }

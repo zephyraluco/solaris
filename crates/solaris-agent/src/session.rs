@@ -77,13 +77,13 @@ pub(crate) struct TurnInput {
 pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     // A cancel belongs to one turn. Clearing it here is what keeps a stop that
     // arrived after the last turn from stopping this one.
-    input.cancel.reset();
+    let turn_cancel = input.cancel.begin_turn();
 
     let TurnInput {
         inner,
         tools,
         options,
-        cancel,
+        cancel: _,
         steering,
         follow_up,
         conversation,
@@ -93,18 +93,41 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         subagent,
     } = input;
 
-    let specs = tools
+    let budget = options
+        .shared_budget
+        .clone()
+        .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
+    let inner: Arc<dyn AgentBackend> = Arc::new(crate::budget::BudgetedBackend {
+        inner,
+        budget: Arc::clone(&budget),
+    });
+    let specs: Vec<ToolSpec> = tools
         .iter()
         .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
         .collect();
+    let lazy_tools = specs.iter().any(|spec| spec.name == "tool_search")
+        && specs
+            .iter()
+            .filter(|spec| spec.name.starts_with("mcp_"))
+            .count()
+            > 8;
+    let active_tools = std::sync::Mutex::new(
+        specs
+            .iter()
+            .filter(|spec| !lazy_tools || !spec.name.starts_with("mcp_"))
+            .map(|spec| spec.name.clone())
+            .collect(),
+    );
     let runner = Runner {
+        active_tools,
         inner,
+        budget: Arc::clone(&budget),
         tools,
         specs,
         approver: Arc::clone(&options.approver),
         cwd: options.cwd.clone(),
         temp_dir: options.temp_dir.clone(),
-        cancel,
+        cancel: turn_cancel,
         steering,
         follow_up,
         conversation,
@@ -119,7 +142,19 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     let (tx, rx) = unbounded_channel();
     let cancel = runner.cancel.clone();
     tokio::spawn(async move {
-        runner.drive(prompt, tx).await;
+        let sender = tx.clone();
+        let drive = runner.drive(prompt, tx);
+        tokio::pin!(drive);
+        tokio::select! {
+            _ = &mut drive => {},
+            _ = tokio::time::sleep_until(budget.deadline()) => {
+                runner.cancel.cancel();
+                let _ = sender.send(AgentEvent::Status("execution deadline exceeded; stopping active work".into()));
+                if tokio::time::timeout(std::time::Duration::from_secs(2), &mut drive).await.is_err() {
+                    let _ = sender.send(AgentEvent::Error("execution deadline exceeded".into()));
+                }
+            }
+        }
     });
 
     Box::pin(EventStream {
@@ -133,8 +168,10 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 /// call that started it.
 struct Runner {
     inner: Arc<dyn AgentBackend>,
+    budget: Arc<crate::ExecutionBudget>,
     tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
+    active_tools: std::sync::Mutex<std::collections::BTreeSet<String>>,
     approver: Arc<dyn Approver>,
     cwd: PathBuf,
     temp_dir: PathBuf,
@@ -177,6 +214,10 @@ impl Runner {
         let mut last_usage: Option<Usage> = None;
 
         loop {
+            if let Some(error) = self.conversation.error() {
+                let _ = tx.send(AgentEvent::Error(error));
+                return;
+            }
             if self.cancel.is_cancelled() {
                 self.give_up("the turn was cancelled".to_string(), &tx);
                 return;
@@ -247,6 +288,10 @@ impl Runner {
                 if self.take_follow_ups(&tx) {
                     continue;
                 }
+                if let Some(error) = self.conversation.error() {
+                    let _ = tx.send(AgentEvent::Error(error));
+                    return;
+                }
                 let _ = tx.send(AgentEvent::TurnComplete {
                     usage: total,
                     cost_usd,
@@ -302,7 +347,14 @@ impl Runner {
             // The prompt is already in the conversation: this loop records it
             // before it asks anything.
             prompt: String::new(),
-            tools: self.specs.clone(),
+            tools: {
+                let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+                self.specs
+                    .iter()
+                    .filter(|spec| active.contains(&spec.name))
+                    .cloned()
+                    .collect()
+            },
         };
 
         let result = tokio::select! {
@@ -597,6 +649,9 @@ impl Runner {
 
     /// Run one call, or explain why it did not run.
     async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
+        if let Err(error) = self.budget.check() {
+            return ToolResult::error(call, error).into();
+        }
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == call.name) else {
             return ToolResult::error(
                 call,
@@ -604,6 +659,23 @@ impl Runner {
             )
             .into();
         };
+
+        // External schema retrieval is disabled in the dependency features.
+        // Validate before approvals or side effects, including extension tools.
+        let schema = tool.parameters();
+        let validator = match jsonschema::validator_for(&schema) {
+            Ok(validator) => validator,
+            Err(error) => {
+                return ToolResult::error(call, format!("invalid tool schema: {error}")).into();
+            }
+        };
+        if let Err(error) = validator.validate(&call.input) {
+            return ToolResult::error(
+                call,
+                format!("invalid tool arguments at {}: {error}", error.instance_path),
+            )
+            .into();
+        }
 
         let approval = tokio::select! {
             biased;
@@ -624,12 +696,63 @@ impl Runner {
             return ToolResult::error(call, "the turn was cancelled before this call ran").into();
         }
 
+        if let Some(error) = self.conversation.error() {
+            return ToolResult::error(call, error).into();
+        }
+        if let Some(journal) = self.conversation.journal()
+            && let Err(error) =
+                journal.append(&crate::SessionRecord::ToolIntent { call: call.clone() })
+        {
+            return ToolResult::error(call, error.to_string()).into();
+        }
         let ctx = ToolContext {
+            images_enabled: self.inner.capabilities().image_input
+                == solaris_backend::Support::Supported,
             cwd: self.cwd.clone(),
-            temp_dir: self.temp_dir.clone(),
+            temp_dir: self.conversation.journal().map_or_else(
+                || self.temp_dir.clone(),
+                |journal| journal.store().artifact_dir(),
+            ),
             cancel: self.cancel.clone(),
         };
-        let (output, usage, cost_usd) = if call.name == SUBAGENT_TOOL {
+        let (output, usage, cost_usd) = if call.name == "tool_search" {
+            let query = call.input["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            let terms: Vec<_> = query.split_whitespace().collect();
+            let limit = call.input["limit"].as_u64().unwrap_or(5).min(8) as usize;
+            let mut matches: Vec<_> = self
+                .specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("mcp_"))
+                .filter_map(|spec| {
+                    let text = format!("{} {}", spec.name, spec.description).to_lowercase();
+                    let score = terms.iter().filter(|term| text.contains(**term)).count();
+                    (score > 0).then_some((score, spec))
+                })
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+            let found: Vec<_> = matches
+                .into_iter()
+                .take(limit)
+                .map(|(_, spec)| spec)
+                .collect();
+            {
+                let mut active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+                active.retain(|name| !name.starts_with("mcp_"));
+                for spec in &found {
+                    active.insert(spec.name.clone());
+                }
+            }
+            (
+                solaris_tools::ToolOutput::ok(
+                    serde_json::json!({"tools":found,"available_next_round":true}).to_string(),
+                ),
+                Usage::default(),
+                0.0,
+            )
+        } else if call.name == SUBAGENT_TOOL {
             let Some(subagent) = &self.subagent else {
                 return ToolResult::error(call, "subagent delegation is disabled in this session")
                     .into();
@@ -659,11 +782,12 @@ impl Runner {
             )
         };
 
-        let result = if output.is_error {
+        let mut result = if output.is_error {
             ToolResult::error(call, output.text)
         } else {
             ToolResult::ok(call, output.text)
         };
+        result.metadata = output.metadata;
         CallOutcome {
             result,
             usage,
@@ -1004,7 +1128,7 @@ mod tests {
             if self.fail {
                 ToolOutput::error("it went wrong")
             } else {
-                ToolOutput::ok("done")
+                solaris_tools::ToolOutput::ok("done")
             }
         }
     }

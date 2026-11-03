@@ -2,7 +2,6 @@
 name = "solaris-agent"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "The agent session for solaris: tools declared to a model and run for it"
 
@@ -20,8 +19,12 @@ serde_json = { workspace = true }
 serde_yaml_ng = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+fs2 = "0.4"
+jsonschema = { version = "0.33", default-features = false }
 
 [dev-dependencies]
+tempfile = "3"
 # The unit tests build tool-call arguments, and the loopback test binds a real
 # socket and drives the real HTTP client.
 serde_json = { workspace = true }
