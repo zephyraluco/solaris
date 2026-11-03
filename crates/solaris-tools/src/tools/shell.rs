@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_zero_exit_is_reported_without_failing_the_tool() {
+    async fn a_non_zero_exit_is_reported_as_a_tool_failure() {
         let dir = test_dir("shell-exit");
         let runner = StubShell::new(ShellOutcome {
             output: "boom\n".to_string(),
@@ -961,7 +961,9 @@ mod tests {
         let (config, command) = if cfg!(windows) {
             (
                 ShellConfig::POWERSHELL,
-                "Write-Output hello; Write-Error boom # why",
+                // Write-Error leaves PowerShell's final command unsuccessful.
+                // This fixture checks stderr capture, so explicitly exit zero.
+                "Write-Output hello; Write-Error boom; exit 0 # why",
             )
         } else {
             (ShellConfig::BASH, "echo hello; echo boom 1>&2 # why")
