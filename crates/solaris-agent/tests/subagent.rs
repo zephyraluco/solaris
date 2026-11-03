@@ -642,6 +642,7 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
         .find(|session| session.parent_id.as_deref() == Some(&parent_id))
         .expect("child session");
     assert_eq!(child.model, "child-model");
+    assert!(child.is_subagent);
     assert!(events.iter().any(|event| matches!(event, AgentEvent::SubagentSession { session_id, .. } if session_id == &child.id)));
     let restored = store.resume(&child.id).expect("child is no longer running");
     assert!(

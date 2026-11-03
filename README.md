@@ -345,8 +345,11 @@ solaris is a Rust port of ideas from two projects, and the source says so where 
 
 Sessions are saved to `sessions/sessions.sqlite` under the resolved configuration directory.
 Use `solaris --sessions` to list sessions for the current directory, `solaris --continue`
-to restore the latest, or `solaris --resume <ID>` to restore one explicitly.
+to restore the latest user conversation (including user forks, excluding delegated
+subagent sessions), or `solaris --resume <ID>` to restore one explicitly.
 `--ephemeral` keeps a run in memory. A session can only be opened by one process at a time.
+The journal records the resolved provider and model on attachment and backend
+changes so subsequent resume restores that choice unless explicitly overridden.
 
 The journal retains prompts, tool calls/results, model context, compaction checkpoints and
 child activity. Interrupted tool calls are never automatically executed again: verify their

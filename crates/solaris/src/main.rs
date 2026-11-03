@@ -400,13 +400,16 @@ fn main() -> Result<()> {
         let sessions = store.list(&cwd)?;
         let resume = args.resume.as_deref().or_else(|| {
             if args.continue_session {
-                sessions.first().map(|s| s.id.as_str())
+                sessions
+                    .iter()
+                    .find(|s| !s.is_subagent)
+                    .map(|s| s.id.as_str())
             } else {
                 None
             }
         });
         if args.continue_session && resume.is_none() {
-            anyhow::bail!("no saved session in this directory");
+            anyhow::bail!("no saved user session in this directory");
         }
         let journal = match resume {
             Some(id) => {

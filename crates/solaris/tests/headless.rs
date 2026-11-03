@@ -111,6 +111,24 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
         .collect();
     assert!(events.iter().all(|event| event["version"] == 1));
     let id = events[0]["session_id"].as_str().expect("session id");
+    let store =
+        solaris_agent::SessionStore::open(&directory.path().join("sessions/sessions.sqlite"))
+            .expect("session store");
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("canonical cwd");
+    let child = store
+        .create_subagent(&cwd, "test-model", id)
+        .expect("child");
+    child
+        .append(&solaris_agent::SessionRecord::Message {
+            message: solaris_agent::Message::user("isolated child history"),
+        })
+        .expect("child history");
+    assert_eq!(store.list(&cwd).expect("sessions")[0].id, child.id());
+    drop(child);
+    drop(store);
     let second = run(
         directory.path(),
         &endpoint,
@@ -144,6 +162,113 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
             .iter()
             .any(|message| message["content"] == "first prompt")
     );
+    assert!(
+        !requests[1]["messages"]
+            .as_array()
+            .expect("history")
+            .iter()
+            .any(|message| message["content"] == "isolated child history")
+    );
+}
+
+#[test]
+fn automatic_continuation_keeps_user_forks_and_explicit_child_resume() {
+    use solaris_agent::{SessionRecord, SessionStore};
+    let directory = tempfile::tempdir().expect("directory");
+    let store =
+        SessionStore::open(&directory.path().join("sessions/sessions.sqlite")).expect("store");
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("canonical cwd");
+    let root = store.create(&cwd, "test-model", None).expect("root");
+    root.append(&SessionRecord::Model {
+        provider: Some("local".into()),
+        model: "test-model".into(),
+    })
+    .expect("model");
+    let fork = root.fork(&cwd, "test-model").expect("user fork");
+    let fork_id = fork.id().to_owned();
+    let child = store
+        .create_subagent(&cwd, "test-model", root.id())
+        .expect("child");
+    child
+        .append(&SessionRecord::Model {
+            provider: Some("local".into()),
+            model: "test-model".into(),
+        })
+        .expect("model");
+    let child_id = child.id().to_owned();
+    let fork_records = store.records(&fork_id).expect("fork records").len();
+    let child_records = store.records(&child_id).expect("child records").len();
+    drop(root);
+    drop(fork);
+    drop(child);
+
+    let output = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--continue", "--rpc"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        store.records(&fork_id).expect("fork records").len(),
+        fork_records + 1
+    );
+    assert_eq!(
+        store.records(&child_id).expect("child records").len(),
+        child_records
+    );
+
+    let output = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--resume", &child_id, "--rpc"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        store.records(&child_id).expect("child records").len(),
+        child_records + 1
+    );
+}
+
+#[test]
+fn automatic_continuation_refuses_a_directory_with_only_delegated_sessions() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store =
+        solaris_agent::SessionStore::open(&directory.path().join("sessions/sessions.sqlite"))
+            .expect("store");
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("canonical cwd");
+    let parent = store
+        .create(
+            &directory.path().join("another-project"),
+            "test-model",
+            None,
+        )
+        .expect("parent");
+    let child = store
+        .create_subagent(&cwd, "test-model", parent.id())
+        .expect("child");
+    drop(parent);
+    drop(child);
+    let output = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--continue", "--rpc"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no saved user session"));
 }
 
 #[test]

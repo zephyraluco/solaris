@@ -28,6 +28,8 @@ pub struct SessionInfo {
     pub id: String,
     pub cwd: PathBuf,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub is_subagent: bool,
     pub model: String,
     #[serde(default)]
     pub provider: Option<String>,
@@ -88,7 +90,7 @@ impl SessionStore {
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(StoreError::Invalid(format!(
                 "unsupported session schema version {version}"
             )));
@@ -104,7 +106,24 @@ impl SessionStore {
         if version < 2 {
             transaction.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
         }
-        transaction.pragma_update(None, "user_version", 2)?;
+        if version < 3 {
+            transaction.execute(
+                "ALTER TABLE sessions ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            // In schema 2, forks recorded a Model entry while ordinary children
+            // did not. Parent event links also identify children whose metadata
+            // was subsequently updated. Unannounced children have no Model entry.
+            transaction.execute_batch(
+                "UPDATE sessions SET is_subagent=1
+                WHERE parent_id IS NOT NULL AND (
+                    EXISTS (SELECT 1 FROM records r WHERE r.session_id=sessions.parent_id
+                        AND json_extract(r.data,'$.event.SubagentSession.session_id')=sessions.id)
+                    OR NOT EXISTS (SELECT 1 FROM records r WHERE r.session_id=sessions.id
+                        AND json_extract(r.data,'$.type')='model'));",
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
         #[cfg(unix)]
         {
@@ -123,19 +142,39 @@ impl SessionStore {
             .map_err(|_| StoreError::Invalid("session database lock poisoned".into()))
     }
 
-    /// Create a session with an unguessable local identifier.
+    /// Create a user session with optional fork lineage and an unguessable ID.
     pub fn create(
         self: &Arc<Self>,
         cwd: &Path,
         model: &str,
         parent: Option<&str>,
     ) -> Result<Arc<SessionJournal>, StoreError> {
+        self.create_entry(cwd, model, parent, false)
+    }
+
+    /// Create a delegated session excluded from automatic user continuation.
+    pub fn create_subagent(
+        self: &Arc<Self>,
+        cwd: &Path,
+        model: &str,
+        parent: &str,
+    ) -> Result<Arc<SessionJournal>, StoreError> {
+        self.create_entry(cwd, model, Some(parent), true)
+    }
+
+    fn create_entry(
+        self: &Arc<Self>,
+        cwd: &Path,
+        model: &str,
+        parent: Option<&str>,
+        is_subagent: bool,
+    ) -> Result<Arc<SessionJournal>, StoreError> {
         let id: String =
             self.lock()?
                 .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
         self.lock()?.execute(
-            "INSERT INTO sessions(id,cwd,model,parent_id) VALUES (?1,?2,?3,?4)",
-            params![id, cwd.to_string_lossy(), model, parent],
+            "INSERT INTO sessions(id,cwd,model,parent_id,is_subagent) VALUES (?1,?2,?3,?4,?5)",
+            params![id, cwd.to_string_lossy(), model, parent, is_subagent],
         )?;
         self.resume(&id)
     }
@@ -184,7 +223,7 @@ impl SessionStore {
     /// Most recently used sessions for this project, newest first.
     pub fn list(&self, cwd: &Path) -> Result<Vec<SessionInfo>, StoreError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at,provider,(SELECT substr(json_extract(data,'$.text'),1,80) FROM records WHERE session_id=sessions.id AND json_extract(data,'$.type')='prompt' ORDER BY seq LIMIT 1) FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
+        let mut statement = connection.prepare("SELECT id,cwd,parent_id,model,status,updated_at,provider,(SELECT substr(json_extract(data,'$.text'),1,80) FROM records WHERE session_id=sessions.id AND json_extract(data,'$.type')='prompt' ORDER BY seq LIMIT 1),is_subagent FROM sessions WHERE cwd=?1 ORDER BY updated_at DESC, rowid DESC")?;
         let rows = statement.query_map([cwd.to_string_lossy()], |row| {
             Ok(SessionInfo {
                 id: row.get(0)?,
@@ -195,6 +234,7 @@ impl SessionStore {
                 updated_at: row.get(5)?,
                 provider: row.get(6)?,
                 title: row.get(7)?,
+                is_subagent: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -346,7 +386,7 @@ mod tests {
         drop(store);
         let connection = Connection::open(&path).expect("old schema");
         connection
-            .execute_batch("ALTER TABLE sessions DROP COLUMN provider; PRAGMA user_version=1;")
+            .execute_batch("ALTER TABLE sessions DROP COLUMN provider; ALTER TABLE sessions DROP COLUMN is_subagent; PRAGMA user_version=1;")
             .expect("simulate version one");
         drop(connection);
         let migrated = SessionStore::open(&path).expect("migrate");
@@ -358,6 +398,58 @@ mod tests {
                 .expect("context"),
             vec![Message::user("preserve")]
         );
+    }
+
+    #[test]
+    fn version_two_migration_distinguishes_children_from_user_forks() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("sessions.sqlite");
+        let cwd = directory.path();
+        let store = SessionStore::open(&path).expect("store");
+        let root = store.create(cwd, "root", None).expect("root");
+        let child = store
+            .create_subagent(cwd, "child", root.id())
+            .expect("child");
+        // Cover an announced child that already has backend metadata.
+        child
+            .append(&SessionRecord::Model {
+                provider: Some("local".into()),
+                model: "child".into(),
+            })
+            .expect("model");
+        root.append(&SessionRecord::Event {
+            event: AgentEvent::SubagentSession {
+                task_id: "task".into(),
+                session_id: child.id().into(),
+            },
+        })
+        .expect("child link");
+        let orphan = store
+            .create_subagent(cwd, "orphan", root.id())
+            .expect("unannounced child");
+        let fork = root.fork(cwd, "fork").expect("user fork");
+        let ids = [root.id(), child.id(), orphan.id(), fork.id()].map(str::to_owned);
+        drop(root);
+        drop(child);
+        drop(orphan);
+        drop(fork);
+        drop(store);
+        Connection::open(&path)
+            .expect("connection")
+            .execute_batch("ALTER TABLE sessions DROP COLUMN is_subagent; PRAGMA user_version=2;")
+            .expect("version two fixture");
+        let store = SessionStore::open(&path).expect("migrate");
+        let sessions = store.list(cwd).expect("sessions");
+        for (id, is_subagent) in ids.iter().zip([false, true, true, false]) {
+            assert_eq!(
+                sessions
+                    .iter()
+                    .find(|session| &session.id == id)
+                    .expect("saved session")
+                    .is_subagent,
+                is_subagent
+            );
+        }
     }
 
     #[test]

@@ -297,7 +297,9 @@ impl SubagentRunner {
                 match parent.store().list(&ctx.cwd) {
                     Ok(sessions)
                         if sessions.iter().any(|session| {
-                            session.id == *id && session.parent_id.as_deref() == Some(parent.id())
+                            session.id == *id
+                                && session.is_subagent
+                                && session.parent_id.as_deref() == Some(parent.id())
                         }) =>
                     {
                         parent.store().resume(id)
@@ -309,7 +311,7 @@ impl SubagentRunner {
             } else {
                 parent
                     .store()
-                    .create(&ctx.cwd, &child_model, Some(parent.id()))
+                    .create_subagent(&ctx.cwd, &child_model, parent.id())
             };
             match result {
                 Ok(journal) => Some(journal),
