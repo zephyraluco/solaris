@@ -305,3 +305,82 @@ fn rpc_binary_accepts_commands_without_initializing_a_terminal() {
     assert_eq!(responses[1]["id"], "cancel");
     assert_eq!(responses[1]["ok"], true);
 }
+
+#[test]
+fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
+    use solaris_agent::{Message, SessionRecord, SessionStore};
+    use solaris_provider::{AuthStore, Credential};
+    let directory = tempfile::tempdir().expect("directory");
+    let store =
+        SessionStore::open(&directory.path().join("sessions/sessions.sqlite")).expect("store");
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("canonical cwd");
+    let source = store.create(&cwd, "test-model", None).expect("source");
+    source
+        .append(&SessionRecord::Model {
+            provider: Some("local".into()),
+            model: "test-model".into(),
+        })
+        .expect("source model");
+    source
+        .append(&SessionRecord::Message {
+            message: Message::user("source private history"),
+        })
+        .expect("history");
+    let source_id = source.id().to_owned();
+    drop(source);
+    let mut auth = AuthStore::new();
+    auth.store(
+        "openai",
+        Credential::Endpoint {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "test-only".into(),
+        },
+    );
+    auth.activate("openai");
+    std::fs::write(
+        directory.path().join("auth.json"),
+        auth.to_json().expect("auth"),
+    )
+    .expect("save auth");
+    for override_provider in [false, true] {
+        let mut args = vec!["--fork", &source_id, "--rpc"];
+        if override_provider {
+            args.extend(["--provider", "openai"]);
+        }
+        let output = run(directory.path(), "http://127.0.0.1:1/v1", &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fork = store
+            .list(&cwd)
+            .expect("sessions")
+            .into_iter()
+            .find(|info| info.parent_id.as_deref() == Some(&source_id))
+            .expect("fork");
+        assert_eq!(
+            fork.provider.as_deref(),
+            Some(if override_provider { "openai" } else { "local" })
+        );
+        let journal = store.resume(&fork.id).expect("fork released");
+        assert_eq!(
+            journal.context().expect("fork context")[0].text(),
+            "source private history"
+        );
+    }
+    assert_eq!(
+        store
+            .list(&cwd)
+            .expect("sessions")
+            .into_iter()
+            .find(|info| info.id == source_id)
+            .expect("source")
+            .provider
+            .as_deref(),
+        Some("local")
+    );
+}

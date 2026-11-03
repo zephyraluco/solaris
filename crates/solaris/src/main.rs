@@ -435,6 +435,11 @@ fn main() -> Result<()> {
                     if args.model.is_none() {
                         config.model = info.model.clone();
                     }
+                    if args.provider.is_none()
+                        && let Some(provider) = &info.provider
+                    {
+                        auth.activate(provider.clone());
+                    }
                     let parent = store.resume(id)?;
                     parent.fork(&cwd, &config.model)?
                 } else {
