@@ -55,6 +55,9 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // Accepted sockets may inherit nonblocking mode on macOS; only
+            // the listener needs it for the bounded accept loop above.
+            socket.set_nonblocking(false).expect("blocking connection");
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .expect("timeout");
