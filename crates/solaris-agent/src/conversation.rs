@@ -131,24 +131,16 @@ impl Conversation {
         self.replace_with(Vec::new());
     }
 
-    /// Drop a trailing request for calls that never got answers.
-    ///
-    /// A turn that is cancelled or fails can leave the conversation ending on an
-    /// assistant message that asked for tools whose results never arrived, and
-    /// every wire rejects a call with no result. Removing that one message is
-    /// enough: results are appended immediately after the request, so an earlier
-    /// request always has its answers.
+    /// Complete missing results in the latest assistant round without replaying
+    /// tools. Older rounds may reuse the same call IDs, so only results after
+    /// this assistant message count as answers.
     pub(crate) fn repair(&self) {
         let mut messages = self.lock();
-        let calls: Vec<_> = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant)
-            .into_iter()
-            .flat_map(|m| m.tool_calls())
-            .cloned()
-            .collect();
-        let answered: std::collections::HashSet<_> = messages
+        let Some(round) = messages.iter().rposition(|m| m.role == Role::Assistant) else {
+            return;
+        };
+        let calls: Vec<_> = messages[round].tool_calls().cloned().collect();
+        let answered: std::collections::HashSet<_> = messages[round + 1..]
             .iter()
             .flat_map(|m| m.tool_results())
             .map(|r| r.id.as_str())
@@ -240,6 +232,108 @@ mod tests {
                 .is_error
         );
         assert_eq!(conversation.snapshot()[0].text(), "read it");
+    }
+
+    fn interrupted_reused_id_history() -> Vec<Message> {
+        vec![
+            Message::user("old round"),
+            Message::tool_use(call("reused")),
+            Message::tool_result(ToolResult::ok(&call("reused"), "old result")),
+            Message::user("new round"),
+            Message::with_content(
+                Role::Assistant,
+                vec![
+                    solaris_backend::Content::ToolUse {
+                        call: call("reused"),
+                    },
+                    solaris_backend::Content::ToolUse {
+                        call: call("other"),
+                    },
+                ],
+            ),
+            Message::tool_result(ToolResult::ok(&call("other"), "current partial result")),
+        ]
+    }
+
+    #[test]
+    fn a_reused_id_is_repaired_without_changing_older_or_current_results() {
+        let conversation = Conversation::new();
+        let before = interrupted_reused_id_history();
+        conversation.replace_with(before.clone());
+        conversation.repair();
+        let after = conversation.snapshot();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(&after[..before.len()], before.as_slice());
+        let repaired = after
+            .last()
+            .expect("repair")
+            .tool_results()
+            .next()
+            .expect("result");
+        assert_eq!(repaired.id, "reused");
+        assert!(repaired.is_error);
+        conversation.repair();
+        assert_eq!(conversation.snapshot(), after, "repair must be idempotent");
+    }
+
+    #[test]
+    fn a_reused_id_with_a_current_result_is_not_repaired() {
+        let conversation = Conversation::new();
+        let mut complete = interrupted_reused_id_history();
+        complete.push(Message::tool_result(ToolResult::ok(
+            &call("reused"),
+            "current result",
+        )));
+        conversation.replace_with(complete.clone());
+        conversation.repair();
+        assert_eq!(conversation.snapshot(), complete);
+    }
+
+    #[test]
+    fn reopening_a_session_repairs_and_persists_the_latest_reused_id_once() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("session");
+        let id = journal.id().to_owned();
+        let before = interrupted_reused_id_history();
+        journal
+            .append(&SessionRecord::Context {
+                messages: before.clone(),
+            })
+            .expect("interrupted context");
+        drop(journal);
+        let conversation = Conversation::new();
+        conversation
+            .attach(store.resume(&id).expect("resume"))
+            .expect("attach");
+        let repaired = conversation.snapshot();
+        assert_eq!(repaired.len(), before.len() + 1);
+        assert_eq!(&repaired[..before.len()], before.as_slice());
+        assert!(
+            repaired
+                .last()
+                .expect("repair")
+                .tool_results()
+                .next()
+                .expect("result")
+                .is_error
+        );
+        drop(conversation);
+
+        let count = store.records(&id).expect("records").len();
+        let reopened = Conversation::new();
+        reopened
+            .attach(store.resume(&id).expect("resume again"))
+            .expect("attach again");
+        assert_eq!(reopened.snapshot(), repaired);
+        assert_eq!(
+            store.records(&id).expect("records").len(),
+            count,
+            "resume must not append a duplicate repair"
+        );
     }
 
     #[test]
