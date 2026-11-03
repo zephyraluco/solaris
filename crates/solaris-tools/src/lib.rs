@@ -31,7 +31,7 @@ pub use diff::{Edit, EditError};
 pub use mutation_queue::FileMutationQueue;
 pub use registry::{BUILTIN_TOOLS, SHELL_TOOL, ToolRegistry, ToolSelection};
 pub use runner::{CommandOutput, CommandRunner, LocalRunner};
-pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput};
+pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput, optional_string_arg};
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size,
 };

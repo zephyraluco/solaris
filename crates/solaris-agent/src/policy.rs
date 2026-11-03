@@ -108,8 +108,18 @@ impl Approver for PolicyApprover {
                 Approval::Approved
             };
         }
-        let resource = if let Some(path) = call.input["path"].as_str() {
-            let path = Path::new(path);
+        // Match the tools' own optional-path parser, including blank/null
+        // values, so omitting path cannot bypass a rule covering the cwd.
+        let path = if matches!(call.name.as_str(), "grep" | "find" | "ls") {
+            match solaris_tools::optional_string_arg(&call.input, "path") {
+                Ok(path) => Some(path.unwrap_or_else(|| ".".into())),
+                Err(_) => return Approval::Denied,
+            }
+        } else {
+            call.input["path"].as_str().map(str::to_owned)
+        };
+        let resource = if let Some(path) = path {
+            let path = Path::new(&path);
             let path = if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -240,5 +250,124 @@ mod tests {
                 .await,
             Approval::Denied
         );
+    }
+
+    #[tokio::test]
+    async fn omitted_builtin_paths_cannot_bypass_directory_deny_rules() {
+        let directory = tempfile::tempdir().expect("directory");
+        let cwd = directory.path().canonicalize().expect("cwd");
+        for profile in [
+            PolicyProfile::Trusted,
+            PolicyProfile::Ask,
+            PolicyProfile::ReadOnly,
+        ] {
+            for name in ["grep", "find", "ls"] {
+                let policy = PolicyApprover {
+                    profile,
+                    cwd: cwd.clone(),
+                    read_only_tools: [name.to_owned()].into_iter().collect(),
+                    rules: vec![PermissionRule {
+                        tool: name.into(),
+                        resource: cwd.to_string_lossy().into_owned(),
+                        effect: PermissionEffect::Deny,
+                    }],
+                    fallback: Arc::new(AlwaysApprove),
+                };
+                for input in [
+                    serde_json::json!({"pattern":"x"}),
+                    serde_json::json!({"pattern":"x","path":"."}),
+                    serde_json::json!({"pattern":"x","path":null}),
+                    serde_json::json!({"pattern":"x","path":""}),
+                    serde_json::json!({"pattern":"x","path":"  \t"}),
+                ] {
+                    assert_eq!(
+                        policy.approve(&ToolCall::new("call", name, input)).await,
+                        Approval::Denied,
+                        "{name} / {profile:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_builtin_paths_use_the_same_ask_hook_as_explicit_dot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().expect("directory");
+        let cwd = directory.path().canonicalize().expect("cwd");
+        for profile in [PolicyProfile::Ask, PolicyProfile::ReadOnly] {
+            for name in ["grep", "find", "ls"] {
+                let called = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&called);
+                let policy = PolicyApprover {
+                    profile,
+                    cwd: cwd.clone(),
+                    read_only_tools: [name.to_owned()].into_iter().collect(),
+                    rules: vec![PermissionRule {
+                        tool: name.into(),
+                        resource: cwd.to_string_lossy().into_owned(),
+                        effect: PermissionEffect::Ask,
+                    }],
+                    fallback: Arc::new(crate::FnApprover::new(move |_: &ToolCall| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Approval::Denied
+                    })),
+                };
+                for input in [
+                    serde_json::json!({"pattern":"x"}),
+                    serde_json::json!({"pattern":"x","path":"."}),
+                    serde_json::json!({"pattern":"x","path":null}),
+                    serde_json::json!({"pattern":"x","path":""}),
+                    serde_json::json!({"pattern":"x","path":"  \t"}),
+                ] {
+                    assert_eq!(
+                        policy.approve(&ToolCall::new("call", name, input)).await,
+                        Approval::Denied
+                    );
+                }
+                assert_eq!(
+                    called.load(Ordering::SeqCst),
+                    5,
+                    "{name} must ask for all default-path forms"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_search_paths_are_not_replaced_by_the_default_directory() {
+        let directory = tempfile::tempdir().expect("directory");
+        let cwd = directory.path().canonicalize().expect("cwd");
+        std::fs::create_dir(cwd.join("restricted")).expect("restricted directory");
+        std::fs::create_dir(cwd.join("allowed")).expect("allowed directory");
+        for name in ["grep", "find", "ls"] {
+            let policy = PolicyApprover {
+                profile: PolicyProfile::ReadOnly,
+                cwd: cwd.clone(),
+                read_only_tools: [name.to_owned()].into_iter().collect(),
+                rules: vec![PermissionRule {
+                    tool: name.into(),
+                    resource: cwd.join("restricted").to_string_lossy().into_owned(),
+                    effect: PermissionEffect::Deny,
+                }],
+                fallback: Arc::new(AlwaysApprove),
+            };
+            for (path, expected) in [
+                ("restricted", Approval::Denied),
+                ("allowed", Approval::Approved),
+                (".", Approval::Approved),
+            ] {
+                assert_eq!(
+                    policy
+                        .approve(&ToolCall::new(
+                            "call",
+                            name,
+                            serde_json::json!({"pattern":"x","path":path})
+                        ))
+                        .await,
+                    expected
+                );
+            }
+        }
     }
 }
