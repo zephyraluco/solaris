@@ -454,6 +454,9 @@ to expose them to Plan mode. Unknown/mutating tools follow the normal approval
 policy. MCP servers run with their process permissions; this is not a sandbox.
 Structured tool payloads and embedded text resources are included in bounded
 model-facing text. The complete accepted result remains in session metadata.
+Resource, resource-template and prompt listings accept an optional `cursor`.
+Pass the returned `nextCursor` unchanged to fetch the next page; each call remains
+bounded independently.
 
 ## Model capabilities and offline model lists
 
