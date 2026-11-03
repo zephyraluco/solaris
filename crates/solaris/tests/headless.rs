@@ -23,18 +23,23 @@ fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
     command.output().expect("run binary")
 }
 
-#[test]
-fn json_run_can_be_resumed_and_exported_without_a_terminal() {
-    let directory = tempfile::tempdir().expect("directory");
-    std::fs::write(directory.path().join("models.json"), r#"{"models":[{"provider":"local","id":"test-model","capabilities":{"image_input":"supported"}}]}"#).expect("model metadata");
-    let image_path = directory.path().join("pixel.png");
-    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npayload").expect("image fixture");
+fn sse_reply(delta: serde_json::Value, finish: &str) -> String {
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
+        serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]})
+    )
+}
+
+fn serve_responses(
+    responses: Vec<String>,
+) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let endpoint = format!("http://{}/v1", listener.local_addr().expect("address"));
     let server = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for _ in 0..2 {
+        for data in responses {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
                 match listener.accept() {
@@ -79,11 +84,21 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
                 }
             };
             requests.push(body);
-            let data = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"headless smoke ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len()).expect("response");
         }
         requests
     });
+    (endpoint, server)
+}
+
+#[test]
+fn json_run_can_be_resumed_and_exported_without_a_terminal() {
+    let directory = tempfile::tempdir().expect("directory");
+    std::fs::write(directory.path().join("models.json"), r#"{"models":[{"provider":"local","id":"test-model","capabilities":{"image_input":"supported"}}]}"#).expect("model metadata");
+    let image_path = directory.path().join("pixel.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npayload").expect("image fixture");
+    let response = sse_reply(serde_json::json!({"content":"headless smoke ok"}), "stop");
+    let (endpoint, server) = serve_responses(vec![response.clone(), response]);
     let first = run(
         directory.path(),
         &endpoint,
@@ -383,4 +398,97 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             .as_deref(),
         Some("local")
     );
+}
+
+#[test]
+fn headless_confirmation_preserves_automatic_reads_and_refuses_required_approvals() {
+    for (case, confirm, ask_tool, tool, allowed) in [
+        ("confirm reads", true, None, "read", true),
+        ("unrelated ask rule", false, Some("write"), "read", true),
+        ("explicit read ask", true, Some("read"), "read", false),
+        ("mutating call", true, None, "write", false),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        let source = directory.path().join("source.txt");
+        let target = directory.path().join("must-not-be-created.txt");
+        std::fs::write(&source, "policy fixture content").expect("source file");
+        if let Some(tool) = ask_tool {
+            std::fs::write(
+                directory.path().join("permissions.json"),
+                serde_json::json!([
+                    {"tool":tool,"resource":"*","effect":"ask"}
+                ])
+                .to_string(),
+            )
+            .expect("rules");
+        }
+        let input = if tool == "read" {
+            serde_json::json!({"path":source})
+        } else {
+            serde_json::json!({"path":target,"content":"blocked"})
+        };
+        let call = sse_reply(
+            serde_json::json!({"tool_calls":[{
+                "index":0,"id":"policy-call","type":"function",
+                "function":{"name":tool,"arguments":input.to_string()}
+            }]}),
+            "tool_calls",
+        );
+        let (endpoint, server) = serve_responses(vec![
+            call,
+            sse_reply(serde_json::json!({"content":"policy done"}), "stop"),
+        ]);
+        let mut args = vec![
+            "--provider",
+            "local",
+            "--model",
+            "test-model",
+            "--print",
+            "test permissions",
+            "--json",
+            "--ephemeral",
+        ];
+        if confirm {
+            args.push("--confirm-tools");
+        }
+        if tool == "read" {
+            args.push("--plan");
+        }
+        let output = run(directory.path(), &endpoint, &args);
+        let requests = server.join().expect("fixture server");
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .expect("UTF8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event"))
+            .collect();
+        let result = &events
+            .iter()
+            .find_map(|event| event["event"].get("ToolResult"))
+            .expect("tool result")["result"];
+        assert_eq!(result["is_error"], !allowed, "{case}: {result}");
+        if allowed {
+            assert!(
+                result["output"]
+                    .as_str()
+                    .expect("output")
+                    .contains("policy fixture content")
+            );
+            assert!(
+                requests[1]["messages"]
+                    .as_array()
+                    .expect("messages")
+                    .iter()
+                    .any(|message| message["role"] == "tool"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("policy fixture content")))
+            );
+        }
+        assert!(!target.exists(), "confirmation must not allow writes");
+    }
 }

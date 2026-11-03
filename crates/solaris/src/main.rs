@@ -506,6 +506,11 @@ fn main() -> Result<()> {
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {
+            // Match the TUI: ordinary reads remain automatic, while explicit
+            // ask rules and mutations reach the noninteractive refusal hook.
+            if options.execution.profile == solaris_agent::PolicyProfile::Trusted {
+                options.execution.profile = solaris_agent::PolicyProfile::Ask;
+            }
             options.approver = Arc::new(solaris_agent::DenyAll);
         }
         let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
