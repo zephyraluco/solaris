@@ -2338,11 +2338,7 @@ impl App {
             return;
         };
 
-        let written = self
-            .auth
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_credentials(&path, &json).map_err(|error| error.to_string()));
+        let written = self.auth.save(&path);
 
         if let Err(error) = written {
             self.notifications
@@ -3113,36 +3109,6 @@ fn describe_call(call: &ToolCall) -> String {
     // `Value`'s own display is the compact JSON the model sent, which is what
     // the user needs to judge the call by.
     truncate_to_width(&call.input.to_string(), 400, "…")
-}
-
-/// Replace credentials atomically so a crash cannot truncate a rotating token.
-fn write_credentials(path: &Path, json: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| time.as_nanos());
-    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), suffix));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    let result = (|| {
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
 }
 
 /// Write `json` to `path`, creating the directory when needed.

@@ -496,17 +496,18 @@ fn main() -> Result<()> {
             .with_skills(skills)
             .with_prompt_context(resources.prompt);
         options.execution = execution;
-        let child_auth = auth.clone();
-        let child_options = backend_options.clone();
-        options.child_backend = Some(Arc::new(move |model| {
-            Ok(choose_backend(&child_auth, model, child_options.clone()))
-        }));
+        let factory = Arc::new(solaris_provider::refreshing_backend_factory(
+            auth,
+            auth_path,
+            backend_options,
+        ));
+        let choice = factory(&config.model);
+        options.child_backend = Some(Arc::new(move |model| Ok(factory(model))));
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {
             options.approver = Arc::new(solaris_agent::DenyAll);
         }
-        let choice = choose_backend(&auth, &config.model, backend_options);
         let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
             choice,
             Arc::new(registry),

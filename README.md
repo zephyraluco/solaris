@@ -375,6 +375,8 @@ directory contains an array of `{ "tool": "write", "resource": "/absolute/path/*
 "effect": "ask" }` rules (`allow`, `ask`, `deny`; last match wins). Paths resolve
 existing symlink ancestors before matching. Shell resource patterns match command
 text, not its actual side effects; these rules are not an OS sandbox.
+An explicit `ask` rule also prompts for read-only tools, including locally trusted
+MCP reads. Reads without a matching ask/deny rule remain automatic.
 
 `--max-requests` (default 100) and `--max-seconds` (default 1800) apply across a turn,
 its children and automatic compaction. `--max-cost <USD>` stops further work when
@@ -388,6 +390,10 @@ request counter or deadline.
 for newline-delimited envelopes containing `version`, `sequence`, `session_id` and
 `event`. A failed turn exits nonzero. Approval requests in headless mode are refused
 unless an explicit policy rule allows the call; they never wait for an invisible UI.
+Saved ChatGPT OAuth credentials refresh before model requests, including later
+prompts in long-lived RPC sessions and child requests. Refreshes are shared across
+models and rotating tokens are saved atomically before requests proceed. Refresh
+or persistence failures stop the request; model requests are not automatically retried.
 
 `--fork <SESSION_ID>` copies a saved conversation into a new session.
 `--export-session <SESSION_ID>` prints its journal as JSON; exports contain private

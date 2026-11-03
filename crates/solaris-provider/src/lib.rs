@@ -14,6 +14,8 @@
 pub mod choose;
 pub mod oauth;
 pub mod providers;
+mod refreshing;
+pub use refreshing::refreshing_backend_factory;
 
 pub use choose::{
     BackendChoice, BackendOptions, CredentialSource, Environment, build_backend, choose_backend,
@@ -237,15 +239,34 @@ impl AuthStore {
         serde_json::to_string_pretty(self).map_err(|error| AuthError::Encode(error.to_string()))
     }
 
+    /// Atomically replace private credentials, including rotating OAuth tokens.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), AuthError> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(self.to_json()?.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     /// Parse a previously serialized store.
     pub fn from_json(text: &str) -> Result<Self, AuthError> {
         serde_json::from_str(text).map_err(|error| AuthError::Decode(error.to_string()))
     }
 }
 
-/// Failures raised while (de)serializing the store.
+/// Failures raised while encoding, decoding or saving the store.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    #[error("could not save credentials: {0}")]
+    Write(#[from] std::io::Error),
     #[error("could not encode credentials: {0}")]
     Encode(String),
     #[error("could not read credentials: {0}")]
