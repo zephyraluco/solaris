@@ -163,28 +163,31 @@ impl Tui {
             }
 
             if dirty {
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    self.render(frame.buffer_mut(), area);
-                    let cursor = self
-                        .overlays
-                        .last()
-                        .and_then(|entry| entry.component.cursor_position())
-                        .or_else(|| {
-                            if self.overlays.is_empty() {
-                                self.root.as_ref().and_then(|root| root.cursor_position())
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(position) = cursor {
-                        frame.set_cursor_position(position);
-                    }
-                })?;
+                self.draw(terminal)?;
             }
         }
 
         Ok(())
+    }
+
+    fn draw<W: io::Write>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    ) -> io::Result<()> {
+        crate::terminal::draw_frame(terminal, |frame| {
+            let area = frame.area();
+            self.render(frame.buffer_mut(), area);
+            // A modal view without an input anchor must not reuse the root's.
+            let cursor = if let Some(entry) = self.overlays.last() {
+                entry
+                    .component
+                    .cursor_position()
+                    .filter(|&(x, y)| rect_contains(entry.rect, x, y))
+            } else {
+                self.root.as_ref().and_then(|root| root.cursor_position())
+            };
+            cursor.filter(|&(x, y)| rect_contains(area, x, y))
+        })
     }
 
     /// Render the root component and then every overlay, bottom to top.
@@ -305,6 +308,100 @@ impl Component for EmptyComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    struct SharedEditor(Rc<RefCell<crate::components::Editor>>);
+
+    #[cfg(not(target_os = "windows"))]
+    impl Component for SharedEditor {
+        fn render(&mut self, buf: &mut Buffer, area: Rect) {
+            self.0.borrow_mut().render(buf, area);
+            if let Some(position) = self.cursor_position() {
+                assert!(
+                    buf[position]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                );
+            }
+        }
+
+        fn cursor_position(&self) -> Option<(u16, u16)> {
+            self.0.borrow().cursor_position()
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn drawing_tracks_editor_resize_focus_and_modal_anchors() {
+        use crate::terminal::tests::{terminal, terminal_with_area};
+        let editor = Rc::new(RefCell::new(crate::components::Editor::new()));
+        let mut tui = Tui::new();
+        tui.set_root(Box::new(SharedEditor(editor.clone())));
+
+        for (width, text) in [(40, "中"), (25, "中文"), (50, "中文 streaming")] {
+            // Fixed-viewport resize still queries the host terminal size. Build
+            // the capture viewport directly so this test also works without a TTY.
+            let (mut terminal, capture) = terminal_with_area(Rect::new(0, 0, width, 10));
+            editor.borrow_mut().set_text(text);
+            for _ in 0..3 {
+                capture.clear();
+                tui.draw(&mut terminal).unwrap();
+                let (x, y) = editor.borrow().cursor_position().unwrap();
+                assert!(capture.output().ends_with(&format!(
+                    "\x1b[{};{}H\x1b[?2026l",
+                    y + 1,
+                    x + 1
+                )));
+                assert!(!capture.output().contains("\x1b[?25h"));
+            }
+        }
+        let (mut terminal, capture) = terminal();
+        // A modal view without an anchor suppresses the underlying editor.
+        let modal = Rc::new(RefCell::new(crate::components::Editor::new()));
+        modal.borrow_mut().set_focused(false);
+        tui.queue.borrow_mut().push((
+            Box::new(SharedEditor(modal.clone())),
+            OverlayOptions::default(),
+        ));
+        for focused in [false, true, false] {
+            modal.borrow_mut().set_focused(focused);
+            capture.clear();
+            tui.draw(&mut terminal).unwrap();
+            if focused {
+                let (x, y) = modal.borrow().cursor_position().unwrap();
+                assert!(capture.output().ends_with(&format!(
+                    "\x1b[{};{}H\x1b[?2026l",
+                    y + 1,
+                    x + 1
+                )));
+            } else {
+                assert!(capture.output().ends_with("\x1b[?25l\x1b[?2026l"));
+            }
+            assert!(!capture.output().contains("\x1b[?25h"));
+        }
+        // A now-invisible overlay must not reuse its last rendered anchor.
+        modal.borrow_mut().set_focused(true);
+        tui.draw(&mut terminal).unwrap();
+        tui.overlays.last_mut().unwrap().options.width = Some(crate::overlay::SizeValue::Cells(0));
+        tui.overlays.last_mut().unwrap().options.min_width = 0;
+        capture.clear();
+        tui.draw(&mut terminal).unwrap();
+        assert!(capture.output().ends_with("\x1b[?25l\x1b[?2026l"));
+        tui.overlays.clear();
+        editor.borrow_mut().set_focused(false);
+        capture.clear();
+        tui.draw(&mut terminal).unwrap();
+        assert!(capture.output().ends_with("\x1b[?25l\x1b[?2026l"));
+        editor.borrow_mut().set_focused(true);
+        capture.clear();
+        tui.draw(&mut terminal).unwrap();
+        let (x, y) = editor.borrow().cursor_position().unwrap();
+        assert!(
+            capture
+                .output()
+                .ends_with(&format!("\x1b[{};{}H\x1b[?2026l", y + 1, x + 1))
+        );
+    }
 
     #[test]
     fn rect_hit_testing_handles_edges() {
