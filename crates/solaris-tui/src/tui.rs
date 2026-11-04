@@ -333,14 +333,15 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn drawing_tracks_editor_resize_focus_and_modal_anchors() {
-        use crate::terminal::tests::terminal;
-        let (mut terminal, capture) = terminal();
+        use crate::terminal::tests::{terminal, terminal_with_area};
         let editor = Rc::new(RefCell::new(crate::components::Editor::new()));
         let mut tui = Tui::new();
         tui.set_root(Box::new(SharedEditor(editor.clone())));
 
         for (width, text) in [(40, "中"), (25, "中文"), (50, "中文 streaming")] {
-            terminal.resize(Rect::new(0, 0, width, 10)).unwrap();
+            // Fixed-viewport resize still queries the host terminal size. Build
+            // the capture viewport directly so this test also works without a TTY.
+            let (mut terminal, capture) = terminal_with_area(Rect::new(0, 0, width, 10));
             editor.borrow_mut().set_text(text);
             for _ in 0..3 {
                 capture.clear();
@@ -354,6 +355,7 @@ mod tests {
                 assert!(!capture.output().contains("\x1b[?25h"));
             }
         }
+        let (mut terminal, capture) = terminal();
         // A modal view without an anchor suppresses the underlying editor.
         let modal = Rc::new(RefCell::new(crate::components::Editor::new()));
         modal.borrow_mut().set_focused(false);

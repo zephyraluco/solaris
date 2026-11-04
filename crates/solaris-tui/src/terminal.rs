@@ -171,11 +171,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn terminal() -> (Terminal<CrosstermBackend<Capture>>, Capture) {
+        terminal_with_area(Rect::new(0, 0, 40, 10))
+    }
+
+    pub(crate) fn terminal_with_area(area: Rect) -> (Terminal<CrosstermBackend<Capture>>, Capture) {
         let capture = Capture::default();
         let terminal = Terminal::with_options(
             CrosstermBackend::new(capture.clone()),
             TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 0, 40, 10)),
+                viewport: Viewport::Fixed(area),
             },
         )
         .unwrap();
