@@ -70,6 +70,19 @@ cargo build
 cargo build --release
 ```
 
+## Windows runtime
+
+Windows uses the bundled Cygwin Bash for shell commands. Extract the complete
+Windows release archive and keep `plugins/windows/cygwin/` beside `solaris.exe`.
+Source builds locate the same runtime in the repository, including when launched
+from another working directory. Startup validates the runtime and prepends its
+`bin` directory to the process PATH; system settings remain unchanged.
+
+Commands run through Bash's login profile while retaining the session directory.
+All platforms expose the same `bash` tool and use Bash command syntax. A missing
+or incomplete Windows runtime is reported explicitly. The standalone EXE is not
+a complete Windows installation.
+
 ## Run
 
 ```bash
@@ -161,8 +174,7 @@ The model can ask solaris to do things. A turn runs what it asks for, hands back
 | `ls` | List a directory | plan |
 | `grep` | Search file contents, respecting `.gitignore` | plan |
 | `find` | Find paths by glob, respecting `.gitignore` | plan |
-| `bash` | Run a shell command and return what it printed | build (not Windows) |
-| `powershell` | Run a PowerShell command and return what it printed | build (Windows) |
+| `bash` | Run a Bash command and return what it printed; bundled Cygwin on Windows | build |
 | `subagent` | Delegate an isolated task to `explore` or `general` | build, plan (`explore` only) |
 
 Plan mode declares the four read-only tools plus delegation to read-only `explore` children, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:

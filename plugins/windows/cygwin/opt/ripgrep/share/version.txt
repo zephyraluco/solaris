@@ -1,0 +1,2 @@
+ripgrep 15.1.0
+BurntSushi/ripgrep af60c2de9d85e7f3d81c78601669468cf02dabab

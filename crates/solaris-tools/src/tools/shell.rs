@@ -1,8 +1,5 @@
-//! `bash` and `powershell` — run a command and report what it printed.
-//!
-//! One implementation, two configurations: the tools differ only in which
-//! program runs the command and what the model is told about it. Which one
-//! exists is a property of the platform, so the registry registers exactly one.
+//! `bash` — run a command with the same tool interface on every platform.
+//! Windows uses the bundled Cygwin runtime.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -37,16 +34,14 @@ pub struct ShellConfig {
     pub tool_name: &'static str,
     /// One-line description handed to the model.
     pub description: &'static str,
-    /// Programs that can run it, best first. The first one present on `PATH`
-    /// wins, so a machine with PowerShell 7 uses `pwsh` and one without still
-    /// has `powershell`.
+    /// Programs that can run it, best first.
     pub programs: &'static [&'static str],
     /// Argument that makes the program run the string it is given.
     pub command_flag: &'static str,
 }
 
 impl ShellConfig {
-    /// `bash`, for Unix.
+    /// Bash on Unix and bundled Cygwin Bash on Windows.
     pub const BASH: ShellConfig = ShellConfig {
         tool_name: "bash",
         description: "Run a shell command in the session directory with bash and return everything \
@@ -55,17 +50,6 @@ impl ShellConfig {
                       whose path is reported. Commands that never finish need a `timeout`.",
         programs: &["bash"],
         command_flag: "-c",
-    };
-
-    /// PowerShell, for Windows.
-    pub const POWERSHELL: ShellConfig = ShellConfig {
-        tool_name: "powershell",
-        description: "Run a command in the session directory with PowerShell and return everything \
-                      it printed, stdout and stderr together. The output is truncated to the last \
-                      2000 lines or 50KB; when that happens the full output is written to a file \
-                      whose path is reported. Commands that never finish need a `timeout`.",
-        programs: &["pwsh", "powershell"],
-        command_flag: "-Command",
     };
 }
 
@@ -118,7 +102,19 @@ impl ShellRunner for LocalShell {
         let mut last_missing = String::new();
 
         for program in config.programs {
+            #[cfg(not(windows))]
             let mut builder = Command::new(program);
+            #[cfg(windows)]
+            let mut builder = {
+                let environment = crate::cygwin::environment()?;
+                let mut builder = Command::new(&environment.bash);
+                builder
+                    .arg("--login")
+                    .env("PATH", &environment.path)
+                    .env("SHELL", &environment.bash)
+                    .env("CHERE_INVOKING", "1");
+                builder
+            };
             builder
                 .arg(config.command_flag)
                 // The command is handed over untouched: appending to it — a
@@ -460,11 +456,6 @@ impl ShellTool {
     /// The `bash` tool.
     pub fn bash(runner: Arc<dyn ShellRunner>) -> Self {
         Self::new(ShellConfig::BASH, runner)
-    }
-
-    /// The `powershell` tool.
-    pub fn powershell(runner: Arc<dyn ShellRunner>) -> Self {
-        Self::new(ShellConfig::POWERSHELL, runner)
     }
 
     /// A tool with its own output budget.
@@ -841,36 +832,18 @@ mod tests {
     }
 
     #[test]
-    fn each_shell_declares_its_own_name() {
+    fn bash_declares_the_platform_independent_shell_name() {
         let bash = ShellTool::bash(StubShell::new(ShellOutcome::default()));
         assert_eq!(bash.name(), "bash");
-
-        let powershell = ShellTool::powershell(StubShell::new(ShellOutcome::default()));
-        assert_eq!(powershell.name(), "powershell");
-        assert!(powershell.description().contains("PowerShell"));
     }
 
     #[tokio::test]
     async fn a_real_command_runs_and_reports_its_output() {
-        // The only test that spawns a shell: it proves the local runner wires a
-        // process up correctly, which a stub cannot.
+        // Exercise actual process execution rather than a canned runner.
         let dir = test_dir("shell-real");
-        let command = if cfg!(windows) {
-            "Write-Output hello"
-        } else {
-            "echo hello"
-        };
-
-        let output = ShellTool::new(
-            if cfg!(windows) {
-                ShellConfig::POWERSHELL
-            } else {
-                ShellConfig::BASH
-            },
-            Arc::new(LocalShell),
-        )
-        .run(json!({ "command": command }), &context(&dir))
-        .await;
+        let output = ShellTool::bash(Arc::new(LocalShell))
+            .run(json!({ "command": "echo hello" }), &context(&dir))
+            .await;
 
         assert!(!output.is_error, "{}", output.text);
         assert!(
@@ -878,6 +851,50 @@ mod tests {
             "{}",
             output.text
         );
+    }
+
+    #[tokio::test]
+    async fn bash_preserves_unicode_working_directory_and_supports_here_documents() {
+        let dir = test_dir("bash workspace 中文");
+        std::fs::write(dir.join("probe 中文.txt"), "session marker").unwrap();
+        let output = ShellTool::bash(Arc::new(LocalShell))
+            .run(json!({ "command": "cat 'probe 中文.txt'; cat <<'EOF'\nhere document marker\nEOF" }), &context(&dir))
+            .await;
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("session marker"), "{}", output.text);
+        assert!(
+            output.text.contains("here document marker"),
+            "{}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_reports_nonzero_exit_codes() {
+        let dir = test_dir("bash-nonzero");
+        let outcome = LocalShell
+            .run(
+                ShellConfig::BASH,
+                "exit 7",
+                &context(&dir),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.code, Some(7));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_uses_cygwin_and_login_profile() {
+        let dir = test_dir("cygwin-login");
+        let output = ShellTool::bash(Arc::new(LocalShell))
+            .run(json!({ "command": "uname -s; printf 'profile=%s\n' \"$PROFILEREAD\"; command -v sed" }), &context(&dir))
+            .await;
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("CYGWIN"), "{}", output.text);
+        assert!(output.text.contains("profile=true"), "{}", output.text);
+        assert!(output.text.contains("/usr/bin/sed"), "{}", output.text);
     }
 
     #[test]
@@ -958,19 +975,11 @@ mod tests {
         // redirect inside the comment, and what the shell itself said about the
         // command would be lost with it.
         let dir = test_dir("shell-stderr");
-        let (config, command) = if cfg!(windows) {
-            (
-                ShellConfig::POWERSHELL,
-                // Write-Error leaves PowerShell's final command unsuccessful.
-                // This fixture checks stderr capture, so explicitly exit zero.
-                "Write-Output hello; Write-Error boom; exit 0 # why",
+        let output = ShellTool::bash(Arc::new(LocalShell))
+            .run(
+                json!({ "command": "echo hello; echo boom 1>&2 # why" }),
+                &context(&dir),
             )
-        } else {
-            (ShellConfig::BASH, "echo hello; echo boom 1>&2 # why")
-        };
-
-        let output = ShellTool::new(config, Arc::new(LocalShell))
-            .run(json!({ "command": command }), &context(&dir))
             .await;
 
         assert!(!output.is_error, "{}", output.text);
@@ -980,11 +989,7 @@ mod tests {
 
     /// The command a real-shell test runs when it must outlive its waiting.
     fn a_command_that_never_finishes() -> (ShellConfig, &'static str) {
-        if cfg!(windows) {
-            (ShellConfig::POWERSHELL, "Start-Sleep -Seconds 30")
-        } else {
-            (ShellConfig::BASH, "sleep 30")
-        }
+        (ShellConfig::BASH, "sleep 30")
     }
 
     #[tokio::test]

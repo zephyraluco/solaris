@@ -14,8 +14,7 @@
 
 | 方面 | pi | solaris | 为什么 |
 | --- | --- | --- | --- |
-| Windows 上的 shell | 找 Git Bash（`%ProgramFiles%\Git\bin\bash.exe` → PATH 上的 `bash.exe` → 否则报错），**默认工具集里就是 `bash`** | 没有 `bash` 工具；Windows 上注册的是 `powershell` | 不假设用户装了 Git for Windows。给 Windows 声明 `bash` 是在声明一个可能跑不起来的东西 |
-| `powershell` 参数 | `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` | 只有 `-Command` | 保持最小；需要时按需加回 |
+| Windows 上的 shell | 查找 Git Bash 或 PATH 上的 Bash | 自动加载随附 Cygwin，调用绝对路径的 Bash | 各平台统一声明 `bash`，不要求用户安装其他 shell |
 | `rg` / `fd` 缺失 | `ensureTool` **自动下载**二进制到 bin 目录 | 明确报错并给出安装提示 | 不引入网络下载与供应链成本 |
 | 工具执行的确认 | project trust + `tool_call` 处理器可拦截 | `Approver` 钩子（异步），默认全部批准，`--confirm-tools` 打开对话框确认 | 默认批准：终端 agent 本来就在替用户做事；有人在看时再打开提问 |
 
@@ -92,7 +91,7 @@ solaris 的取舍：一轮对外仍是「一次提问到一次回答」，内部
 
 默认 500 条 + 50KB 字节截断，两侧一致。
 
-### shell（`bash` / `powershell`）
+### shell（`bash`）
 
 | | pi | solaris |
 | --- | --- | --- |

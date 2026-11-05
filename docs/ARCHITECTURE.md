@@ -329,9 +329,9 @@ pub trait Tool: Send + Sync {
 | `ls` | 列目录，目录带 `/` 后缀，含 dotfiles |
 | `grep` | shell out 到 ripgrep，输出 `path:line: text` |
 | `find` | shell out 到 fd，按 glob 找路径 |
-| `bash` / `powershell` | 合并 stdout+stderr，超时可杀，输出尾部截断 |
+| `bash` | 合并 stdout+stderr，超时可杀，输出尾部截断 |
 
-两个 shell 是同一份实现的两套配置（`ShellConfig`），注册表按平台只放其中一个：Windows 放 `powershell`，其余放 `bash`——给 Windows 声明 `bash` 是在声明一个跑不起来的东西。`edit` 与 `write` 共用一张按路径的锁（`FileMutationQueue`）：一轮里模型完全可能同时要求改同一个文件的两处，两次「读—改—写」重叠就会丢掉一次改动。
+所有平台统一注册 `bash`。Windows 启动时验证随附的 Cygwin，将其 `bin` 加入进程 PATH；shell runner 使用 Bash 的绝对路径和登录配置，并通过 `CHERE_INVOKING` 保留会话工作目录。运行库缺失时明确报错。`edit` 与 `write` 共用一张按路径的锁（`FileMutationQueue`）：一轮里模型完全可能同时要求改同一个文件的两处，两次「读—改—写」重叠就会丢掉一次改动。
 
 ### 4.2 可测的缝
 
@@ -359,7 +359,7 @@ pub fn selected_names(&self, defaults: &[&str], selection: &ToolSelection) -> Ve
 registry.select(default_tool_names(Mode::Plan), &selection)   // → read + grep + find + ls
 ```
 
-名字在注册表里不存在（例如给 Windows 的默认集合写 `bash`）时只是不被声明，不会报错；`unmatched()` 则专门报出选择里打错的名字。
+名字在注册表里不存在时只是不被声明，不会报错；`unmatched()` 则专门报出选择里打错的名字。
 
 ### 4.4 截断
 

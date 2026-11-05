@@ -22,22 +22,11 @@ use crate::tools::write::WriteTool;
 
 /// Every tool this build implements, by name.
 ///
-/// Both shells are listed because both are implemented, but a registry only
-/// ever holds the one its platform has: offering `bash` on Windows would be
-/// offering something that cannot run.
-pub const BUILTIN_TOOLS: &[&str] = &[
-    "read",
-    "bash",
-    "powershell",
-    "edit",
-    "write",
-    "grep",
-    "find",
-    "ls",
-];
+/// Bash is the shell tool on every platform.
+pub const BUILTIN_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 /// The shell tool this platform has.
-pub const SHELL_TOOL: &str = if cfg!(windows) { "powershell" } else { "bash" };
+pub const SHELL_TOOL: &str = "bash";
 
 /// The tools a session can declare.
 #[derive(Clone)]
@@ -69,11 +58,7 @@ impl ToolRegistry {
         registry.add(Arc::new(GrepTool::new(Arc::clone(&commands))));
         registry.add(Arc::new(FindTool::new(commands)));
 
-        let shell_tool: Arc<dyn Tool> = match SHELL_TOOL {
-            "powershell" => Arc::new(ShellTool::powershell(shell)),
-            _ => Arc::new(ShellTool::bash(shell)),
-        };
-        registry.add(shell_tool);
+        registry.add(Arc::new(ShellTool::bash(shell)));
 
         registry
     }
@@ -326,12 +311,7 @@ mod tests {
     fn the_registry_holds_one_shell_for_this_platform() {
         let registry = registry();
         assert!(registry.get(SHELL_TOOL).is_some());
-        let other = if SHELL_TOOL == "bash" {
-            "powershell"
-        } else {
-            "bash"
-        };
-        assert!(registry.get(other).is_none(), "only one shell can run here");
+        assert_eq!(SHELL_TOOL, "bash");
         assert_eq!(registry.get("read").expect("read").name(), "read");
     }
 
@@ -470,8 +450,8 @@ mod tests {
         }
         assert_eq!(
             registry.len(),
-            BUILTIN_TOOLS.len() - 1,
-            "eight tools are implemented, but only one shell can run on this platform"
+            BUILTIN_TOOLS.len(),
+            "every built-in tool is available on every platform"
         );
         assert!(!registry.is_empty());
     }

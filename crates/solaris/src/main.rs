@@ -144,6 +144,18 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    #[cfg(windows)]
+    {
+        let environment = solaris_tools::cygwin::environment().map_err(anyhow::Error::msg)?;
+        // SAFETY: main has not started a runtime or any background threads.
+        // Initialize inherited child-process variables before any concurrent use.
+        unsafe {
+            std::env::set_var("PATH", &environment.path);
+            std::env::set_var("SHELL", &environment.bash);
+            std::env::set_var("CHERE_INVOKING", "1");
+        }
+    }
+
     let mut config = Config {
         theme: args
             .theme

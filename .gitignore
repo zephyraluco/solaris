@@ -1,1 +1,5 @@
 /target
+
+# Created by the bundled Cygwin runtime at startup.
+/plugins/windows/cygwin/tmp/
+/plugins/windows/cygwin/home/

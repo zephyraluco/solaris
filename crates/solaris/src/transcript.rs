@@ -478,7 +478,7 @@ fn push_steps(
 }
 
 fn is_shell(step: &ToolStep) -> bool {
-    matches!(step.call.name.as_str(), "shell" | "bash" | "powershell")
+    matches!(step.call.name.as_str(), "shell" | "bash")
 }
 
 fn tool_group_view(
@@ -720,7 +720,7 @@ fn tool_counts(steps: &[ToolStep], running: bool) -> String {
             "ls" => ("listing", "listings"),
             "edit" | "patch" => ("edit", "edits"),
             "write" => ("write", "writes"),
-            "shell" | "bash" | "powershell" => ("command", "commands"),
+            "shell" | "bash" => ("command", "commands"),
             _ => ("tool call", "tool calls"),
         };
         *counts.entry(label).or_default() += 1;
@@ -752,7 +752,7 @@ fn tool_step_title(step: &ToolStep) -> String {
         "edit" => "Edit",
         "patch" => "Patch",
         "write" => "Write",
-        "shell" | "bash" | "powershell" => "Shell",
+        "shell" | "bash" => "Shell",
         "webfetch" => "WebFetch",
         "websearch" => "WebSearch",
         name => name,
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn each_shell_command_has_its_own_disclosure_and_output() {
-        for name in ["shell", "bash", "powershell"] {
+        for name in ["shell", "bash"] {
             let call = ToolCall::new(name, name, serde_json::json!({"command":"cargo test"}));
             let mut step = ToolStep::pending(call.clone());
             step.finish(
@@ -1322,7 +1322,7 @@ mod tests {
                         serde_json::json!({"path":"源代码👩‍💻e\u{301}".repeat(20)}),
                     ),
                     (
-                        "powershell",
+                        "bash",
                         serde_json::json!({"command":"echo 中文👩‍💻\necho more\ttext"}),
                     ),
                 ] {

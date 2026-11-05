@@ -108,7 +108,7 @@ impl Approver for PolicyApprover {
                 Approval::Approved
             };
         }
-        let resource = if matches!(call.name.as_str(), "bash" | "powershell") {
+        let resource = if call.name == "bash" {
             // Shells consume command text, not path. Extra ignored arguments
             // must never change which command permission rule applies.
             let Some(command) = call.input["command"].as_str() else {
@@ -382,7 +382,8 @@ mod tests {
     #[tokio::test]
     async fn shell_command_rules_cannot_be_bypassed_by_ignored_path_fields() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for name in ["bash", "powershell"] {
+        {
+            let name = "bash";
             for effect in [PermissionEffect::Deny, PermissionEffect::Ask] {
                 let called = Arc::new(AtomicUsize::new(0));
                 let observed = Arc::clone(&called);
@@ -437,7 +438,8 @@ mod tests {
             .expect("cwd")
             .canonicalize()
             .expect("canonical cwd");
-        for name in ["bash", "powershell"] {
+        {
+            let name = "bash";
             let policy = PolicyApprover {
                 profile: PolicyProfile::Trusted,
                 cwd: cwd.clone(),

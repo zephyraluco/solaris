@@ -149,7 +149,7 @@ impl AgentBackend for InspectingBackend {
                 read("second"),
                 AgentEvent::ToolCall(ToolCall::new(
                     "command",
-                    if cfg!(windows) { "powershell" } else { "bash" },
+                    "bash",
                     serde_json::json!({"command":"echo solaris-shell-output"}),
                 )),
                 read("third"),

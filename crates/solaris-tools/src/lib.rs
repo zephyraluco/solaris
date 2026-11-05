@@ -17,6 +17,8 @@
 //!   business.
 
 pub mod changes;
+#[cfg(any(windows, test))]
+pub mod cygwin;
 mod diff;
 mod mutation_queue;
 mod output;
