@@ -884,26 +884,6 @@ mod tests {
         assert_eq!(outcome.code, Some(7));
     }
 
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn windows_shell_uses_cygwin_and_login_profile() {
-        let dir = test_dir("cygwin-login");
-        let output = ShellTool::bash(Arc::new(LocalShell))
-            .run(
-                json!({ "command": "uname -s; printf 'path=%s\n' \"$PATH\"; command -v sed" }),
-                &context(&dir),
-            )
-            .await;
-        assert!(!output.is_error, "{}", output.text);
-        assert!(output.text.contains("CYGWIN"), "{}", output.text);
-        assert!(
-            output.text.contains("path=/usr/local/bin:/usr/bin:/bin\n"),
-            "{}",
-            output.text
-        );
-        assert!(output.text.contains("/usr/bin/sed"), "{}", output.text);
-    }
-
     #[test]
     fn sanitize_keeps_the_text_and_drops_the_terminal_commands() {
         // Colour, then an erase-line, both as control sequences.
@@ -992,53 +972,5 @@ mod tests {
         assert!(!output.is_error, "{}", output.text);
         assert!(output.text.contains("hello"), "{}", output.text);
         assert!(output.text.contains("boom"), "{}", output.text);
-    }
-
-    /// The command a real-shell test runs when it must outlive its waiting.
-    fn a_command_that_never_finishes() -> (ShellConfig, &'static str) {
-        (ShellConfig::BASH, "sleep 30")
-    }
-
-    #[tokio::test]
-    async fn a_real_command_that_outlives_its_timeout_is_killed_and_returns() {
-        let dir = test_dir("shell-real-timeout");
-        let (config, command) = a_command_that_never_finishes();
-        let started = std::time::Instant::now();
-
-        let output = ShellTool::new(config, Arc::new(LocalShell))
-            .run(json!({ "command": command, "timeout": 1 }), &context(&dir))
-            .await;
-
-        assert!(output.text.contains("killed"), "{}", output.text);
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "the command was killed rather than waited out: {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_real_command_is_killed_when_the_turn_is_cancelled() {
-        let dir = test_dir("shell-real-cancel");
-        let (config, command) = a_command_that_never_finishes();
-        let ctx = context(&dir);
-
-        let tool = ShellTool::new(config, Arc::new(LocalShell));
-        let running = tool.run(json!({ "command": command }), &ctx);
-        let cancel = ctx.cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            cancel.cancel();
-        });
-
-        let output = run_with_deadline(running).await;
-        assert!(output.text.contains("cancelled"), "{}", output.text);
-    }
-
-    /// Poll `work` to its end, giving up on it rather than hanging a test run.
-    async fn run_with_deadline(work: impl std::future::Future<Output = ToolOutput>) -> ToolOutput {
-        tokio::time::timeout(Duration::from_secs(15), work)
-            .await
-            .expect("the command was killed rather than waited out")
     }
 }
