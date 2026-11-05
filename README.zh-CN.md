@@ -74,7 +74,8 @@ cargo build --release
 
 Windows 使用随附的 Cygwin Bash。发布包中的 `plugins/windows/cygwin/` 必须与
 `solaris.exe` 保持配套；源码构建会从仓库查找该目录。启动时验证运行库，
-将其 `bin` 加入当前进程的 PATH，不修改系统设置。命令加载登录配置并保留会话目录，
+不修改当前进程的 PATH。Bash 仅使用 Cygwin 的 `/usr/local/bin:/usr/bin:/bin`，
+不继承 Windows PATH。命令加载登录配置并保留会话目录，
 所有平台统一使用 `bash` 工具和 Bash 语法；运行库缺失或不完整时明确报错。
 
 ```bash

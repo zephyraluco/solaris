@@ -75,8 +75,9 @@ cargo build --release
 Windows uses the bundled Cygwin Bash for shell commands. Extract the complete
 Windows release archive and keep `plugins/windows/cygwin/` beside `solaris.exe`.
 Source builds locate the same runtime in the repository, including when launched
-from another working directory. Startup validates the runtime and prepends its
-`bin` directory to the process PATH; system settings remain unchanged.
+from another working directory. Startup validates the runtime without changing
+the process PATH. Bash uses only `/usr/local/bin:/usr/bin:/bin` from Cygwin;
+the Windows PATH is not inherited by Bash.
 
 Commands run through Bash's login profile while retaining the session directory.
 All platforms expose the same `bash` tool and use Bash command syntax. A missing
