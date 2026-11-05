@@ -38,10 +38,23 @@ jobs:
           path: target/release/solaris
           if-no-files-found: error
       - if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && runner.os == 'Windows'
+        name: Package Windows runtime
+        shell: python
+        run: |
+          import pathlib
+          import shutil
+          package = pathlib.Path("target/windows-package")
+          package.mkdir(parents=True, exist_ok=True)
+          shutil.copy2("target/release/solaris.exe", package / "solaris.exe")
+          def ignore_runtime_state(directory, names):
+              return {"home", "tmp"}.intersection(names) if pathlib.Path(directory) == pathlib.Path("plugins/windows/cygwin") else set()
+          shutil.copytree("plugins/windows", package / "plugins/windows", dirs_exist_ok=True, ignore=ignore_runtime_state)
+          shutil.make_archive("target/release/solaris-Windows", "zip", package)
+      - if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: solaris-${{ runner.os }}
-          path: target/release/solaris.exe
+          path: target/release/solaris-Windows.zip
           if-no-files-found: error
   msrv:
     runs-on: ubuntu-latest

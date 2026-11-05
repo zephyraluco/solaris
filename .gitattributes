@@ -1,0 +1,2 @@
+# Preserve runtime scripts and binaries exactly, including on Windows checkouts.
+plugins/windows/cygwin/** -text

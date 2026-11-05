@@ -72,6 +72,13 @@ cargo build --release
 
 ## 运行
 
+Windows 使用随附的 Cygwin Bash。发布包中的 `plugins/windows/cygwin/` 必须与
+`solaris.exe` 保持配套；源码构建会从仓库查找该目录。启动时验证运行库，
+不修改当前进程的 PATH。Bash 仅使用 Cygwin 的 `/usr/local/bin:/usr/bin:/bin`，
+不继承 Windows PATH。命令加载登录配置并保留会话目录，
+临时文件写入当前用户的临时目录，启动无需对安装目录拥有写入权限。
+所有平台统一使用 `bash` 工具和 Bash 语法；运行库缺失或不完整时明确报错。
+
 ```bash
 # 在仓库内直接运行
 cargo run --release
@@ -161,8 +168,7 @@ solaris --print-config
 | `ls` | 列出目录内容 | plan |
 | `grep` | 搜索文件内容，遵守 `.gitignore` | plan |
 | `find` | 按 glob 查找路径，遵守 `.gitignore` | plan |
-| `bash` | 执行 shell 命令并返回它打印的内容 | build（非 Windows） |
-| `powershell` | 执行 PowerShell 命令并返回它打印的内容 | build（Windows） |
+| `bash` | 执行 Bash 命令并返回输出；Windows 使用随附的 Cygwin | build |
 | `subagent` | 将独立任务委派给 `explore` 或 `general` | build、plan（仅 `explore`） |
 
 plan 模式声明四个只读工具，并允许委派给只读的 `explore` 子代理，所以计划不会失手改动任何东西。`--tools` 整体替换这套集合，`--exclude-tools` 在此基础上再撤下：

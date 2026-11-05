@@ -144,6 +144,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    #[cfg(windows)]
+    solaris_tools::cygwin::environment().map_err(anyhow::Error::msg)?;
+
     let mut config = Config {
         theme: args
             .theme
