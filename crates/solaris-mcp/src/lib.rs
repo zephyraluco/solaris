@@ -11,7 +11,7 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt, service::RunningService};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput, ToolRegistry};
+use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput};
 
 /// User-level configuration. Secret values are referenced by environment name.
 #[derive(Debug, Default, Deserialize)]
@@ -50,16 +50,26 @@ pub struct ServerStatus {
     pub message: String,
 }
 
-/// Retains live services until all tools/clients have been dropped.
+/// Owns connections and discovered adapters without registering tools.
+/// Cloned adapters keep their service alive independently of this manager.
 pub struct McpManager {
     services: Vec<Arc<RunningService<RoleClient, ()>>>,
     pub status: Vec<ServerStatus>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 impl McpManager {
-    pub async fn connect(config: McpConfig, cwd: &Path, registry: &mut ToolRegistry) -> Self {
+    /// Discovered tool adapters; the application decides where to register them.
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// Connect configured servers and discover adapters without registering them.
+    /// Failures are recorded per server and do not discard other connections.
+    pub async fn connect(config: McpConfig, cwd: &Path) -> Self {
         let mut manager = Self {
             services: Vec::new(),
             status: Vec::new(),
+            tools: Vec::new(),
         };
         for (name, server) in config.servers {
             if !valid_name(&name) {
@@ -98,80 +108,87 @@ impl McpManager {
                         continue;
                     }
                 };
-            let tools =
-                match tokio::time::timeout(Duration::from_secs(15), discover_tools(&service)).await
-                {
-                    Ok(Ok(tools)) if tools.len() <= 512 => tools,
-                    _ => {
-                        manager.status.push(ServerStatus {
-                            name,
-                            connected: false,
-                            tools: 0,
-                            message: "tool discovery failed, timed out, or exceeded 512 tools"
-                                .into(),
-                        });
-                        continue;
-                    }
-                };
-            let mut count = 0;
-            for tool in tools {
-                if !valid_name(&tool.name) {
-                    continue;
-                }
-                let registered = format!("mcp__{name}__{}", tool.name);
-                let read_only = trusted_read_only.contains(tool.name.as_ref());
-                // Remote annotations are hints, not a permission grant. Read-only
-                // mode requires an explicit local allowlist.
-                registry.add(Arc::new(McpTool {
-                    name: registered,
-                    remote: tool.name.to_string(),
-                    description: tool.description.unwrap_or_default().into_owned(),
-                    schema: Value::Object(tool.input_schema.as_ref().clone()),
-                    service: Arc::clone(&service),
-                    read_only,
-                }));
-                count += 1;
-            }
-            let capabilities = service.peer_info().map(|info| info.capabilities.clone());
-            if capabilities
-                .as_ref()
-                .is_some_and(|cap| cap.resources.is_some())
-            {
-                for operation in [
-                    ProtocolOperation::ListResources,
-                    ProtocolOperation::ListResourceTemplates,
-                    ProtocolOperation::ReadResource,
-                ] {
-                    registry.add(Arc::new(ProtocolTool::new(
-                        &name,
-                        operation,
-                        Arc::clone(&service),
-                    )));
-                    count += 1;
-                }
-            }
-            if capabilities
-                .as_ref()
-                .is_some_and(|cap| cap.prompts.is_some())
-            {
-                for operation in [ProtocolOperation::ListPrompts, ProtocolOperation::GetPrompt] {
-                    registry.add(Arc::new(ProtocolTool::new(
-                        &name,
-                        operation,
-                        Arc::clone(&service),
-                    )));
-                    count += 1;
-                }
-            }
-            manager.status.push(ServerStatus {
-                name,
-                connected: true,
-                tools: count,
-                message: "connected".into(),
-            });
-            manager.services.push(service);
+            manager.discover(name, service, trusted_read_only).await;
         }
         manager
+    }
+
+    async fn discover(
+        &mut self,
+        name: String,
+        service: Arc<RunningService<RoleClient, ()>>,
+        trusted_read_only: BTreeSet<String>,
+    ) {
+        let tools =
+            match tokio::time::timeout(Duration::from_secs(15), discover_tools(&service)).await {
+                Ok(Ok(tools)) if tools.len() <= 512 => tools,
+                _ => {
+                    self.status.push(ServerStatus {
+                        name,
+                        connected: false,
+                        tools: 0,
+                        message: "tool discovery failed, timed out, or exceeded 512 tools".into(),
+                    });
+                    return;
+                }
+            };
+        let mut count = 0;
+        for tool in tools {
+            if !valid_name(&tool.name) {
+                continue;
+            }
+            let registered = format!("mcp__{name}__{}", tool.name);
+            let read_only = trusted_read_only.contains(tool.name.as_ref());
+            // Remote annotations are hints, not a permission grant. Read-only
+            // mode requires an explicit local allowlist.
+            self.tools.push(Arc::new(McpTool {
+                name: registered,
+                remote: tool.name.to_string(),
+                description: tool.description.unwrap_or_default().into_owned(),
+                schema: Value::Object(tool.input_schema.as_ref().clone()),
+                service: Arc::clone(&service),
+                read_only,
+            }));
+            count += 1;
+        }
+        let capabilities = service.peer_info().map(|info| info.capabilities.clone());
+        if capabilities
+            .as_ref()
+            .is_some_and(|cap| cap.resources.is_some())
+        {
+            for operation in [
+                ProtocolOperation::ListResources,
+                ProtocolOperation::ListResourceTemplates,
+                ProtocolOperation::ReadResource,
+            ] {
+                self.tools.push(Arc::new(ProtocolTool::new(
+                    &name,
+                    operation,
+                    Arc::clone(&service),
+                )));
+                count += 1;
+            }
+        }
+        if capabilities
+            .as_ref()
+            .is_some_and(|cap| cap.prompts.is_some())
+        {
+            for operation in [ProtocolOperation::ListPrompts, ProtocolOperation::GetPrompt] {
+                self.tools.push(Arc::new(ProtocolTool::new(
+                    &name,
+                    operation,
+                    Arc::clone(&service),
+                )));
+                count += 1;
+            }
+        }
+        self.status.push(ServerStatus {
+            name,
+            connected: true,
+            tools: count,
+            message: "connected".into(),
+        });
+        self.services.push(service);
     }
 }
 
@@ -718,6 +735,48 @@ mod tests {
         let (read, write) = tokio::io::split(client);
         let service = Arc::new(().serve((read, write)).await.expect("initialize"));
         (service, server)
+    }
+
+    #[tokio::test]
+    async fn application_registers_discovered_tools_and_keeps_connections_alive() {
+        let (service, server) = fixture().await;
+        let mut manager = McpManager {
+            services: Vec::new(),
+            status: Vec::new(),
+            tools: Vec::new(),
+        };
+        manager
+            .discover("fixture".into(), service, BTreeSet::from(["echo".into()]))
+            .await;
+        assert!(manager.status[0].connected);
+        // One remote tool, three resource operations and two prompt operations.
+        assert_eq!(manager.status[0].tools, 6);
+        let mut registry = solaris_tools::ToolRegistry::builtin();
+        assert!(registry.get("mcp__fixture__echo").is_none());
+        for tool in manager.tools() {
+            registry.add(Arc::clone(tool));
+        }
+        assert!(registry.get("read").is_some());
+        assert_eq!(
+            registry
+                .names()
+                .iter()
+                .filter(|name| name.starts_with("mcp_"))
+                .count(),
+            6
+        );
+        let tool = registry.get("mcp__fixture__echo").expect("registered tool");
+        assert!(tool.is_read_only());
+        drop(manager);
+        let output = tool
+            .run(
+                json!({"text":"still connected"}),
+                &ToolContext::new(".", std::env::temp_dir()),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.text);
+        assert_eq!(output.text, "still connected");
+        server.abort();
     }
 
     #[tokio::test]

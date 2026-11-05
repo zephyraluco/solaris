@@ -11,9 +11,7 @@
 //!   can ask for the instructions of the one it needs
 //!   ([`Skills::prompt_section`]) — the instructions are not in here, which is
 //!   the point of a skill;
-//! - **this endpoint's own note**, when the platform needs one
-//!   ([`ProviderSpec::prompt`](solaris_provider::ProviderSpec::prompt)) — a
-//!   gateway that routes to any family, or a small model on this machine.
+//! - **this endpoint's own note**, resolved and supplied by the application.
 //!
 //! Everything else a model might want to know is already on the wire: the
 //! endpoint, the model id, and the tool schemas. Repeating any of it here would
@@ -27,7 +25,6 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use solaris_backend::{Content, Message, Role};
-use solaris_provider::provider_spec;
 use solaris_tools::Tool;
 
 use crate::mode::Mode;
@@ -132,20 +129,20 @@ pub(crate) fn existing_summary(messages: &[Message]) -> Option<String> {
 /// `tools` is what the turn will declare, so a tool that is withdrawn for the
 /// mode contributes neither a declaration nor a guideline; `skills` is what a
 /// `SKILL.md` scan turned up, of which only the names, descriptions and files
-/// are written here; `provider` is the id the turn is resolved to, whose note is
-/// appended last.
+/// are written here; `instructions` is an optional endpoint note supplied by
+/// the application.
 #[cfg(test)]
 pub fn system_prompt(
     mode: Mode,
     tools: &[Arc<dyn Tool>],
     skills: &Skills,
-    provider: Option<&str>,
+    instructions: Option<&str>,
 ) -> String {
     build_system_prompt(
         mode,
         tools,
         skills,
-        provider,
+        instructions,
         Path::new("."),
         &PromptContext::default(),
     )
@@ -156,7 +153,7 @@ pub(crate) fn build_system_prompt(
     mode: Mode,
     tools: &[Arc<dyn Tool>],
     skills: &Skills,
-    provider: Option<&str>,
+    instructions: Option<&str>,
     cwd: &Path,
     context: &PromptContext,
 ) -> String {
@@ -206,7 +203,7 @@ pub(crate) fn build_system_prompt(
          answer unless it is the answer.\n",
     );
 
-    if let Some(note) = provider_note(provider) {
+    if let Some(note) = instructions {
         prompt.push_str("\n# This endpoint\n");
         prompt.push_str(note);
         prompt.push('\n');
@@ -230,11 +227,6 @@ pub(crate) fn build_system_prompt(
     }
 
     prompt
-}
-
-/// The note the platform behind this turn contributes, if it has one.
-fn provider_note(provider: Option<&str>) -> Option<&'static str> {
-    provider_spec(provider?).and_then(|spec| spec.prompt)
 }
 
 /// The conversation as text, for a summarizer to read.
@@ -357,33 +349,20 @@ mod tests {
     }
 
     #[test]
-    fn a_platforms_own_note_is_appended_when_it_has_one() {
-        let local = system_prompt(
+    fn application_instructions_are_used_without_catalogue_lookup() {
+        let supplied = "Custom backend instructions, resolved by the caller.";
+        let prompt = system_prompt(
             Mode::Build,
             &tools(Mode::Build),
             &Skills::empty(),
-            Some("local"),
+            Some(supplied),
         );
-        assert!(local.contains("# This endpoint"), "{local}");
-        assert!(local.contains("small model"), "{local}");
-
-        // Most platforms have nothing to add, so nothing is added.
-        let anthropic = system_prompt(
-            Mode::Build,
-            &tools(Mode::Build),
-            &Skills::empty(),
-            Some("anthropic"),
+        assert!(
+            prompt.contains(&format!("# This endpoint\n{supplied}")),
+            "{prompt}"
         );
-        assert!(!anthropic.contains("# This endpoint"), "{anthropic}");
-
-        // An id the catalogue does not know is not an error.
-        let unknown = system_prompt(
-            Mode::Build,
-            &tools(Mode::Build),
-            &Skills::empty(),
-            Some("nope"),
-        );
-        assert!(!unknown.contains("# This endpoint"), "{unknown}");
+        let without = system_prompt(Mode::Build, &[], &Skills::empty(), None);
+        assert!(!without.contains("# This endpoint"), "{without}");
     }
 
     #[test]
