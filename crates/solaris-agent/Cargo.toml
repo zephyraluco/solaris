@@ -10,7 +10,6 @@ workspace = true
 
 [dependencies]
 solaris-backend = { workspace = true }
-solaris-provider = { workspace = true }
 solaris-tools = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

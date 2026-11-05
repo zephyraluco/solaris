@@ -2,8 +2,8 @@
 //! them.
 //!
 //! A model can only ask; something has to act, and something has to carry the
-//! answer back and ask again. That is this crate. It sits above the three layers
-//! it composes and is the only door the application needs:
+//! answer back and ask again. That is this crate. It sits above the backend and tool layers
+//! it composes; the application supplies resolved backend metadata and tools:
 //!
 //! - [`Agent`] wraps a resolved backend ([`solaris_backend`]) in the multi-round
 //!   loop, declaring the tools ([`solaris_tools`]) a turn's [`Mode`] offers and
@@ -12,13 +12,14 @@
 //!   decides the default tool set and nothing else.
 //! - [`Approver`] is the hook that can refuse a call before it runs.
 //!
-//! Because the app talks to this crate alone, the vocabulary it needs comes from
+//! For callers running sessions, the execution vocabulary comes from
 //! here too: the messages and events a turn is made of, the tool calls and
 //! results, and the usage a turn is billed for are re-exported from
 //! [`solaris_backend`], and the tools and their registry from [`solaris_tools`].
 
 mod agent;
 mod approver;
+mod backend;
 mod background;
 mod compaction;
 mod conversation;
@@ -36,6 +37,7 @@ pub use agent::{Agent, AgentOptions};
 pub use approver::{
     AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, DenyAll, FnApprover,
 };
+pub use backend::AgentBackendConfig;
 pub use compaction::Compaction;
 pub use input::{InputError, expand_input};
 pub use mode::{Mode, default_tool_names};
@@ -80,7 +82,7 @@ pub struct ExecutionSettings {
 pub use runtime::{RuntimeCommand, SessionRuntime};
 
 pub type ChildBackendFactory =
-    std::sync::Arc<dyn Fn(&str) -> Result<solaris_provider::BackendChoice, String> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&str) -> Result<AgentBackendConfig, String> + Send + Sync>;
 pub use subagent::TaskControls;
 
 mod tool_search;

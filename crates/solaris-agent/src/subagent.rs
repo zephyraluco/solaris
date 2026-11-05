@@ -12,11 +12,10 @@ use serde_json::{Value, json};
 use solaris_backend::{
     AgentBackend, AgentEvent, AgentEventStream, BackendError, TurnRequest, Usage,
 };
-use solaris_provider::BackendChoice;
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
-use crate::{Agent, AgentOptions, Mode, ResourceSnapshot, default_tool_names};
+use crate::{Agent, AgentBackendConfig, AgentOptions, Mode, ResourceSnapshot, default_tool_names};
 
 /// Runtime tool for delegating a self-contained task to an isolated child agent.
 pub const SUBAGENT_TOOL: &str = "subagent";
@@ -96,7 +95,7 @@ pub(crate) struct Task {
 
 /// Snapshot captured at the parent's turn boundary, not a reference to its history.
 pub(crate) struct SubagentRunner {
-    pub choice: BackendChoice,
+    pub choice: AgentBackendConfig,
     pub parent: Option<Arc<crate::SessionJournal>>,
     pub registry: Arc<ToolRegistry>,
     pub options: AgentOptions,

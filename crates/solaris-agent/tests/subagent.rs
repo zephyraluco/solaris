@@ -8,11 +8,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentEventStream, AgentOptions, Approval, BackendError,
-    FnApprover, Mode, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext, ToolOutput,
-    ToolRegistry, ToolSelection, TurnRequest, Usage,
+    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions, Approval,
+    BackendError, FnApprover, Mode, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
+    ToolOutput, ToolRegistry, ToolSelection, TurnRequest, Usage,
 };
-use solaris_provider::{BackendChoice, CredentialSource};
 use tokio::sync::{Barrier, Notify};
 
 fn complete(text: &str) -> Vec<AgentEvent> {
@@ -184,12 +183,12 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
         }),
     ]);
     Agent::new(
-        BackendChoice {
+        AgentBackendConfig {
             backend: model,
             provider_id: None,
-            base_url: None,
             model: "test-model".into(),
-            source: CredentialSource::None,
+            fallback_context_window: 128_000,
+            instructions: None,
         },
         Arc::new(registry),
         options,
@@ -624,18 +623,33 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     options.child_backend = Some(Arc::new(move |name| {
         assert_eq!(name, "child-model");
         called.fetch_add(1, Ordering::SeqCst);
-        Ok(BackendChoice {
+        Ok(AgentBackendConfig {
             backend: child_model.clone(),
             provider_id: None,
-            base_url: None,
             model: name.into(),
-            source: CredentialSource::None,
+            fallback_context_window: 128_000,
+            instructions: Some("Child model instructions resolved by the caller".into()),
         })
     }));
     let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
     parent.attach_journal(journal).expect("attach");
     let events = run(&parent, Mode::Build).await;
     assert_eq!(factory_called.load(Ordering::SeqCst), 1);
+    let requests = model.requests();
+    let child_request = requests
+        .iter()
+        .find(|request| is_child(request))
+        .expect("child request");
+    assert!(
+        child_request.history[0]
+            .text()
+            .contains("Child model instructions resolved by the caller")
+    );
+    assert!(
+        !requests[0].history[0]
+            .text()
+            .contains("Child model instructions resolved by the caller")
+    );
     let sessions = store.list(directory.path()).expect("list");
     let child = sessions
         .iter()
@@ -699,12 +713,12 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
     let options = AgentOptions {
         child_backend: Some(Arc::new(move |name| {
             assert_eq!(name, "child-model");
-            Ok(BackendChoice {
+            Ok(AgentBackendConfig {
                 backend: Arc::clone(&child_backend) as Arc<dyn AgentBackend>,
                 provider_id: None,
-                base_url: None,
                 model: name.into(),
-                source: CredentialSource::None,
+                fallback_context_window: 128_000,
+                instructions: None,
             })
         })),
         ..AgentOptions::default()

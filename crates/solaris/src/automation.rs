@@ -134,9 +134,9 @@ pub async fn serve_rpc(
 mod tests {
     use super::*;
     use solaris_agent::{
-        Agent, AgentBackend, AgentOptions, BackendError, ToolRegistry, TurnRequest,
+        Agent, AgentBackend, AgentBackendConfig, AgentOptions, BackendError, ToolRegistry,
+        TurnRequest,
     };
-    use solaris_provider::{BackendChoice, CredentialSource};
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
@@ -149,12 +149,12 @@ mod tests {
     }
     fn session() -> SessionRuntime {
         SessionRuntime::new(Agent::new(
-            BackendChoice {
+            AgentBackendConfig {
                 backend: Arc::new(Waiting),
                 provider_id: None,
-                base_url: None,
                 model: "test".into(),
-                source: CredentialSource::Missing,
+                fallback_context_window: 128_000,
+                instructions: None,
             },
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::default(),

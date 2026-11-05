@@ -251,9 +251,13 @@ fn with_tools(
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
     let auth = auth.clone();
-    options.child_backend = Some(Arc::new(move |model| Ok(factory(&auth, model))));
+    options.child_backend = Some(Arc::new(move |model| {
+        Ok(crate::agent_backend(factory(&auth, model)))
+    }));
     let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
-        choice, registry, options,
+        crate::agent_backend(choice),
+        registry,
+        options,
     )));
     let cancel = agent.cancel_handle();
     (agent, cancel)
@@ -734,7 +738,7 @@ impl App {
     ///
     /// The model picker lists this provider's models, so it needs the id rather
     /// than the backend's display label.
-    fn provider_id(&self) -> Option<&'static str> {
+    fn provider_id(&self) -> Option<&str> {
         self.agent.provider_id()
     }
 
@@ -744,6 +748,7 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+        let source = choice.source;
         let (agent, cancel) = with_tools(
             choice,
             Arc::clone(&self.registry),
@@ -761,7 +766,7 @@ impl App {
         }
         self.agent = agent;
         self.tool_cancel = cancel;
-        self.agent.source()
+        source
     }
 
     /// Whether an overlay is currently visible.
@@ -1007,8 +1012,8 @@ impl App {
         self.config.model = name.to_string();
         // A model belongs to the provider that offers it, so it is remembered
         // beside that provider rather than in the settings file.
-        if let Some(provider) = self.provider_id() {
-            self.auth.activate(provider);
+        if let Some(provider) = self.provider_id().map(str::to_owned) {
+            self.auth.activate(&provider);
         }
         self.auth.remember_model(name);
         self.persist_auth();
@@ -1807,8 +1812,10 @@ impl App {
         let auth = self.auth.clone();
         self.agent = Arc::new(
             self.agent
-                .with_refreshed_backend(choice)
-                .with_child_backend(Arc::new(move |model| Ok(factory(&auth, model)))),
+                .with_refreshed_backend(crate::agent_backend(choice))
+                .with_child_backend(Arc::new(move |model| {
+                    Ok(crate::agent_backend(factory(&auth, model)))
+                })),
         );
     }
 
@@ -3352,13 +3359,13 @@ mod tests {
     /// test that needs one has to resolve a backend that carries it.
     fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
         Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
-            BackendChoice {
+            crate::agent_backend(BackendChoice {
                 backend: fake_backend(),
                 provider_id: Some(provider),
                 base_url: None,
                 model: String::new(),
                 source: CredentialSource::None,
-            },
+            }),
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::default(),
         )))

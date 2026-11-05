@@ -2787,7 +2787,6 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "solaris-backend",
- "solaris-provider",
  "solaris-tools",
  "tempfile",
  "thiserror 2.0.21",

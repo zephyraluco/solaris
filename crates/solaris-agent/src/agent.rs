@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use solaris_backend::{AgentEventStream, BackendError};
-use solaris_provider::{BackendChoice, CredentialSource, context_window_for};
 use solaris_tools::{Cancel, ToolRegistry, ToolSelection};
 
 use crate::approver::{AlwaysApprove, Approver};
@@ -17,7 +16,7 @@ use crate::queue::Queue;
 use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
 use crate::skills::Skills;
 use crate::subagent::{SubagentRunner, SubagentTool};
-use crate::{InputError, PromptContext, ResourceSnapshot, expand_input};
+use crate::{AgentBackendConfig, InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -133,16 +132,16 @@ impl AgentOptions {
 ///
 /// The application holds one of these and asks it for turns; everything else —
 /// which tools a turn declares, running them, feeding the results back, asking
-/// again — happens behind this type. So the app never learns which tools exist,
-/// how many model calls a turn took, or which platform answered.
+/// again — happens behind this type. The application assembles the backend
+/// configuration and tool registry before constructing the session.
 ///
 /// The conversation lives here rather than in the application because it is the
 /// model's view, not the user's: a summary has to still stand on the next turn, a
 /// steered message has to still be where it landed, and neither is something the
 /// transcript can be asked to reconstruct. [`Agent::clear`] is what forgets it.
 pub struct Agent {
-    /// The backend the credentials resolved to, and how it was chosen.
-    choice: BackendChoice,
+    /// Application-resolved backend and execution metadata.
+    choice: AgentBackendConfig,
     active: Arc<std::sync::atomic::AtomicBool>,
     /// Every tool this platform has, built once so `edit` and `write` keep
     /// serialising against the same per-file locks for the whole session.
@@ -162,7 +161,7 @@ pub struct Agent {
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
     pub fn new(
-        choice: BackendChoice,
+        choice: AgentBackendConfig,
         registry: Arc<ToolRegistry>,
         mut options: AgentOptions,
     ) -> Self {
@@ -228,7 +227,7 @@ impl Agent {
             })?;
         self.conversation.attach(journal)?;
         self.conversation
-            .record_model(self.choice.provider_id, &self.choice.model);
+            .record_model(self.choice.provider_id.as_deref(), &self.choice.model);
         self.conversation
             .error()
             .map_or(Ok(()), |error| Err(crate::StoreError::Invalid(error)))
@@ -272,11 +271,11 @@ impl Agent {
 
     /// Replace transport credentials at an idle boundary without losing the
     /// conversation, queued input, resources, tools or cancellation handle.
-    pub fn with_refreshed_backend(&self, choice: BackendChoice) -> Self {
+    pub fn with_refreshed_backend(&self, choice: AgentBackendConfig) -> Self {
         // Persistence failures are retained by the conversation and block the
         // next request, including callers whose refresh API cannot return errors.
         self.conversation
-            .record_model(choice.provider_id, &choice.model);
+            .record_model(choice.provider_id.as_deref(), &choice.model);
         Self {
             choice,
             active: Arc::clone(&self.active),
@@ -358,8 +357,8 @@ impl Agent {
     }
 
     /// The provider requests go to, when one was picked at all.
-    pub fn provider_id(&self) -> Option<&'static str> {
-        self.choice.provider_id
+    pub fn provider_id(&self) -> Option<&str> {
+        self.choice.provider_id.as_deref()
     }
 
     /// The model that will really be asked for, which is not always the one that
@@ -367,11 +366,6 @@ impl Agent {
     /// offer.
     pub fn model(&self) -> &str {
         &self.choice.model
-    }
-
-    /// Where the credential behind this session came from.
-    pub fn source(&self) -> CredentialSource {
-        self.choice.source
     }
 
     pub fn capabilities(&self) -> solaris_backend::ModelCapabilities {
@@ -390,7 +384,7 @@ impl Agent {
     fn context_window(&self) -> u32 {
         self.capabilities()
             .context_window
-            .unwrap_or_else(|| context_window_for(&self.choice.model))
+            .unwrap_or(self.choice.fallback_context_window)
     }
 
     /// The tools a turn in `mode` would declare.
@@ -523,7 +517,7 @@ impl Agent {
             mode,
             &tools,
             &resources.skills,
-            self.choice.provider_id,
+            self.choice.instructions.as_deref(),
             &self.options.cwd,
             &resources.prompt,
         );
@@ -840,13 +834,13 @@ mod tests {
     }
 
     /// A backend as the choice carries it, with a provider behind it.
-    fn choice(backend: Arc<dyn AgentBackend>) -> BackendChoice {
-        BackendChoice {
+    fn choice(backend: Arc<dyn AgentBackend>) -> AgentBackendConfig {
+        AgentBackendConfig {
             backend,
-            provider_id: Some("anthropic"),
-            base_url: Some("https://api.anthropic.com/v1".to_string()),
+            provider_id: Some("anthropic".into()),
             model: "claude-sonnet-4-5".to_string(),
-            source: CredentialSource::Stored,
+            fallback_context_window: 128_000,
+            instructions: None,
         }
     }
 
@@ -889,7 +883,7 @@ mod tests {
             .push(crate::Message::user("remember this"));
 
         let mut next = choice(Scripted::new(Vec::new()));
-        next.provider_id = Some("openai");
+        next.provider_id = Some("openai".into());
         next.model = "next-model".into();
         let refreshed = original.with_refreshed_backend(next);
         assert_eq!(refreshed.conversation_len(), 1);
@@ -1209,7 +1203,34 @@ mod tests {
 
         assert_eq!(agent.provider_id(), Some("anthropic"));
         assert_eq!(agent.model(), "claude-sonnet-4-5");
-        assert_eq!(agent.source(), CredentialSource::Stored);
+    }
+
+    #[tokio::test]
+    async fn refreshing_backend_replaces_injected_instructions_and_window() {
+        let first = Scripted::new(Vec::new());
+        let mut initial = choice(first);
+        initial.instructions = Some("Initial caller instructions".into());
+        initial.fallback_context_window = 32_000;
+        let original = Agent::new(
+            initial,
+            Arc::new(ToolRegistry::builtin()),
+            AgentOptions::default(),
+        );
+        assert_eq!(original.context_window(), 32_000);
+        let backend = Scripted::new(vec![vec![AgentEvent::TextDelta("done".into())]]);
+        let mut next = choice(backend.clone());
+        next.instructions = Some("Replacement caller instructions".into());
+        next.fallback_context_window = 64_000;
+        let refreshed = original.with_refreshed_backend(next);
+        assert_eq!(refreshed.context_window(), 64_000);
+        drain(refreshed.run_turn("hi", Mode::Build)).await;
+        let requests = backend.requests();
+        let system = requests[0].history[0].text();
+        assert!(
+            system.contains("Replacement caller instructions"),
+            "{system}"
+        );
+        assert!(!system.contains("Initial caller instructions"), "{system}");
     }
 
     #[test]
@@ -1217,7 +1238,6 @@ mod tests {
         let mut choice = choice(Scripted::new(Vec::new()));
         choice.provider_id = None;
         choice.model = String::new();
-        choice.source = CredentialSource::Missing;
 
         let agent = Agent::new(
             choice,
@@ -1226,7 +1246,6 @@ mod tests {
         );
         assert_eq!(agent.provider_id(), None);
         assert_eq!(agent.model(), "");
-        assert_eq!(agent.source(), CredentialSource::Missing);
     }
 
     #[tokio::test]

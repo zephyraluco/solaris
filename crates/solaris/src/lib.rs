@@ -48,3 +48,6 @@ pub use state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, Turn}
 // The vocabulary a turn is written in comes from the agent, which is the app's
 // only door to a backend and to the tools.
 pub use solaris_agent::Mode;
+
+mod assembly;
+pub use assembly::agent_backend;

@@ -6,33 +6,36 @@
 
 ## 1. 总览
 
-solaris 是一个用 Rust 编写的终端 AI 助手：一个全屏 TUI 聊天客户端，外带一套可复用的终端 UI 框架。仓库是一个 Cargo workspace（edition 2024，Rust 1.85+），由六个 crate 组成，依赖严格单向：
+solaris 是一个用 Rust 编写的终端 AI 助手。Cargo workspace 使用 edition 2024，最低支持 Rust 1.88，由八个 crate 组成。应用负责组装各层，依赖保持单向：
 
 ```text
-solaris                  应用：根组件、对话框、/connect 向导、转录渲染、按键映射、CLI 入口
-├── solaris-tui          可复用终端 UI 框架                        【无工作区依赖】
-├── solaris-provider     平台层：provider 目录、鉴权、模型与价格，把凭据解析成一个后端
-│   └── solaris-backend  传输层与对话词汇（消息、事件、工具声明、计费）  【无工作区依赖】
-└── solaris-agent        agent 会话：多轮工具循环、审批钩子、模式与默认工具集
-    ├── solaris-tools    工具层：八个内建工具、注册表、runner、截断      【无工作区依赖】
-    ├── solaris-provider
-    └── solaris-backend
+solaris                  应用组装、配置、认证、TUI 与 CLI
+├── solaris-tui          可复用终端 UI 框架
+├── solaris-provider     provider 目录、鉴权、模型与价格、后端解析
+│   ├── solaris-backend
+│   └── solaris-types
+├── solaris-agent        会话、多轮工具循环、审批与子代理
+│   ├── solaris-backend  后端接口与传输协议 → solaris-types
+│   └── solaris-tools    工具接口、内建工具与注册表 → solaris-types
+├── solaris-mcp          MCP 连接、发现与工具适配 → solaris-tools
+└── solaris-tools        应用显式注册 MCP 返回的工具
 ```
 
 三条硬性约束：
 
-1. **依赖只能向下**。`solaris-backend` 与 `solaris-tools` 是两片叶子：它们互不依赖，也不依赖工作区里任何其他 crate。`solaris-provider` 建在 `solaris-backend` 之上——平台层必须知道「哪个模型讲哪种协议」；`solaris-agent` 把后端、工具与平台三者组起来；应用层只向上组合 `solaris-agent`、`solaris-provider` 与 `solaris-tui`。
-2. **UI 不认识任何 provider，也不认识任何工具**。界面把一次请求交给 [`Agent`](../crates/solaris-agent/src/agent.rs)，只消费它回流的 `AgentEvent` 流；`solaris` 的依赖里既没有 `solaris-tools`，也没有 `solaris-backend`。
-3. **传输层与工具层互不相识**。`solaris-backend` 不认识工具，`solaris-tools` 不认识模型、消息或 provider。把工具声明翻成某条 wire 的请求形状、把工具结果写回历史，都是 `solaris-agent` 的事。
+1. **应用负责组装**。`solaris` 调用 provider 解析后端，转换成 `AgentBackendConfig` 后注入 agent；同时发起 MCP 连接并显式注册返回的工具。agent 不依赖 provider，MCP 不接收或修改注册表。
+2. **认证与执行分离**。provider 目录、凭据来源、端点选择和认证刷新由应用与 provider 层处理。agent 只接收后端接口、模型、会话记录标识、上下文窗口回退值与已解析的附加指令。
+3. **协议与策略分离**。MCP 返回的适配器实现 `Tool`，与本地工具共用审批、预算和执行路径。适配器持有连接引用；应用注册它们后，连接持续到最后一个持有者释放。
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
 | `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`reqwest`（rustls）、`bytes`、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 统一接口、`HttpBackend`（三条协议的请求体与流解析）、SSE 解码、重试与计费；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`/`Price`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
 | `solaris-tools` | [`crates/solaris-tools`](../crates/solaris-tools) | `async-trait`、`futures`、`tokio`（`process`/`io-util`/`fs`）、`serde_json`、`thiserror`、`libc`（仅 Unix） | 工具层：八个内建工具（`read`/`write`/`edit`/`ls`/`grep`/`find` 与所在平台的 shell）、`ToolRegistry`、命令 runner、截断与文件写入串行化、`edit` 的 diff。不依赖工作区里任何其他 crate。 |
 | `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
-| `solaris-agent` | [`crates/solaris-agent`](../crates/solaris-agent) | `solaris-backend`、`solaris-tools`、`solaris-provider`、`async-trait`、`futures`、`serde`、`tokio` | agent 会话：`Agent`（把解析好的后端包进多轮工具循环）、`Mode` 与它声明给一轮的默认工具集、`Approver` 审批钩子，并把应用需要的词汇（消息、事件、工具、用量、注册表与选择）再导出。 |
+| `solaris-agent` | [`crates/solaris-agent`](../crates/solaris-agent) | `solaris-backend`、`solaris-tools`、`async-trait`、`futures`、`serde`、`tokio` | agent 会话：`Agent`（把解析好的后端包进多轮工具循环）、`Mode` 与它声明给一轮的默认工具集、`Approver` 审批钩子，并把应用需要的词汇（消息、事件、工具、用量、注册表与选择）再导出。 |
 | `solaris-tui` | [`crates/solaris-tui`](../crates/solaris-tui) | `ratatui`、`crossterm`、`unicode-width`、`unicode-segmentation` | 终端 UI 框架：组件模型、类 flex 布局、浮层、主题、按键匹配、组件集、终端生命周期。 |
-| `solaris` | [`crates/solaris`](../crates/solaris) | `solaris-agent`、`solaris-provider`、`solaris-tui` + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio`、`serde`、`serde_json`、`thiserror` | 应用本体，同时产出库与 `solaris` 二进制；斜杠命令表、偏好设置、伙伴与提示语也住在这里。 |
+| `solaris-mcp` | [`crates/solaris-mcp`](../crates/solaris-mcp) | `solaris-tools`、`rmcp`、`tokio`、`reqwest` | 连接 MCP 服务器、发现工具与资源/提示词操作，返回工具适配器和状态；不负责注册。 |
+| `solaris` | [`crates/solaris`](../crates/solaris) | `solaris-agent`、`solaris-provider`、`solaris-mcp`、`solaris-tools`、`solaris-tui` + `ratatui`、`crossterm`、`futures`、`anyhow`、`clap`、`tokio`、`serde`、`serde_json`、`thiserror` | 应用本体，同时产出库与 `solaris` 二进制；斜杠命令表、偏好设置、伙伴与提示语也住在这里。 |
 
 ---
 
@@ -106,16 +109,20 @@ pub trait AgentBackend: Send + Sync {
 
 ## 3. solaris-agent：agent 会话
 
-模型只能「请求」，真正把「请求 → 执行 → 再请求」串起来的是这一层。它同时是应用唯一需要认识的 crate：`Agent` 包住一个已经解析好的后端，持有整段对话，按模式决定一轮声明哪些工具，跑完本轮的调用，把结果写回对话，再问一次。
+`solaris/src/assembly.rs::agent_backend` 是 provider 到 agent 的唯一转换入口，TUI、headless、认证刷新和子代理模型覆盖共用它。`BackendChoice` 与 `CredentialSource` 留在应用/provider 侧；agent 的 `AgentBackendConfig` 不包含凭据或端点。后端报告的上下文窗口优先，否则使用应用注入的 `fallback_context_window`。更换后端时，模型、附加指令与回退窗口一起更新。
+
+`McpManager::connect(config, cwd)` 只连接与发现；应用遍历 `manager.tools()` 并调用 `registry.add(...)`。资源、资源模板和提示词对应的协议工具也遵循同一路径。失败服务器只产生状态诊断，不阻止已连接工具和本地工具使用。
+
+模型只能「请求」，真正把「请求 → 执行 → 再请求」串起来的是这一层。它接收应用组装好的执行参数：`Agent` 包住一个已经解析好的后端，持有整段对话，按模式决定一轮声明哪些工具，跑完本轮的调用，把结果写回对话，再问一次。
 
 ```rust
 pub struct Agent {
-    choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions,
+    choice: AgentBackendConfig, registry: Arc<ToolRegistry>, options: AgentOptions,
     cancel: Cancel, conversation: Arc<Conversation>, steering: Queue, follow_up: Queue,
 }
 
 impl Agent {
-    pub fn new(choice: BackendChoice, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self;
+    pub fn new(choice: AgentBackendConfig, registry: Arc<ToolRegistry>, options: AgentOptions) -> Self;
     pub fn cancel_handle(&self) -> Cancel;
     pub fn steering_handle(&self) -> Queue;      // 纠正正在跑的这一轮
     pub fn follow_up_handle(&self) -> Queue;     // 这一轮之后另起一轮
@@ -151,7 +158,7 @@ You are solaris, a terminal assistant. …
 # Using the tools     ← 每个工具自己的 Tool::guideline()，只列这一轮声明的
 # Skills              ← 每个技能的名字、描述与 SKILL.md 路径，说明留在文件里
 # How to work         ← 调查先于修改、最小改动、不重排无关代码、失败要读原因
-# This endpoint       ← ProviderSpec::prompt，仅当平台确实需要不同措辞
+# This endpoint       ← AgentBackendConfig.instructions，由应用解析后传入
 # Project instructions ← 全局规则，再按祖先到工作目录排列的项目规则
 # Additional instructions ← 用户与项目 APPEND_SYSTEM.md
 ```
@@ -674,7 +681,7 @@ cargo test --workspace
 
 ## 9. 当前边界
 
-- **工具调用已经打通，但工具集是固定的八个**。`Agent` 会跑「模型 → 工具 → 模型」直到模型不再请求，用量与费用按轮累计；但可声明的工具就是内建那八个，没有 MCP、没有第三方扩展工具。
+- **工具调用已经打通，但工具集是固定的八个**。`Agent` 会跑「模型 → 工具 → 模型」直到模型不再请求，用量与费用按轮累计；应用也可注册 MCP 工具及其资源/提示词操作，沿用同一执行策略。
 - **确认对话框只在 `--confirm-tools` 下出现**。默认是 `AlwaysApprove`（终端 agent 已经在替你动手，为一次 `read` 弹框只是噪音）；打开后，改动型调用会弹一个确认框，被拒绝的调用作为错误结果回到模型。
 - **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
 - **插话在两轮之间生效**。steering 的消息由循环在「构造下一轮之前」读入，所以正在跑的那条命令不会被它打断；要立刻停下只有 `Ctrl+C`。

@@ -471,8 +471,10 @@ fn main() -> Result<()> {
     let mcp = runtime.block_on(solaris_mcp::McpManager::connect(
         mcp_config,
         &std::env::current_dir()?,
-        &mut registry,
     ));
+    for tool in mcp.tools() {
+        registry.add(Arc::clone(tool));
+    }
     if args.mcp_status {
         println!("{}", serde_json::to_string_pretty(&mcp.status)?);
         if mcp.status.iter().any(|server| !server.connected) {
@@ -505,7 +507,9 @@ fn main() -> Result<()> {
             backend_options,
         ));
         let choice = factory(&config.model);
-        options.child_backend = Some(Arc::new(move |model| Ok(factory(model))));
+        options.child_backend = Some(Arc::new(move |model| {
+            Ok(solaris::agent_backend(factory(model)))
+        }));
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {
@@ -517,7 +521,7 @@ fn main() -> Result<()> {
             options.approver = Arc::new(solaris_agent::DenyAll);
         }
         let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
-            choice,
+            solaris::agent_backend(choice),
             Arc::new(registry),
             options,
         ));

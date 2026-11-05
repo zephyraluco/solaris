@@ -94,7 +94,7 @@ impl SessionRuntime {
     pub fn new(agent: crate::Agent) -> Self {
         Self { agent }
     }
-    pub fn with_refreshed_backend(&self, choice: solaris_provider::BackendChoice) -> Self {
+    pub fn with_refreshed_backend(&self, choice: crate::AgentBackendConfig) -> Self {
         Self::new(self.agent.with_refreshed_backend(choice))
     }
     pub fn with_child_backend(self, factory: crate::ChildBackendFactory) -> Self {

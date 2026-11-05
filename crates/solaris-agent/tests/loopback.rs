@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_agent::{Agent, AgentEvent, AgentOptions, Mode, Tool, ToolRegistry, ToolSelection};
+use solaris_agent::{
+    Agent, AgentBackendConfig, AgentEvent, AgentOptions, Mode, Tool, ToolRegistry, ToolSelection,
+};
 use solaris_backend::{Endpoint, HttpBackend, TurnPlan, Wire};
-use solaris_provider::{BackendChoice, CredentialSource};
 use solaris_tools::tools::read::ReadTool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -149,12 +150,12 @@ fn registry() -> Arc<ToolRegistry> {
 /// A gateway answers no catalogue, so the tool is named outright rather than
 /// left to a mode's default set.
 fn agent(addr: SocketAddr, dir: &Path) -> Agent {
-    let choice = BackendChoice {
+    let choice = AgentBackendConfig {
         backend: Arc::new(backend(addr)),
         provider_id: None,
-        base_url: None,
         model: "test-model".to_string(),
-        source: CredentialSource::None,
+        fallback_context_window: 128_000,
+        instructions: None,
     };
     let selection = ToolSelection {
         only: vec!["read".to_string()],

@@ -8,10 +8,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentEventStream, AgentOptions, BackendError, Mode, Tool,
-    ToolCall, ToolContext, ToolOutput, ToolRegistry, TurnRequest, Usage,
+    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions,
+    BackendError, Mode, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, TurnRequest, Usage,
 };
-use solaris_provider::{BackendChoice, CredentialSource};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Default)]
@@ -201,12 +200,12 @@ impl Tool for Read {
 
 fn agent(model: &Arc<Model>, options: AgentOptions, read: &Arc<Read>) -> Agent {
     Agent::new(
-        BackendChoice {
+        AgentBackendConfig {
             backend: model.clone(),
             provider_id: None,
-            base_url: None,
             model: "test-model".into(),
-            source: CredentialSource::None,
+            fallback_context_window: 128_000,
+            instructions: None,
         },
         Arc::new(ToolRegistry::with_tools(vec![read.clone()])),
         options,
