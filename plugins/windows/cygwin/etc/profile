@@ -1,4 +1,8 @@
 export PATH="/usr/local/bin:/usr/bin:/bin"
+# TMPDIR comes from the native launcher; normalize it for POSIX utilities.
+if [ -x /usr/bin/cygpath ]; then
+    export TMPDIR="$(/usr/bin/cygpath -u "${TMPDIR:-${TEMP:-${TMP:-/tmp}}}")"
+fi
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export TERMINFO=/usr/share/terminfo

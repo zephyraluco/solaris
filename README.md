@@ -78,6 +78,8 @@ Source builds locate the same runtime in the repository, including when launched
 from another working directory. Startup validates the runtime without changing
 the process PATH. Bash uses only `/usr/local/bin:/usr/bin:/bin` from Cygwin;
 the Windows PATH is not inherited by Bash.
+Bash temporary files use the current user's temporary directory; startup does
+not require write access to the installation directory.
 
 Commands run through Bash's login profile while retaining the session directory.
 All platforms expose the same `bash` tool and use Bash command syntax. A missing

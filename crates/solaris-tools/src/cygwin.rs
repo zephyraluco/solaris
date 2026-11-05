@@ -58,10 +58,6 @@ pub fn environment() -> Result<&'static Environment, String> {
         .get_or_init(|| {
             let executable = std::env::current_exe().map_err(|error| error.to_string())?;
             let root = find_root(&executable)?;
-            // Git and ZIP archives do not preserve empty directories. The
-            // login profile and Bash here-documents expect /tmp to exist.
-            std::fs::create_dir_all(root.join("tmp"))
-                .map_err(|error| format!("cannot create Cygwin temporary directory: {error}"))?;
             Ok(Environment {
                 bash: root.join("bin/bash.exe"),
             })

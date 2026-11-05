@@ -107,11 +107,15 @@ impl ShellRunner for LocalShell {
             #[cfg(windows)]
             let mut builder = {
                 let environment = crate::cygwin::environment()?;
+                let temporary = std::env::temp_dir();
+                std::fs::create_dir_all(&temporary)
+                    .map_err(|error| format!("cannot create Bash temporary directory: {error}"))?;
                 let mut builder = Command::new(&environment.bash);
                 builder
                     .arg("--login")
                     .env("PATH", crate::cygwin::PATH)
                     .env("SHELL", &environment.bash)
+                    .env("TMPDIR", temporary)
                     .env("CHERE_INVOKING", "1");
                 builder
             };
@@ -882,6 +886,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.code, Some(7));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bash_can_create_temporary_files_outside_the_runtime() {
+        let dir = test_dir("cygwin-temp");
+        let output = ShellTool::bash(Arc::new(LocalShell))
+            .run(
+                json!({ "command": "file=$(mktemp \"$TMPDIR/solaris-test.XXXXXX\") || exit 1; printf 'temporary data' > \"$file\"; cat \"$file\"; rm \"$file\"" }),
+                &context(&dir),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.text.contains("temporary data"), "{}", output.text);
     }
 
     #[test]
