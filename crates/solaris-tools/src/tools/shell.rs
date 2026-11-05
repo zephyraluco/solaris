@@ -110,7 +110,7 @@ impl ShellRunner for LocalShell {
                 let mut builder = Command::new(&environment.bash);
                 builder
                     .arg("--login")
-                    .env("PATH", &environment.path)
+                    .env("PATH", crate::cygwin::PATH)
                     .env("SHELL", &environment.bash)
                     .env("CHERE_INVOKING", "1");
                 builder
@@ -889,11 +889,18 @@ mod tests {
     async fn windows_shell_uses_cygwin_and_login_profile() {
         let dir = test_dir("cygwin-login");
         let output = ShellTool::bash(Arc::new(LocalShell))
-            .run(json!({ "command": "uname -s; printf 'profile=%s\n' \"$PROFILEREAD\"; command -v sed" }), &context(&dir))
+            .run(
+                json!({ "command": "uname -s; printf 'path=%s\n' \"$PATH\"; command -v sed" }),
+                &context(&dir),
+            )
             .await;
         assert!(!output.is_error, "{}", output.text);
         assert!(output.text.contains("CYGWIN"), "{}", output.text);
-        assert!(output.text.contains("profile=true"), "{}", output.text);
+        assert!(
+            output.text.contains("path=/usr/local/bin:/usr/bin:/bin\n"),
+            "{}",
+            output.text
+        );
         assert!(output.text.contains("/usr/bin/sed"), "{}", output.text);
     }
 

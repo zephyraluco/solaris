@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 const RUNTIME: &str = "plugins/windows/cygwin";
 
+/// Command search is confined to the bundled POSIX environment.
+pub const PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
 fn validate(root: PathBuf) -> Result<PathBuf, String> {
     for relative in ["bin/bash.exe", "bin/cygwin1.dll", "etc/profile"] {
         if !root.join(relative).is_file() {
@@ -39,13 +42,11 @@ fn find_root(executable: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-/// Windows environment shared by startup and Bash subprocesses.
+/// Bundled Windows Bash runtime, applied only to Bash subprocesses.
 #[cfg(windows)]
 pub struct Environment {
     /// Absolute path to the bundled Bash executable.
     pub bash: PathBuf,
-    /// Native Windows PATH with the Cygwin binaries first.
-    pub path: std::ffi::OsString,
 }
 
 /// Resolve the runtime once without changing the process environment.
@@ -61,14 +62,8 @@ pub fn environment() -> Result<&'static Environment, String> {
             // login profile and Bash here-documents expect /tmp to exist.
             std::fs::create_dir_all(root.join("tmp"))
                 .map_err(|error| format!("cannot create Cygwin temporary directory: {error}"))?;
-            let mut paths = vec![root.join("bin")];
-            paths.extend(std::env::split_paths(
-                &std::env::var_os("PATH").unwrap_or_default(),
-            ));
-            let path = std::env::join_paths(paths).map_err(|error| error.to_string())?;
             Ok(Environment {
                 bash: root.join("bin/bash.exe"),
-                path,
             })
         })
         .as_ref()
@@ -78,6 +73,43 @@ pub fn environment() -> Result<&'static Environment, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn login_profile_discards_inherited_command_search_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let native_bin = dir.path().join("native-bin");
+        std::fs::create_dir(&native_bin).unwrap();
+        let native_command = native_bin.join("native-only.exe");
+        std::fs::write(&native_command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&native_command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::write(
+            &profile,
+            include_str!("../../../plugins/windows/cygwin/etc/profile"),
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "source \"$1\"; printf '%s\\n' \"$PATH\"; command -v native-only.exe",
+                "bash",
+            ])
+            .arg(profile)
+            .env("PATH", native_bin)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{PATH}\n")
+        );
+    }
 
     fn runtime(root: &Path) {
         for relative in ["bin/bash.exe", "bin/cygwin1.dll", "etc/profile"] {

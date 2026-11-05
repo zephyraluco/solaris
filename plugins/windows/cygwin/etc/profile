@@ -1,4 +1,4 @@
-export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="/usr/local/bin:/usr/bin:/bin"
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export TERMINFO=/usr/share/terminfo
