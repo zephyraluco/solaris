@@ -1,2 +1,4 @@
 # Preserve runtime scripts and binaries exactly, including on Windows checkouts.
 plugins/windows/cygwin/** -text
+# Embedded Bash programs must retain LF even when core.autocrlf=true.
+crates/solaris-tools/src/scripts/*.sh text eol=lf
