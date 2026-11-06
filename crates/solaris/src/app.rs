@@ -4039,6 +4039,12 @@ mod tests {
                 }],
                 fallback: Arc::new(ChannelApprover::new(tx)),
             };
+            let cwd = policy.cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                let path = solaris_tools::environment::resolve_path(&cwd, "a.txt");
+                solaris_tools::environment::ExecutionEnvironment.canonical_path(&path)
+                    .unwrap_or_else(|error| panic!("approval resource normalization failed for {path:?} (cwd {cwd:?}): {error}"))
+            }).await.expect("resource worker");
             let answer = tokio::spawn(async move {
                 policy
                     .approve(&ToolCall::new(
