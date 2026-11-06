@@ -65,28 +65,20 @@ fn matches(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
+fn path_rule_matches(tool: &str, pattern: &str, resource: &str) -> bool {
+    if tool == "bash" {
+        return matches(pattern, resource);
+    }
+    let environment = solaris_tools::environment::ExecutionEnvironment;
+    matches(
+        &environment.comparison_path(pattern),
+        &environment.comparison_path(resource),
+    )
+}
+
 /// Canonicalize existing ancestors so symlink aliases cannot bypass a path rule.
 fn normalized(path: &Path) -> Result<PathBuf, std::io::Error> {
-    let clean = path.to_path_buf();
-    let mut parent = clean.as_path();
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::canonicalize(parent) {
-            Ok(mut base) => {
-                for part in suffix.iter().rev() {
-                    base.push(part);
-                }
-                return Ok(base);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                suffix.push(parent.file_name().ok_or(error)?);
-                parent = parent
-                    .parent()
-                    .ok_or_else(|| std::io::Error::other("path has no existing ancestor"))?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    solaris_tools::environment::ExecutionEnvironment.canonical_path(path)
 }
 
 #[async_trait]
@@ -126,15 +118,15 @@ impl Approver for PolicyApprover {
                 call.input["path"].as_str().map(str::to_owned)
             };
             if let Some(path) = path {
-                let path = Path::new(&path);
-                let path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    self.cwd.join(path)
-                };
-                match normalized(&path) {
-                    Ok(path) => path.to_string_lossy().into_owned(),
-                    Err(_) => return Approval::Denied,
+                let cwd = self.cwd.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let path = solaris_tools::environment::resolve_path(&cwd, &path);
+                    normalized(&path)
+                })
+                .await;
+                match result {
+                    Ok(Ok(path)) => path.to_string_lossy().into_owned(),
+                    _ => return Approval::Denied,
                 }
             } else {
                 call.input["command"].as_str().unwrap_or("*").to_string()
@@ -144,7 +136,10 @@ impl Approver for PolicyApprover {
             .rules
             .iter()
             .rev()
-            .find(|rule| matches(&rule.tool, &call.name) && matches(&rule.resource, &resource))
+            .find(|rule| {
+                matches(&rule.tool, &call.name)
+                    && path_rule_matches(&call.name, &rule.resource, &resource)
+            })
             .map(|r| r.effect)
             .unwrap_or(
                 if self.profile == PolicyProfile::Trusted
@@ -201,6 +196,43 @@ mod tests {
             Approval::Approved
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_parent_collapse_cannot_hide_a_protected_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let protected = directory.path().join("protected");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        symlink(&protected, workspace.join("link")).unwrap();
+        let policy = PolicyApprover {
+            profile: PolicyProfile::Trusted,
+            read_only_tools: Default::default(),
+            cwd: workspace.clone(),
+            rules: vec![
+                PermissionRule {
+                    tool: "write".into(),
+                    resource: format!("{}/*", workspace.canonicalize().unwrap().display()),
+                    effect: PermissionEffect::Allow,
+                },
+                PermissionRule {
+                    tool: "write".into(),
+                    resource: format!("{}/*", protected.canonicalize().unwrap().display()),
+                    effect: PermissionEffect::Deny,
+                },
+            ],
+            fallback: Arc::new(crate::AlwaysApprove),
+        };
+        let call = ToolCall::new(
+            "write",
+            "write",
+            serde_json::json!({"path":"missing/../link/new.txt","content":"blocked"}),
+        );
+        assert_eq!(policy.approve(&call).await, Approval::Denied);
+        assert!(!protected.join("new.txt").exists());
+    }
+
     #[test]
     fn wildcard_rules_match_the_complete_resource() {
         assert!(matches("*/src/*.rs", "/project/src/main.rs"));

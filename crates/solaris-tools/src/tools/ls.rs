@@ -87,23 +87,18 @@ impl Tool for LsTool {
         };
 
         let absolute = path_utils::resolve(&ctx.cwd, &path);
-        let mut entries = match tokio::fs::read_dir(&absolute).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                return ToolOutput::error(format!("could not list {path}: {error}"));
-            }
-        };
-
-        let mut names: Vec<String> = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry
-                .file_type()
+        let entries =
+            match tokio::task::spawn_blocking(move || crate::filesystem::entries(&absolute))
                 .await
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false);
-            names.push(if is_dir { format!("{name}/") } else { name });
-        }
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+            {
+                Ok(entries) => entries,
+                Err(error) => return ToolOutput::error(format!("could not list {path}: {error}")),
+            };
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .map(|(name, is_dir)| if is_dir { format!("{name}/") } else { name })
+            .collect();
 
         if names.is_empty() {
             return ToolOutput::ok(format!("({path} is empty)"));

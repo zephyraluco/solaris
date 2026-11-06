@@ -20,6 +20,8 @@ pub mod changes;
 #[cfg(any(windows, test))]
 pub mod cygwin;
 mod diff;
+pub mod environment;
+mod filesystem;
 mod mutation_queue;
 mod output;
 mod path_utils;

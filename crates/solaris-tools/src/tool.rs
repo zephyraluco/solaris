@@ -126,7 +126,8 @@ impl Cancel {
 /// What a tool needs from whoever called it.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
-    /// Directory a relative path resolves against.
+    /// Native application working directory. Model paths are interpreted by the
+    /// execution environment; child processes start in this directory.
     pub cwd: PathBuf,
     /// Directory a truncated shell output is written to.
     pub temp_dir: PathBuf,

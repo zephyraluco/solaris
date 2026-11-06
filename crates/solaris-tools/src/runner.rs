@@ -12,7 +12,7 @@ use std::process::Stdio;
 
 use crate::{Cancel, ToolContext};
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 /// What a finished program left behind.
@@ -99,11 +99,21 @@ async fn run_local(
     cancel: &Cancel,
 ) -> Result<CommandOutput, String> {
     const CAP: usize = 2 * 1024 * 1024;
-    let mut command = Command::new(program);
+    let script = "command -v -- \"$1\" >/dev/null 2>&1 || { printf 'solaris_missing_program:%s' \"$1\" >&2; exit 127; }; exec \"$@\"";
+    let arguments: Vec<&Path> = std::iter::once(Path::new(program))
+        .chain(args.iter().map(Path::new))
+        .collect();
+    let (command, input) = crate::environment::ExecutionEnvironment
+        .invocation(script, &arguments, &[])
+        .map_err(|error| error.to_string())?;
+    let mut command = Command::from(command);
     command
-        .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -113,7 +123,12 @@ async fn run_local(
     command.creation_flags(0x0800_0000);
     let mut child = command
         .spawn()
-        .map_err(|error| describe_spawn_failure(program, &error))?;
+        .map_err(|error| describe_spawn_failure("bash", &error))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+        });
+    }
     let pid = child.id();
     let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
@@ -169,6 +184,15 @@ async fn run_local(
     if let Some(error) = failure {
         return Err(error);
     }
+    if status.code() == Some(127) && missing_program_marker(&err, program) {
+        return Err(if cfg!(windows) {
+            format!(
+                "`{program}` was not found on the bundled Cygwin PATH; reinstall the complete runtime"
+            )
+        } else {
+            format!("`{program}` was not found on PATH — install it and try again")
+        });
+    }
     let mut stdout = String::from_utf8_lossy(&out).into_owned();
     if exceeded {
         stdout.push_str("\n[search output truncated at the 2 MiB capture limit; narrow the query]");
@@ -178,6 +202,10 @@ async fn run_local(
         stderr: String::from_utf8_lossy(&err).into_owned(),
         code: if exceeded { Some(0) } else { status.code() },
     })
+}
+
+fn missing_program_marker(stderr: &[u8], program: &str) -> bool {
+    stderr.ends_with(format!("solaris_missing_program:{program}").as_bytes())
 }
 
 /// Why a program could not be started, in words the user can act on.
@@ -209,6 +237,15 @@ pub(crate) mod tests {
         ) -> Result<CommandOutput, String> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn startup_warnings_do_not_hide_missing_program_diagnostics() {
+        let stderr =
+            b"bash.exe: warning: could not find /tmp, please create!\nsolaris_missing_program:rg";
+        assert!(missing_program_marker(stderr, "rg"));
+        assert!(!missing_program_marker(stderr, "fd"));
+        assert!(!missing_program_marker(b"unrelated exit 127", "rg"));
     }
 
     #[tokio::test]

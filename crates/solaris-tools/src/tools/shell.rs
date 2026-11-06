@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -102,31 +102,17 @@ impl ShellRunner for LocalShell {
         let mut last_missing = String::new();
 
         for program in config.programs {
-            #[cfg(not(windows))]
-            let mut builder = Command::new(program);
-            #[cfg(windows)]
-            let mut builder = {
-                let environment = crate::cygwin::environment()?;
-                let temporary = std::env::temp_dir();
-                std::fs::create_dir_all(&temporary)
-                    .map_err(|error| format!("cannot create Bash temporary directory: {error}"))?;
-                let mut builder = Command::new(&environment.bash);
-                builder
-                    .arg("--login")
-                    .env("PATH", crate::cygwin::PATH)
-                    .env("SHELL", &environment.bash)
-                    .env("TMPDIR", temporary)
-                    .env("CHERE_INVOKING", "1");
-                builder
-            };
+            let (builder, input) = crate::environment::ExecutionEnvironment
+                .invocation(command, &[], &[])
+                .map_err(|error| error.to_string())?;
+            let mut builder = Command::from(builder);
             builder
-                .arg(config.command_flag)
-                // The command is handed over untouched: appending to it — a
-                // `2>&1`, say — rewrites what the model asked for and breaks
-                // anything ending in a comment or a continuation.
-                .arg(command)
                 .current_dir(&ctx.cwd)
-                .stdin(Stdio::null())
+                .stdin(if input.is_empty() {
+                    Stdio::null()
+                } else {
+                    Stdio::piped()
+                })
                 .stdout(Stdio::piped())
                 // Both streams are piped and merged here instead. What the shell
                 // itself reports about the command only ever reaches its stderr,
@@ -166,6 +152,11 @@ impl ShellRunner for LocalShell {
 
             let mut buffer = crate::output::OutputAccumulator::new(&ctx.temp_dir);
             let mut capture_error = None;
+            if let Some(mut stdin) = child.stdin.take() {
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(&input).await;
+                });
+            }
             let pid = child.id();
             let mut timed_out = false;
             let mut cancelled = false;
@@ -554,7 +545,7 @@ impl Tool for ShellTool {
                         "output truncated to the last {} lines / {}; full output at {}",
                         self.limits.max_lines,
                         format_size(self.limits.max_bytes),
-                        path.display()
+                        crate::environment::display_path(&path)
                     ));
                     artifact_path = Some(path);
                 }
@@ -806,8 +797,11 @@ mod tests {
             .nth(1)
             .expect("a path")
             .trim_end_matches(']');
-        let saved = std::fs::read_to_string(saved).expect("saved output");
-        assert!(saved.contains("line 1\n"), "the whole output is there");
+        let saved = crate::tools::read::ReadTool::new()
+            .run(json!({"path":saved}), &context(&dir))
+            .await;
+        assert!(!saved.is_error, "{}", saved.text);
+        assert!(saved.text.contains("line 1\n"), "the whole output is there");
     }
 
     #[tokio::test]

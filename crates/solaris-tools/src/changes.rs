@@ -1,6 +1,6 @@
 //! Atomic file changes with private before-images and conflict-checked undo.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -26,44 +26,15 @@ pub struct FileChange {
 }
 
 pub(crate) fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.len() > MAX_FILE_BYTES as u64 => {
-            return Err(io::Error::other("file exceeds the 16 MiB mutation limit"));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    match crate::filesystem::read_limited(path, MAX_FILE_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    // take prevents a growing file from bypassing the metadata size check.
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take((MAX_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(io::Error::other("file grew beyond the mutation limit"));
-    }
-    Ok(Some(bytes))
 }
 
-fn atomic_replace(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<std::fs::Permissions>,
-) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("file has no parent"))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    if let Some(permissions) = permissions {
-        file.as_file().set_permissions(permissions)?;
-    }
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+fn atomic_replace(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    crate::filesystem::atomic_replace(path, bytes, mode, None)
 }
 
 fn private_directory(path: &Path) -> io::Result<()> {
@@ -92,18 +63,10 @@ pub fn commit(
     if ctx.is_cancelled() {
         return Err(io::Error::other("file change cancelled"));
     }
-    let target = if path.exists() {
-        std::fs::canonicalize(path)?
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("file has no parent"))?;
-        std::fs::create_dir_all(parent)?;
-        std::fs::canonicalize(parent)?.join(
-            path.file_name()
-                .ok_or_else(|| io::Error::other("missing filename"))?,
-        )
-    };
+    let target = crate::filesystem::canonicalize(path)?;
+    if let Some(parent) = target.parent() {
+        crate::filesystem::create_dir_all(parent)?;
+    }
     if read_optional(&target)?.as_deref() != before {
         return Err(io::Error::other(
             "file changed while preparing the edit; read it again",
@@ -137,15 +100,7 @@ pub fn commit(
         patch.truncate(end);
         patch.push_str("\n[patch truncated; inspect the file for the full change]\n");
     }
-    #[cfg(unix)]
-    let original_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(&target)
-            .ok()
-            .map(|m| m.permissions().mode())
-    };
-    #[cfg(not(unix))]
-    let original_mode = None;
+    let original_mode = crate::filesystem::mode(&target).ok();
     let change = FileChange {
         id,
         path: target.clone(),
@@ -172,10 +127,9 @@ pub fn commit(
             "file changed before replacement; read it again",
         ));
     }
-    let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    atomic_replace(&target, after, permissions)?;
+    crate::filesystem::atomic_replace(&target, after, original_mode, Some(&ctx.cancel))?;
     Ok(ToolMetadata {
-        details: json!({ "change": change, "undo_record": kept.join("change.json") }),
+        details: json!({ "change": change, "undo_record": crate::environment::display_path(&kept.join("change.json")) }),
         ..Default::default()
     })
 }
@@ -229,19 +183,9 @@ pub fn undo(directory: &Path, id: &str) -> io::Result<FileChange> {
         if hash(&before) != *expected {
             return Err(io::Error::other("undo backup checksum mismatch"));
         }
-        let permissions = std::fs::metadata(&change.path)?.permissions();
-        #[cfg(unix)]
-        let mut permissions = permissions;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = change.original_mode {
-                permissions.set_mode(mode);
-            }
-        }
-        atomic_replace(&change.path, &before, Some(permissions))?;
+        atomic_replace(&change.path, &before, change.original_mode)?;
     } else {
-        std::fs::remove_file(&change.path)?;
+        crate::filesystem::remove_file(&change.path)?;
     }
     Ok(change)
 }

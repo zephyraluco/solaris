@@ -338,7 +338,29 @@ pub trait Tool: Send + Sync {
 | `find` | shell out 到 fd，按 glob 找路径 |
 | `bash` | 合并 stdout+stderr，超时可杀，输出尾部截断 |
 
-所有平台统一注册 `bash`。Windows 启动时验证随附的 Cygwin，将其 `bin` 加入进程 PATH；shell runner 使用 Bash 的绝对路径和登录配置，并通过 `CHERE_INVOKING` 保留会话工作目录。运行库缺失时明确报错。`edit` 与 `write` 共用一张按路径的锁（`FileMutationQueue`）：一轮里模型完全可能同时要求改同一个文件的两处，两次「读—改—写」重叠就会丢掉一次改动。
+所有平台统一使用 `environment::ExecutionEnvironment` 构造 Bash 子进程。Windows
+只定位随包 Bash，禁用个人启动文件，显式加载 `/etc/profile`；PATH 限定为 Cygwin
+目录，HOME/TMPDIR 位于用户可写位置。`grep/find` 通过固定 `exec "$@"` 脚本传递
+程序名与参数，不再直接启动原生程序。Linux/macOS 使用系统 Bash、系统工具和 PATH。
+
+`filesystem.rs` 通过固定脚本调用系统命令，实现用户文件的读取、目录枚举、原子替换
+和撤销；Rust 不直接访问这些目标文件。二进制内容通过 stdin/stdout 传输，目录响应
+采用 NUL 分隔字段，不解析人工目录列表。Rust 在内存中保留精确编辑、BOM/CRLF、
+补丁与哈希检查。写入限制 16 MiB，读取限制 32 MiB，图片限制 8 MiB；固定文件操作
+有 60 秒期限、输出上限和取消控制。应用内部数据库、变更记录目录、输出捕获等状态
+仍由 Rust 管理。
+
+Windows 工具路径统一使用 `/cygdrive/<盘符>/...`；应用原生工作目录与技能路径通过
+`cygpath` 转为模型可见路径。文件工具与权限检查共用 Bash 路径规范化：`cd -P` 解析
+目录链接，`readlink` 解析文件链接，并处理尚不存在的后缀。Windows 路径规则兼容
+原生路径，并保守地忽略路径大小写；shell 规则始终按命令原文匹配。更改队列按规范
+路径加锁，原子替换使用同目录临时文件、保留权限，变更前后仍做乐观冲突检查。
+替换前同步临时文件，替换后同步父目录；Linux 使用 GNU `sync` 的逐文件屏障，
+macOS/Cygwin 使用系统级 `sync`，因此写操作可能产生额外同步延迟。
+这不是文件系统沙箱，也不宣称消除外部进程修改文件的竞争窗口。
+
+Windows 启动校验包含随包命令集；缺失时明确提示发行包不完整，不回退到宿主工具。
+`edit` 与 `write` 共用一张按路径的锁（`FileMutationQueue`）：一轮里模型完全可能同时要求改同一个文件的两处，两次「读—改—写」重叠就会丢掉一次改动。
 
 ### 4.2 可测的缝
 
