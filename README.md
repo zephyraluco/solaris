@@ -53,7 +53,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 ## Requirements
 
-- **Bash and standard utilities** (`cat`, `head`, `cp`, `ls`, `chmod`, `mkdir`, `mktemp`, `mv`, `rm`, `readlink`) on Linux/macOS; included in the Windows runtime.
+- **Bash and standard utilities** (`cat`, `head`, `cp`, `ls`, `chmod`, `mkdir`, `mktemp`, `mv`, `rm`, `readlink`, `sync`) on Linux/macOS; included in the Windows runtime.
 - **Rust 1.88 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
