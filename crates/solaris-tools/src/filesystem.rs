@@ -153,6 +153,7 @@ mod tests {
     fn replacement_converts_native_paths_before_parent_extraction() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("artifacts/deep/before");
+        let mapped = crate::environment::display_path(&target);
         // Stand in for cygpath so the native-boundary regression executes on
         // every host, including systems without a Cygwin installation.
         let script = format!(
@@ -166,7 +167,7 @@ mod tests {
                     Path::new(r"C:\Users\alice\artifacts\deep\before"),
                     Path::new(""),
                     Path::new("cygwin"),
-                    &target,
+                    Path::new(&mapped),
                 ],
                 b"backup content",
                 Some(directory.path()),
@@ -195,7 +196,8 @@ mod tests {
             "destination=$1; log=$4; sync() {{ cat \"$destination\" >> \"$log\"; printf '\\0' >> \"$log\"; }};\n{}",
             include_str!("scripts/replace.sh")
         );
-        let args = [&target as &Path, Path::new(""), Path::new("native"), &log];
+        let kind = if cfg!(windows) { "cygwin" } else { "native" };
+        let args = [&target as &Path, Path::new(""), Path::new(kind), &log];
         let output = ExecutionEnvironment
             .run(&script, &args, b"new", Some(directory.path()), None, 4096)
             .unwrap();
