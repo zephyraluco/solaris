@@ -1057,7 +1057,7 @@ mod tests {
         for (text, request) in user_text.iter().zip(["initial", "steer", "follow"]) {
             assert!(text.contains("New body"), "{text}");
             assert!(
-                text.contains(&dir.join("pdf").display().to_string()),
+                text.contains(&solaris_tools::environment::display_path(&dir.join("pdf"))),
                 "{text}"
             );
             assert!(text.contains(&format!("Request: {request}")), "{text}");
@@ -1118,7 +1118,9 @@ mod tests {
         let system = requests[1].history[0].text();
         assert!(system.contains("Project rule marker"));
         assert!(system.contains("Addendum marker"));
-        assert!(system.contains(&agent.options.cwd.display().to_string()));
+        assert!(system.contains(&solaris_tools::environment::display_path(
+            &agent.options.cwd
+        )));
         assert!(
             requests[1]
                 .history
