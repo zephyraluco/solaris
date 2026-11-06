@@ -185,6 +185,45 @@ mod tests {
         assert_eq!(read(&target).unwrap(), b"backup content");
     }
 
+    #[test]
+    fn replacement_flushes_before_and_after_rename_and_propagates_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let log = directory.path().join("barriers");
+        std::fs::write(&target, "old").unwrap();
+        let script = format!(
+            "destination=$1; log=$4; sync() {{ cat \"$destination\" >> \"$log\"; printf '\\0' >> \"$log\"; }};\n{}",
+            include_str!("scripts/replace.sh")
+        );
+        let args = [&target as &Path, Path::new(""), Path::new("native"), &log];
+        let output = ExecutionEnvironment
+            .run(&script, &args, b"new", Some(directory.path()), None, 4096)
+            .unwrap();
+        assert_eq!(
+            output.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(read(&log).unwrap(), b"old\0new\0");
+        let script = format!(
+            "sync() {{ return 1; }};\n{}",
+            include_str!("scripts/replace.sh")
+        );
+        let output = ExecutionEnvironment
+            .run(
+                &script,
+                &args,
+                b"must not replace",
+                Some(directory.path()),
+                None,
+                4096,
+            )
+            .unwrap();
+        assert_ne!(output.code, Some(0));
+        assert_eq!(read(&target).unwrap(), b"new");
+    }
+
     #[cfg(unix)]
     #[test]
     fn canonicalization_follows_file_and_directory_symlinks_and_new_suffixes() {

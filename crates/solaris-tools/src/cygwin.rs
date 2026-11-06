@@ -20,6 +20,7 @@ pub const REQUIRED_FILES: &[&str] = &[
     "bin/mv.exe",
     "bin/rm.exe",
     "bin/readlink.exe",
+    "bin/sync.exe",
     "usr/local/bin/rg.exe",
     "usr/local/bin/fd.exe",
 ];
