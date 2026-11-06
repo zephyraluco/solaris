@@ -1,7 +1,7 @@
 //! Small image attachments are detected by content, not a filename extension.
 use crate::InlineImage;
 use base64::Engine;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 fn media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -19,15 +19,23 @@ fn media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 /// Return None for text/other binary data. Image bytes are limited before encoding.
 pub fn read_image(path: &Path) -> io::Result<Option<InlineImage>> {
-    let mut file = std::fs::File::open(path)?;
-    let mut prefix = [0u8; 16];
-    let count = file.read(&mut prefix)?;
-    let Some(media_type) = media_type(&prefix[..count]) else {
+    let prefix = crate::environment::ExecutionEnvironment.checked(
+        "[[ -f $1 ]] || { printf 'file not found or not a regular file' >&2; exit 44; }; head -c 16 -- \"$1\"", &[path], &[], None)?;
+    let Some(_) = media_type(&prefix) else {
         return Ok(None);
     };
-    let mut bytes = prefix[..count].to_vec();
-    file.take((MAX_IMAGE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    let bytes = crate::filesystem::read_limited(path, MAX_IMAGE_BYTES).map_err(|error| {
+        io::Error::other(format!(
+            "image exceeds the 8 MiB input limit or could not be read: {error}"
+        ))
+    })?;
+    from_bytes(&bytes)
+}
+
+pub(crate) fn from_bytes(bytes: &[u8]) -> io::Result<Option<InlineImage>> {
+    let Some(media_type) = media_type(bytes) else {
+        return Ok(None);
+    };
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(io::Error::other("image exceeds the 8 MiB input limit"));
     }

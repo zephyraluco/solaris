@@ -99,9 +99,29 @@ impl Tool for EditTool {
             return ToolOutput::error(format!("{path} is a directory — `edit` works on a file"));
         }
 
+        let lock_path = absolute.clone();
+        let lock_path =
+            match tokio::task::spawn_blocking(move || crate::filesystem::canonicalize(&lock_path))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return ToolOutput::error(format!("could not resolve {path}: {error}"));
+                }
+            };
+        #[cfg(windows)]
+        let lock_path = std::path::PathBuf::from(lock_path.to_string_lossy().to_lowercase());
+
         self.queue
-            .with_lock(&absolute, || async {
-                let raw = match crate::changes::read_optional(&absolute) {
+            .with_lock(&lock_path, || async {
+                let read_path = absolute.clone();
+                let raw = match tokio::task::spawn_blocking(move || {
+                    crate::changes::read_optional(&read_path)
+                })
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+                {
                     Ok(Some(raw)) => raw,
                     Ok(None) => {
                         return ToolOutput::error(format!("could not read {path}: file not found"));
@@ -136,12 +156,19 @@ impl Tool for EditTool {
                 }
 
                 let final_text = format!("{bom}{}", restore_line_endings(&updated, ending));
-                match crate::changes::commit(
-                    &absolute,
-                    Some(text.as_bytes()),
-                    final_text.as_bytes(),
-                    ctx,
-                ) {
+                let target = absolute.clone();
+                let context = ctx.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::changes::commit(
+                        &target,
+                        Some(text.as_bytes()),
+                        final_text.as_bytes(),
+                        &context,
+                    )
+                })
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+                {
                     Ok(metadata) => {
                         let mut output =
                             ToolOutput::ok(format!("Replaced {edit_count} block(s) in {path}."));

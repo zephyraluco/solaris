@@ -172,8 +172,8 @@ impl Skill {
         let mut prompt = format!(
             "Use the `{}` skill.\nSkill file: {}\nResolve relative references against: {}\n\nIts instructions follow:\n\n{}\n",
             self.name,
-            self.path.display(),
-            self.base_dir.display(),
+            solaris_tools::environment::display_path(&self.path),
+            solaris_tools::environment::display_path(&self.base_dir),
             self.instructions.trim()
         );
         let args = args.trim();
@@ -420,7 +420,7 @@ impl Skills {
                 "- `{}`: {} — {}",
                 skill.name,
                 skill.description_inline(),
-                skill.path.display()
+                solaris_tools::environment::display_path(&skill.path)
             );
         }
 
@@ -1155,7 +1155,7 @@ mod tests {
         assert!(section.contains("# Skills"));
         assert!(section.contains("`read` tool"));
         assert!(section.contains("- `pdf-tools`: Extract text from PDFs."));
-        assert!(section.contains(&path.display().to_string()));
+        assert!(section.contains(&solaris_tools::environment::display_path(&path)));
     }
 
     #[test]

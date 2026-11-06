@@ -7,7 +7,7 @@ fn complete_distribution_does_not_require_writing_to_its_runtime() {
     let executable = directory.path().join("solaris.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_solaris"), &executable).unwrap();
     let runtime = directory.path().join("plugins/windows/cygwin");
-    for relative in ["bin/bash.exe", "bin/cygwin1.dll", "etc/profile"] {
+    for relative in solaris_tools::cygwin::REQUIRED_FILES {
         let file = runtime.join(relative);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, []).unwrap();

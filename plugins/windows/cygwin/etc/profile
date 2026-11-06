@@ -8,5 +8,6 @@ export LC_ALL=C.UTF-8
 export TERMINFO=/usr/share/terminfo
 export TZ="${TZ:-UTC0}"
 export HOME="${HOME:-/home/${USER:-default}}"
+if [ -x /usr/bin/cygpath ]; then export HOME="$(/usr/bin/cygpath -au -- "$HOME")"; fi
 mkdir -p "$HOME" 2>/dev/null || :
 if [ -t 1 ]; then PS1='\u@\h:\w\$ '; fi

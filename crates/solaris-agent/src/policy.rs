@@ -65,28 +65,20 @@ fn matches(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
+fn path_rule_matches(tool: &str, pattern: &str, resource: &str) -> bool {
+    if tool == "bash" {
+        return matches(pattern, resource);
+    }
+    let environment = solaris_tools::environment::ExecutionEnvironment;
+    matches(
+        &environment.comparison_path(pattern),
+        &environment.comparison_path(resource),
+    )
+}
+
 /// Canonicalize existing ancestors so symlink aliases cannot bypass a path rule.
 fn normalized(path: &Path) -> Result<PathBuf, std::io::Error> {
-    let clean = path.to_path_buf();
-    let mut parent = clean.as_path();
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::canonicalize(parent) {
-            Ok(mut base) => {
-                for part in suffix.iter().rev() {
-                    base.push(part);
-                }
-                return Ok(base);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                suffix.push(parent.file_name().ok_or(error)?);
-                parent = parent
-                    .parent()
-                    .ok_or_else(|| std::io::Error::other("path has no existing ancestor"))?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    solaris_tools::environment::ExecutionEnvironment.canonical_path(path)
 }
 
 #[async_trait]
@@ -126,15 +118,15 @@ impl Approver for PolicyApprover {
                 call.input["path"].as_str().map(str::to_owned)
             };
             if let Some(path) = path {
-                let path = Path::new(&path);
-                let path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    self.cwd.join(path)
-                };
-                match normalized(&path) {
-                    Ok(path) => path.to_string_lossy().into_owned(),
-                    Err(_) => return Approval::Denied,
+                let cwd = self.cwd.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let path = solaris_tools::environment::resolve_path(&cwd, &path);
+                    normalized(&path)
+                })
+                .await;
+                match result {
+                    Ok(Ok(path)) => path.to_string_lossy().into_owned(),
+                    _ => return Approval::Denied,
                 }
             } else {
                 call.input["command"].as_str().unwrap_or("*").to_string()
@@ -144,7 +136,10 @@ impl Approver for PolicyApprover {
             .rules
             .iter()
             .rev()
-            .find(|rule| matches(&rule.tool, &call.name) && matches(&rule.resource, &resource))
+            .find(|rule| {
+                matches(&rule.tool, &call.name)
+                    && path_rule_matches(&call.name, &rule.resource, &resource)
+            })
             .map(|r| r.effect)
             .unwrap_or(
                 if self.profile == PolicyProfile::Trusted

@@ -99,7 +99,15 @@ async fn run_local(
     cancel: &Cancel,
 ) -> Result<CommandOutput, String> {
     const CAP: usize = 2 * 1024 * 1024;
-    let mut command = Command::new(program);
+    let mut command = Command::from(
+        crate::environment::ExecutionEnvironment
+            .command()
+            .map_err(|error| error.to_string())?,
+    );
+    let script = crate::environment::ExecutionEnvironment.bootstrap(
+        "command -v -- \"$1\" >/dev/null 2>&1 || { printf 'solaris_missing_program:%s' \"$1\" >&2; exit 127; }; exec \"$@\""
+    );
+    command.args(["-c", &script, "solaris", program]);
     command
         .args(args)
         .current_dir(cwd)
@@ -113,7 +121,7 @@ async fn run_local(
     command.creation_flags(0x0800_0000);
     let mut child = command
         .spawn()
-        .map_err(|error| describe_spawn_failure(program, &error))?;
+        .map_err(|error| describe_spawn_failure("bash", &error))?;
     let pid = child.id();
     let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
@@ -168,6 +176,15 @@ async fn run_local(
     };
     if let Some(error) = failure {
         return Err(error);
+    }
+    if status.code() == Some(127) && err.starts_with(b"solaris_missing_program:") {
+        return Err(if cfg!(windows) {
+            format!(
+                "`{program}` was not found on the bundled Cygwin PATH; reinstall the complete runtime"
+            )
+        } else {
+            format!("`{program}` was not found on PATH — install it and try again")
+        });
     }
     let mut stdout = String::from_utf8_lossy(&out).into_owned();
     if exceeded {

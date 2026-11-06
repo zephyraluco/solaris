@@ -158,12 +158,21 @@ pub(crate) fn build_system_prompt(
     context: &PromptContext,
 ) -> String {
     let mut prompt = String::new();
+    let _ = writeln!(
+        prompt,
+        "# Execution environment\n{}\n",
+        solaris_tools::environment::ExecutionEnvironment.description()
+    );
 
     prompt.push_str(
         "You are solaris, a terminal assistant. You work in the directory solaris was started in, \
          you act by calling the tools declared to you, and your replies are read in a terminal.\n",
     );
-    let _ = writeln!(prompt, "\n# Working directory\n{}", cwd.display());
+    let _ = writeln!(
+        prompt,
+        "\n# Working directory\n{}",
+        solaris_tools::environment::display_path(cwd)
+    );
 
     prompt.push_str("\n# Working mode\n");
     prompt.push_str(mode.instructions());
@@ -219,7 +228,7 @@ pub(crate) fn build_system_prompt(
                 let _ = writeln!(
                     prompt,
                     "\n--- Begin instructions: {} ---\n{}\n--- End instructions ---",
-                    file.path.display(),
+                    solaris_tools::environment::display_path(&file.path),
                     file.content.trim()
                 );
             }

@@ -84,8 +84,22 @@ impl Tool for WriteTool {
 
         let bytes = content.len();
 
+        let lock_path = absolute.clone();
+        let lock_path =
+            match tokio::task::spawn_blocking(move || crate::filesystem::canonicalize(&lock_path))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return ToolOutput::error(format!("could not resolve {path}: {error}"));
+                }
+            };
+        #[cfg(windows)]
+        let lock_path = std::path::PathBuf::from(lock_path.to_string_lossy().to_lowercase());
+
         self.queue
-            .with_lock(&absolute, || async {
+            .with_lock(&lock_path, || async {
                 // A cancelled call must not touch the filesystem at all, and the
                 // checks sit inside the lock because what they read — whether
                 // the file is there, whether a stop has arrived — is only
@@ -94,7 +108,13 @@ impl Tool for WriteTool {
                     return ToolOutput::error("the write was cancelled before it started");
                 }
 
-                let before = match crate::changes::read_optional(&absolute) {
+                let read_path = absolute.clone();
+                let before = match tokio::task::spawn_blocking(move || {
+                    crate::changes::read_optional(&read_path)
+                })
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+                {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return ToolOutput::error(format!("could not read {path}: {error}"));
@@ -102,20 +122,16 @@ impl Tool for WriteTool {
                 };
                 let existed = before.is_some();
 
-                if let Some(parent) = absolute
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    && let Err(error) = tokio::fs::create_dir_all(parent).await
-                {
-                    return ToolOutput::error(format!(
-                        "could not create {}: {error}",
-                        parent.display()
-                    ));
-                }
                 if ctx.is_cancelled() {
                     return ToolOutput::error("the write was cancelled before it was written");
                 }
-                match crate::changes::commit(&absolute, before.as_deref(), content.as_bytes(), ctx)
+                let target = absolute.clone();
+                let context = ctx.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::changes::commit(&target, before.as_deref(), content.as_bytes(), &context)
+                })
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
                 {
                     Ok(metadata) => {
                         let mut output = ToolOutput::ok(describe(&path, bytes, existed));

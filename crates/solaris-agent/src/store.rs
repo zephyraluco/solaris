@@ -261,6 +261,15 @@ pub struct SessionJournal {
     _lease: File,
 }
 
+impl Drop for SessionJournal {
+    fn drop(&mut self) {
+        // A concurrently spawned process can briefly inherit this open file
+        // description before exec closes it. Closing only our descriptor would
+        // leave the lease locked until that child finishes exec.
+        let _ = fs2::FileExt::unlock(&self._lease);
+    }
+}
+
 impl SessionJournal {
     pub fn id(&self) -> &str {
         &self.id
@@ -365,6 +374,26 @@ impl SessionJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_journal_releases_lease_despite_a_duplicated_descriptor() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("session");
+        let id = journal.id().to_owned();
+        let inherited = journal._lease.try_clone().expect("duplicate descriptor");
+        assert!(store.resume(&id).is_err());
+        drop(journal);
+        let resumed = store.resume(&id).expect("released owner lease");
+        drop(inherited);
+        assert!(
+            store.resume(&id).is_err(),
+            "new owner must still hold its lock"
+        );
+        drop(resumed);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 

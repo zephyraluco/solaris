@@ -53,6 +53,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 ## Requirements
 
+- **Bash and standard utilities** (`cat`, `head`, `cp`, `ls`, `chmod`, `mkdir`, `mktemp`, `mv`, `rm`, `readlink`) on Linux/macOS; included in the Windows runtime.
 - **Rust 1.88 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
@@ -81,7 +82,13 @@ the Windows PATH is not inherited by Bash.
 Bash temporary files use the current user's temporary directory; startup does
 not require write access to the installation directory.
 
-Commands run through Bash's login profile while retaining the session directory.
+All built-in tools use Bash and system utilities, including file reads, directory
+listing, atomic writes and undo. Windows starts the bundled Bash with personal
+startup files disabled and explicitly sources `/etc/profile`; it does not inherit
+the host PATH. Use `/cygdrive/c/...` for Windows system files. `rg` and `fd` are
+resolved by that same Cygwin PATH, not by Windows process lookup. Linux/macOS use
+system Bash, standard utilities, and the system PATH. Structured arguments are
+passed separately, with file content on stdin. Commands retain the session directory.
 All platforms expose the same `bash` tool and use Bash command syntax. A missing
 or incomplete Windows runtime is reported explicitly. The standalone EXE is not
 a complete Windows installation.

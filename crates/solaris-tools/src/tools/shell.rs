@@ -102,29 +102,17 @@ impl ShellRunner for LocalShell {
         let mut last_missing = String::new();
 
         for program in config.programs {
-            #[cfg(not(windows))]
-            let mut builder = Command::new(program);
-            #[cfg(windows)]
-            let mut builder = {
-                let environment = crate::cygwin::environment()?;
-                let temporary = std::env::temp_dir();
-                std::fs::create_dir_all(&temporary)
-                    .map_err(|error| format!("cannot create Bash temporary directory: {error}"))?;
-                let mut builder = Command::new(&environment.bash);
-                builder
-                    .arg("--login")
-                    .env("PATH", crate::cygwin::PATH)
-                    .env("SHELL", &environment.bash)
-                    .env("TMPDIR", temporary)
-                    .env("CHERE_INVOKING", "1");
-                builder
-            };
+            let mut builder = Command::from(
+                crate::environment::ExecutionEnvironment
+                    .command()
+                    .map_err(|error| error.to_string())?,
+            );
             builder
                 .arg(config.command_flag)
                 // The command is handed over untouched: appending to it — a
                 // `2>&1`, say — rewrites what the model asked for and breaks
                 // anything ending in a comment or a continuation.
-                .arg(command)
+                .arg(crate::environment::ExecutionEnvironment.bootstrap(command))
                 .current_dir(&ctx.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -554,7 +542,7 @@ impl Tool for ShellTool {
                         "output truncated to the last {} lines / {}; full output at {}",
                         self.limits.max_lines,
                         format_size(self.limits.max_bytes),
-                        path.display()
+                        crate::environment::display_path(&path)
                     ));
                     artifact_path = Some(path);
                 }

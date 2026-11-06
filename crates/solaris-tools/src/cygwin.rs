@@ -4,11 +4,31 @@ use std::path::{Path, PathBuf};
 
 const RUNTIME: &str = "plugins/windows/cygwin";
 
+/// Files required for the complete Bash-backed tool environment.
+pub const REQUIRED_FILES: &[&str] = &[
+    "bin/bash.exe",
+    "bin/cygwin1.dll",
+    "etc/profile",
+    "bin/cygpath.exe",
+    "bin/cat.exe",
+    "bin/head.exe",
+    "bin/cp.exe",
+    "bin/ls.exe",
+    "bin/chmod.exe",
+    "bin/mkdir.exe",
+    "bin/mktemp.exe",
+    "bin/mv.exe",
+    "bin/rm.exe",
+    "bin/readlink.exe",
+    "usr/local/bin/rg.exe",
+    "usr/local/bin/fd.exe",
+];
+
 /// Command search is confined to the bundled POSIX environment.
 pub const PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 fn validate(root: PathBuf) -> Result<PathBuf, String> {
-    for relative in ["bin/bash.exe", "bin/cygwin1.dll", "etc/profile"] {
+    for relative in REQUIRED_FILES {
         if !root.join(relative).is_file() {
             return Err(format!(
                 "Cygwin runtime is incomplete: missing {}. Install the complete Windows distribution.",
@@ -108,7 +128,7 @@ mod tests {
     }
 
     fn runtime(root: &Path) {
-        for relative in ["bin/bash.exe", "bin/cygwin1.dll", "etc/profile"] {
+        for relative in REQUIRED_FILES {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, []).unwrap();

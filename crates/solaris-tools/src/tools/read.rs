@@ -95,7 +95,17 @@ impl Tool for ReadTool {
             return ToolOutput::error(format!("{path} is a directory — use `ls` to list it"));
         }
 
-        match crate::read_image(&absolute) {
+        let cancel = ctx.cancel.clone();
+        let bytes = match tokio::task::spawn_blocking(move || {
+            crate::filesystem::read_with_cancel(&absolute, 32 * 1024 * 1024, Some(&cancel))
+        })
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return ToolOutput::error(format!("could not read {path}: {error}")),
+        };
+        match crate::image::from_bytes(&bytes) {
             Ok(Some(image)) => {
                 if !ctx.images_enabled {
                     return ToolOutput::error(
@@ -111,12 +121,6 @@ impl Tool for ReadTool {
             Err(error) => return ToolOutput::error(format!("could not read {path}: {error}")),
         }
 
-        let bytes = match tokio::fs::read(&absolute).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return ToolOutput::error(format!("could not read {path}: {error}"));
-            }
-        };
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(_) => {
