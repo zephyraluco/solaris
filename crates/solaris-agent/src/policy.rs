@@ -196,6 +196,43 @@ mod tests {
             Approval::Approved
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_parent_collapse_cannot_hide_a_protected_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let protected = directory.path().join("protected");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        symlink(&protected, workspace.join("link")).unwrap();
+        let policy = PolicyApprover {
+            profile: PolicyProfile::Trusted,
+            read_only_tools: Default::default(),
+            cwd: workspace.clone(),
+            rules: vec![
+                PermissionRule {
+                    tool: "write".into(),
+                    resource: format!("{}/*", workspace.canonicalize().unwrap().display()),
+                    effect: PermissionEffect::Allow,
+                },
+                PermissionRule {
+                    tool: "write".into(),
+                    resource: format!("{}/*", protected.canonicalize().unwrap().display()),
+                    effect: PermissionEffect::Deny,
+                },
+            ],
+            fallback: Arc::new(crate::AlwaysApprove),
+        };
+        let call = ToolCall::new(
+            "write",
+            "write",
+            serde_json::json!({"path":"missing/../link/new.txt","content":"blocked"}),
+        );
+        assert_eq!(policy.approve(&call).await, Approval::Denied);
+        assert!(!protected.join("new.txt").exists());
+    }
+
     #[test]
     fn wildcard_rules_match_the_complete_resource() {
         assert!(matches("*/src/*.rs", "/project/src/main.rs"));

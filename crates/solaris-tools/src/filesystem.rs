@@ -228,6 +228,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn collapsing_missing_parent_segments_resolves_newly_exposed_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let protected = directory.path().join("protected");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        symlink(&protected, workspace.join("link")).unwrap();
+        let input = workspace.join("missing/../link/new.txt");
+        let target = canonicalize(&input).unwrap();
+        assert_eq!(target, protected.canonicalize().unwrap().join("new.txt"));
+        atomic_replace(&target, b"actual target", None, None).unwrap();
+        assert_eq!(read(&protected.join("new.txt")).unwrap(), b"actual target");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn canonicalization_follows_file_and_directory_symlinks_and_new_suffixes() {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
