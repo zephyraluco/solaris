@@ -184,7 +184,7 @@ async fn run_local(
     if let Some(error) = failure {
         return Err(error);
     }
-    if status.code() == Some(127) && err.starts_with(b"solaris_missing_program:") {
+    if status.code() == Some(127) && missing_program_marker(&err, program) {
         return Err(if cfg!(windows) {
             format!(
                 "`{program}` was not found on the bundled Cygwin PATH; reinstall the complete runtime"
@@ -202,6 +202,10 @@ async fn run_local(
         stderr: String::from_utf8_lossy(&err).into_owned(),
         code: if exceeded { Some(0) } else { status.code() },
     })
+}
+
+fn missing_program_marker(stderr: &[u8], program: &str) -> bool {
+    stderr.ends_with(format!("solaris_missing_program:{program}").as_bytes())
 }
 
 /// Why a program could not be started, in words the user can act on.
@@ -233,6 +237,15 @@ pub(crate) mod tests {
         ) -> Result<CommandOutput, String> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn startup_warnings_do_not_hide_missing_program_diagnostics() {
+        let stderr =
+            b"bash.exe: warning: could not find /tmp, please create!\nsolaris_missing_program:rg";
+        assert!(missing_program_marker(stderr, "rg"));
+        assert!(!missing_program_marker(stderr, "fd"));
+        assert!(!missing_program_marker(b"unrelated exit 127", "rg"));
     }
 
     #[tokio::test]

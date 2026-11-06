@@ -797,8 +797,11 @@ mod tests {
             .nth(1)
             .expect("a path")
             .trim_end_matches(']');
-        let saved = std::fs::read_to_string(saved).expect("saved output");
-        assert!(saved.contains("line 1\n"), "the whole output is there");
+        let saved = crate::tools::read::ReadTool::new()
+            .run(json!({"path":saved}), &context(&dir))
+            .await;
+        assert!(!saved.is_error, "{}", saved.text);
+        assert!(saved.text.contains("line 1\n"), "the whole output is there");
     }
 
     #[tokio::test]
