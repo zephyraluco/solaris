@@ -117,3 +117,23 @@ fn bundled_profile_discards_an_inherited_host_path() {
     assert!(stdout.contains("ripgrep"), "{stdout}");
     assert!(stdout.contains("fd "), "{stdout}");
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn grep_preserves_cargo_regex_backslashes_and_glob_characters() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("Cargo.toml"), "[package]\nname = 'fixture'\nversion = '1'\nedition = '2024'\ndescription = 'test'\n[dependencies]\n").unwrap();
+    // These files would be candidates for native Cygwin startup globbing.
+    std::fs::write(directory.path().join("a"), "unrelated").unwrap();
+    let ctx = ToolContext::new(directory.path(), directory.path());
+    let pattern = r"^\[|^name|^version|^edition|^description|^\[dependencies\]";
+    let result = ToolRegistry::builtin()
+        .get("grep")
+        .unwrap()
+        .run(json!({"pattern":pattern,"path":"Cargo.toml"}), &ctx)
+        .await;
+    assert!(!result.is_error, "{}", result.text);
+    assert!(result.text.contains("[package]"), "{}", result.text);
+    assert!(result.text.contains("[dependencies]"), "{}", result.text);
+    assert!(result.text.contains("name = 'fixture'"), "{}", result.text);
+}

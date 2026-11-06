@@ -22,6 +22,46 @@ pub(crate) struct Output {
     pub code: Option<i32>,
 }
 
+// Only this fixed, backslash-free script crosses the native Windows argv
+// boundary. Cygwin startup globbing must never see scripts or user arguments.
+#[cfg(any(windows, test))]
+const DISPATCHER: &str = r#"
+IFS= read -r -d '' __solaris_script || exit 64
+IFS= read -r -d '' __solaris_count || exit 64
+__solaris_args=()
+for ((__solaris_i=0; __solaris_i<__solaris_count; __solaris_i++)); do
+    IFS= read -r -d '' __solaris_arg || exit 64
+    __solaris_args+=("$__solaris_arg")
+done
+set -- "${__solaris_args[@]}"
+eval "$__solaris_script"
+"#;
+
+#[cfg(any(windows, test))]
+fn frame(script: &str, args: &[&Path], input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut field = |value: &str| -> io::Result<()> {
+        if value.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "script and arguments cannot contain NUL",
+            ));
+        }
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+        Ok(())
+    };
+    field(script)?;
+    field(&args.len().to_string())?;
+    for arg in args {
+        field(arg.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "argument is not valid Unicode")
+        })?)?;
+    }
+    bytes.extend_from_slice(input);
+    Ok(bytes)
+}
+
 impl ExecutionEnvironment {
     /// User-facing execution contract, independent of the host's native shell.
     pub fn description(self) -> &'static str {
@@ -68,6 +108,28 @@ impl ExecutionEnvironment {
             format!("source /etc/profile || exit;\n{script}")
         } else {
             script.to_owned()
+        }
+    }
+
+    /// Configure the process and its stdin together. On Windows payloads use
+    /// NUL-delimited stdin framing, bypassing Cygwin's native argv globbing.
+    pub(crate) fn invocation(
+        self,
+        script: &str,
+        args: &[&Path],
+        input: &[u8],
+    ) -> io::Result<(Command, Vec<u8>)> {
+        let mut command = self.command()?;
+        let script = self.bootstrap(script);
+        #[cfg(windows)]
+        {
+            command.args(["-c", DISPATCHER, "solaris"]);
+            Ok((command, frame(&script, args, input)?))
+        }
+        #[cfg(not(windows))]
+        {
+            command.args(["-c", &script, "solaris"]).args(args);
+            Ok((command, input.to_vec()))
         }
     }
 
@@ -163,10 +225,7 @@ impl ExecutionEnvironment {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Err(io::Error::other("tool cancelled"));
         }
-        let mut command = self.command()?;
-        let script = self.bootstrap(script);
-        command.args(["-c", &script, "solaris"]);
-        command.args(args);
+        let (mut command, data) = self.invocation(script, args, input)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -185,7 +244,6 @@ impl ExecutionEnvironment {
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("stdin unavailable"))?;
-        let data = input.to_vec();
         let writer = std::thread::spawn(move || {
             let mut stdin = stdin;
             stdin.write_all(&data)
@@ -306,6 +364,43 @@ pub fn resolve_path(cwd: &Path, input: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_arguments_preserve_regex_quotes_empty_values_and_binary_stdin() {
+        let args = [
+            r"^\[|^name|^\[dependencies\]",
+            r"\\regex",
+            "",
+            "a 'quote' \"double\" * ? [abc]",
+            "line\nend",
+        ];
+        let paths: Vec<&Path> = args.iter().map(Path::new).collect();
+        let input = b"\0\xffbinary\n";
+        let script = r#"printf '%s\0' "$@"; cat"#;
+        let framed = frame(script, &paths, input).unwrap();
+        let mut command = ExecutionEnvironment.command().unwrap();
+        command
+            .args(["-c", DISPATCHER, "solaris"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&framed).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = Vec::new();
+        for arg in args {
+            expected.extend_from_slice(arg.as_bytes());
+            expected.push(0);
+        }
+        expected.extend_from_slice(input);
+        assert_eq!(output.stdout, expected);
+        assert!(frame("script", &[Path::new("bad\0arg")], &[]).is_err());
+    }
 
     #[test]
     fn positional_arguments_are_data_and_stdin_is_binary() {

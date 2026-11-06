@@ -12,7 +12,7 @@ use std::process::Stdio;
 
 use crate::{Cancel, ToolContext};
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 /// What a finished program left behind.
@@ -99,19 +99,21 @@ async fn run_local(
     cancel: &Cancel,
 ) -> Result<CommandOutput, String> {
     const CAP: usize = 2 * 1024 * 1024;
-    let mut command = Command::from(
-        crate::environment::ExecutionEnvironment
-            .command()
-            .map_err(|error| error.to_string())?,
-    );
-    let script = crate::environment::ExecutionEnvironment.bootstrap(
-        "command -v -- \"$1\" >/dev/null 2>&1 || { printf 'solaris_missing_program:%s' \"$1\" >&2; exit 127; }; exec \"$@\""
-    );
-    command.args(["-c", &script, "solaris", program]);
+    let script = "command -v -- \"$1\" >/dev/null 2>&1 || { printf 'solaris_missing_program:%s' \"$1\" >&2; exit 127; }; exec \"$@\"";
+    let arguments: Vec<&Path> = std::iter::once(Path::new(program))
+        .chain(args.iter().map(Path::new))
+        .collect();
+    let (command, input) = crate::environment::ExecutionEnvironment
+        .invocation(script, &arguments, &[])
+        .map_err(|error| error.to_string())?;
+    let mut command = Command::from(command);
     command
-        .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -122,6 +124,11 @@ async fn run_local(
     let mut child = command
         .spawn()
         .map_err(|error| describe_spawn_failure("bash", &error))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+        });
+    }
     let pid = child.id();
     let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;

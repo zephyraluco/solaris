@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -102,19 +102,17 @@ impl ShellRunner for LocalShell {
         let mut last_missing = String::new();
 
         for program in config.programs {
-            let mut builder = Command::from(
-                crate::environment::ExecutionEnvironment
-                    .command()
-                    .map_err(|error| error.to_string())?,
-            );
+            let (builder, input) = crate::environment::ExecutionEnvironment
+                .invocation(command, &[], &[])
+                .map_err(|error| error.to_string())?;
+            let mut builder = Command::from(builder);
             builder
-                .arg(config.command_flag)
-                // The command is handed over untouched: appending to it — a
-                // `2>&1`, say — rewrites what the model asked for and breaks
-                // anything ending in a comment or a continuation.
-                .arg(crate::environment::ExecutionEnvironment.bootstrap(command))
                 .current_dir(&ctx.cwd)
-                .stdin(Stdio::null())
+                .stdin(if input.is_empty() {
+                    Stdio::null()
+                } else {
+                    Stdio::piped()
+                })
                 .stdout(Stdio::piped())
                 // Both streams are piped and merged here instead. What the shell
                 // itself reports about the command only ever reaches its stderr,
@@ -154,6 +152,11 @@ impl ShellRunner for LocalShell {
 
             let mut buffer = crate::output::OutputAccumulator::new(&ctx.temp_dir);
             let mut capture_error = None;
+            if let Some(mut stdin) = child.stdin.take() {
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(&input).await;
+                });
+            }
             let pid = child.id();
             let mut timed_out = false;
             let mut cancelled = false;

@@ -7,7 +7,9 @@ HOME and TMPDIR refer to user-writable locations outside the installation.
 
 The runtime must include Bash, cygpath, cat, head, cp, ls, chmod, mkdir, mktemp,
 mv, rm, readlink, rg and fd, plus their DLL dependencies. Startup checks their
-presence. Rust passes arguments separately and file bytes over stdin.
+presence. Rust sends scripts and positional arguments as NUL-delimited stdin frames, followed
+by raw file bytes. Only a fixed dispatcher crosses the native Windows argv boundary;
+Cygwin startup globbing cannot expand regexes or strip argument backslashes.
 
 `bin/readlink.exe` was extracted from the official Cygwin coreutils 9.0-1 package:
 
