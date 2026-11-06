@@ -24,7 +24,10 @@ else
     count=0
     while [[ -L $p ]]; do
         ((count+=1)); ((count<=40)) || { printf 'too many symbolic links' >&2; exit 1; }
-        get readlink "$p"; target=$value
+        # GNU and BSD readlink differ in their default final-newline behavior.
+        # -n requests raw target bytes; the sentinel preserves target newlines.
+        value=$(readlink -n "$p" && printf '.') || exit
+        target=${value%.}
         [[ $target = /* ]] && p=$target || p=${p%/*}/$target
         parent=${p%/*}; name=${p##*/}
         get physical_dir "$parent"; p=${value%/}/$name
