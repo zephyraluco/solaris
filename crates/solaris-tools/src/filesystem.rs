@@ -114,7 +114,11 @@ pub(crate) fn atomic_replace(
     ExecutionEnvironment
         .checked(
             include_str!("scripts/replace.sh"),
-            &[path, Path::new(&mode)],
+            &[
+                path,
+                Path::new(&mode),
+                Path::new(if cfg!(windows) { "cygwin" } else { "native" }),
+            ],
             bytes,
             cancel,
         )
@@ -143,6 +147,42 @@ mod tests {
         assert_eq!(read(&canonicalize(&file).unwrap()).unwrap(), bytes);
         remove_file(&file).unwrap();
         assert!(!exists(&file));
+    }
+
+    #[test]
+    fn replacement_converts_native_paths_before_parent_extraction() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("artifacts/deep/before");
+        // Stand in for cygpath so the native-boundary regression executes on
+        // every host, including systems without a Cygwin installation.
+        let script = format!(
+            "mapped=$4; cygpath() {{ printf '%s\\n' \"$mapped\"; }};\n{}",
+            include_str!("scripts/replace.sh")
+        );
+        ExecutionEnvironment
+            .run(
+                &script,
+                &[
+                    Path::new(r"C:\Users\alice\artifacts\deep\before"),
+                    Path::new(""),
+                    Path::new("cygwin"),
+                    &target,
+                ],
+                b"backup content",
+                Some(directory.path()),
+                None,
+                4096,
+            )
+            .map(|output| {
+                assert_eq!(
+                    output.code,
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            })
+            .unwrap();
+        assert_eq!(read(&target).unwrap(), b"backup content");
     }
 
     #[cfg(unix)]

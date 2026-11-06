@@ -1,5 +1,10 @@
 set -e
 path=$1
+if [[ $3 == cygwin ]]; then
+    value=$(cygpath -au -- "$path" && printf '.') || exit
+    path=${value%.}
+    path=${path%$'\n'}
+fi
 parent=${path%/*}
 [[ $parent != "$path" ]] || parent=.
 mkdir -p -- "$parent"
