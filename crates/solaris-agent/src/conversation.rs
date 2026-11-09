@@ -25,6 +25,8 @@ use solaris_backend::{Message, Role, tokens_for_characters};
 #[derive(Default)]
 pub(crate) struct Conversation {
     messages: Mutex<Vec<Message>>,
+    headers: Mutex<Vec<crate::projection::Header>>,
+    published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
     failure: Mutex<Option<String>>,
 }
@@ -49,6 +51,7 @@ impl Conversation {
             .write()
             .map_err(|_| StoreError::Invalid("journal lock poisoned".into()))? = Some(journal);
         self.repair();
+        self.publish();
         if let Some(error) = self.error() {
             return Err(StoreError::Invalid(error));
         }
@@ -111,16 +114,26 @@ impl Conversation {
         }) {
             messages.push(message);
         }
+        drop(messages);
+        self.publish();
     }
 
     /// Replace everything, which is what compaction does.
-    pub(crate) fn replace_with(&self, messages: Vec<Message>) {
+    pub(crate) fn replace_with(&self, mut messages: Vec<Message>) {
+        for message in &mut messages {
+            message.context = None;
+        }
+        if let Some(first) = messages.first_mut() {
+            first.context = Some(solaris_backend::MessageContext::Boundary);
+        }
         let mut current = self.lock();
         if self.persist(SessionRecord::Context {
             messages: messages.clone(),
         }) {
             *current = messages;
         }
+        drop(current);
+        self.publish();
     }
 
     /// Forget the conversation, for `/clear`.
@@ -160,6 +173,52 @@ impl Conversation {
                 messages.push(message);
             }
         }
+        drop(messages);
+        self.publish();
+    }
+
+    pub(crate) fn set_headers(&self, headers: Vec<crate::projection::Header>) {
+        *self.headers.lock().unwrap_or_else(|p| p.into_inner()) = headers;
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let messages = self.lock();
+        let headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshots = headers
+            .iter()
+            .map(|header| {
+                (
+                    header.base_id.clone(),
+                    crate::projection::estimate(&messages, header, false, 0).1,
+                )
+            })
+            .collect();
+        *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshots;
+    }
+
+    pub(crate) fn context_usage(
+        &self,
+        base_id: &str,
+        window: u32,
+    ) -> solaris_backend::ContextUsage {
+        let unknown = solaris_backend::ContextUsage {
+            tokens: None,
+            window,
+            estimated: true,
+        };
+        self.published
+            .try_lock()
+            .ok()
+            .and_then(|snapshots| snapshots.get(base_id).copied())
+            .map_or(unknown, |context| solaris_backend::ContextUsage {
+                window,
+                ..context
+            })
+    }
+
+    pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
+        crate::projection::estimate(&self.lock(), header, true, 0).0
     }
 
     /// Roughly what the conversation costs the model, by character count.
@@ -259,7 +318,8 @@ mod tests {
     fn a_reused_id_is_repaired_without_changing_older_or_current_results() {
         let conversation = Conversation::new();
         let before = interrupted_reused_id_history();
-        conversation.replace_with(before.clone());
+        conversation.replace_with(before);
+        let before = conversation.snapshot();
         conversation.repair();
         let after = conversation.snapshot();
         assert_eq!(after.len(), before.len() + 1);
@@ -284,9 +344,10 @@ mod tests {
             &call("reused"),
             "current result",
         )));
-        conversation.replace_with(complete.clone());
+        conversation.replace_with(complete);
+        let before = conversation.snapshot();
         conversation.repair();
-        assert_eq!(conversation.snapshot(), complete);
+        assert_eq!(conversation.snapshot(), before);
     }
 
     #[test]

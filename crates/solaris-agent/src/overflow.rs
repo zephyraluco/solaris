@@ -16,8 +16,6 @@
 //! regular expressions: the parts that actually identify these errors are fixed
 //! phrases, and the numbers around them are not what makes a message an overflow.
 
-use solaris_backend::Usage;
-
 /// Phrases that mean the input was longer than the model's window.
 ///
 /// Each is the fixed part of one platform's wording; the numbers and punctuation
@@ -98,20 +96,6 @@ pub(crate) fn is_overflow(message: &str) -> bool {
             .any(|(first, second)| text.contains(first) && text.contains(second))
 }
 
-/// Whether a call that reported `usage` already filled the window.
-///
-/// Some platforms accept an over-long request and answer anyway, so nothing in
-/// the error path will ever say the window was full. The input side of the usage
-/// does: `input_tokens` and `cache_read_tokens` are the four-bucket split's two
-/// halves of "what was read", and neither overlaps the other.
-pub(crate) fn filled_the_window(usage: &Usage, context_window: u32) -> bool {
-    if context_window == 0 || usage.estimated {
-        return false;
-    }
-    let read = usage.input_tokens.saturating_add(usage.cache_read_tokens);
-    read > context_window
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,30 +150,5 @@ mod tests {
         assert!(!is_overflow("exceeds the maximum number of retries"));
         // Neither half of the Gemini pair means anything on its own.
         assert!(!is_overflow("input token count must be positive"));
-    }
-
-    #[test]
-    fn a_window_filled_without_a_complaint_is_still_noticed() {
-        let mut usage = Usage::new(250_000, 10);
-        assert!(filled_the_window(&usage, 200_000));
-
-        usage = Usage::new(150_000, 10).with_cache(60_000, 0);
-        assert!(
-            filled_the_window(&usage, 200_000),
-            "cache reads count towards what was read"
-        );
-
-        usage = Usage::new(150_000, 10).with_cache(40_000, 0);
-        assert!(!filled_the_window(&usage, 200_000));
-    }
-
-    #[test]
-    fn an_unknown_window_or_an_estimate_proves_nothing() {
-        let usage = Usage::new(250_000, 10);
-        assert!(!filled_the_window(&usage, 0), "no window was reported");
-        assert!(
-            !filled_the_window(&Usage::estimate(400, 400), 100),
-            "an estimate is not a measurement"
-        );
     }
 }

@@ -82,3 +82,11 @@ impl InlineImage {
         format!("data:{};base64,{}", self.media_type, self.data)
     }
 }
+
+/// Current context occupancy; independent from cumulative task billing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub tokens: Option<u32>,
+    pub window: u32,
+    pub estimated: bool,
+}

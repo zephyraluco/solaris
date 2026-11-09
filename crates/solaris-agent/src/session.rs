@@ -31,7 +31,7 @@ use crate::approver::{Approval, Approver};
 use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
-use crate::overflow::{filled_the_window, is_overflow};
+use crate::overflow::is_overflow;
 use crate::prompt::{
     COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
 };
@@ -66,6 +66,8 @@ pub(crate) struct TurnInput {
     pub prompt: String,
     /// The model's context window, which sizes the compaction budget.
     pub context_window: u32,
+    pub model_key: String,
+    pub base_id: String,
     pub subagent: Option<Arc<SubagentRunner>>,
 }
 
@@ -90,6 +92,8 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         system,
         prompt,
         context_window,
+        model_key,
+        base_id,
         subagent,
     } = input;
 
@@ -133,6 +137,8 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         conversation,
         compaction: options.compaction,
         context_window,
+        model_key,
+        base_id,
         max_parallel: options.max_parallel.max(1),
         system,
         subagent,
@@ -186,6 +192,8 @@ struct Runner {
     compaction: Compaction,
     /// The window the budget is measured against.
     context_window: u32,
+    model_key: String,
+    base_id: String,
     max_parallel: usize,
     /// The system prompt, sent ahead of the conversation on every round.
     system: String,
@@ -209,9 +217,6 @@ impl Runner {
 
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
-        // What the provider reported for the last round, which is the honest
-        // measure of how full the window is. An estimate is not.
-        let mut last_usage: Option<Usage> = None;
 
         loop {
             if let Some(error) = self.conversation.error() {
@@ -228,7 +233,7 @@ impl Runner {
 
             self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
-            self.compact(last_usage.as_ref(), false, &tx).await;
+            self.compact(false, &tx).await;
 
             // One round, with one chance to recover from a window that turned out
             // to be full: the conversation is summarized and the same round asked
@@ -248,7 +253,7 @@ impl Runner {
                             return;
                         }
                         recovered = true;
-                        if !self.compact(last_usage.as_ref(), true, &tx).await {
+                        if !self.compact(true, &tx).await {
                             self.give_up(message, &tx);
                             return;
                         }
@@ -256,14 +261,13 @@ impl Runner {
                 }
             };
 
-            last_usage = Some(reply.usage);
             cost_usd += reply.cost_usd;
 
             if reply.calls.is_empty() {
                 // The answer belongs to the conversation as much as the question
                 // does: without it the next turn would read every prompt the user
                 // ever sent with nothing in between.
-                self.record_reply(&reply.text);
+                self.record_reply(&reply.text, reply.usage);
 
                 if self.absorb_background(&mut total, &mut cost_usd) {
                     continue;
@@ -299,10 +303,10 @@ impl Runner {
                 return;
             }
 
-            self.conversation.push(Message::with_content(
-                Role::Assistant,
-                assistant_blocks(reply.text, &reply.calls),
-            ));
+            let mut message =
+                Message::with_content(Role::Assistant, assistant_blocks(reply.text, &reply.calls));
+            self.request_header().annotate(&mut message, reply.usage);
+            self.conversation.push(message);
 
             // A message the model stopped writing early may carry half-written
             // calls, so none of them run: it is told to ask again with whole
@@ -347,14 +351,7 @@ impl Runner {
             // The prompt is already in the conversation: this loop records it
             // before it asks anything.
             prompt: String::new(),
-            tools: {
-                let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
-                self.specs
-                    .iter()
-                    .filter(|spec| active.contains(&spec.name))
-                    .cloned()
-                    .collect()
-            },
+            tools: self.request_tools(),
         };
 
         let result = tokio::select! {
@@ -391,11 +388,13 @@ impl Runner {
     ///
     /// An empty message is left out rather than sent: some wires reject a blank
     /// text block outright, and a turn that answered nothing has nothing to add.
-    fn record_reply(&self, text: &str) {
+    fn record_reply(&self, text: &str, usage: Usage) {
         if text.trim().is_empty() {
             return;
         }
-        self.conversation.push(Message::assistant(text));
+        let mut message = Message::assistant(text);
+        self.request_header().annotate(&mut message, usage);
+        self.conversation.push(message);
     }
 
     /// Fold everything the user steered in into the conversation.
@@ -500,16 +499,11 @@ impl Runner {
     /// `force` is for the two cases where the budget is not the question: a round
     /// that came back with an overflow, and the user asking for it. Returns
     /// whether anything was replaced.
-    async fn compact(
-        &self,
-        last_usage: Option<&Usage>,
-        force: bool,
-        tx: &UnboundedSender<AgentEvent>,
-    ) -> bool {
+    async fn compact(&self, force: bool, tx: &UnboundedSender<AgentEvent>) -> bool {
         if !self.compaction.enabled {
             return false;
         }
-        if !force && !self.over_budget(last_usage) {
+        if !force && !self.over_budget() {
             return false;
         }
 
@@ -546,22 +540,34 @@ impl Runner {
     }
 
     /// Whether the conversation has reached the point of needing a summary.
-    fn over_budget(&self, last_usage: Option<&Usage>) -> bool {
-        // A provider that accepted an over-long request and answered anyway will
-        // never say so in an error, but its own usage says how much was read.
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+        self.specs
+            .iter()
+            .filter(|spec| active.contains(&spec.name))
+            .cloned()
+            .collect()
+    }
+
+    fn request_header(&self) -> crate::projection::Header {
+        let mut header =
+            crate::projection::Header::new(&self.model_key, &self.system, &self.request_tools());
+        if !self.base_id.is_empty() {
+            header.base_id.clone_from(&self.base_id);
+        }
+        header
+    }
+
+    fn over_budget(&self) -> bool {
         let capabilities = self.inner.capabilities();
         let context_window = capabilities.context_window.unwrap_or(self.context_window);
-        if last_usage.is_some_and(|usage| filled_the_window(usage, context_window)) {
-            return true;
-        }
-        let tokens = match last_usage {
-            Some(usage) if !usage.estimated && !usage.is_empty() => usage.total(),
-            _ => self.conversation.estimated_tokens(),
-        };
         let window = capabilities.max_input.map_or(context_window, |limit| {
             context_window.min(limit.saturating_add(self.compaction.reserve_tokens))
         });
-        self.compaction.should_compact(tokens, window)
+        self.compaction.should_compact(
+            self.conversation.projected_tokens(&self.request_header()),
+            window,
+        )
     }
 
     /// Read one round to its end, forwarding what it produces.
@@ -1361,6 +1367,8 @@ mod tests {
                 ),
                 prompt: prompt.to_string(),
                 context_window: self.context_window,
+                model_key: "test".into(),
+                base_id: String::new(),
                 subagent: None,
             });
             let mut events = Vec::new();
@@ -1779,6 +1787,8 @@ mod tests {
             ),
             prompt: "do it".to_string(),
             context_window: 0,
+            model_key: "test".into(),
+            base_id: String::new(),
             subagent: None,
         });
         // Read one round's worth, then walk away.

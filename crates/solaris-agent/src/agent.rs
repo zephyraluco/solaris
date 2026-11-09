@@ -139,7 +139,14 @@ impl AgentOptions {
 /// model's view, not the user's: a summary has to still stand on the next turn, a
 /// steered message has to still be where it landed, and neither is something the
 /// transcript can be asked to reconstruct. [`Agent::clear`] is what forgets it.
+#[derive(Clone)]
+struct CachedPrompt {
+    text: String,
+    header: crate::projection::Header,
+}
+
 pub struct Agent {
+    prompts: RwLock<Vec<CachedPrompt>>,
     /// Application-resolved backend and execution metadata.
     choice: AgentBackendConfig,
     active: Arc<std::sync::atomic::AtomicBool>,
@@ -205,7 +212,8 @@ impl Agent {
         }));
         let steering = Queue::for_resources(Arc::clone(&resources));
         let follow_up = Queue::for_resources(Arc::clone(&resources));
-        Self {
+        let agent = Self {
+            prompts: RwLock::new(Vec::new()),
             choice,
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
@@ -215,7 +223,9 @@ impl Agent {
             steering,
             follow_up,
             resources,
-        }
+        };
+        agent.rebuild_prompts();
+        agent
     }
 
     /// Attach a persistent session at an idle boundary and restore its context.
@@ -278,7 +288,8 @@ impl Agent {
         // next request, including callers whose refresh API cannot return errors.
         self.conversation
             .record_model(choice.provider_id.as_deref(), &choice.model);
-        Self {
+        let agent = Self {
+            prompts: RwLock::new(Vec::new()),
             choice,
             active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
@@ -288,7 +299,9 @@ impl Agent {
             steering: self.steering.clone(),
             follow_up: self.follow_up.clone(),
             resources: Arc::clone(&self.resources),
-        }
+        };
+        agent.rebuild_prompts();
+        agent
     }
 
     /// Replace the factory used by subsequent child model overrides.
@@ -377,6 +390,61 @@ impl Agent {
         self.choice.backend.model_catalog_notice()
     }
 
+    fn rebuild_prompts(&self) {
+        let resources = self.resources.read().unwrap_or_else(|p| p.into_inner());
+        let mut prompts = Vec::new();
+        for mode in [Mode::Build, Mode::Plan] {
+            let tools = self.turn_tools(mode);
+            let text = prompt::build_system_prompt(
+                mode,
+                &tools,
+                &resources.skills,
+                self.choice.instructions.as_deref(),
+                &self.options.cwd,
+                &resources.prompt,
+            );
+            let specs: Vec<_> = tools
+                .iter()
+                .map(|tool| {
+                    solaris_backend::ToolSpec::new(
+                        tool.name(),
+                        tool.description(),
+                        tool.parameters(),
+                    )
+                })
+                .collect();
+            let header = crate::projection::Header::new(&self.model_key(mode), &text, &specs);
+            prompts.push(CachedPrompt { text, header });
+        }
+        self.conversation
+            .set_headers(prompts.iter().map(|prompt| prompt.header.clone()).collect());
+        *self.prompts.write().unwrap_or_else(|p| p.into_inner()) = prompts;
+    }
+
+    fn model_key(&self, mode: Mode) -> String {
+        format!(
+            "{:?}:{}:{mode:?}",
+            self.choice.provider_id, self.choice.model
+        )
+    }
+
+    pub fn context_usage(&self, mode: Mode) -> solaris_backend::ContextUsage {
+        let unknown = solaris_backend::ContextUsage {
+            tokens: None,
+            window: self.context_window(),
+            estimated: true,
+        };
+        let Ok(prompts) = self.prompts.try_read() else {
+            return unknown;
+        };
+        prompts
+            .get(if mode == Mode::Build { 0 } else { 1 })
+            .map_or(unknown, |prompt| {
+                self.conversation
+                    .context_usage(&prompt.header.base_id, unknown.window)
+            })
+    }
+
     /// The models the endpoint offers, for the picker to choose from.
     pub async fn models(&self) -> Result<Vec<String>, BackendError> {
         self.choice.backend.models().await
@@ -444,6 +512,7 @@ impl Agent {
             .resources
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+        self.rebuild_prompts();
     }
 
     /// Current instructions, also used when the application rebuilds a backend.
@@ -512,17 +581,10 @@ impl Agent {
                 })
             });
 
-        // The prompt is written per turn because every part of it can change:
-        // the mode, which tools the mode leaves standing, and which platform the
-        // credentials resolve to.
-        let system = prompt::build_system_prompt(
-            mode,
-            &tools,
-            &resources.skills,
-            self.choice.instructions.as_deref(),
-            &self.options.cwd,
-            &resources.prompt,
-        );
+        let cached = self.prompts.read().unwrap_or_else(|p| p.into_inner())
+            [if mode == Mode::Build { 0 } else { 1 }]
+        .clone();
+        let system = cached.text;
         drop(resources);
 
         let journal = self.journal();
@@ -546,6 +608,8 @@ impl Agent {
             system,
             prompt,
             context_window: self.context_window(),
+            model_key: self.model_key(mode),
+            base_id: cached.header.base_id,
             subagent,
         });
         crate::runtime::leased_stream(crate::runtime::journal_stream(stream, journal), lease)
@@ -1280,5 +1344,66 @@ mod tests {
             panic!("a cancelled turn ends in an error: {events:?}");
         };
         assert!(message.contains("cancelled"), "{message}");
+    }
+    #[tokio::test]
+    async fn restored_projection_reports_usage_without_background_validation_or_model_calls() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        let first = agent(Scripted::new(vec![vec![
+            AgentEvent::TextDelta("reply".into()),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(100, 10),
+                cost_usd: 0.0,
+            },
+        ]]));
+        first.attach_journal(Arc::clone(&journal)).expect("attach");
+        drain(first.run_turn("hello", Mode::Build)).await;
+        let backend = Scripted::new(vec![]);
+        let restored = agent(backend.clone());
+        restored.attach_journal(journal).expect("restore");
+        assert_eq!(restored.context_usage(Mode::Build).tokens, Some(110));
+        assert!(backend.requests().is_empty());
+    }
+
+    #[test]
+    fn context_queries_do_not_rebuild_prompts_or_call_tool_metadata() {
+        struct ObservedTool(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Tool for ObservedTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn description(&self) -> &str {
+                "Read"
+            }
+            fn parameters(&self) -> Value {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                json!({})
+            }
+            fn guideline(&self) -> Option<&'static str> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some("Read a file")
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                ToolOutput::ok("done")
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            choice(Scripted::new(vec![])),
+            Arc::new(ToolRegistry::with_tools(vec![Arc::new(ObservedTool(
+                Arc::clone(&calls),
+            ))])),
+            AgentOptions::default(),
+        );
+        let before = calls.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            agent.context_usage(Mode::Build);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before);
     }
 }
