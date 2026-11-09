@@ -1,6 +1,6 @@
 //! Minimal, reloadable filesystem resources shared by the application and agent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::{SkillRoot, SkillSource, SkillWarning, Skills};
@@ -17,10 +17,34 @@ pub struct PromptFile {
 /// User and project instructions appended to the built-in prompt.
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
+    /// Model-visible path strings prepared during resource loading.
+    pub model_paths: BTreeMap<PathBuf, String>,
     /// Global instructions followed by ancestor and working-directory rules.
     pub project_rules: Vec<PromptFile>,
     /// User APPEND_SYSTEM.md followed by project APPEND_SYSTEM.md.
     pub append_system: Vec<PromptFile>,
+}
+
+impl PromptContext {
+    pub fn prepare_paths(&mut self, cwd: &Path) {
+        for path in std::iter::once(cwd).chain(
+            self.project_rules
+                .iter()
+                .chain(&self.append_system)
+                .map(|file| file.path.as_path()),
+        ) {
+            self.model_paths
+                .entry(path.to_path_buf())
+                .or_insert_with(|| solaris_tools::environment::display_path(path));
+        }
+    }
+
+    pub(crate) fn model_path(&self, path: &Path) -> String {
+        self.model_paths
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
 }
 
 /// One consistent view of the resources advertised to the model and user.
@@ -123,6 +147,7 @@ impl ResourcePaths {
             &mut seen,
             &mut snapshot.warnings,
         );
+        snapshot.prompt.prepare_paths(&cwd);
         Ok(snapshot)
     }
 }
@@ -276,5 +301,15 @@ mod tests {
             "updated"
         );
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn prepared_path_text_is_retained_in_the_resource_snapshot() {
+        let cwd = PathBuf::from("/workspace");
+        let mut context = PromptContext::default();
+        context
+            .model_paths
+            .insert(cwd.clone(), "/prepared/workspace".into());
+        context.prepare_paths(&cwd);
+        assert_eq!(context.model_path(&cwd), "/prepared/workspace");
     }
 }

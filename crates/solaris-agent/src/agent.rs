@@ -196,9 +196,11 @@ impl Agent {
         } else {
             registry
         };
+        let mut prompt = options.prompt_context.clone();
+        prompt.prepare_paths(&options.cwd);
         let resources = Arc::new(RwLock::new(ResourceSnapshot {
             skills: options.skills.clone(),
-            prompt: options.prompt_context.clone(),
+            prompt,
             warnings: Vec::new(),
         }));
         let steering = Queue::for_resources(Arc::clone(&resources));
@@ -1109,6 +1111,7 @@ mod tests {
                     path: agent.options.cwd.join("APPEND_SYSTEM.md"),
                     content: "Addendum marker".to_string(),
                 }],
+                ..Default::default()
             },
             ..Default::default()
         });

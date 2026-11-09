@@ -168,11 +168,7 @@ pub(crate) fn build_system_prompt(
         "You are solaris, a terminal assistant. You work in the directory solaris was started in, \
          you act by calling the tools declared to you, and your replies are read in a terminal.\n",
     );
-    let _ = writeln!(
-        prompt,
-        "\n# Working directory\n{}",
-        solaris_tools::environment::display_path(cwd)
-    );
+    let _ = writeln!(prompt, "\n# Working directory\n{}", context.model_path(cwd));
 
     prompt.push_str("\n# Working mode\n");
     prompt.push_str(mode.instructions());
@@ -228,7 +224,7 @@ pub(crate) fn build_system_prompt(
                 let _ = writeln!(
                     prompt,
                     "\n--- Begin instructions: {} ---\n{}\n--- End instructions ---",
-                    solaris_tools::environment::display_path(&file.path),
+                    context.model_path(&file.path),
                     file.content.trim()
                 );
             }
