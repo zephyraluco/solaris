@@ -728,8 +728,9 @@ cargo test --workspace
 into provider-scoped snapshots. Startup merges independent validated caches over a
 bundled snapshot and refreshes them in the background. Exact model lookup and user
 overrides produce one `ResolvedModel` containing request aliases, capabilities,
-limits, provider prices, context tiers and field provenance. Capability references
-across providers never import prices or protocols. `choose_backend` captures an
+limits, provider prices, context tiers and field provenance. Explicit capability references across providers never import prices or protocols.
+Providers without catalogs can fall back to a unique exact model ID in the bundled
+manufacturer allowlist, including official estimated prices; user overrides win. `choose_backend` captures an
 immutable resolution for each HTTP request; later requests can observe refreshed
 metadata while reusing the HTTP pool. Agent code consumes backend capabilities and
 input budgets without depending on provider catalog types. Provider credentials and

@@ -20,8 +20,12 @@ fn bundled_snapshot_is_valid_and_offline_capabilities_are_provider_scoped() {
     assert_eq!(official.capabilities.tool_calling, Support::Supported);
     assert!(official.price.is_some());
     let gateway = catalog.resolve("new-api", "claude-sonnet-4-5");
-    assert_eq!(gateway.capabilities.tool_calling, Support::Unknown);
-    assert!(gateway.price.is_none());
+    assert_eq!(gateway.capabilities.tool_calling, Support::Supported);
+    assert_eq!(gateway.price, official.price);
+    assert_eq!(
+        gateway.catalog.expect("official reference").provider,
+        "anthropic"
+    );
     assert!(
         catalog
             .resolve("anthropic", "claude-sonnet-4-5-imposter")
@@ -30,7 +34,7 @@ fn bundled_snapshot_is_valid_and_offline_capabilities_are_provider_scoped() {
     );
     assert!(
         catalog
-            .resolve("Anthropic", "claude-sonnet-4-5")
+            .resolve("anthropic", "CLAUDE-SONNET-4-5")
             .price
             .is_none()
     );
@@ -304,4 +308,42 @@ fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
         .insert("cache:models.dev".into(), updated);
     assert_eq!(live.backend().capabilities().context_window, Some(32000));
     assert_eq!(first.capabilities().context_window, Some(128000));
+}
+
+#[test]
+fn gateway_fallback_preserves_user_overrides_and_request_identity() {
+    let catalog = ModelCatalog::from_json(
+        r#"{"models":[{
+      "provider":"new-api","id":"gpt-5",
+      "capabilities":{"max_output":1234},
+      "price":{"input":0,"output":0,"cache_read":0,"cache_write":0}
+    }]}"#,
+    )
+    .expect("catalog");
+    let model = catalog.resolve("new-api", "gpt-5");
+    assert_eq!(model.capabilities.tool_calling, Support::Supported);
+    assert_eq!(model.capabilities.max_output, Some(1234));
+    assert_eq!(model.request_id, "gpt-5");
+    assert_eq!(model.price, Some(Price::FREE));
+    assert_eq!(model.sources["price"], "user");
+}
+
+#[test]
+fn providers_with_catalogs_and_ambiguous_ids_do_not_fall_back() {
+    let catalog = ModelCatalog::default();
+    assert!(catalog.resolve("anthropic", "gpt-5").catalog.is_none());
+    let shared = CatalogSnapshot::from_json(
+        r#"{"providers":{
+      "openai":{"shared":{"name":"A","capabilities":{},"price":null}},
+      "anthropic":{"shared":{"name":"B","capabilities":{},"price":null}}
+    }}"#,
+    )
+    .expect("snapshot");
+    catalog
+        .state
+        .0
+        .write()
+        .expect("write")
+        .insert("cache:models.dev".into(), shared);
+    assert!(catalog.resolve("new-api", "shared").catalog.is_none());
 }

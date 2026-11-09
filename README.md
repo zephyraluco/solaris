@@ -486,14 +486,16 @@ Model capabilities, context/input/output limits and pricing come from provider-s
 [models.dev](https://models.dev/experimental/v2.0/api.json) metadata. OpenRouter's own
 model catalog takes precedence for OpenRouter. A compact snapshot ships with Solaris;
 the bundled snapshot includes only OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
-Meta, Alibaba/Qwen, Moonshot, Zhipu and MiniMax. Gateway metadata is available from
+Meta, Moonshot, Zhipu and MiniMax. Gateway metadata is available from
 runtime caches and refreshes. Startup loads validated local caches immediately, then refreshes public catalogs in
 the background (24-hour freshness, hourly retry). Downloads never receive provider
 credentials. Failed refreshes retain cached data or the bundled snapshot.
 
 Matching uses exact, case-sensitive provider/model IDs. Solaris's `opencode` provider
-maps to the upstream `opencode-go` catalog. Unlisted models retain unknown features
-and prices, a 128,000-token context window and an 8,192-token output limit. The default
+maps to the upstream `opencode-go` catalog. When a provider has no catalog, an exact model ID shared by only one of these
+manufacturers inherits that manufacturer's parameters and estimated prices; user
+overrides still win. Ambiguous or unknown IDs retain unknown features and prices,
+a 128,000-token context window and an 8,192-token output limit. The default
 requested output is capped at 8,192 and the model's limits. Model-name prefixes do not
 imply capabilities, prices or request protocols.
 

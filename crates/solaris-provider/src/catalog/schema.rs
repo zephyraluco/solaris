@@ -42,7 +42,6 @@ pub const SNAPSHOT_PROVIDERS: &[&str] = &[
     "xai",
     "mistral",
     "meta",
-    "alibaba",
     "moonshotai",
     "zhipuai",
     "minimax",

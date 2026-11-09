@@ -156,7 +156,7 @@ impl ModelCatalog {
             .models
             .iter()
             .find(|entry| entry.provider == provider && entry.id == model);
-        let reference = patch
+        let mut reference = patch
             .and_then(|entry| entry.catalog.clone())
             .unwrap_or_else(|| CatalogReference {
                 provider: provider.to_owned(),
@@ -180,7 +180,30 @@ impl ModelCatalog {
             .0
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        let found = Self::lookup(&layers, &reference.provider, &reference.id);
+        let mut found = Self::lookup(&layers, &reference.provider, &reference.id);
+        let provider_key = if provider == "opencode" {
+            "opencode-go"
+        } else {
+            provider
+        };
+        let has_provider = layers
+            .values()
+            .any(|snapshot| snapshot.providers.contains_key(provider_key));
+        let mut official_fallback = false;
+        if found.is_none() && !has_provider && patch.is_none_or(|entry| entry.catalog.is_none()) {
+            let candidates: Vec<_> = super::SNAPSHOT_PROVIDERS
+                .iter()
+                .filter_map(|official| {
+                    Self::lookup(&layers, official, &reference.id).map(|entry| (*official, entry))
+                })
+                .collect();
+            // Never choose arbitrarily between two manufacturers sharing an ID.
+            if let [(official, entry)] = candidates.as_slice() {
+                reference.provider = (*official).into();
+                found = Some(entry.clone());
+                official_fallback = true;
+            }
+        }
         let mut price = None;
         let mut tiers = Vec::new();
         let mut name = model.to_owned();
@@ -200,6 +223,16 @@ impl ModelCatalog {
             tiers = entry.price_tiers;
             if price.is_some() {
                 sources.insert("price".into(), source);
+            }
+        }
+        if official_fallback && let Some((entry, source)) = &found {
+            price = entry.price;
+            tiers.clone_from(&entry.price_tiers);
+            if price.is_some() {
+                sources.insert(
+                    "price".into(),
+                    format!("official estimate:{}:{source}", reference.provider),
+                );
             }
         }
         drop(layers);
