@@ -3,12 +3,12 @@
 //! Mirrors claurst's `claurst-api` provider list in miniature: each entry says
 //! how it authenticates, which wire protocol it speaks, where its endpoint
 //! lives, which environment variables carry its credentials, and which models
-//! it offers. The wizard's steps, the model picker and the price table are all
+//! it offers. The wizard's steps and protocol selection are
 //! driven from this one table, and [`crate::choose_backend`] turns one of them
 //! into a backend.
 
 use serde::{Deserialize, Serialize};
-use solaris_backend::{Price, Wire};
+use solaris_backend::Wire;
 
 /// How a provider authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,15 +31,6 @@ pub struct ModelSpec {
     pub id: &'static str,
     /// One-line description shown after the ` · ` separator in the picker.
     pub description: &'static str,
-    /// Context window in tokens, which sizes the footer's context gauge, or
-    /// `None` when the platform publishes none — a plan billed monthly does not
-    /// quote one per model — and then the unlisted-model default applies.
-    pub context_window: Option<u32>,
-    /// Largest reply the provider will produce for this model, or `None` for the
-    /// default.
-    pub max_output: Option<u32>,
-    /// List price, or `None` when it varies per request — a router's `auto`.
-    pub price: Option<Price>,
     /// Protocol this model is answered over, when the provider's is not it.
     ///
     /// The protocol belongs to the model, not to the subscription that carries
@@ -64,20 +55,9 @@ impl ProviderSpec {
     ///
     /// Scoped to the provider on purpose: `claude-sonnet-4-5` is reachable both
     /// from Anthropic itself and through a gateway, and the two need not answer
-    /// it the same way. Matching mirrors [`model_spec`] — an exact id, else the
-    /// longest listed id `model` starts with, so a date-suffixed name still
-    /// finds its entry.
+    /// it the same way. IDs are matched exactly.
     fn listed(&self, model: &str) -> Option<&ModelSpec> {
-        self.models
-            .iter()
-            .find(|spec| spec.id.eq_ignore_ascii_case(model))
-            .or_else(|| {
-                let lowered = model.to_ascii_lowercase();
-                self.models
-                    .iter()
-                    .filter(|spec| lowered.starts_with(spec.id))
-                    .max_by_key(|spec| spec.id.len())
-            })
+        self.models.iter().find(|spec| spec.id == model)
     }
 }
 
@@ -127,11 +107,6 @@ pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 /// Largest reply asked of a model the catalogue does not list.
 pub const DEFAULT_MAX_OUTPUT: u32 = 8_192;
 
-/// Terser alias for the price table below — USD per million tokens.
-const fn usd(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Price {
-    Price::per_million(input, output, cache_read, cache_write)
-}
-
 /// Prompt text for an endpoint that routes to whichever model family it likes.
 ///
 /// Shared by every gateway entry: what matters is not *which* gateway but that a
@@ -173,25 +148,16 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "claude-sonnet-4-5",
                 description: "balanced",
-                context_window: Some(200_000),
-                max_output: Some(64_000),
-                price: Some(usd(3.00, 15.00, 0.30, 3.75)),
                 wire: None,
             },
             ModelSpec {
                 id: "claude-opus-4-1",
                 description: "most capable",
-                context_window: Some(200_000),
-                max_output: Some(32_000),
-                price: Some(usd(15.00, 75.00, 1.50, 18.75)),
                 wire: None,
             },
             ModelSpec {
                 id: "claude-haiku-4-5",
                 description: "fastest",
-                context_window: Some(200_000),
-                max_output: Some(64_000),
-                price: Some(usd(1.00, 5.00, 0.10, 1.25)),
                 wire: None,
             },
         ],
@@ -218,82 +184,52 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "grok-4.7",
                 description: "flagship",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(2.00, 6.00, 0.50, 0.00)),
                 wire: Some(Wire::OpenAiResponses),
             },
             ModelSpec {
                 id: "gpt-5.6-luna",
                 description: "cheap and fast",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(0.20, 1.20, 0.02, 0.25)),
                 wire: Some(Wire::OpenAiResponses),
             },
             ModelSpec {
                 id: "muse-spark-1.3-contributor",
                 description: "contributor tier",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(0.10, 0.20, 0.002, 0.00)),
                 wire: Some(Wire::OpenAiResponses),
             },
             ModelSpec {
                 id: "claude-haiku-5-5",
                 description: "fastest of the family",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(0.10, 0.50, 0.01, 0.125)),
                 wire: Some(Wire::AnthropicMessages),
             },
             // The floor: the open models that speak the chat wire.
             ModelSpec {
                 id: "glm-5.3",
                 description: "open weights",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(1.40, 4.40, 0.26, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "kimi-k3",
                 description: "open weights",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(3.00, 15.00, 0.30, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "qwen3.8-max",
                 description: "open weights",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(2.00, 6.00, 0.25, 2.50)),
                 wire: None,
             },
             ModelSpec {
                 id: "deepseek-v4-pro",
                 description: "open weights, peak-hours price",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(1.32, 3.96, 0.044, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "minimax-m3",
                 description: "open weights",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(0.30, 1.20, 0.06, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "longcat-2.0",
                 description: "open weights",
-                context_window: None,
-                max_output: None,
-                price: Some(usd(0.30, 1.20, 0.006, 0.00)),
                 wire: None,
             },
         ],
@@ -314,17 +250,11 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "gpt-5",
                 description: "flagship",
-                context_window: Some(400_000),
-                max_output: Some(128_000),
-                price: Some(usd(1.25, 10.00, 0.125, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "gpt-5-mini",
                 description: "cheap and fast",
-                context_window: Some(400_000),
-                max_output: Some(128_000),
-                price: Some(usd(0.25, 2.00, 0.025, 0.00)),
                 wire: None,
             },
         ],
@@ -347,17 +277,11 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "gemini-2.5-pro",
                 description: "long context",
-                context_window: Some(1_048_576),
-                max_output: Some(65_536),
-                price: Some(usd(1.25, 10.00, 0.31, 0.00)),
                 wire: None,
             },
             ModelSpec {
                 id: "gemini-2.5-flash",
                 description: "fast",
-                context_window: Some(1_048_576),
-                max_output: Some(65_536),
-                price: Some(usd(0.30, 2.50, 0.075, 0.00)),
                 wire: None,
             },
         ],
@@ -396,11 +320,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         models: &[ModelSpec {
             id: "auto",
             description: "the router picks a model",
-            context_window: Some(128_000),
-            max_output: Some(8_192),
             // Billed at whichever upstream the router chose, so there is no
             // list price to report.
-            price: None,
             wire: None,
         }],
     },
@@ -420,17 +341,11 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "llama3.2",
                 description: "local",
-                context_window: Some(131_072),
-                max_output: Some(8_192),
-                price: Some(Price::FREE),
                 wire: None,
             },
             ModelSpec {
                 id: "qwen2.5-coder",
                 description: "local",
-                context_window: Some(131_072),
-                max_output: Some(8_192),
-                price: Some(Price::FREE),
                 wire: None,
             },
         ],
@@ -455,49 +370,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
 /// Look up a provider by id.
 pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|spec| spec.id == id)
-}
-
-/// Every model the catalogue lists, in table order.
-pub fn models() -> impl Iterator<Item = &'static ModelSpec> {
-    PROVIDERS.iter().flat_map(|spec| spec.models.iter())
-}
-
-/// The catalogue entry for `model`.
-///
-/// Providers date-suffix their model ids (`claude-sonnet-4-5-20250929`), so an
-/// exact miss falls back to the longest catalogue id that prefixes it.
-pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
-    models()
-        .find(|spec| spec.id.eq_ignore_ascii_case(model))
-        .or_else(|| {
-            let lowered = model.to_ascii_lowercase();
-            models()
-                .filter(|spec| lowered.starts_with(spec.id))
-                .max_by_key(|spec| spec.id.len())
-        })
-}
-
-/// List price for `model`.
-///
-/// `None` means the price is unknown — either the model is not in the
-/// catalogue, or it is one whose price varies per request — so callers report
-/// no cost rather than a wrong one.
-pub fn price_for(model: &str) -> Option<Price> {
-    model_spec(model).and_then(|spec| spec.price)
-}
-
-/// Largest reply to ask `model` for.
-pub fn max_output_for(model: &str) -> u32 {
-    model_spec(model)
-        .and_then(|spec| spec.max_output)
-        .unwrap_or(DEFAULT_MAX_OUTPUT)
-}
-
-/// Context window of `model`, which sizes the footer's context gauge.
-pub fn context_window_for(model: &str) -> u32 {
-    model_spec(model)
-        .and_then(|spec| spec.context_window)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
 #[cfg(test)]
@@ -616,11 +488,8 @@ mod tests {
         assert_eq!(go.wire_for("claude-haiku-5-5"), Wire::AnthropicMessages);
         // A model the table does not name takes the platform's floor.
         assert_eq!(go.wire_for("qwen3.8-max"), Wire::OpenAiChat);
-        // A date-suffixed id still finds the entry it belongs to.
-        assert_eq!(
-            go.wire_for("claude-haiku-5-5-20260101"),
-            Wire::AnthropicMessages
-        );
+        // An unlisted suffix keeps the provider default protocol.
+        assert_eq!(go.wire_for("claude-haiku-5-5-20260101"), Wire::OpenAiChat);
     }
 
     #[test]
@@ -687,44 +556,6 @@ mod tests {
                     "{} cannot accept an environment API key",
                     spec.id
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn model_lookup_accepts_date_suffixed_ids() {
-        let spec = model_spec("claude-sonnet-4-5-20250929").expect("prefix match");
-        assert_eq!(spec.id, "claude-sonnet-4-5");
-
-        assert_eq!(model_spec("gpt-5").expect("exact match").id, "gpt-5");
-
-        // A model nobody has heard of falls back to the defaults.
-        assert!(model_spec("some-new-model").is_none());
-        assert_eq!(price_for("some-new-model"), None);
-        assert_eq!(max_output_for("some-new-model"), DEFAULT_MAX_OUTPUT);
-        assert_eq!(context_window_for("some-new-model"), DEFAULT_CONTEXT_WINDOW);
-    }
-
-    #[test]
-    fn only_the_routed_model_has_no_list_price() {
-        let unpriced: Vec<_> = models()
-            .filter(|spec| spec.price.is_none())
-            .map(|spec| spec.id)
-            .collect();
-        assert_eq!(unpriced, vec!["auto"]);
-    }
-
-    #[test]
-    fn local_models_are_free_and_hosted_ones_are_not() {
-        for spec in PROVIDERS {
-            for model in spec.models {
-                let Some(price) = model.price else {
-                    continue;
-                };
-                match spec.auth {
-                    AuthKind::Local => assert_eq!(price, Price::FREE, "{}", model.id),
-                    _ => assert!(price.input > 0.0, "{} bills nothing", model.id),
-                }
             }
         }
     }

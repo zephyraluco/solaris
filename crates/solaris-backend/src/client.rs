@@ -110,12 +110,14 @@ pub struct TurnPlan {
 }
 
 /// Streams one turn from an HTTP endpoint, over whichever wire it speaks.
+#[derive(Clone)]
 pub struct HttpBackend {
     client: reqwest::Client,
     endpoint: Endpoint,
     model: String,
     max_tokens: u32,
     price: Option<Price>,
+    price_tiers: Vec<crate::PriceTier>,
     prompt_cache_key: Option<&'static str>,
     chatgpt: Option<(String, u64)>,
     capabilities: crate::ModelCapabilities,
@@ -130,10 +132,34 @@ impl HttpBackend {
             model: plan.model,
             max_tokens: plan.max_tokens,
             price: plan.price,
+            price_tiers: Vec::new(),
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
             capabilities: crate::ModelCapabilities::default(),
         })
+    }
+
+    /// Reuse the HTTP pool while fixing one request's resolved model parameters.
+    pub fn with_model_parameters(
+        mut self,
+        model: String,
+        max_tokens: u32,
+        capabilities: crate::ModelCapabilities,
+        price: Option<Price>,
+        tiers: Vec<crate::PriceTier>,
+    ) -> Self {
+        self.model = model;
+        self.max_tokens = max_tokens;
+        self.capabilities = capabilities;
+        self.price = price;
+        self.price_tiers = tiers;
+        self
+    }
+
+    /// Apply provider-specific context pricing tiers.
+    pub fn with_price_tiers(mut self, tiers: Vec<crate::PriceTier>) -> Self {
+        self.price_tiers = tiers;
+        self
     }
 
     /// Attach explicit catalog metadata without inferring features from model names.
@@ -340,6 +366,7 @@ impl AgentBackend for HttpBackend {
             input_characters: request_characters(&request),
             output_characters: 0,
             price: self.price,
+            price_tiers: self.price_tiers.clone(),
             done: false,
         };
 
@@ -491,6 +518,7 @@ struct StreamEngine {
     input_characters: usize,
     output_characters: usize,
     price: Option<Price>,
+    price_tiers: Vec<crate::PriceTier>,
     done: bool,
 }
 
@@ -600,7 +628,10 @@ impl StreamEngine {
             .parser
             .usage()
             .unwrap_or_else(|| Usage::estimate(self.input_characters, self.output_characters));
-        let cost_usd = self.price.map(|price| price.cost(&usage)).unwrap_or(0.0);
+        let cost_usd = self
+            .price
+            .map(|price| price.cost_with_tiers(&usage, &self.price_tiers))
+            .unwrap_or(0.0);
 
         self.pending
             .push_back(AgentEvent::TurnComplete { usage, cost_usd });
@@ -820,6 +851,7 @@ mod tests {
             pending: VecDeque::new(),
             input_characters: 40,
             output_characters: 0,
+            price_tiers: Vec::new(),
             price: Some(Price::per_million(3.0, 15.0, 0.0, 0.0)),
             done: false,
         }

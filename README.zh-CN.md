@@ -349,3 +349,22 @@ solaris 是从两个项目移植 / 借鉴设计的 Rust 实现，源码在相关
 
 - [**claurst**](https://github.com/Kuberwastaken/claurst) —— 终端伙伴、两栏欢迎框、内联 `/connect` 流程，以及 provider 目录的形态，都沿用了它的设计。
 - **`@earendil-works/pi-tui`** —— 保留式组件树的 TUI 设计（由应用持有焦点与浮层、类 flex 的布局栈）沿用了该库的做法；`solaris-tui` 中每个移植自它的模块都在文件头注明了出处。
+
+## 模型目录与参数覆盖
+
+模型能力、上下文及输入输出限制、价格默认来自 models.dev 的 Provider 目录，
+OpenRouter 使用自身目录优先补充。Solaris 附带精简快照；启动读取有效缓存或快照，
+后台更新目录，失败继续使用已有数据。模型按 Provider 和 ID 精确匹配，
+不再跨平台按名称前缀继承能力或价格。
+
+全局 `models.json` 保持现有格式，用户配置优先。新增可选字段：
+
+- `request_id`：实际请求名称，默认等于 `id`。
+- `catalog`：例如 `{"provider":"anthropic","id":"claude-sonnet-4-5"}`，为网关别名引用能力和限制；不会继承其他平台的价格或协议。
+- `output_tokens`：请求的输出预算，受模型输出和上下文限制约束，默认 8,192。
+- `capabilities.max_input`：模型的独立输入上限。
+- `price_tiers`：包含 `input_tokens_above` 和四项价格的长上下文阶梯费率。
+
+价格单位为美元/百万 tokens。缺失价格保持未知，显式零价格表示免费；
+ChatGPT 账号授权不按 API 价格估算。`--print-config` 显示最终参数及来源。
+维护者使用 `bash scripts/update-model-catalog.sh` 更新随包快照。

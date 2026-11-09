@@ -117,6 +117,15 @@ pub struct Price {
     pub cache_write: f64,
 }
 
+/// Rates that apply when total input (including caches) exceeds a threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceTier {
+    pub input_tokens_above: u32,
+    #[serde(flatten)]
+    pub price: Price,
+}
+
 impl Price {
     /// A price from its four rates, each in USD per million tokens.
     pub const fn per_million(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
@@ -130,6 +139,20 @@ impl Price {
 
     /// A model running on this machine, which costs nothing to call.
     pub const FREE: Price = Price::per_million(0.0, 0.0, 0.0, 0.0);
+
+    /// Choose the highest applicable context tier before calculating cost.
+    pub fn cost_with_tiers(&self, usage: &Usage, tiers: &[PriceTier]) -> f64 {
+        let input = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
+        tiers
+            .iter()
+            .filter(|tier| input > tier.input_tokens_above)
+            .max_by_key(|tier| tier.input_tokens_above)
+            .map_or(*self, |tier| tier.price)
+            .cost(usage)
+    }
 
     /// What `usage` costs at this price.
     pub fn cost(&self, usage: &Usage) -> f64 {

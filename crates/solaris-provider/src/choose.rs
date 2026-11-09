@@ -15,7 +15,7 @@ use solaris_backend::{
     AgentBackend, AgentEventStream, BackendError, Endpoint, HttpBackend, TurnPlan, TurnRequest,
 };
 
-use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, max_output_for, provider_spec};
+use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, provider_spec};
 use crate::{AuthStore, Credential};
 
 /// The backend that stands in while nothing is connected.
@@ -184,10 +184,11 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     } else {
         real_model(spec, model)
     };
+    let resolved = options.catalog.resolve(spec.id, &model);
     let wire = if chatgpt.is_some() {
         solaris_backend::Wire::OpenAiResponses
     } else {
-        spec.wire_for(&model)
+        spec.wire_for(&resolved.request_id)
     };
 
     let endpoint = Endpoint {
@@ -204,27 +205,32 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     // Everything platform-specific is decided here, so the backend can stay a
     // transport: which model, how long a reply, what it costs, and whether a
     // prompt-cache key rides along.
-    let mut capabilities = options.catalog.capabilities(spec.id, &model);
+    let mut capabilities = resolved.capabilities.clone();
     if chatgpt.is_some() {
         capabilities.price_known = Some(false);
     }
     let plan = TurnPlan {
-        max_tokens: capabilities
-            .max_output
-            .unwrap_or_else(|| max_output_for(&model)),
+        max_tokens: resolved.output_tokens,
         price: if chatgpt.is_some() {
             None
         } else {
-            options.catalog.price(spec.id, &model)
+            resolved.price
         },
         prompt_cache_key,
-        model: model.clone(),
+        model: resolved.request_id.clone(),
         endpoint,
     };
 
     match HttpBackend::new(plan) {
         Ok(backend) => {
-            let backend = backend.with_capabilities(capabilities.clone());
+            let backend = backend
+                .with_capabilities(capabilities.clone())
+                .with_price_tiers(if chatgpt.is_some() {
+                    Vec::new()
+                } else {
+                    resolved.price_tiers
+                });
+            let account_authorized = chatgpt.is_some();
             let backend = match chatgpt {
                 Some((account, expiry)) => backend.with_chatgpt(account, expiry),
                 None => backend,
@@ -253,6 +259,13 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
             BackendChoice {
                 backend: Arc::new(crate::catalog::CatalogBackend {
+                    live: Some(crate::catalog::LiveModel {
+                        catalog: Arc::clone(&options.catalog),
+                        provider: spec.id,
+                        model: model.clone(),
+                        prototype: backend.clone(),
+                        account_authorized,
+                    }),
                     inner: Arc::new(backend),
                     capabilities,
                     cache_dir: options.model_cache_dir.clone(),

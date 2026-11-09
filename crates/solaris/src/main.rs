@@ -18,7 +18,7 @@ use solaris::{
     RecentActivity, Soul,
 };
 use solaris_agent::{ResourcePaths, ToolSelection, default_tool_names};
-use solaris_provider::{AuthStore, context_window_for, provider_spec};
+use solaris_provider::{AuthStore, provider_spec};
 use solaris_provider::{BackendOptions, CredentialSource, choose_backend};
 use solaris_tui::Tui;
 
@@ -234,7 +234,9 @@ fn main() -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        backend_options.model_cache_dir = Some(directory.join("model-cache"));
+        let cache_dir = directory.join("model-cache");
+        backend_options.catalog.load_cache(&cache_dir);
+        backend_options.model_cache_dir = Some(cache_dir);
     }
     // Resolved here for reporting, and again by the app whenever the
     // credentials or the model change.
@@ -274,7 +276,25 @@ fn main() -> Result<()> {
                     .join(", ")
             }
         );
-        println!("context window: {}", context_window_for(&choice.model));
+        let mut resolved = backend_options
+            .catalog
+            .resolve(choice.provider_id.unwrap_or(""), &choice.model);
+        if matches!(
+            auth.credential("openai"),
+            Some(solaris_provider::Credential::ChatGpt { .. })
+        ) && choice.provider_id == Some("openai")
+        {
+            resolved.price = None;
+            resolved.price_tiers.clear();
+            resolved.capabilities.price_known = Some(false);
+            resolved
+                .sources
+                .insert("price".into(), "account authorization".into());
+        }
+        println!(
+            "model parameters: {}",
+            serde_json::to_string_pretty(&resolved)?
+        );
         match &auth_path {
             Some(path) => println!("credentials: {}", path.display()),
             None => println!("credentials: (unsaved — no config directory)"),
@@ -454,6 +474,10 @@ fn main() -> Result<()> {
         Some(journal)
     };
     let runtime = tokio::runtime::Runtime::new()?;
+    if let Some(directory) = &backend_options.model_cache_dir {
+        let _runtime_guard = runtime.enter();
+        backend_options.catalog.start_refresh(directory.clone());
+    }
     let _guard = runtime.enter();
     let mcp_path = args
         .mcp_config

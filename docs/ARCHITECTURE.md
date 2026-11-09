@@ -721,3 +721,16 @@ cargo test --workspace
 - **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，只是 `Ctrl+C` 会发一条「取不到剪贴板」的警告。
 - **剪贴板只走文本**。`Ctrl+V` 粘贴的是文本；图片、文件不在范围内 —— Claude Code 的 `Ctrl+V` 是「贴图片」，solaris 没有这条通路。终端若把 `ctrl+v` 留给自己（Windows Terminal 默认如此），按键不会到达应用，走的是终端自己的粘贴通路。
 - 伙伴素材是 claurst 十八个物种的一个子集；新增物种 = 一个 `Species` 变体 + 三帧 12 格宽的精灵图。
+
+### Provider model metadata
+
+`solaris-provider::ModelCatalog` normalizes models.dev v2 and OpenRouter catalogs
+into provider-scoped snapshots. Startup merges independent validated caches over a
+bundled snapshot and refreshes them in the background. Exact model lookup and user
+overrides produce one `ResolvedModel` containing request aliases, capabilities,
+limits, provider prices, context tiers and field provenance. Capability references
+across providers never import prices or protocols. `choose_backend` captures an
+immutable resolution for each HTTP request; later requests can observe refreshed
+metadata while reusing the HTTP pool. Agent code consumes backend capabilities and
+input budgets without depending on provider catalog types. Provider credentials and
+wire selection remain in the application/provider boundary.

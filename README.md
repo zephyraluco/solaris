@@ -482,6 +482,19 @@ bounded independently.
 
 ## Model capabilities and offline model lists
 
+Model capabilities, context/input/output limits and pricing come from provider-scoped
+[models.dev](https://models.dev/experimental/v2.0/api.json) metadata. OpenRouter's own
+model catalog takes precedence for OpenRouter. A compact snapshot ships with Solaris;
+startup loads validated local caches immediately, then refreshes public catalogs in
+the background (24-hour freshness, hourly retry). Downloads never receive provider
+credentials. Failed refreshes retain cached data or the bundled snapshot.
+
+Matching uses exact, case-sensitive provider/model IDs. Solaris's `opencode` provider
+maps to the upstream `opencode-go` catalog. Unlisted models retain unknown features
+and prices, a 128,000-token context window and an 8,192-token output limit. The default
+requested output is capped at 8,192 and the model's limits. Model-name prefixes do not
+imply capabilities, prices or request protocols.
+
 `models.json` in the user configuration directory provides explicit, provider-scoped
 overrides. For example:
 
@@ -507,6 +520,21 @@ no tools. Strict schema sampling is enabled only for explicit support and compat
 schemas. `--print-config` reports resolved capabilities. Optional `price` uses
 `input`, `output`, `cache_read`, and `cache_write` USD-per-million-token rates.
 Unknown prices display as unknown; `--max-cost` requires known pricing.
+
+An override may additionally set `request_id` (defaults to `id`), `output_tokens` (requested reply budget), and
+`catalog: {"provider": "anthropic", "id": "claude-sonnet-4-5"}` to map a gateway alias
+to catalog capabilities. This reference never imports another provider's price or
+protocol. `capabilities.max_input` limits the input budget separately from the total
+context window. Optional `price_tiers` entries contain `input_tokens_above` and the
+same four price fields; the highest matching threshold is used. Explicit zero prices
+mean free, while absent input/output prices remain unknown. ChatGPT account sessions
+never use API prices. `--print-config` includes resolved parameters and their sources.
+Updates apply at the next model request and reuse the HTTP connection pool.
+
+Maintainers can regenerate the bundled snapshot with
+`bash scripts/update-model-catalog.sh`. Both refresh and generation use the same
+Rust source adapters; unused upstream documentation and benchmarks are omitted.
+The snapshot is metadata, not a guarantee that an account can access every model.
 
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
