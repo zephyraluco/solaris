@@ -441,5 +441,6 @@ mod tests {
 mod catalog;
 pub use catalog::{
     CatalogModel, CatalogReference, CatalogSnapshot, MODELS_DEV_URL, ModelCatalog, ModelOverride,
-    OPENROUTER_URL, ParameterSources, ResolvedModel, parse_models_dev, parse_openrouter,
+    OPENROUTER_URL, ParameterSources, ResolvedModel, SNAPSHOT_PROVIDERS, parse_models_dev,
+    parse_openrouter,
 };

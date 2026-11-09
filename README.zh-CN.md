@@ -353,7 +353,9 @@ solaris 是从两个项目移植 / 借鉴设计的 Rust 实现，源码在相关
 ## 模型目录与参数覆盖
 
 模型能力、上下文及输入输出限制、价格默认来自 models.dev 的 Provider 目录，
-OpenRouter 使用自身目录优先补充。Solaris 附带精简快照；启动读取有效缓存或快照，
+OpenRouter 使用自身目录优先补充。随包快照仅保留 OpenAI、Anthropic、Google、
+DeepSeek、xAI、Mistral、Meta、阿里 Qwen、Moonshot、智谱和 MiniMax；
+网关参数由运行时缓存和刷新提供。启动读取有效缓存或快照，
 后台更新目录，失败继续使用已有数据。模型按 Provider 和 ID 精确匹配，
 不再跨平台按名称前缀继承能力或价格。
 

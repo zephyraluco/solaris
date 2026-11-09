@@ -6,7 +6,14 @@ use solaris_types::Support;
 fn bundled_snapshot_is_valid_and_offline_capabilities_are_provider_scoped() {
     let snapshot =
         CatalogSnapshot::from_json(include_str!("snapshot.json")).expect("valid snapshot");
-    assert!(snapshot.providers.contains_key("openrouter"));
+    assert!(snapshot.providers.contains_key("openai"));
+    assert!(
+        snapshot
+            .providers
+            .keys()
+            .all(|provider| SNAPSHOT_PROVIDERS.contains(&provider.as_str()))
+    );
+    assert!(!snapshot.providers.contains_key("openrouter"));
     let catalog = ModelCatalog::default();
     let official = catalog.resolve("anthropic", "claude-sonnet-4-5");
     assert_eq!(official.capabilities.context_window, Some(200_000));

@@ -485,7 +485,9 @@ bounded independently.
 Model capabilities, context/input/output limits and pricing come from provider-scoped
 [models.dev](https://models.dev/experimental/v2.0/api.json) metadata. OpenRouter's own
 model catalog takes precedence for OpenRouter. A compact snapshot ships with Solaris;
-startup loads validated local caches immediately, then refreshes public catalogs in
+the bundled snapshot includes only OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
+Meta, Alibaba/Qwen, Moonshot, Zhipu and MiniMax. Gateway metadata is available from
+runtime caches and refreshes. Startup loads validated local caches immediately, then refreshes public catalogs in
 the background (24-hour freshness, hourly retry). Downloads never receive provider
 credentials. Failed refreshes retain cached data or the bundled snapshot.
 

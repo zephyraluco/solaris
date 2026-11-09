@@ -7,7 +7,7 @@ mod sources;
 mod tests;
 
 pub use resolve::{CatalogReference, ModelCatalog, ModelOverride, ResolvedModel};
-pub use schema::{CatalogModel, CatalogSnapshot, ParameterSources};
+pub use schema::{CatalogModel, CatalogSnapshot, ParameterSources, SNAPSHOT_PROVIDERS};
 pub use sources::{MODELS_DEV_URL, OPENROUTER_URL, parse_models_dev, parse_openrouter};
 
 use async_trait::async_trait;

@@ -33,7 +33,28 @@ pub(super) fn valid_price(price: Price) -> bool {
     .all(|rate| rate.is_finite() && *rate >= 0.0)
 }
 
+/// Model manufacturers included in the offline distribution, excluding resellers.
+pub const SNAPSHOT_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "deepseek",
+    "xai",
+    "mistral",
+    "meta",
+    "alibaba",
+    "moonshotai",
+    "zhipuai",
+    "minimax",
+];
+
 impl CatalogSnapshot {
+    /// Keep the bundled catalog focused; downloaded caches can still cover all hosts.
+    pub fn retain_snapshot_providers(&mut self) {
+        self.providers
+            .retain(|provider, _| SNAPSHOT_PROVIDERS.contains(&provider.as_str()));
+    }
+
     pub fn from_json(text: &str) -> Result<Self, String> {
         if text.len() > super::cache::MAX_BYTES {
             return Err("model snapshot is too large".into());
