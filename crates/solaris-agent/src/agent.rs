@@ -413,7 +413,23 @@ impl Agent {
                     )
                 })
                 .collect();
-            let header = crate::projection::Header::new(&self.model_key(mode), &text, &specs);
+            let mut header = crate::projection::Header::new(&self.model_key(mode), &text, &specs);
+            if specs.iter().any(|spec| spec.name == "tool_search")
+                && specs
+                    .iter()
+                    .filter(|spec| spec.name.starts_with("mcp_"))
+                    .count()
+                    > 8
+            {
+                let declared: Vec<_> = specs
+                    .into_iter()
+                    .filter(|spec| !spec.name.starts_with("mcp_"))
+                    .collect();
+                let initial =
+                    crate::projection::Header::new(&self.model_key(mode), &text, &declared);
+                header.overhead = initial.overhead;
+                header.request_id = initial.request_id;
+            }
             prompts.push(CachedPrompt { text, header });
         }
         self.conversation

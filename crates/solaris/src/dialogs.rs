@@ -727,10 +727,15 @@ pub fn stats_lines(
     let tokens = session.total_tokens();
     let usage = session.total_usage();
     let context = session.context_tokens();
+    let context_window = if session.context.window > 0 {
+        u64::from(session.context.window)
+    } else {
+        context_window
+    };
     let used_ratio = if context_window == 0 {
         0.0
     } else {
-        f64::from(context) / context_window as f64
+        f64::from(context.unwrap_or(0)) / context_window as f64
     };
 
     let row = |name: &str, value_text: String| {
@@ -763,7 +768,14 @@ pub fn stats_lines(
         row("context window", context_window.to_string()),
         row(
             "context used",
-            format!("{:.1}% ({context} tok)", used_ratio * 100.0),
+            match context {
+                Some(tokens) => format!(
+                    "{}{:.1}% ({tokens} tok)",
+                    if session.context.estimated { "~" } else { "" },
+                    used_ratio * 100.0
+                ),
+                None => "unknown".into(),
+            },
         ),
         Line::default(),
         Line::from(Span::styled(
@@ -1143,6 +1155,11 @@ mod tests {
     fn stats_lines_report_totals() {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
+        session.context = solaris_agent::ContextUsage {
+            tokens: Some(150),
+            window: 1000,
+            estimated: false,
+        };
         session.turns.push(crate::state::Turn {
             usage: solaris_agent::Usage::new(120, 30),
             cost_usd: 0.01,
@@ -1187,6 +1204,11 @@ mod tests {
     fn the_context_gauge_measures_the_window_not_the_session() {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
+        session.context = solaris_agent::ContextUsage {
+            tokens: Some(150),
+            window: 1000,
+            estimated: false,
+        };
         for _ in 0..3 {
             session.turns.push(crate::state::Turn {
                 prompt: "hi".to_string(),
@@ -1206,9 +1228,7 @@ mod tests {
             None,
         ));
 
-        // 450 tokens went by in total, but only the last turn describes what is
-        // in the window; summing them would claim 45% of a window that is 15%
-        // full.
+        // Cumulative billing and the independently measured request have different sizes.
         assert!(text.contains("450"), "the session total: {text}");
         assert!(text.contains("15.0% (150 tok)"), "the context: {text}");
     }

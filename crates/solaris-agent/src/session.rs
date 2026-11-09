@@ -233,6 +233,7 @@ impl Runner {
 
             self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
+            self.emit_context(&tx);
             self.compact(false, &tx).await;
 
             // One round, with one chance to recover from a window that turned out
@@ -268,6 +269,7 @@ impl Runner {
                 // does: without it the next turn would read every prompt the user
                 // ever sent with nothing in between.
                 self.record_reply(&reply.text, reply.usage);
+                self.emit_context(&tx);
 
                 if self.absorb_background(&mut total, &mut cost_usd) {
                     continue;
@@ -307,6 +309,7 @@ impl Runner {
                 Message::with_content(Role::Assistant, assistant_blocks(reply.text, &reply.calls));
             self.request_header().annotate(&mut message, reply.usage);
             self.conversation.push(message);
+            self.emit_context(&tx);
 
             // A message the model stopped writing early may carry half-written
             // calls, so none of them run: it is told to ask again with whole
@@ -334,6 +337,7 @@ impl Runner {
                 .collect();
             self.conversation
                 .push(Message::with_content(Role::User, results));
+            self.emit_context(&tx);
 
             // A stop during the round ends the turn here: asking the model again
             // would only queue work for nobody.
@@ -381,6 +385,7 @@ impl Runner {
     /// End a turn without a completion, leaving the conversation consistent.
     fn give_up(&self, message: String, tx: &UnboundedSender<AgentEvent>) {
         self.conversation.repair();
+        self.emit_context(tx);
         let _ = tx.send(AgentEvent::Error(message));
     }
 
@@ -536,6 +541,7 @@ impl Runner {
         self.conversation.replace_with(replaced);
 
         let _ = tx.send(AgentEvent::Compacted { dropped: cut });
+        self.emit_context(tx);
         true
     }
 
@@ -556,6 +562,17 @@ impl Runner {
             header.base_id.clone_from(&self.base_id);
         }
         header
+    }
+
+    fn emit_context(&self, tx: &UnboundedSender<AgentEvent>) {
+        let window = self
+            .inner
+            .capabilities()
+            .context_window
+            .unwrap_or(self.context_window);
+        let _ = tx.send(AgentEvent::ContextUsageUpdated {
+            context: self.conversation.context_usage(&self.base_id, window),
+        });
     }
 
     fn over_budget(&self) -> bool {
@@ -1682,7 +1699,10 @@ mod tests {
             .run("do it")
             .await;
         assert_eq!(
-            events,
+            events
+                .into_iter()
+                .filter(|event| !matches!(event, AgentEvent::ContextUsageUpdated { .. }))
+                .collect::<Vec<_>>(),
             vec![AgentEvent::Error("the model exploded".to_string())]
         );
     }

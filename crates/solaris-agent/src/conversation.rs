@@ -19,7 +19,7 @@
 use crate::{SessionJournal, SessionRecord, StoreError};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use solaris_backend::{Message, Role, tokens_for_characters};
+use solaris_backend::{Message, Role};
 
 /// The messages a turn is built from and appends to.
 #[derive(Default)]
@@ -221,14 +221,6 @@ impl Conversation {
         crate::projection::estimate(&self.lock(), header, true, 0).0
     }
 
-    /// Roughly what the conversation costs the model, by character count.
-    ///
-    /// Only a fallback and a budget: a provider that reports usage gives the real
-    /// number, and this is what is left when none has been heard from yet.
-    pub(crate) fn estimated_tokens(&self) -> u32 {
-        tokens_for_characters(self.lock().iter().map(Message::characters).sum())
-    }
-
     /// The lock, recovering from a panic in another holder rather than panicking
     /// here: a poisoned conversation must not take down the turn that is running.
     fn lock(&self) -> MutexGuard<'_, Vec<Message>> {
@@ -243,6 +235,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use solaris_backend::{ToolCall, ToolResult};
+
+    fn tokens(conversation: &Conversation) -> u32 {
+        let header = crate::projection::Header {
+            base_id: String::new(),
+            request_id: String::new(),
+            overhead: 0,
+        };
+        conversation.projected_tokens(&header)
+    }
 
     fn call(id: &str) -> ToolCall {
         ToolCall::new(id, "read", json!({ "path": "a.txt" }))
@@ -271,7 +272,7 @@ mod tests {
 
         assert_eq!(conversation.len(), 0);
         assert!(conversation.snapshot().is_empty());
-        assert_eq!(conversation.estimated_tokens(), 0);
+        assert_eq!(tokens(&conversation), 0);
     }
 
     #[test]
@@ -424,9 +425,9 @@ mod tests {
     fn the_estimate_grows_with_what_is_in_it() {
         let conversation = Conversation::new();
         conversation.push(Message::user("x".repeat(400)));
-        let small = conversation.estimated_tokens();
+        let small = tokens(&conversation);
 
         conversation.push(Message::assistant("y".repeat(400)));
-        assert!(conversation.estimated_tokens() > small);
+        assert!(tokens(&conversation) > small);
     }
 }

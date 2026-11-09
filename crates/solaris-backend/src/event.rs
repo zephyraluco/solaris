@@ -88,6 +88,10 @@ pub enum AgentEvent {
         /// What the user typed.
         text: String,
     },
+    /// Snapshot of current context occupancy, separate from billing totals.
+    ContextUsageUpdated {
+        context: solaris_types::ContextUsage,
+    },
     /// Terminal event: the turn finished successfully.
     TurnComplete {
         /// What the turn consumed, measured by the provider or estimated when

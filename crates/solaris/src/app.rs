@@ -536,8 +536,11 @@ impl App {
                 solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
                     "session interrupted; verify unfinished tool outcomes before retrying".into(),
                 )),
-                solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => {
-                    self.session.turns.clear()
+                solaris_agent::SessionRecord::Context { messages } => {
+                    self.session.context = Default::default();
+                    if messages.is_empty() {
+                        self.session.turns.clear();
+                    }
                 }
                 _ => {}
             }
@@ -1295,6 +1298,7 @@ impl App {
 
     /// Report what the manual compaction did.
     fn on_compacted(&mut self, dropped: Option<usize>) {
+        self.session.context = self.agent.context_usage(self.config.mode);
         match dropped {
             Some(dropped) => self.notifications.info(format!(
                 "summarized {dropped} messages; {} left in context",
@@ -1360,6 +1364,7 @@ impl App {
 
     fn apply_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::ContextUsageUpdated { context } => self.session.context = context,
             AgentEvent::ThinkingDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.thinking.push_str(&chunk);
@@ -1661,6 +1666,7 @@ impl App {
     }
 
     fn open_stats(&mut self) {
+        self.session.context = self.agent.context_usage(self.config.mode);
         let backend = self.agent.label().to_string();
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
@@ -3018,6 +3024,12 @@ impl Component for App {
         );
         if self.config.context_window != context_window {
             self.config.context_window = context_window;
+            dirty = true;
+        }
+
+        let context = self.agent.context_usage(self.config.mode);
+        if self.session.context != context {
+            self.session.context = context;
             dirty = true;
         }
 
