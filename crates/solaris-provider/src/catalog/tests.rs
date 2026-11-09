@@ -347,3 +347,16 @@ fn providers_with_catalogs_and_ambiguous_ids_do_not_fall_back() {
         .insert("cache:models.dev".into(), shared);
     assert!(catalog.resolve("new-api", "shared").catalog.is_none());
 }
+
+#[test]
+fn small_models_have_a_safe_default_reply_budget() {
+    let catalog = ModelCatalog::from_json(
+        r#"{"models":[{
+      "provider":"local","id":"small","capabilities":{"context_window":8192,"max_output":8192}}
+    ]}"#,
+    )
+    .expect("catalog");
+    let resolved = catalog.resolve("local", "small");
+    assert_eq!(resolved.output_tokens, 2048);
+    assert_eq!(resolved.capabilities.output_budget, Some(2048));
+}

@@ -513,7 +513,7 @@ impl Runner {
         }
 
         let messages = self.conversation.snapshot();
-        let cut = self.compaction.cut_point(&messages);
+        let cut = self.compaction_policy().cut_point(&messages);
         if cut == 0 {
             return false;
         }
@@ -575,13 +575,24 @@ impl Runner {
         });
     }
 
+    fn compaction_policy(&self) -> Compaction {
+        let caps = self.inner.capabilities();
+        let window = caps.context_window.unwrap_or(self.context_window);
+        let policy = self.compaction.for_window(window, caps.output_budget);
+        let input_window = caps.max_input.map_or(window, |limit| {
+            window.min(limit.saturating_add(policy.reserve_tokens))
+        });
+        policy.for_window(input_window, caps.output_budget)
+    }
+
     fn over_budget(&self) -> bool {
         let capabilities = self.inner.capabilities();
         let context_window = capabilities.context_window.unwrap_or(self.context_window);
+        let policy = self.compaction_policy();
         let window = capabilities.max_input.map_or(context_window, |limit| {
-            context_window.min(limit.saturating_add(self.compaction.reserve_tokens))
+            context_window.min(limit.saturating_add(policy.reserve_tokens))
         });
-        self.compaction.should_compact(
+        policy.should_compact(
             self.conversation.projected_tokens(&self.request_header()),
             window,
         )
@@ -1024,7 +1035,9 @@ pub(crate) async fn compact_now(
         return None;
     }
     let messages = conversation.snapshot();
-    let cut = compaction.cut_point(&messages);
+    let caps = inner.capabilities();
+    let policy = compaction.for_window(caps.context_window.unwrap_or(0), caps.output_budget);
+    let cut = policy.cut_point(&messages);
     if cut == 0 {
         return None;
     }

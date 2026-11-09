@@ -60,6 +60,24 @@ impl Compaction {
         keep_recent_tokens: 0,
     };
 
+    /// Fit configured budgets into a model's usable input window.
+    pub fn for_window(self, window: u32, output_budget: Option<u32>) -> Self {
+        if window == 0 {
+            return self;
+        }
+        let reserve = self
+            .reserve_tokens
+            .min(output_budget.unwrap_or(window / 4))
+            .min(window.saturating_sub(1));
+        Self {
+            reserve_tokens: reserve,
+            keep_recent_tokens: self
+                .keep_recent_tokens
+                .min(window.saturating_sub(reserve) / 2),
+            ..self
+        }
+    }
+
     /// Whether the conversation has reached the point of needing a summary.
     ///
     /// A window of zero means nothing reported a size, and then nothing is ever
@@ -196,5 +214,15 @@ mod tests {
         let messages = vec![Message::user("hello")];
         assert_eq!(compaction.cut_point(&messages), 0);
         assert_eq!(compaction.cut_point(&[]), 0);
+    }
+    #[test]
+    fn small_windows_leave_space_for_input_and_summarize_old_history() {
+        let policy = Compaction::default().for_window(8192, Some(2048));
+        assert_eq!(policy.reserve_tokens, 2048);
+        assert_eq!(policy.keep_recent_tokens, 3072);
+        assert!(policy.should_compact(7000, 8192));
+        let messages: Vec<_> = (0..8).map(|_| Message::user("x".repeat(3500))).collect();
+        assert!(policy.cut_point(&messages) > 0);
+        assert!(!policy.should_compact(100, 8192));
     }
 }
