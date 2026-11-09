@@ -735,3 +735,26 @@ immutable resolution for each HTTP request; later requests can observe refreshed
 metadata while reusing the HTTP pool. Agent code consumes backend capabilities and
 input budgets without depending on provider catalog types. Provider credentials and
 wire selection remain in the application/provider boundary.
+
+### Resource preparation, context projection, and billing
+
+Resources own prepared model-path strings. Agent caches the in-memory prompt and
+tool estimation inputs for each mode when resources or backend selection change.
+Each request derives its actual tool loadout from those inputs. Context queries do
+not invoke resource loaders or prompt builders. Reload workers run serially and
+publish resources only when the session is idle; session navigation cannot overtake
+a pending loader.
+
+`MessageContext` annotates journaled messages with single-request measurements or
+projection boundaries; protocol encoders exclude these annotations. `projection`
+uses the most recent compatible measurement plus trailing message estimates, with
+a full in-memory estimate when the request configuration changes. Replacement
+invalidates retained annotations. The same estimator drives pre-request compaction
+and published UI snapshots. Restoration reads the ordinary message projection;
+there are no asynchronous checkpoint-validation writes or history-prefix hashes.
+
+`AccountingBackend` journals each request's usage before forwarding its completion.
+Model and child charges are separate from context annotations. Billing restore
+supports legacy cumulative completions and manual summary charges without counting
+new request records twice. Successful task completion remains a cumulative API
+event, while the session ledger also retains charges before failures/cancellation.
