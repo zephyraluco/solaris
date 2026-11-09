@@ -1,91 +1,22 @@
-//! Built-in metadata with explicit local overrides and integrity-checked model-list caches.
+//! Provider-scoped model metadata and endpoint model-list caching.
+mod cache;
+mod resolve;
+mod schema;
+mod sources;
+#[cfg(test)]
+mod tests;
+
+pub use resolve::{CatalogReference, ModelCatalog, ModelOverride, ResolvedModel};
+pub use schema::{CatalogModel, CatalogSnapshot, ParameterSources, SNAPSHOT_PROVIDERS};
+pub use sources::{MODELS_DEV_URL, OPENROUTER_URL, parse_models_dev, parse_openrouter};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use solaris_backend::{AgentBackend, AgentEventStream, BackendError, Price, TurnRequest};
-use solaris_types::{ModelCapabilities, Support};
-use std::collections::BTreeSet;
+use solaris_backend::{AgentBackend, AgentEventStream, BackendError, TurnRequest};
+use solaris_types::ModelCapabilities;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelCatalog {
-    #[serde(default)]
-    pub models: Vec<ModelOverride>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelOverride {
-    pub provider: String,
-    pub id: String,
-    #[serde(default)]
-    pub capabilities: ModelCapabilities,
-    #[serde(default)]
-    pub price: Option<Price>,
-}
-impl ModelCatalog {
-    pub fn from_json(text: &str) -> Result<Self, String> {
-        if text.len() > 1024 * 1024 {
-            return Err("model catalog exceeds 1 MiB".into());
-        }
-        let catalog: Self = serde_json::from_str(text).map_err(|error| error.to_string())?;
-        let mut ids = BTreeSet::new();
-        for entry in &catalog.models {
-            if entry.id.is_empty()
-                || entry.id.len() > 512
-                || !ids.insert((&entry.provider, &entry.id))
-            {
-                return Err("empty or duplicate provider/model ID".into());
-            }
-            if entry.capabilities.context_window == Some(0)
-                || entry.capabilities.max_output == Some(0)
-            {
-                return Err("model token limits must be positive".into());
-            }
-            if let Some(price) = entry.price
-                && [
-                    price.input,
-                    price.output,
-                    price.cache_read,
-                    price.cache_write,
-                ]
-                .iter()
-                .any(|rate| !rate.is_finite() || *rate < 0.0)
-            {
-                return Err("model prices must be finite and nonnegative".into());
-            }
-        }
-        Ok(catalog)
-    }
-    pub fn capabilities(&self, provider: &str, model: &str) -> ModelCapabilities {
-        let mut capabilities = self
-            .models
-            .iter()
-            .find(|entry| entry.provider == provider && entry.id == model)
-            .map(|entry| entry.capabilities.clone())
-            .unwrap_or_default();
-        let spec = crate::model_spec(model);
-        if capabilities.tool_calling == Support::Unknown && spec.is_some() {
-            capabilities.tool_calling = Support::Supported;
-        }
-        capabilities.context_window = capabilities
-            .context_window
-            .or_else(|| spec.and_then(|spec| spec.context_window));
-        capabilities.max_output = capabilities
-            .max_output
-            .or_else(|| spec.and_then(|spec| spec.max_output));
-        capabilities.price_known = Some(self.price(provider, model).is_some());
-        capabilities
-    }
-    pub fn price(&self, provider: &str, model: &str) -> Option<Price> {
-        self.models
-            .iter()
-            .find(|entry| entry.provider == provider && entry.id == model)
-            .and_then(|entry| entry.price)
-            .or_else(|| crate::price_for(model))
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 struct CachedModels {
@@ -98,8 +29,53 @@ fn digest(text: &[u8]) -> String {
     format!("{:x}", Sha256::digest(text))
 }
 
+/// A fresh immutable parameter set is taken at the start of each model request.
+pub(crate) struct LiveModel {
+    pub catalog: Arc<ModelCatalog>,
+    pub provider: &'static str,
+    pub model: String,
+    pub prototype: solaris_backend::HttpBackend,
+    pub account_authorized: bool,
+}
+impl LiveModel {
+    fn resolved(&self) -> ResolvedModel {
+        let mut resolved = self.catalog.resolve(self.provider, &self.model);
+        if self.account_authorized {
+            resolved.price = None;
+            resolved.price_tiers.clear();
+            resolved.capabilities.price_known = Some(false);
+        }
+        resolved
+    }
+    fn backend(&self) -> solaris_backend::HttpBackend {
+        let resolved = self.resolved();
+        self.prototype.clone().with_model_parameters(
+            resolved.request_id,
+            resolved.output_tokens,
+            resolved.capabilities,
+            resolved.price,
+            resolved.price_tiers,
+        )
+    }
+}
+
+pub(crate) fn output_budget(capabilities: &ModelCapabilities, requested: u32) -> u32 {
+    capabilities
+        .max_output
+        .unwrap_or(crate::DEFAULT_MAX_OUTPUT)
+        .min(requested)
+        .min(
+            capabilities
+                .context_window
+                .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
+                .saturating_sub(1)
+                .max(1),
+        )
+}
+
 pub(crate) struct CatalogBackend {
     pub inner: Arc<dyn AgentBackend>,
+    pub live: Option<LiveModel>,
     pub capabilities: ModelCapabilities,
     pub cache_dir: Option<PathBuf>,
     pub endpoint: String,
@@ -153,7 +129,10 @@ impl AgentBackend for CatalogBackend {
         self.inner.label()
     }
     fn capabilities(&self) -> ModelCapabilities {
-        self.capabilities.clone()
+        self.live.as_ref().map_or_else(
+            || self.capabilities.clone(),
+            |live| live.resolved().capabilities,
+        )
     }
     fn model_catalog_notice(&self) -> Option<String> {
         self.notice
@@ -162,7 +141,10 @@ impl AgentBackend for CatalogBackend {
             .clone()
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        self.inner.run_turn(request).await
+        match &self.live {
+            Some(live) => live.backend().run_turn(request).await,
+            None => self.inner.run_turn(request).await,
+        }
     }
     async fn models(&self) -> Result<Vec<String>, BackendError> {
         match self.inner.models().await {
@@ -187,8 +169,9 @@ impl AgentBackend for CatalogBackend {
 }
 
 #[cfg(test)]
-mod tests {
+mod model_list_tests {
     use super::*;
+    use solaris_types::Support;
     #[test]
     fn overrides_are_provider_scoped_and_unknown_features_stay_unknown() {
         let catalog = ModelCatalog::from_json(r#"{"models":[{"provider":"local","id":"custom","capabilities":{"tool_calling":"unsupported","context_window":8192}}]}"#).expect("catalog");
@@ -221,6 +204,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let backend = CatalogBackend {
             inner: Arc::new(Missing),
+            live: None,
             capabilities: ModelCapabilities::default(),
             cache_dir: Some(directory.path().into()),
             endpoint: "https://example.com/v1".into(),

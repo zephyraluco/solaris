@@ -549,14 +549,19 @@ impl Runner {
     fn over_budget(&self, last_usage: Option<&Usage>) -> bool {
         // A provider that accepted an over-long request and answered anyway will
         // never say so in an error, but its own usage says how much was read.
-        if last_usage.is_some_and(|usage| filled_the_window(usage, self.context_window)) {
+        let capabilities = self.inner.capabilities();
+        let context_window = capabilities.context_window.unwrap_or(self.context_window);
+        if last_usage.is_some_and(|usage| filled_the_window(usage, context_window)) {
             return true;
         }
         let tokens = match last_usage {
             Some(usage) if !usage.estimated && !usage.is_empty() => usage.total(),
             _ => self.conversation.estimated_tokens(),
         };
-        self.compaction.should_compact(tokens, self.context_window)
+        let window = capabilities.max_input.map_or(context_window, |limit| {
+            context_window.min(limit.saturating_add(self.compaction.reserve_tokens))
+        });
+        self.compaction.should_compact(tokens, window)
     }
 
     /// Read one round to its end, forwarding what it produces.

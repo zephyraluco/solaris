@@ -64,6 +64,8 @@ pub struct ModelCapabilities {
     pub reasoning: Support,
     pub streaming_usage: Support,
     pub prompt_caching: Support,
+    pub temperature: Support,
+    pub max_input: Option<u32>,
     pub context_window: Option<u32>,
     pub max_output: Option<u32>,
     pub price_known: Option<bool>,

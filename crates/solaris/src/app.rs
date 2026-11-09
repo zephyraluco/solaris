@@ -27,7 +27,7 @@ use solaris_agent::{
     ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
-    AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, context_window_for,
+    AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, DEFAULT_CONTEXT_WINDOW,
 };
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
@@ -219,7 +219,7 @@ fn resolve_backend(
             .backend
             .capabilities()
             .context_window
-            .unwrap_or_else(|| context_window_for(&config.model)),
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
     );
     choice
 }
@@ -1978,8 +1978,9 @@ impl App {
         self.discovered
             .iter()
             .map(|id| {
-                let description =
-                    solaris_provider::model_spec(id).map_or("", |spec| spec.description);
+                let description = catalogue
+                    .and_then(|provider| provider.models.iter().find(|model| model.id == id))
+                    .map_or("", |model| model.description);
                 SelectItem::new(id.as_str(), id.as_str()).description(description)
             })
             .collect()
@@ -2995,6 +2996,16 @@ impl Component for App {
 
     fn tick(&mut self) -> bool {
         let mut dirty = self.poll_oauth();
+        let context_window = u64::from(
+            self.agent
+                .capabilities()
+                .context_window
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        );
+        if self.config.context_window != context_window {
+            self.config.context_window = context_window;
+            dirty = true;
+        }
 
         // Drain backend events without holding a borrow across the handler.
         let mut events = Vec::new();
@@ -3864,7 +3875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reported_model_is_annotated_from_the_catalogue() {
+    async fn a_gateway_model_does_not_inherit_another_providers_description() {
         let mut app = app_with_backend(fake_backend_reporting(&[
             "claude-sonnet-4-5",
             "acme-internal-1",
@@ -3873,8 +3884,9 @@ mod tests {
         app.submit("/model".to_string());
 
         let text = rendered_text(&mut app, 100, 24);
-        // The catalogue knows this one, so its description comes along.
-        assert!(text.contains("claude-sonnet-4-5 · balanced"), "{text}");
+        // This gateway has not declared an Anthropic model mapping.
+        assert!(text.contains("claude-sonnet-4-5"), "{text}");
+        assert!(!text.contains("balanced"), "{text}");
         // And one it has never heard of is offered all the same.
         assert!(text.contains("acme-internal-1"), "{text}");
     }
@@ -5362,7 +5374,8 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.model(), "claude-opus-4-1");
-        assert_eq!(app.config.context_window, 200_000);
+        // An ID absent from the upstream snapshot uses conservative defaults.
+        assert_eq!(app.config.context_window, 128_000);
     }
 
     #[tokio::test]

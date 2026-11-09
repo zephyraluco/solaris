@@ -25,7 +25,7 @@ pub use solaris_backend::Wire;
 
 pub use providers::{
     AuthKind, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelSpec, PROVIDERS, ProviderSpec,
-    context_window_for, max_output_for, model_spec, models, price_for, provider_spec,
+    provider_spec,
 };
 
 use std::collections::BTreeMap;
@@ -439,4 +439,8 @@ mod tests {
 }
 
 mod catalog;
-pub use catalog::{ModelCatalog, ModelOverride};
+pub use catalog::{
+    CatalogModel, CatalogReference, CatalogSnapshot, MODELS_DEV_URL, ModelCatalog, ModelOverride,
+    OPENROUTER_URL, ParameterSources, ResolvedModel, SNAPSHOT_PROVIDERS, parse_models_dev,
+    parse_openrouter,
+};

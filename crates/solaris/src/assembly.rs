@@ -1,13 +1,17 @@
 //! Application-owned translation from provider resolution to agent inputs.
 
 use solaris_agent::AgentBackendConfig;
-use solaris_provider::{BackendChoice, context_window_for, provider_spec};
+use solaris_provider::{BackendChoice, DEFAULT_CONTEXT_WINDOW, provider_spec};
 
 /// Resolve provider catalogue metadata into the agent's execution contract.
 /// Authentication provenance and endpoint configuration remain in the app.
 pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
     AgentBackendConfig {
-        fallback_context_window: context_window_for(&choice.model),
+        fallback_context_window: choice
+            .backend
+            .capabilities()
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
         instructions: choice
             .provider_id
             .and_then(provider_spec)
@@ -47,10 +51,7 @@ mod tests {
         assert!(Arc::ptr_eq(&config.backend, &backend));
         assert_eq!(config.provider_id.as_deref(), Some("local"));
         assert_eq!(config.model, "claude-sonnet-4-5");
-        assert_eq!(
-            config.fallback_context_window,
-            context_window_for(&config.model)
-        );
+        assert_eq!(config.fallback_context_window, DEFAULT_CONTEXT_WINDOW);
         assert_eq!(
             config.instructions.as_deref(),
             provider_spec("local").unwrap().prompt
@@ -70,9 +71,6 @@ mod tests {
         assert!(config.provider_id.is_none());
         assert!(config.instructions.is_none());
         assert_eq!(config.model, "custom-model");
-        assert_eq!(
-            config.fallback_context_window,
-            context_window_for("custom-model")
-        );
+        assert_eq!(config.fallback_context_window, DEFAULT_CONTEXT_WINDOW);
     }
 }
