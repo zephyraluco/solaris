@@ -531,7 +531,29 @@ impl Agent {
 
     /// Replace resources for future turns without clearing conversation or queues.
     /// Call at an idle boundary; an active turn keeps its existing system prompt.
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
+    /// ResourcePaths::load prepares paths on the loader worker. Hand-built
+    /// snapshots are prepared here before publication, outside the resource lock.
+    pub fn replace_resources(&self, mut snapshot: ResourceSnapshot) {
+        {
+            let current = self.resources.read().unwrap_or_else(|p| p.into_inner());
+            for path in std::iter::once(&self.options.cwd).chain(
+                snapshot
+                    .prompt
+                    .project_rules
+                    .iter()
+                    .chain(&snapshot.prompt.append_system)
+                    .map(|file| &file.path),
+            ) {
+                if let Some(prepared) = current.prompt.model_paths.get(path) {
+                    snapshot
+                        .prompt
+                        .model_paths
+                        .entry(path.clone())
+                        .or_insert_with(|| prepared.clone());
+                }
+            }
+        }
+        snapshot.prompt.prepare_paths(&self.options.cwd);
         *self
             .resources
             .write()
@@ -1204,6 +1226,17 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(agent.conversation_len(), before);
+        let prepared = agent.prompt_context();
+        for path in [
+            &agent.options.cwd,
+            &prepared.project_rules[0].path,
+            &prepared.append_system[0].path,
+        ] {
+            assert!(
+                prepared.model_paths.contains_key(path),
+                "replacement must prepare {path:?}"
+            );
+        }
         drain(agent.run_turn("second request", Mode::Plan)).await;
         let requests = inner.requests();
         let system = requests[1].history[0].text();
