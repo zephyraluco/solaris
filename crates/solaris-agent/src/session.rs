@@ -102,7 +102,11 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         .clone()
         .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
     let inner: Arc<dyn AgentBackend> = Arc::new(crate::budget::BudgetedBackend {
-        inner,
+        inner: Arc::new(crate::billing::AccountingBackend {
+            inner,
+            conversation: Arc::clone(&conversation),
+            kind: crate::UsageKind::Model,
+        }),
         budget: Arc::clone(&budget),
     });
     let specs: Vec<ToolSpec> = tools
@@ -234,7 +238,7 @@ impl Runner {
             self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
             self.emit_context(&tx);
-            self.compact(false, &tx).await;
+            self.compact(false, &tx, &mut total, &mut cost_usd).await;
 
             // One round, with one chance to recover from a window that turned out
             // to be full: the conversation is summarized and the same round asked
@@ -254,7 +258,7 @@ impl Runner {
                             return;
                         }
                         recovered = true;
-                        if !self.compact(true, &tx).await {
+                        if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
                             self.give_up(message, &tx);
                             return;
                         }
@@ -328,6 +332,11 @@ impl Runner {
             let results = results
                 .into_iter()
                 .map(|outcome| {
+                    self.conversation.record_billing(
+                        outcome.usage,
+                        outcome.cost_usd,
+                        crate::UsageKind::Child,
+                    );
                     total = total.merge(outcome.usage);
                     cost_usd += outcome.cost_usd;
                     Content::ToolResult {
@@ -433,6 +442,11 @@ impl Runner {
         let Completion {
             task_id, result, ..
         } = completion;
+        self.conversation.record_billing(
+            result.totals.usage,
+            result.totals.cost_usd,
+            crate::UsageKind::Child,
+        );
         *total = total.merge(result.totals.usage);
         *cost_usd += result.totals.cost_usd;
         // A launch was already answered. A plain data notification preserves
@@ -504,7 +518,13 @@ impl Runner {
     /// `force` is for the two cases where the budget is not the question: a round
     /// that came back with an overflow, and the user asking for it. Returns
     /// whether anything was replaced.
-    async fn compact(&self, force: bool, tx: &UnboundedSender<AgentEvent>) -> bool {
+    async fn compact(
+        &self,
+        force: bool,
+        tx: &UnboundedSender<AgentEvent>,
+        total: &mut Usage,
+        cost_usd: &mut f64,
+    ) -> bool {
         if !self.compaction.enabled {
             return false;
         }
@@ -522,14 +542,16 @@ impl Runner {
         // summarized again, so what the first summary captured is not re-derived
         // from a conversation that no longer contains it.
         let previous = existing_summary(&messages[..cut]);
-        let Some(summary) = summarize(
+        let outcome = summarize(
             &self.inner,
             &self.cancel,
             &messages[..cut],
             previous.as_deref(),
         )
-        .await
-        else {
+        .await;
+        *total = total.merge(outcome.usage);
+        *cost_usd += outcome.cost_usd;
+        let Some(summary) = outcome.text else {
             // Summarizing failed. Sending the conversation as it stands is worse
             // than asking for less, but far better than sending nothing.
             return false;
@@ -971,12 +993,19 @@ pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
 /// forwarded — the caller asked for a turn's answer, not for the notes taken
 /// along the way. It observes the turn's cancel, because a summary of a long
 /// conversation is not something to sit through after the user has given up.
+#[derive(Default)]
+pub(crate) struct SummaryOutcome {
+    text: Option<String>,
+    usage: Usage,
+    cost_usd: f64,
+}
+
 pub(crate) async fn summarize(
     inner: &Arc<dyn AgentBackend>,
     cancel: &Cancel,
     older: &[Message],
     previous: Option<&str>,
-) -> Option<String> {
+) -> SummaryOutcome {
     let (system, prompt) = match previous {
         Some(existing) => (
             UPDATE_COMPACT_PROMPT,
@@ -993,17 +1022,20 @@ pub(crate) async fn summarize(
         prompt,
         tools: Vec::new(),
     };
+    let mut outcome = SummaryOutcome::default();
     let mut stream = tokio::select! {
         biased;
-        _ = wait_for_cancel(cancel) => return None,
-        result = inner.run_turn(request) => result.ok()?,
+        _ = wait_for_cancel(cancel) => return outcome,
+        result = inner.run_turn(request) => match result { Ok(stream) => stream, Err(_) => return outcome },
     };
 
     let mut summary = String::new();
+    let mut completed = false;
+    let mut truncated = false;
     loop {
         let event = tokio::select! {
             biased;
-            _ = wait_for_cancel(cancel) => return None,
+            _ = wait_for_cancel(cancel) => return outcome,
             event = stream.next() => event,
         };
         let Some(event) = event else {
@@ -1011,12 +1043,19 @@ pub(crate) async fn summarize(
         };
         match event {
             AgentEvent::TextDelta(chunk) => summary.push_str(&chunk),
-            AgentEvent::Error(_) => return None,
+            AgentEvent::Error(_) => return outcome,
+            AgentEvent::TurnComplete { usage, cost_usd } => {
+                outcome.usage = usage;
+                outcome.cost_usd = cost_usd;
+                completed = true;
+            }
+            AgentEvent::OutputTruncated => truncated = true,
             // Thinking, status and anything else are not the summary.
             _ => {}
         }
     }
-    (!summary.trim().is_empty()).then_some(summary)
+    outcome.text = (completed && !truncated && !summary.trim().is_empty()).then_some(summary);
+    outcome
 }
 
 /// Summarize the conversation now, at the user's request.
@@ -1043,7 +1082,9 @@ pub(crate) async fn compact_now(
     }
 
     let previous = existing_summary(&messages[..cut]);
-    let summary = summarize(inner, cancel, &messages[..cut], previous.as_deref()).await?;
+    let summary = summarize(inner, cancel, &messages[..cut], previous.as_deref())
+        .await
+        .text?;
 
     let mut replaced = Vec::with_capacity(messages.len() - cut + 1);
     replaced.push(summary_message(&summary));

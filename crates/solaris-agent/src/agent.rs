@@ -360,7 +360,11 @@ impl Agent {
         let cancel = self.cancel.begin_turn();
         let inner: Arc<dyn solaris_backend::AgentBackend> =
             Arc::new(crate::budget::BudgetedBackend {
-                inner: Arc::clone(&self.choice.backend),
+                inner: Arc::new(crate::billing::AccountingBackend {
+                    inner: Arc::clone(&self.choice.backend),
+                    conversation: Arc::clone(&self.conversation),
+                    kind: crate::UsageKind::Manual,
+                }),
                 budget: crate::ExecutionBudget::new(self.options.execution.budget.clone()),
             });
         session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel).await
@@ -459,6 +463,10 @@ impl Agent {
                 self.conversation
                     .context_usage(&prompt.header.base_id, unknown.window)
             })
+    }
+
+    pub fn usage_totals(&self) -> Option<crate::UsageTotals> {
+        self.conversation.usage_totals()
     }
 
     /// The models the endpoint offers, for the picker to choose from.
@@ -1421,5 +1429,59 @@ mod tests {
             agent.context_usage(Mode::Build);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
+    }
+    #[tokio::test]
+    async fn request_billing_survives_failure_without_a_terminal_completion() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        let backend = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(ToolCall::new("one", "missing", json!({}))),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(100, 10),
+                    cost_usd: 0.01,
+                },
+            ],
+            vec![AgentEvent::Error("next request failed".into())],
+        ]);
+        let original = agent(backend);
+        original
+            .attach_journal(Arc::clone(&journal))
+            .expect("attach");
+        let events = drain(original.run_turn("work", Mode::Build)).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+        assert_eq!(original.usage_totals().expect("totals").usage.total(), 110);
+        let restored = agent(Scripted::new(vec![]));
+        restored.attach_journal(journal).expect("restore");
+        assert_eq!(restored.usage_totals(), original.usage_totals());
+    }
+
+    #[tokio::test]
+    async fn manual_summaries_are_billed_without_changing_the_context_baseline() {
+        let backend = Scripted::new(vec![vec![
+            AgentEvent::TextDelta("summary".into()),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(500, 50),
+                cost_usd: 0.02,
+            },
+        ]]);
+        let mut agent = agent(backend);
+        agent.options.compaction.keep_recent_tokens = 1;
+        agent
+            .conversation
+            .push(solaris_backend::Message::user("old context"));
+        agent
+            .conversation
+            .push(solaris_backend::Message::assistant("old reply"));
+        agent
+            .conversation
+            .push(solaris_backend::Message::user("new question"));
+        assert!(agent.compact().await.is_some());
+        assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
+        assert_eq!(agent.context_usage(Mode::Build).tokens, None);
     }
 }

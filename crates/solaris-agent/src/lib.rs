@@ -21,6 +21,8 @@ mod agent;
 mod approver;
 mod backend;
 mod background;
+mod billing;
+pub use billing::{UsageKind, UsageTotals};
 mod compaction;
 mod conversation;
 mod input;

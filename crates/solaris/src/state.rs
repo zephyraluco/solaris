@@ -160,6 +160,7 @@ impl Turn {
 /// The conversation plus its streaming state.
 #[derive(Debug, Default)]
 pub struct SessionState {
+    pub billing: Option<solaris_agent::UsageTotals>,
     pub context: ContextUsage,
     /// Completed and in-flight turns, oldest first.
     pub turns: Vec<Turn>,
@@ -207,7 +208,14 @@ impl SessionState {
     /// This is a session total, not a measure of the context window; see
     /// [`SessionState::context_tokens`] for that.
     pub fn total_tokens(&self) -> u32 {
-        self.turns.iter().map(Turn::tokens).sum()
+        self.billing.map_or_else(
+            || {
+                self.turns
+                    .iter()
+                    .fold(0u32, |sum, turn| sum.saturating_add(turn.tokens()))
+            },
+            |total| total.usage.total(),
+        )
     }
 
     /// Occupancy reported by Agent, never inferred from cumulative task usage.
@@ -219,6 +227,9 @@ impl SessionState {
     ///
     /// The result is flagged as an estimate when any turn in it was one.
     pub fn total_usage(&self) -> Usage {
+        if let Some(totals) = self.billing {
+            return totals.usage;
+        }
         self.turns
             .iter()
             .fold(Usage::default(), |total, turn| Usage {
@@ -236,6 +247,9 @@ impl SessionState {
 
     /// Total cost reported across all turns.
     pub fn total_cost(&self) -> f64 {
+        if let Some(totals) = self.billing {
+            return totals.cost_usd;
+        }
         // `Iterator::sum` seeds floats with `-0.0`, which would render as
         // `$-0.0000`; adding zero normalises the sign.
         self.turns.iter().map(|turn| turn.cost_usd).sum::<f64>() + 0.0

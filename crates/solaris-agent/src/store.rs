@@ -43,6 +43,13 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionRecord {
+    #[serde(alias = "auxiliary_usage")]
+    Usage {
+        usage: solaris_backend::Usage,
+        cost_usd: f64,
+        #[serde(default)]
+        kind: crate::UsageKind,
+    },
     Model {
         provider: Option<String>,
         model: String,
@@ -248,9 +255,16 @@ impl SessionStore {
         let data = statement
             .query_map([id], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        data.iter()
-            .map(|text| Ok(serde_json::from_str(text)?))
-            .collect()
+        let mut records = Vec::new();
+        for text in data {
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            // Obsolete hashes from the previous implementation are not a projection input.
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("context_checkpoint") {
+                continue;
+            }
+            records.push(serde_json::from_value(value)?);
+        }
+        Ok(records)
     }
 }
 
@@ -532,5 +546,38 @@ mod tests {
         drop(session);
         drop(store);
         std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+    #[test]
+    fn obsolete_context_checkpoints_do_not_prevent_reading_old_sessions() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("session");
+        store
+            .lock()
+            .expect("connection")
+            .execute(
+                "INSERT INTO records(session_id,data) VALUES (?1,?2)",
+                params![
+                    journal.id(),
+                    r#"{"type":"context_checkpoint","checkpoint":{"unused":true}}"#
+                ],
+            )
+            .expect("old checkpoint");
+        journal
+            .append(&SessionRecord::Prompt {
+                text: "hello".into(),
+            })
+            .expect("prompt");
+        assert_eq!(store.records(journal.id()).expect("read").len(), 1);
+        let old_fee: SessionRecord = serde_json::from_str(r#"{"type":"auxiliary_usage","usage":{"input_tokens":10,"output_tokens":2},"cost_usd":0.01}"#).expect("old fee");
+        assert!(matches!(
+            old_fee,
+            SessionRecord::Usage {
+                kind: crate::UsageKind::Manual,
+                ..
+            }
+        ));
     }
 }

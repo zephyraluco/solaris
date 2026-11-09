@@ -29,6 +29,7 @@ pub(crate) struct Conversation {
     published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
     failure: Mutex<Option<String>>,
+    billing: Mutex<crate::UsageTotals>,
 }
 
 impl Conversation {
@@ -45,6 +46,8 @@ impl Conversation {
                 return Err(error);
             }
         };
+        let billing = crate::UsageTotals::restore(&journal.store().records(journal.id())?);
+        *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
         *self.lock() = context;
         *self
             .journal
@@ -142,6 +145,7 @@ impl Conversation {
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
         self.replace_with(Vec::new());
+        *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
     }
 
     /// Complete missing results in the latest assistant round without replaying
@@ -175,6 +179,30 @@ impl Conversation {
         }
         drop(messages);
         self.publish();
+    }
+
+    pub(crate) fn record_billing(
+        &self,
+        usage: solaris_backend::Usage,
+        cost_usd: f64,
+        kind: crate::UsageKind,
+    ) -> bool {
+        if usage.is_empty() && cost_usd == 0.0 {
+            return true;
+        }
+        self.billing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(usage, cost_usd);
+        self.persist(SessionRecord::Usage {
+            usage,
+            cost_usd,
+            kind,
+        })
+    }
+
+    pub(crate) fn usage_totals(&self) -> Option<crate::UsageTotals> {
+        self.billing.try_lock().ok().map(|totals| *totals)
     }
 
     pub(crate) fn set_headers(&self, headers: Vec<crate::projection::Header>) {

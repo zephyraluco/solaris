@@ -1666,6 +1666,7 @@ impl App {
     }
 
     fn open_stats(&mut self) {
+        self.session.billing = self.agent.usage_totals().or(self.session.billing);
         self.session.context = self.agent.context_usage(self.config.mode);
         let backend = self.agent.label().to_string();
         let model = if self.config.model.is_empty() {
@@ -3030,6 +3031,13 @@ impl Component for App {
         let context = self.agent.context_usage(self.config.mode);
         if self.session.context != context {
             self.session.context = context;
+            dirty = true;
+        }
+
+        if let Some(billing) = self.agent.usage_totals()
+            && self.session.billing != Some(billing)
+        {
+            self.session.billing = Some(billing);
             dirty = true;
         }
 
