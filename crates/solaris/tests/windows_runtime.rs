@@ -1,4 +1,4 @@
-//! Startup failures must identify an incomplete Windows distribution.
+//! Startup failures must identify a missing Windows distribution.
 #![cfg(windows)]
 
 #[test]
@@ -7,11 +7,7 @@ fn complete_distribution_does_not_require_writing_to_its_runtime() {
     let executable = directory.path().join("solaris.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_solaris"), &executable).unwrap();
     let runtime = directory.path().join("plugins/windows/cygwin");
-    for relative in solaris_tools::cygwin::REQUIRED_FILES {
-        let file = runtime.join(relative);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(file, []).unwrap();
-    }
+    std::fs::create_dir_all(&runtime).unwrap();
     // A file at this path makes the old create_dir_all(root/tmp) fail even
     // when the test runner has permission to write the installation tree.
     std::fs::write(runtime.join("tmp"), "not a directory").unwrap();

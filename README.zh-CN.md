@@ -73,7 +73,7 @@ cargo build --release
 ## 运行
 
 Windows 使用随附的 Cygwin Bash。发布包中的 `plugins/windows/cygwin/` 必须与
-`solaris.exe` 保持配套；源码构建会从仓库查找该目录。启动时验证运行库，
+`solaris.exe` 保持配套；源码构建会从仓库查找该目录。启动时定位运行库，
 不修改当前进程的 PATH。Bash 仅使用 Cygwin 的 `/usr/local/bin:/usr/bin:/bin`，
 不继承 Windows PATH，也不读取个人登录脚本；显式加载随包 `/etc/profile`。
 所有内建工具（包括读取、目录枚举、原子写入和撤销）都通过 Bash 和系统命令执行，
@@ -81,7 +81,7 @@ Rust 负责参数校验、精确编辑、结果解析和进程控制。Windows �
 `/cygdrive/c/...`；`rg/fd` 也由相同的 Cygwin PATH 查找。Linux/macOS 使用系统
 Bash、标准工具和系统 PATH。参数独立传递，文件内容通过 stdin 输入；工作目录保持不变。
 临时文件写入当前用户的临时目录，启动无需对安装目录拥有写入权限。
-所有平台统一使用 `bash` 工具和 Bash 语法；运行库缺失或不完整时明确报错。
+所有平台统一使用 `bash` 工具和 Bash 语法；运行库缺失时明确报错。
 
 ```bash
 # 在仓库内直接运行
