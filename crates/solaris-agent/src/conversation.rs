@@ -458,4 +458,24 @@ mod tests {
         conversation.push(Message::assistant("y".repeat(400)));
         assert!(tokens(&conversation) > small);
     }
+    #[test]
+    fn ui_reads_published_projection_without_waiting_for_message_lock() {
+        let conversation = Arc::new(Conversation::new());
+        let header = crate::projection::Header::new("model", "system", &[]);
+        let base = header.base_id.clone();
+        conversation.set_headers(vec![header.clone()]);
+        let mut message = Message::assistant("reply");
+        header.annotate(&mut message, solaris_backend::Usage::new(100, 10));
+        conversation.push(message);
+        let lock = conversation.lock();
+        let reader = Arc::clone(&conversation);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(reader.context_usage(&base, 1000)).expect("send");
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(lock);
+        thread.join().expect("reader");
+        assert_eq!(result.expect("nonblocking snapshot").tokens, Some(110));
+    }
 }
