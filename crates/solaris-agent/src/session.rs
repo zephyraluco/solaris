@@ -533,22 +533,12 @@ impl Runner {
         }
 
         let messages = self.conversation.snapshot();
-        let cut = self.compaction_policy().cut_point(&messages);
+        let plan = self.compaction_policy().plan(&messages);
+        let cut = plan.first_kept;
         if cut == 0 {
             return false;
         }
-
-        // A conversation that has been summarized before is updated rather than
-        // summarized again, so what the first summary captured is not re-derived
-        // from a conversation that no longer contains it.
-        let previous = existing_summary(&messages[..cut]);
-        let outcome = summarize(
-            &self.inner,
-            &self.cancel,
-            &messages[..cut],
-            previous.as_deref(),
-        )
-        .await;
+        let outcome = summarize_plan(&self.inner, &self.cancel, &messages, plan).await;
         *total = total.merge(outcome.usage);
         *cost_usd += outcome.cost_usd;
         let Some(summary) = outcome.text else {
@@ -1005,6 +995,7 @@ pub(crate) async fn summarize(
     cancel: &Cancel,
     older: &[Message],
     previous: Option<&str>,
+    purpose: Option<&str>,
 ) -> SummaryOutcome {
     let (system, prompt) = match previous {
         Some(existing) => (
@@ -1017,6 +1008,11 @@ pub(crate) async fn summarize(
         None => (COMPACT_PROMPT, conversation_text(older)),
     };
 
+    let prompt = if let Some(purpose) = purpose {
+        format!("{purpose}\n\n{prompt}")
+    } else {
+        prompt
+    };
     let request = TurnRequest {
         history: vec![Message::system(system)],
         prompt,
@@ -1058,6 +1054,47 @@ pub(crate) async fn summarize(
     outcome
 }
 
+/// Prepare all summary parts before publishing any replacement history.
+async fn summarize_plan(
+    inner: &Arc<dyn AgentBackend>,
+    cancel: &Cancel,
+    messages: &[Message],
+    plan: crate::compaction::CutPlan,
+) -> SummaryOutcome {
+    let history_end = plan.turn_start.unwrap_or(plan.first_kept);
+    let mut result = SummaryOutcome::default();
+    let mut parts = Vec::new();
+    if history_end > 0 {
+        let previous = existing_summary(&messages[..history_end]);
+        let history = summarize(
+            inner,
+            cancel,
+            &messages[..history_end],
+            previous.as_deref(),
+            None,
+        )
+        .await;
+        result.usage = result.usage.merge(history.usage);
+        result.cost_usd += history.cost_usd;
+        let Some(text) = history.text else {
+            return result;
+        };
+        parts.push(text);
+    }
+    if let Some(start) = plan.turn_start {
+        let prefix = summarize(inner, cancel, &messages[start..plan.first_kept], None,
+            Some("Summarize only the current task prefix. Preserve the original user request, constraints, completed work, and remaining work so the retained tool-call/result tail can continue the task. Do not infer later results.")).await;
+        result.usage = result.usage.merge(prefix.usage);
+        result.cost_usd += prefix.cost_usd;
+        let Some(text) = prefix.text else {
+            return result;
+        };
+        parts.push(format!("Current task context:\n{text}"));
+    }
+    result.text = (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"));
+    result
+}
+
 /// Summarize the conversation now, at the user's request.
 ///
 /// Not the loop's path: there is no turn to protect here, so nothing is forced
@@ -1076,15 +1113,12 @@ pub(crate) async fn compact_now(
     let messages = conversation.snapshot();
     let caps = inner.capabilities();
     let policy = compaction.for_window(caps.context_window.unwrap_or(0), caps.output_budget);
-    let cut = policy.cut_point(&messages);
+    let plan = policy.plan(&messages);
+    let cut = plan.first_kept;
     if cut == 0 {
         return None;
     }
-
-    let previous = existing_summary(&messages[..cut]);
-    let summary = summarize(inner, cancel, &messages[..cut], previous.as_deref())
-        .await
-        .text?;
+    let summary = summarize_plan(inner, cancel, &messages, plan).await.text?;
 
     let mut replaced = Vec::with_capacity(messages.len() - cut + 1);
     replaced.push(summary_message(&summary));
@@ -2192,6 +2226,7 @@ mod tests {
             // The summarizer answers first, because compaction runs before the
             // round it is there to protect.
             round(vec![AgentEvent::TextDelta("we added a flag".to_string())]),
+            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let options = AgentOptions {
@@ -2211,7 +2246,11 @@ mod tests {
             .await;
 
         let seen = inner.requests();
-        assert_eq!(seen.len(), 2, "a summary call, then the round");
+        assert_eq!(
+            seen.len(),
+            3,
+            "history summary, task prefix, then the round"
+        );
 
         // The summary call is a plain question: it declares no tools.
         assert!(seen[0].tools.is_empty());
@@ -2224,7 +2263,7 @@ mod tests {
         );
 
         // The round that follows reads the summary where the messages were.
-        let round = &seen[1];
+        let round = &seen[2];
         assert!(
             round.history[0].text().contains("You are solaris"),
             "the system prompt still leads: {}",
@@ -2578,6 +2617,7 @@ mod tests {
                 },
             ],
             round(vec![AgentEvent::TextDelta("a summary".to_string())]),
+            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let options = AgentOptions {
@@ -2606,5 +2646,73 @@ mod tests {
             events.last(),
             Some(AgentEvent::TurnComplete { .. })
         ));
+    }
+    fn split_task_history() -> Vec<Message> {
+        vec![
+            Message::user("old history"),
+            Message::assistant("old answer"),
+            Message::user("current target: parser.rs; preserve flags"),
+            Message::tool_use(call("first", "record")),
+            Message::tool_result(ToolResult::ok(&call("first", "record"), "first result")),
+            Message::tool_use(call("last", "record")),
+            Message::tool_result(ToolResult::ok(&call("last", "record"), "x".repeat(4000))),
+        ]
+    }
+
+    #[tokio::test]
+    async fn split_task_keeps_tool_tail_and_summarizes_its_prefix_separately() {
+        let scripted = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            round(vec![AgentEvent::TextDelta("preserve parser flags".into())]),
+        ]);
+        let inner: Arc<dyn AgentBackend> = scripted.clone();
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            Some(5)
+        );
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 2);
+        assert!(!seen[0].prompt.contains("current target"));
+        assert!(seen[1].prompt.contains("current target: parser.rs"));
+        assert!(seen[1].prompt.contains("current task prefix"));
+        let kept = conversation.snapshot();
+        assert!(kept[0].text().contains("history summary"));
+        assert!(kept[0].text().contains("Current task context"));
+        assert_eq!(
+            kept[1].tool_calls().next().expect("retained call").id,
+            "last"
+        );
+        assert_eq!(
+            kept[2].tool_results().next().expect("retained result").id,
+            "last"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_task_prefix_summary_does_not_publish_a_partial_compaction() {
+        let inner: Arc<dyn AgentBackend> = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            vec![AgentEvent::Error("prefix failed".into())],
+        ]);
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let before = conversation.snapshot();
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            None
+        );
+        assert_eq!(conversation.snapshot(), before);
     }
 }

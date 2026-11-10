@@ -17,7 +17,7 @@
 //!   number of messages for the same reason: eight messages can be a paragraph or
 //!   a whole file.
 
-use solaris_backend::{Message, tokens_for_characters};
+use solaris_backend::{Message, Role, tokens_for_characters};
 
 /// Tokens held back from the window for the reply itself.
 pub const DEFAULT_RESERVE_TOKENS: u32 = 16_384;
@@ -47,6 +47,18 @@ impl Default for Compaction {
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CutPlan {
+    pub first_kept: usize,
+    pub turn_start: Option<usize>,
+}
+
+fn is_turn_start(message: &Message) -> bool {
+    message.role == Role::User
+        && !message.is_tool_results()
+        && !message.text().starts_with(crate::prompt::SUMMARY_PREFIX)
 }
 
 impl Compaction {
@@ -90,31 +102,41 @@ impl Compaction {
         context_tokens > context_window.saturating_sub(self.reserve_tokens)
     }
 
-    /// Where the kept tail starts, so `messages[..cut]` is what gets summarized.
-    ///
-    /// Returns `0` when there is nothing worth summarizing, and never leaves a
-    /// tool result at the start of the tail: a result with no request ahead of it
-    /// is rejected by every wire, so the cut moves forward until the tail can
-    /// begin a conversation on its own.
+    /// Keep a legal message boundary; oversized tool results retain their call.
     pub fn cut_point(self, messages: &[Message]) -> usize {
-        let mut kept = 0u32;
-        let mut index = messages.len();
+        self.plan(messages).first_kept
+    }
 
-        while index > 0 {
-            let cost = tokens_for_characters(messages[index - 1].characters());
-            // At least one message is always kept: a summary of everything would
-            // leave the model with no idea what was just said.
-            if kept > 0 && kept.saturating_add(cost) > self.keep_recent_tokens {
+    pub(crate) fn plan(self, messages: &[Message]) -> CutPlan {
+        let legal: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (is_turn_start(message) || message.role == Role::Assistant).then_some(index)
+            })
+            .collect();
+        let mut cut = legal.first().copied().unwrap_or(0);
+        let mut kept = 0u32;
+        for index in (0..messages.len()).rev() {
+            kept = kept.saturating_add(tokens_for_characters(messages[index].characters()));
+            if kept >= self.keep_recent_tokens {
+                cut = legal
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate >= index)
+                    .or_else(|| legal.last().copied())
+                    .unwrap_or(0);
                 break;
             }
-            kept = kept.saturating_add(cost);
-            index -= 1;
         }
-
-        while index < messages.len() && messages[index].is_tool_results() {
-            index += 1;
+        let turn_start = messages
+            .get(cut)
+            .filter(|message| !is_turn_start(message))
+            .and_then(|_| messages[..cut].iter().rposition(is_turn_start));
+        CutPlan {
+            first_kept: cut,
+            turn_start,
         }
-        index
     }
 }
 
@@ -196,10 +218,9 @@ mod tests {
             Message::tool_result(ToolResult::ok(&call("call-1"), "contents")),
         ];
 
-        // The natural cut would be at the tool result, which no wire accepts
-        // without the call it answers; the cut moves past it instead.
+        // Keep the preceding call and all results, even beyond the target budget.
         let cut = compaction.cut_point(&messages);
-        assert_eq!(cut, 3);
+        assert_eq!(cut, 1);
         assert!(
             !messages[cut..]
                 .first()
@@ -224,5 +245,30 @@ mod tests {
         let messages: Vec<_> = (0..8).map(|_| Message::user("x".repeat(3500))).collect();
         assert!(policy.cut_point(&messages) > 0);
         assert!(!policy.should_compact(100, 8192));
+    }
+    #[test]
+    fn oversized_results_keep_the_preceding_call_and_all_of_its_results() {
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        let calls = Message::with_content(
+            Role::Assistant,
+            vec![
+                solaris_backend::Content::ToolUse { call: call("one") },
+                solaris_backend::Content::ToolUse { call: call("two") },
+            ],
+        );
+        let messages = vec![
+            Message::user("task"),
+            calls,
+            Message::tool_result(ToolResult::ok(&call("one"), "x".repeat(4000))),
+            Message::tool_result(ToolResult::ok(&call("two"), "y".repeat(4000))),
+        ];
+        let plan = policy.plan(&messages);
+        assert_eq!(plan.first_kept, 1);
+        assert_eq!(plan.turn_start, Some(0));
+        assert_eq!(messages[plan.first_kept..].len(), 3);
     }
 }
