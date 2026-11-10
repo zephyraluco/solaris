@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/solaris-rig",
     "crates/solaris-mcp",
     "crates/solaris-types",
 	"crates/solaris-provider",
@@ -14,9 +15,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
 license = "MIT"
 
 [workspace.dependencies]
+solaris-rig = { path = "crates/solaris-rig", version = "0.1.0" }
+rig-core = { version = "0.46.0", default-features = false, features = ["reqwest", "rustls"] }
 solaris-mcp = { path = "crates/solaris-mcp", version = "0.1.0" }
 solaris-types = { path = "crates/solaris-types", version = "0.1.0" }
 # Internal crates
