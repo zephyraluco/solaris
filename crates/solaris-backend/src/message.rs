@@ -65,6 +65,17 @@ impl Content {
     }
 }
 
+/// Journal-only context annotations, excluded by protocol message encoders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MessageContext {
+    Boundary,
+    Measurement {
+        usage: crate::Usage,
+        base_id: String,
+        request_id: String,
+    },
+}
+
 /// A single message in the conversation history.
 ///
 /// `Eq` is deliberately absent: tool arguments are JSON, and a JSON number is
@@ -73,6 +84,8 @@ impl Content {
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MessageContext>,
 }
 
 impl Message {
@@ -81,12 +94,17 @@ impl Message {
         Self {
             role,
             content: vec![Content::text(content)],
+            context: None,
         }
     }
 
     /// A message built from blocks of the caller's choosing.
     pub fn with_content(role: Role, content: Vec<Content>) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            context: None,
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {

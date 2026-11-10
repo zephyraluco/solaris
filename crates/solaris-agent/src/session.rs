@@ -31,7 +31,7 @@ use crate::approver::{Approval, Approver};
 use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
-use crate::overflow::{filled_the_window, is_overflow};
+use crate::overflow::is_overflow;
 use crate::prompt::{
     COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
 };
@@ -66,6 +66,8 @@ pub(crate) struct TurnInput {
     pub prompt: String,
     /// The model's context window, which sizes the compaction budget.
     pub context_window: u32,
+    pub model_key: String,
+    pub base_id: String,
     pub subagent: Option<Arc<SubagentRunner>>,
 }
 
@@ -90,6 +92,8 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         system,
         prompt,
         context_window,
+        model_key,
+        base_id,
         subagent,
     } = input;
 
@@ -98,7 +102,11 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         .clone()
         .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
     let inner: Arc<dyn AgentBackend> = Arc::new(crate::budget::BudgetedBackend {
-        inner,
+        inner: Arc::new(crate::billing::AccountingBackend {
+            inner,
+            conversation: Arc::clone(&conversation),
+            kind: crate::UsageKind::Model,
+        }),
         budget: Arc::clone(&budget),
     });
     let specs: Vec<ToolSpec> = tools
@@ -133,6 +141,8 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         conversation,
         compaction: options.compaction,
         context_window,
+        model_key,
+        base_id,
         max_parallel: options.max_parallel.max(1),
         system,
         subagent,
@@ -186,6 +196,8 @@ struct Runner {
     compaction: Compaction,
     /// The window the budget is measured against.
     context_window: u32,
+    model_key: String,
+    base_id: String,
     max_parallel: usize,
     /// The system prompt, sent ahead of the conversation on every round.
     system: String,
@@ -209,9 +221,6 @@ impl Runner {
 
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
-        // What the provider reported for the last round, which is the honest
-        // measure of how full the window is. An estimate is not.
-        let mut last_usage: Option<Usage> = None;
 
         loop {
             if let Some(error) = self.conversation.error() {
@@ -228,7 +237,8 @@ impl Runner {
 
             self.absorb_background(&mut total, &mut cost_usd);
             self.absorb_steering(&tx);
-            self.compact(last_usage.as_ref(), false, &tx).await;
+            self.emit_context(&tx);
+            self.compact(false, &tx, &mut total, &mut cost_usd).await;
 
             // One round, with one chance to recover from a window that turned out
             // to be full: the conversation is summarized and the same round asked
@@ -248,7 +258,7 @@ impl Runner {
                             return;
                         }
                         recovered = true;
-                        if !self.compact(last_usage.as_ref(), true, &tx).await {
+                        if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
                             self.give_up(message, &tx);
                             return;
                         }
@@ -256,14 +266,14 @@ impl Runner {
                 }
             };
 
-            last_usage = Some(reply.usage);
             cost_usd += reply.cost_usd;
 
             if reply.calls.is_empty() {
                 // The answer belongs to the conversation as much as the question
                 // does: without it the next turn would read every prompt the user
                 // ever sent with nothing in between.
-                self.record_reply(&reply.text);
+                self.record_reply(&reply.text, reply.usage);
+                self.emit_context(&tx);
 
                 if self.absorb_background(&mut total, &mut cost_usd) {
                     continue;
@@ -299,10 +309,11 @@ impl Runner {
                 return;
             }
 
-            self.conversation.push(Message::with_content(
-                Role::Assistant,
-                assistant_blocks(reply.text, &reply.calls),
-            ));
+            let mut message =
+                Message::with_content(Role::Assistant, assistant_blocks(reply.text, &reply.calls));
+            self.request_header().annotate(&mut message, reply.usage);
+            self.conversation.push(message);
+            self.emit_context(&tx);
 
             // A message the model stopped writing early may carry half-written
             // calls, so none of them run: it is told to ask again with whole
@@ -330,6 +341,7 @@ impl Runner {
                 .collect();
             self.conversation
                 .push(Message::with_content(Role::User, results));
+            self.emit_context(&tx);
 
             // A stop during the round ends the turn here: asking the model again
             // would only queue work for nobody.
@@ -347,14 +359,7 @@ impl Runner {
             // The prompt is already in the conversation: this loop records it
             // before it asks anything.
             prompt: String::new(),
-            tools: {
-                let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
-                self.specs
-                    .iter()
-                    .filter(|spec| active.contains(&spec.name))
-                    .cloned()
-                    .collect()
-            },
+            tools: self.request_tools(),
         };
 
         let result = tokio::select! {
@@ -384,6 +389,7 @@ impl Runner {
     /// End a turn without a completion, leaving the conversation consistent.
     fn give_up(&self, message: String, tx: &UnboundedSender<AgentEvent>) {
         self.conversation.repair();
+        self.emit_context(tx);
         let _ = tx.send(AgentEvent::Error(message));
     }
 
@@ -391,11 +397,13 @@ impl Runner {
     ///
     /// An empty message is left out rather than sent: some wires reject a blank
     /// text block outright, and a turn that answered nothing has nothing to add.
-    fn record_reply(&self, text: &str) {
+    fn record_reply(&self, text: &str, usage: Usage) {
         if text.trim().is_empty() {
             return;
         }
-        self.conversation.push(Message::assistant(text));
+        let mut message = Message::assistant(text);
+        self.request_header().annotate(&mut message, usage);
+        self.conversation.push(message);
     }
 
     /// Fold everything the user steered in into the conversation.
@@ -502,35 +510,28 @@ impl Runner {
     /// whether anything was replaced.
     async fn compact(
         &self,
-        last_usage: Option<&Usage>,
         force: bool,
         tx: &UnboundedSender<AgentEvent>,
+        total: &mut Usage,
+        cost_usd: &mut f64,
     ) -> bool {
         if !self.compaction.enabled {
             return false;
         }
-        if !force && !self.over_budget(last_usage) {
+        if !force && !self.over_budget() {
             return false;
         }
 
         let messages = self.conversation.snapshot();
-        let cut = self.compaction.cut_point(&messages);
+        let plan = self.compaction_policy().plan(&messages);
+        let cut = plan.first_kept;
         if cut == 0 {
             return false;
         }
-
-        // A conversation that has been summarized before is updated rather than
-        // summarized again, so what the first summary captured is not re-derived
-        // from a conversation that no longer contains it.
-        let previous = existing_summary(&messages[..cut]);
-        let Some(summary) = summarize(
-            &self.inner,
-            &self.cancel,
-            &messages[..cut],
-            previous.as_deref(),
-        )
-        .await
-        else {
+        let outcome = summarize_plan(&self.inner, &self.cancel, &messages, plan).await;
+        *total = total.merge(outcome.usage);
+        *cost_usd += outcome.cost_usd;
+        let Some(summary) = outcome.text else {
             // Summarizing failed. Sending the conversation as it stands is worse
             // than asking for less, but far better than sending nothing.
             return false;
@@ -542,26 +543,63 @@ impl Runner {
         self.conversation.replace_with(replaced);
 
         let _ = tx.send(AgentEvent::Compacted { dropped: cut });
+        self.emit_context(tx);
         true
     }
 
     /// Whether the conversation has reached the point of needing a summary.
-    fn over_budget(&self, last_usage: Option<&Usage>) -> bool {
-        // A provider that accepted an over-long request and answered anyway will
-        // never say so in an error, but its own usage says how much was read.
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+        self.specs
+            .iter()
+            .filter(|spec| active.contains(&spec.name))
+            .cloned()
+            .collect()
+    }
+
+    fn request_header(&self) -> crate::projection::Header {
+        let mut header =
+            crate::projection::Header::new(&self.model_key, &self.system, &self.request_tools());
+        if !self.base_id.is_empty() {
+            header.base_id.clone_from(&self.base_id);
+        }
+        header
+    }
+
+    fn emit_context(&self, tx: &UnboundedSender<AgentEvent>) {
+        self.conversation
+            .update_request_header(self.request_header());
+        let window = self
+            .inner
+            .capabilities()
+            .context_window
+            .unwrap_or(self.context_window);
+        let _ = tx.send(AgentEvent::ContextUsageUpdated {
+            context: self.conversation.context_usage(&self.base_id, window),
+        });
+    }
+
+    fn compaction_policy(&self) -> Compaction {
+        let caps = self.inner.capabilities();
+        let window = caps.context_window.unwrap_or(self.context_window);
+        let policy = self.compaction.for_window(window, caps.output_budget);
+        let input_window = caps.max_input.map_or(window, |limit| {
+            window.min(limit.saturating_add(policy.reserve_tokens))
+        });
+        policy.for_window(input_window, caps.output_budget)
+    }
+
+    fn over_budget(&self) -> bool {
         let capabilities = self.inner.capabilities();
         let context_window = capabilities.context_window.unwrap_or(self.context_window);
-        if last_usage.is_some_and(|usage| filled_the_window(usage, context_window)) {
-            return true;
-        }
-        let tokens = match last_usage {
-            Some(usage) if !usage.estimated && !usage.is_empty() => usage.total(),
-            _ => self.conversation.estimated_tokens(),
-        };
+        let policy = self.compaction_policy();
         let window = capabilities.max_input.map_or(context_window, |limit| {
-            context_window.min(limit.saturating_add(self.compaction.reserve_tokens))
+            context_window.min(limit.saturating_add(policy.reserve_tokens))
         });
-        self.compaction.should_compact(tokens, window)
+        policy.should_compact(
+            self.conversation.projected_tokens(&self.request_header()),
+            window,
+        )
     }
 
     /// Read one round to its end, forwarding what it produces.
@@ -937,12 +975,20 @@ pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
 /// forwarded — the caller asked for a turn's answer, not for the notes taken
 /// along the way. It observes the turn's cancel, because a summary of a long
 /// conversation is not something to sit through after the user has given up.
+#[derive(Default)]
+pub(crate) struct SummaryOutcome {
+    text: Option<String>,
+    usage: Usage,
+    cost_usd: f64,
+}
+
 pub(crate) async fn summarize(
     inner: &Arc<dyn AgentBackend>,
     cancel: &Cancel,
     older: &[Message],
     previous: Option<&str>,
-) -> Option<String> {
+    purpose: Option<&str>,
+) -> SummaryOutcome {
     let (system, prompt) = match previous {
         Some(existing) => (
             UPDATE_COMPACT_PROMPT,
@@ -954,22 +1000,30 @@ pub(crate) async fn summarize(
         None => (COMPACT_PROMPT, conversation_text(older)),
     };
 
+    let prompt = if let Some(purpose) = purpose {
+        format!("{purpose}\n\n{prompt}")
+    } else {
+        prompt
+    };
     let request = TurnRequest {
         history: vec![Message::system(system)],
         prompt,
         tools: Vec::new(),
     };
+    let mut outcome = SummaryOutcome::default();
     let mut stream = tokio::select! {
         biased;
-        _ = wait_for_cancel(cancel) => return None,
-        result = inner.run_turn(request) => result.ok()?,
+        _ = wait_for_cancel(cancel) => return outcome,
+        result = inner.run_turn(request) => match result { Ok(stream) => stream, Err(_) => return outcome },
     };
 
     let mut summary = String::new();
+    let mut completed = false;
+    let mut truncated = false;
     loop {
         let event = tokio::select! {
             biased;
-            _ = wait_for_cancel(cancel) => return None,
+            _ = wait_for_cancel(cancel) => return outcome,
             event = stream.next() => event,
         };
         let Some(event) = event else {
@@ -977,12 +1031,60 @@ pub(crate) async fn summarize(
         };
         match event {
             AgentEvent::TextDelta(chunk) => summary.push_str(&chunk),
-            AgentEvent::Error(_) => return None,
+            AgentEvent::Error(_) => return outcome,
+            AgentEvent::TurnComplete { usage, cost_usd } => {
+                outcome.usage = usage;
+                outcome.cost_usd = cost_usd;
+                completed = true;
+            }
+            AgentEvent::OutputTruncated => truncated = true,
             // Thinking, status and anything else are not the summary.
             _ => {}
         }
     }
-    (!summary.trim().is_empty()).then_some(summary)
+    outcome.text = (completed && !truncated && !summary.trim().is_empty()).then_some(summary);
+    outcome
+}
+
+/// Prepare all summary parts before publishing any replacement history.
+async fn summarize_plan(
+    inner: &Arc<dyn AgentBackend>,
+    cancel: &Cancel,
+    messages: &[Message],
+    plan: crate::compaction::CutPlan,
+) -> SummaryOutcome {
+    let history_end = plan.turn_start.unwrap_or(plan.first_kept);
+    let mut result = SummaryOutcome::default();
+    let mut parts = Vec::new();
+    if history_end > 0 {
+        let previous = existing_summary(&messages[..history_end]);
+        let history = summarize(
+            inner,
+            cancel,
+            &messages[..history_end],
+            previous.as_deref(),
+            None,
+        )
+        .await;
+        result.usage = result.usage.merge(history.usage);
+        result.cost_usd += history.cost_usd;
+        let Some(text) = history.text else {
+            return result;
+        };
+        parts.push(text);
+    }
+    if let Some(start) = plan.turn_start {
+        let prefix = summarize(inner, cancel, &messages[start..plan.first_kept], None,
+            Some("Summarize only the current task prefix. Preserve the original user request, constraints, completed work, and remaining work so the retained tool-call/result tail can continue the task. Do not infer later results.")).await;
+        result.usage = result.usage.merge(prefix.usage);
+        result.cost_usd += prefix.cost_usd;
+        let Some(text) = prefix.text else {
+            return result;
+        };
+        parts.push(format!("Current task context:\n{text}"));
+    }
+    result.text = (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"));
+    result
 }
 
 /// Summarize the conversation now, at the user's request.
@@ -1001,13 +1103,14 @@ pub(crate) async fn compact_now(
         return None;
     }
     let messages = conversation.snapshot();
-    let cut = compaction.cut_point(&messages);
+    let caps = inner.capabilities();
+    let policy = compaction.for_window(caps.context_window.unwrap_or(0), caps.output_budget);
+    let plan = policy.plan(&messages);
+    let cut = plan.first_kept;
     if cut == 0 {
         return None;
     }
-
-    let previous = existing_summary(&messages[..cut]);
-    let summary = summarize(inner, cancel, &messages[..cut], previous.as_deref()).await?;
+    let summary = summarize_plan(inner, cancel, &messages, plan).await.text?;
 
     let mut replaced = Vec::with_capacity(messages.len() - cut + 1);
     replaced.push(summary_message(&summary));
@@ -1361,6 +1464,8 @@ mod tests {
                 ),
                 prompt: prompt.to_string(),
                 context_window: self.context_window,
+                model_key: "test".into(),
+                base_id: String::new(),
                 subagent: None,
             });
             let mut events = Vec::new();
@@ -1674,7 +1779,10 @@ mod tests {
             .run("do it")
             .await;
         assert_eq!(
-            events,
+            events
+                .into_iter()
+                .filter(|event| !matches!(event, AgentEvent::ContextUsageUpdated { .. }))
+                .collect::<Vec<_>>(),
             vec![AgentEvent::Error("the model exploded".to_string())]
         );
     }
@@ -1779,6 +1887,8 @@ mod tests {
             ),
             prompt: "do it".to_string(),
             context_window: 0,
+            model_key: "test".into(),
+            base_id: String::new(),
             subagent: None,
         });
         // Read one round's worth, then walk away.
@@ -2108,6 +2218,7 @@ mod tests {
             // The summarizer answers first, because compaction runs before the
             // round it is there to protect.
             round(vec![AgentEvent::TextDelta("we added a flag".to_string())]),
+            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let options = AgentOptions {
@@ -2127,7 +2238,11 @@ mod tests {
             .await;
 
         let seen = inner.requests();
-        assert_eq!(seen.len(), 2, "a summary call, then the round");
+        assert_eq!(
+            seen.len(),
+            3,
+            "history summary, task prefix, then the round"
+        );
 
         // The summary call is a plain question: it declares no tools.
         assert!(seen[0].tools.is_empty());
@@ -2140,7 +2255,7 @@ mod tests {
         );
 
         // The round that follows reads the summary where the messages were.
-        let round = &seen[1];
+        let round = &seen[2];
         assert!(
             round.history[0].text().contains("You are solaris"),
             "the system prompt still leads: {}",
@@ -2494,6 +2609,7 @@ mod tests {
                 },
             ],
             round(vec![AgentEvent::TextDelta("a summary".to_string())]),
+            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let options = AgentOptions {
@@ -2522,5 +2638,73 @@ mod tests {
             events.last(),
             Some(AgentEvent::TurnComplete { .. })
         ));
+    }
+    fn split_task_history() -> Vec<Message> {
+        vec![
+            Message::user("old history"),
+            Message::assistant("old answer"),
+            Message::user("current target: parser.rs; preserve flags"),
+            Message::tool_use(call("first", "record")),
+            Message::tool_result(ToolResult::ok(&call("first", "record"), "first result")),
+            Message::tool_use(call("last", "record")),
+            Message::tool_result(ToolResult::ok(&call("last", "record"), "x".repeat(4000))),
+        ]
+    }
+
+    #[tokio::test]
+    async fn split_task_keeps_tool_tail_and_summarizes_its_prefix_separately() {
+        let scripted = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            round(vec![AgentEvent::TextDelta("preserve parser flags".into())]),
+        ]);
+        let inner: Arc<dyn AgentBackend> = scripted.clone();
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            Some(5)
+        );
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 2);
+        assert!(!seen[0].prompt.contains("current target"));
+        assert!(seen[1].prompt.contains("current target: parser.rs"));
+        assert!(seen[1].prompt.contains("current task prefix"));
+        let kept = conversation.snapshot();
+        assert!(kept[0].text().contains("history summary"));
+        assert!(kept[0].text().contains("Current task context"));
+        assert_eq!(
+            kept[1].tool_calls().next().expect("retained call").id,
+            "last"
+        );
+        assert_eq!(
+            kept[2].tool_results().next().expect("retained result").id,
+            "last"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_task_prefix_summary_does_not_publish_a_partial_compaction() {
+        let inner: Arc<dyn AgentBackend> = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            vec![AgentEvent::Error("prefix failed".into())],
+        ]);
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let before = conversation.snapshot();
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            None
+        );
+        assert_eq!(conversation.snapshot(), before);
     }
 }

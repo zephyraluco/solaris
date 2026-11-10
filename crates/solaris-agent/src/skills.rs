@@ -116,6 +116,8 @@ pub struct Skill {
     path: PathBuf,
     /// The directory holding it, which its relative paths resolve against.
     base_dir: PathBuf,
+    model_path: String,
+    model_base_dir: String,
     /// Where it was found.
     source: SkillSource,
     /// Whether it is kept out of the model's view of what exists.
@@ -172,8 +174,8 @@ impl Skill {
         let mut prompt = format!(
             "Use the `{}` skill.\nSkill file: {}\nResolve relative references against: {}\n\nIts instructions follow:\n\n{}\n",
             self.name,
-            solaris_tools::environment::display_path(&self.path),
-            solaris_tools::environment::display_path(&self.base_dir),
+            self.model_path,
+            self.model_base_dir,
             self.instructions.trim()
         );
         let args = args.trim();
@@ -420,7 +422,7 @@ impl Skills {
                 "- `{}`: {} — {}",
                 skill.name,
                 skill.description_inline(),
-                solaris_tools::environment::display_path(&skill.path)
+                skill.model_path
             );
         }
 
@@ -617,6 +619,8 @@ fn read_skill(
     }
 
     let skill = Skill {
+        model_path: solaris_tools::environment::display_path(path),
+        model_base_dir: solaris_tools::environment::display_path(&base_dir),
         name,
         description,
         path: path.to_path_buf(),
@@ -729,6 +733,10 @@ impl Skill {
     pub(crate) fn sample(name: &str, description: &str, path: &str) -> Self {
         let path = PathBuf::from(path);
         Self {
+            model_path: solaris_tools::environment::display_path(&path),
+            model_base_dir: solaris_tools::environment::display_path(
+                path.parent().unwrap_or(Path::new(".")),
+            ),
             name: name.to_string(),
             description: description.to_string(),
             base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),

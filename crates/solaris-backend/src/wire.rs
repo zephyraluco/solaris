@@ -289,4 +289,31 @@ mod tests {
         assert!(stream.finished());
         assert_eq!(stream.usage(), Some(Usage::new(7, 2)));
     }
+    #[test]
+    fn journal_projection_annotations_never_change_provider_payloads() {
+        let plain = crate::TurnRequest::new(
+            vec![
+                crate::Message::user("question"),
+                crate::Message::assistant("reply"),
+            ],
+            "next",
+        );
+        let mut annotated = plain.clone();
+        annotated.history[0].context = Some(crate::MessageContext::Boundary);
+        annotated.history[1].context = Some(crate::MessageContext::Measurement {
+            usage: crate::Usage::new(100, 10),
+            base_id: "local-base".into(),
+            request_id: "local-request".into(),
+        });
+        for wire in [
+            Wire::OpenAiChat,
+            Wire::OpenAiResponses,
+            Wire::AnthropicMessages,
+        ] {
+            assert_eq!(
+                request_body(wire, &plain, "model", 1000, None),
+                request_body(wire, &annotated, "model", 1000, None)
+            );
+        }
+    }
 }

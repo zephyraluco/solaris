@@ -576,3 +576,28 @@ and `/tree` shows parent/child relationships in the same picker. Switching waits
 until the current operation has ended and only replays saved events; it never
 re-executes tool calls. Fork copies the complete conversation at the current
 boundary; arbitrary message-level rewinding is not implemented.
+
+## Context occupancy and request accounting
+
+Context statistics use an in-memory message projection, independently from cumulative
+billing. A valid assistant message carries the usage of its own request; occupancy is
+that usage plus estimates of messages appended afterward. Cache reads count once for
+that request. Model, prompt and tool-loadout identities determine whether a measurement
+can be reused. Historical edits and compaction invalidate retained measurements.
+After compaction the display stays unknown until a fresh measurement; budgeting still
+estimates the new projection. Legacy histories without measurements use estimates.
+
+Rule and skill loading prepares model-visible path text, including Windows Cygwin
+conversions. `/reload` loads resources on a worker and publishes at an idle boundary;
+loaders are serialized. Request preparation renders cached resources and retains the
+prompt/tool estimation inputs. UI polling only reads nonblocking snapshots: it never
+builds prompts, reads files or starts a shell. Restoring messages uses the same
+projection as ordinary requests, without a separate recovery-validation task.
+
+Each completed model request records usage and estimated cost immediately, including
+automatic and manual summary calls. Known charges survive later request failures or
+cancellation. Child usage is accounted separately from parent context occupancy. Old
+cumulative records are supported without double counting new per-request records.
+The default reply budget is reduced for small model windows, and compaction retention
+is bounded by the usable window. `ContextUsageUpdated` events expose occupancy while
+`TurnComplete.usage` remains cumulative for a successful task.

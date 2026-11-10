@@ -735,3 +735,40 @@ immutable resolution for each HTTP request; later requests can observe refreshed
 metadata while reusing the HTTP pool. Agent code consumes backend capabilities and
 input budgets without depending on provider catalog types. Provider credentials and
 wire selection remain in the application/provider boundary.
+
+### Resource preparation, context projection, and billing
+
+Resources own prepared model-path strings. Agent caches the in-memory prompt and
+tool estimation inputs for each mode when resources or backend selection change.
+Each request derives its actual tool loadout from those inputs. Context queries do
+not invoke resource loaders or prompt builders. Reload workers run serially and
+publish resources only when the session is idle; session navigation cannot overtake
+a pending loader.
+
+`MessageContext` annotates journaled messages with single-request measurements or
+projection boundaries; protocol encoders exclude these annotations. `projection`
+uses the most recent compatible measurement plus trailing message estimates, with
+a full in-memory estimate when the request configuration changes. Replacement
+invalidates retained annotations. The same estimator drives pre-request compaction
+and published UI snapshots. Restoration reads the ordinary message projection;
+there are no asynchronous checkpoint-validation writes or history-prefix hashes.
+
+Tool activation, removal, or schema changes update the current request header and
+publish a full estimate before context events and budget checks. Measurements must
+match both the base prompt and the actual request header. No tool-change journal is
+required; restored sessions estimate against the currently available tool loadout.
+
+Compaction cuts only before user turns or assistant messages, retaining tool calls
+with all their results. When the retained tail begins inside a task, the preceding
+history and the current task prefix are summarized separately. Both summaries must
+succeed before replacing history, preserving the original task and constraints
+without publishing a partial compaction after failure.
+
+`AccountingBackend` journals each request's usage before forwarding its completion.
+Child requests write to the parent ledger before forwarding their completion, so
+parent failure or cancellation cannot discard already consumed usage. Absorbing
+a child report updates turn totals without charging the ledger again.
+Model and child charges are separate from context annotations. Billing restore
+supports legacy cumulative completions and manual summary charges without counting
+new request records twice. Successful task completion remains a cumulative API
+event, while the session ledger also retains charges before failures/cancellation.

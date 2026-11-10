@@ -97,6 +97,7 @@ pub(crate) struct Task {
 pub(crate) struct SubagentRunner {
     pub choice: AgentBackendConfig,
     pub parent: Option<Arc<crate::SessionJournal>>,
+    pub billing: Arc<crate::conversation::Conversation>,
     pub registry: Arc<ToolRegistry>,
     pub options: AgentOptions,
     pub resources: ResourceSnapshot,
@@ -272,7 +273,11 @@ impl SubagentRunner {
         };
         // Each child retains its own request ceiling while sharing the parent's budget.
         let backend = Arc::new(BoundedBackend {
-            inner: Arc::clone(&choice.backend),
+            inner: Arc::new(crate::billing::AccountingBackend {
+                inner: Arc::clone(&choice.backend),
+                conversation: Arc::clone(&self.billing),
+                kind: crate::UsageKind::Child,
+            }),
             requests: AtomicUsize::new(0),
             totals: Arc::clone(&totals),
             usage_tx: task.background.then(|| tx.clone()),

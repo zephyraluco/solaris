@@ -68,6 +68,8 @@ pub struct ModelCapabilities {
     pub max_input: Option<u32>,
     pub context_window: Option<u32>,
     pub max_output: Option<u32>,
+    /// Actual reply budget used by the transport, distinct from the model limit.
+    pub output_budget: Option<u32>,
     pub price_known: Option<bool>,
 }
 
@@ -81,4 +83,12 @@ impl InlineImage {
     pub fn data_url(&self) -> String {
         format!("data:{};base64,{}", self.media_type, self.data)
     }
+}
+
+/// Current context occupancy; independent from cumulative task billing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub tokens: Option<u32>,
+    pub window: u32,
+    pub estimated: bool,
 }

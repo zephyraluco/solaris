@@ -28,7 +28,7 @@ mod wire;
 pub use client::{Endpoint, HttpBackend, TurnPlan};
 pub use event::{AgentEvent, BackendError, TurnRequest};
 pub use http::IDLE_TIMEOUT;
-pub use message::{Content, Message, Role};
+pub use message::{Content, Message, MessageContext, Role};
 pub use tool::{ToolCall, ToolResult, ToolSpec};
 pub use usage::{Price, PriceTier, Usage, tokens_for_characters};
 pub use wire::Wire;
@@ -75,7 +75,7 @@ pub trait AgentBackend: Send + Sync {
     }
 }
 
-pub use solaris_types::{ModelCapabilities, Support};
+pub use solaris_types::{ContextUsage, ModelCapabilities, Support};
 
 pub use solaris_types::InlineImage;
 

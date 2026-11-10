@@ -135,7 +135,10 @@ impl HttpBackend {
             price_tiers: Vec::new(),
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
-            capabilities: crate::ModelCapabilities::default(),
+            capabilities: crate::ModelCapabilities {
+                output_budget: Some(plan.max_tokens),
+                ..Default::default()
+            },
         })
     }
 
@@ -151,6 +154,7 @@ impl HttpBackend {
         self.model = model;
         self.max_tokens = max_tokens;
         self.capabilities = capabilities;
+        self.capabilities.output_budget = Some(self.max_tokens);
         self.price = price;
         self.price_tiers = tiers;
         self
@@ -165,6 +169,7 @@ impl HttpBackend {
     /// Attach explicit catalog metadata without inferring features from model names.
     pub fn with_capabilities(mut self, capabilities: crate::ModelCapabilities) -> Self {
         self.capabilities = capabilities;
+        self.capabilities.output_budget = Some(self.max_tokens);
         self
     }
 

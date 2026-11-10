@@ -139,7 +139,14 @@ impl AgentOptions {
 /// model's view, not the user's: a summary has to still stand on the next turn, a
 /// steered message has to still be where it landed, and neither is something the
 /// transcript can be asked to reconstruct. [`Agent::clear`] is what forgets it.
+#[derive(Clone)]
+struct CachedPrompt {
+    text: String,
+    header: crate::projection::Header,
+}
+
 pub struct Agent {
+    prompts: RwLock<Vec<CachedPrompt>>,
     /// Application-resolved backend and execution metadata.
     choice: AgentBackendConfig,
     active: Arc<std::sync::atomic::AtomicBool>,
@@ -196,14 +203,17 @@ impl Agent {
         } else {
             registry
         };
+        let mut prompt = options.prompt_context.clone();
+        prompt.prepare_paths(&options.cwd);
         let resources = Arc::new(RwLock::new(ResourceSnapshot {
             skills: options.skills.clone(),
-            prompt: options.prompt_context.clone(),
+            prompt,
             warnings: Vec::new(),
         }));
         let steering = Queue::for_resources(Arc::clone(&resources));
         let follow_up = Queue::for_resources(Arc::clone(&resources));
-        Self {
+        let agent = Self {
+            prompts: RwLock::new(Vec::new()),
             choice,
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
@@ -213,7 +223,9 @@ impl Agent {
             steering,
             follow_up,
             resources,
-        }
+        };
+        agent.rebuild_prompts();
+        agent
     }
 
     /// Attach a persistent session at an idle boundary and restore its context.
@@ -276,7 +288,8 @@ impl Agent {
         // next request, including callers whose refresh API cannot return errors.
         self.conversation
             .record_model(choice.provider_id.as_deref(), &choice.model);
-        Self {
+        let agent = Self {
+            prompts: RwLock::new(Vec::new()),
             choice,
             active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
@@ -286,7 +299,9 @@ impl Agent {
             steering: self.steering.clone(),
             follow_up: self.follow_up.clone(),
             resources: Arc::clone(&self.resources),
-        }
+        };
+        agent.rebuild_prompts();
+        agent
     }
 
     /// Replace the factory used by subsequent child model overrides.
@@ -345,7 +360,11 @@ impl Agent {
         let cancel = self.cancel.begin_turn();
         let inner: Arc<dyn solaris_backend::AgentBackend> =
             Arc::new(crate::budget::BudgetedBackend {
-                inner: Arc::clone(&self.choice.backend),
+                inner: Arc::new(crate::billing::AccountingBackend {
+                    inner: Arc::clone(&self.choice.backend),
+                    conversation: Arc::clone(&self.conversation),
+                    kind: crate::UsageKind::Manual,
+                }),
                 budget: crate::ExecutionBudget::new(self.options.execution.budget.clone()),
             });
         session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel).await
@@ -373,6 +392,81 @@ impl Agent {
     }
     pub fn model_catalog_notice(&self) -> Option<String> {
         self.choice.backend.model_catalog_notice()
+    }
+
+    fn rebuild_prompts(&self) {
+        let resources = self.resources.read().unwrap_or_else(|p| p.into_inner());
+        let mut prompts = Vec::new();
+        for mode in [Mode::Build, Mode::Plan] {
+            let tools = self.turn_tools(mode);
+            let text = prompt::build_system_prompt(
+                mode,
+                &tools,
+                &resources.skills,
+                self.choice.instructions.as_deref(),
+                &self.options.cwd,
+                &resources.prompt,
+            );
+            let specs: Vec<_> = tools
+                .iter()
+                .map(|tool| {
+                    solaris_backend::ToolSpec::new(
+                        tool.name(),
+                        tool.description(),
+                        tool.parameters(),
+                    )
+                })
+                .collect();
+            let mut header = crate::projection::Header::new(&self.model_key(mode), &text, &specs);
+            if specs.iter().any(|spec| spec.name == "tool_search")
+                && specs
+                    .iter()
+                    .filter(|spec| spec.name.starts_with("mcp_"))
+                    .count()
+                    > 8
+            {
+                let declared: Vec<_> = specs
+                    .into_iter()
+                    .filter(|spec| !spec.name.starts_with("mcp_"))
+                    .collect();
+                let initial =
+                    crate::projection::Header::new(&self.model_key(mode), &text, &declared);
+                header.overhead = initial.overhead;
+                header.request_id = initial.request_id;
+            }
+            prompts.push(CachedPrompt { text, header });
+        }
+        self.conversation
+            .set_headers(prompts.iter().map(|prompt| prompt.header.clone()).collect());
+        *self.prompts.write().unwrap_or_else(|p| p.into_inner()) = prompts;
+    }
+
+    fn model_key(&self, mode: Mode) -> String {
+        format!(
+            "{:?}:{}:{mode:?}",
+            self.choice.provider_id, self.choice.model
+        )
+    }
+
+    pub fn context_usage(&self, mode: Mode) -> solaris_backend::ContextUsage {
+        let unknown = solaris_backend::ContextUsage {
+            tokens: None,
+            window: self.context_window(),
+            estimated: true,
+        };
+        let Ok(prompts) = self.prompts.try_read() else {
+            return unknown;
+        };
+        prompts
+            .get(if mode == Mode::Build { 0 } else { 1 })
+            .map_or(unknown, |prompt| {
+                self.conversation
+                    .context_usage(&prompt.header.base_id, unknown.window)
+            })
+    }
+
+    pub fn usage_totals(&self) -> Option<crate::UsageTotals> {
+        self.conversation.usage_totals()
     }
 
     /// The models the endpoint offers, for the picker to choose from.
@@ -437,11 +531,34 @@ impl Agent {
 
     /// Replace resources for future turns without clearing conversation or queues.
     /// Call at an idle boundary; an active turn keeps its existing system prompt.
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
+    /// ResourcePaths::load prepares paths on the loader worker. Hand-built
+    /// snapshots are prepared here before publication, outside the resource lock.
+    pub fn replace_resources(&self, mut snapshot: ResourceSnapshot) {
+        {
+            let current = self.resources.read().unwrap_or_else(|p| p.into_inner());
+            for path in std::iter::once(&self.options.cwd).chain(
+                snapshot
+                    .prompt
+                    .project_rules
+                    .iter()
+                    .chain(&snapshot.prompt.append_system)
+                    .map(|file| &file.path),
+            ) {
+                if let Some(prepared) = current.prompt.model_paths.get(path) {
+                    snapshot
+                        .prompt
+                        .model_paths
+                        .entry(path.clone())
+                        .or_insert_with(|| prepared.clone());
+                }
+            }
+        }
+        snapshot.prompt.prepare_paths(&self.options.cwd);
         *self
             .resources
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+        self.rebuild_prompts();
     }
 
     /// Current instructions, also used when the application rebuilds a backend.
@@ -502,6 +619,7 @@ impl Agent {
                 Arc::new(SubagentRunner {
                     choice: self.choice.clone(),
                     parent: self.journal(),
+                    billing: Arc::clone(&self.conversation),
                     registry: Arc::clone(&self.registry),
                     options: turn_options.clone(),
                     resources: resources.clone(),
@@ -510,17 +628,10 @@ impl Agent {
                 })
             });
 
-        // The prompt is written per turn because every part of it can change:
-        // the mode, which tools the mode leaves standing, and which platform the
-        // credentials resolve to.
-        let system = prompt::build_system_prompt(
-            mode,
-            &tools,
-            &resources.skills,
-            self.choice.instructions.as_deref(),
-            &self.options.cwd,
-            &resources.prompt,
-        );
+        let cached = self.prompts.read().unwrap_or_else(|p| p.into_inner())
+            [if mode == Mode::Build { 0 } else { 1 }]
+        .clone();
+        let system = cached.text;
         drop(resources);
 
         let journal = self.journal();
@@ -544,6 +655,8 @@ impl Agent {
             system,
             prompt,
             context_window: self.context_window(),
+            model_key: self.model_key(mode),
+            base_id: cached.header.base_id,
             subagent,
         });
         crate::runtime::leased_stream(crate::runtime::journal_stream(stream, journal), lease)
@@ -1109,10 +1222,22 @@ mod tests {
                     path: agent.options.cwd.join("APPEND_SYSTEM.md"),
                     content: "Addendum marker".to_string(),
                 }],
+                ..Default::default()
             },
             ..Default::default()
         });
         assert_eq!(agent.conversation_len(), before);
+        let prepared = agent.prompt_context();
+        for path in [
+            &agent.options.cwd,
+            &prepared.project_rules[0].path,
+            &prepared.append_system[0].path,
+        ] {
+            assert!(
+                prepared.model_paths.contains_key(path),
+                "replacement must prepare {path:?}"
+            );
+        }
         drain(agent.run_turn("second request", Mode::Plan)).await;
         let requests = inner.requests();
         let system = requests[1].history[0].text();
@@ -1277,5 +1402,120 @@ mod tests {
             panic!("a cancelled turn ends in an error: {events:?}");
         };
         assert!(message.contains("cancelled"), "{message}");
+    }
+    #[tokio::test]
+    async fn restored_projection_reports_usage_without_background_validation_or_model_calls() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        let first = agent(Scripted::new(vec![vec![
+            AgentEvent::TextDelta("reply".into()),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(100, 10),
+                cost_usd: 0.0,
+            },
+        ]]));
+        first.attach_journal(Arc::clone(&journal)).expect("attach");
+        drain(first.run_turn("hello", Mode::Build)).await;
+        let backend = Scripted::new(vec![]);
+        let restored = agent(backend.clone());
+        restored.attach_journal(journal).expect("restore");
+        assert_eq!(restored.context_usage(Mode::Build).tokens, Some(110));
+        assert!(backend.requests().is_empty());
+    }
+
+    #[test]
+    fn context_queries_do_not_rebuild_prompts_or_call_tool_metadata() {
+        struct ObservedTool(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Tool for ObservedTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn description(&self) -> &str {
+                "Read"
+            }
+            fn parameters(&self) -> Value {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                json!({})
+            }
+            fn guideline(&self) -> Option<&'static str> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some("Read a file")
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                ToolOutput::ok("done")
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(
+            choice(Scripted::new(vec![])),
+            Arc::new(ToolRegistry::with_tools(vec![Arc::new(ObservedTool(
+                Arc::clone(&calls),
+            ))])),
+            AgentOptions::default(),
+        );
+        let before = calls.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            agent.context_usage(Mode::Build);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+    }
+    #[tokio::test]
+    async fn request_billing_survives_failure_without_a_terminal_completion() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
+        let journal = store
+            .create(directory.path(), "model", None)
+            .expect("journal");
+        let backend = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(ToolCall::new("one", "missing", json!({}))),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(100, 10),
+                    cost_usd: 0.01,
+                },
+            ],
+            vec![AgentEvent::Error("next request failed".into())],
+        ]);
+        let original = agent(backend);
+        original
+            .attach_journal(Arc::clone(&journal))
+            .expect("attach");
+        let events = drain(original.run_turn("work", Mode::Build)).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+        assert_eq!(original.usage_totals().expect("totals").usage.total(), 110);
+        let restored = agent(Scripted::new(vec![]));
+        restored.attach_journal(journal).expect("restore");
+        assert_eq!(restored.usage_totals(), original.usage_totals());
+    }
+
+    #[tokio::test]
+    async fn manual_summaries_are_billed_without_changing_the_context_baseline() {
+        let backend = Scripted::new(vec![vec![
+            AgentEvent::TextDelta("summary".into()),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(500, 50),
+                cost_usd: 0.02,
+            },
+        ]]);
+        let mut agent = agent(backend);
+        agent.options.compaction.keep_recent_tokens = 1;
+        agent
+            .conversation
+            .push(solaris_backend::Message::user("old context"));
+        agent
+            .conversation
+            .push(solaris_backend::Message::assistant("old reply"));
+        agent
+            .conversation
+            .push(solaris_backend::Message::user("new question"));
+        assert!(agent.compact().await.is_some());
+        assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
+        assert_eq!(agent.context_usage(Mode::Build).tokens, None);
     }
 }

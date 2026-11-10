@@ -248,8 +248,17 @@ impl ModelCatalog {
         let requested_output = patch.and_then(|entry| entry.output_tokens);
         let output_tokens = super::output_budget(
             &capabilities,
-            requested_output.unwrap_or(crate::DEFAULT_MAX_OUTPUT),
+            requested_output.unwrap_or_else(|| {
+                crate::DEFAULT_MAX_OUTPUT.min(
+                    capabilities
+                        .context_window
+                        .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
+                        .saturating_div(4)
+                        .max(1),
+                )
+            }),
         );
+        capabilities.output_budget = Some(output_tokens);
         sources.insert(
             "output_tokens".into(),
             if requested_output.is_some() {

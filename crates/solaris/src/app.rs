@@ -329,6 +329,7 @@ pub struct App {
     oauth: Option<OAuthPending>,
     /// Answer from a `/compact` that is in flight.
     compact_rx: Option<UnboundedReceiver<Option<usize>>>,
+    resource_rx: Option<UnboundedReceiver<std::io::Result<solaris_agent::ResourceSnapshot>>>,
     /// Whether asking the provider for its models is allowed at all.
     discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
@@ -498,6 +499,7 @@ impl App {
             models_error: None,
             oauth: None,
             compact_rx: None,
+            resource_rx: None,
             discover_models,
             tools,
             skills,
@@ -534,8 +536,11 @@ impl App {
                 solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
                     "session interrupted; verify unfinished tool outcomes before retrying".into(),
                 )),
-                solaris_agent::SessionRecord::Context { messages } if messages.is_empty() => {
-                    self.session.turns.clear()
+                solaris_agent::SessionRecord::Context { messages } => {
+                    self.session.context = Default::default();
+                    if messages.is_empty() {
+                        self.session.turns.clear();
+                    }
                 }
                 _ => {}
             }
@@ -607,7 +612,11 @@ impl App {
     }
 
     fn switch_session(&mut self, id: &str, fork: bool) {
-        if self.events_rx.is_some() || self.compact_rx.is_some() || self.oauth.is_some() {
+        if self.events_rx.is_some()
+            || self.compact_rx.is_some()
+            || self.resource_rx.is_some()
+            || self.oauth.is_some()
+        {
             self.notifications
                 .warning("finish or cancel the active operation before changing sessions");
             return;
@@ -1222,17 +1231,25 @@ impl App {
                 .warning("no resource locations configured for this session");
             return;
         }
-        if self.events_rx.is_some() || self.compact_rx.is_some() {
+        if self.events_rx.is_some() || self.compact_rx.is_some() || self.resource_rx.is_some() {
             self.reload_pending = true;
             self.notifications
                 .info("resources will reload when the active turn finishes".to_string());
             return;
         }
         self.reload_pending = false;
-        let Some(paths) = &self.resource_paths else {
+        let Some(paths) = self.resource_paths.clone() else {
             return;
         };
-        match paths.load() {
+        let (tx, rx) = unbounded_channel();
+        self.resource_rx = Some(rx);
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(paths.load());
+        });
+    }
+
+    fn publish_resources(&mut self, result: std::io::Result<solaris_agent::ResourceSnapshot>) {
+        match result {
             Ok(snapshot) => {
                 let warnings = snapshot.warnings.iter().chain(snapshot.skills.warnings());
                 let diagnostics = warnings
@@ -1281,6 +1298,7 @@ impl App {
 
     /// Report what the manual compaction did.
     fn on_compacted(&mut self, dropped: Option<usize>) {
+        self.session.context = self.agent.context_usage(self.config.mode);
         match dropped {
             Some(dropped) => self.notifications.info(format!(
                 "summarized {dropped} messages; {} left in context",
@@ -1346,6 +1364,7 @@ impl App {
 
     fn apply_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::ContextUsageUpdated { context } => self.session.context = context,
             AgentEvent::ThinkingDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.thinking.push_str(&chunk);
@@ -1647,6 +1666,8 @@ impl App {
     }
 
     fn open_stats(&mut self) {
+        self.session.billing = self.agent.usage_totals().or(self.session.billing);
+        self.session.context = self.agent.context_usage(self.config.mode);
         let backend = self.agent.label().to_string();
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
@@ -3007,6 +3028,19 @@ impl Component for App {
             dirty = true;
         }
 
+        let context = self.agent.context_usage(self.config.mode);
+        if self.session.context != context {
+            self.session.context = context;
+            dirty = true;
+        }
+
+        if let Some(billing) = self.agent.usage_totals()
+            && self.session.billing != Some(billing)
+        {
+            self.session.billing = Some(billing);
+            dirty = true;
+        }
+
         // Drain backend events without holding a borrow across the handler.
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -3039,9 +3073,32 @@ impl Component for App {
             }
             dirty = true;
         }
-        if self.reload_pending && self.events_rx.is_none() && self.compact_rx.is_none() {
+        if self.reload_pending
+            && self.events_rx.is_none()
+            && self.compact_rx.is_none()
+            && self.resource_rx.is_none()
+        {
             self.reload_resources();
             dirty = true;
+        }
+
+        // One loader runs at a time. A ready result waits for an idle publication boundary.
+        if self.events_rx.is_none() && self.compact_rx.is_none() {
+            let result = self
+                .resource_rx
+                .as_mut()
+                .and_then(|rx| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err(std::io::Error::other("resource loader stopped")))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+            if let Some(result) = result {
+                self.resource_rx = None;
+                self.publish_resources(result);
+                dirty = true;
+            }
         }
 
         // Dialog results.
@@ -5609,6 +5666,17 @@ mod tests {
         assert!(reply.contains("extract report.pdf"), "{reply}");
     }
 
+    async fn settle_resources(app: &mut App) {
+        for _ in 0..1000 {
+            app.tick();
+            if app.resource_rx.is_none() && !app.reload_pending {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("resource load did not finish");
+    }
+
     #[tokio::test]
     async fn reload_waits_for_stream_and_keeps_history_and_expanded_queue_content() {
         let skills = skills_holding("reload", "pdf-tools", "PDF work", "Original instructions");
@@ -5638,6 +5706,7 @@ mod tests {
         .expect("update skill");
         std::fs::write(cwd.join("AGENTS.md"), "Reloaded project rules").expect("rules");
         settle_turn(&mut app).await;
+        settle_resources(&mut app).await;
         assert!(!app.reload_pending);
         assert_eq!(
             app.skills.get("pdf-tools").expect("skill").description(),
@@ -5661,13 +5730,14 @@ mod tests {
         assert!(app.session.turns[2].reply.contains("New instructions"));
         std::fs::remove_file(path).expect("remove skill");
         app.submit("/reload".to_string());
+        settle_resources(&mut app).await;
         assert!(app.skills.is_empty());
         assert_eq!(app.session.turns.len(), 3);
         std::fs::remove_dir_all(cwd).expect("cleanup");
     }
 
-    #[test]
-    fn failed_reload_preserves_previous_resources() {
+    #[tokio::test]
+    async fn failed_reload_preserves_previous_resources() {
         let skills = skills_holding("failed-reload", "pdf-tools", "PDF work", "Body");
         let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
         let mut app = app_with_skills(skills);
@@ -5678,6 +5748,7 @@ mod tests {
             extra_skills: Vec::new(),
         });
         app.submit("/reload".to_string());
+        settle_resources(&mut app).await;
         assert!(app.skills.get("pdf-tools").is_some());
         assert!(
             app.notifications.current().is_some_and(

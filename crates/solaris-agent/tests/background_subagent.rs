@@ -138,6 +138,9 @@ impl AgentBackend for Model {
             } else if round == 1 {
                 if self.fail_parent {
                     self.wait_started(1).await;
+                    if self.hold_parent_request {
+                        self.parent_release.acquire().await.unwrap().forget();
+                    }
                     return Err(BackendError::new("parent backend unavailable"));
                 }
                 self.progressed.notify_one();
@@ -288,6 +291,9 @@ async fn background_launch_returns_an_id_and_parent_work_runs_before_child_finis
         1
     );
     let rounds = u32::try_from(requests.len()).unwrap();
+    let billed = agent.usage_totals().unwrap();
+    assert_eq!(billed.usage, Usage::new(rounds * 2, rounds));
+    assert_eq!(billed.cost_usd, f64::from(rounds) * 0.25);
     let child_usage = events
         .iter()
         .fold(Usage::default(), |total, event| match event {
@@ -330,6 +336,10 @@ async fn foreground_default_and_explicit_false_wait_before_parent_work_continues
         })
         .await
         .unwrap();
+        let rounds = u32::try_from(model.requests().len()).unwrap();
+        let billed = agent.usage_totals().unwrap();
+        assert_eq!(billed.usage, Usage::new(rounds * 2, rounds));
+        assert_eq!(billed.cost_usd, f64::from(rounds) * 0.25);
         assert!(completions(&events).is_empty());
         assert!(events.iter().any(|event| matches!(event,
             AgentEvent::ToolResult { result, .. } if result.output == "child final report")));
@@ -692,4 +702,52 @@ async fn background_timeout_is_a_notification_and_the_parent_can_finish() {
         Some(AgentEvent::TurnComplete { .. })
     ));
     wait_stopped(&model).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_requests_are_billed_before_parent_failure_or_cancellation_and_survive_restore() {
+    for fail_parent in [true, false] {
+        let mut model = Model::new(1);
+        model.child_tool_before_wait = true;
+        model.hold_parent_request = true;
+        model.fail_parent = fail_parent;
+        let model = Arc::new(model);
+        let original = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let journal = store.create(directory.path(), "test-model", None).unwrap();
+        original.attach_journal(journal.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stream = original.run_turn("Delegate", Mode::Build);
+            while let Some(event) = stream.next().await {
+                if matches!(event, AgentEvent::SubagentUsage { .. }) {
+                    // The child's first request completed; its next request is still blocked.
+                    assert_eq!(original.usage_totals().unwrap().usage.total(), 6);
+                    if fail_parent {
+                        model.parent_release.add_permits(1);
+                    } else {
+                        original.cancel_handle().cancel();
+                    }
+                }
+                if let AgentEvent::Error(error) = event {
+                    assert!(error.contains(if fail_parent {
+                        "parent backend unavailable"
+                    } else {
+                        "cancelled"
+                    }));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("parent stops without waiting for child completion");
+        wait_stopped(&model).await;
+        let totals = original.usage_totals().unwrap();
+        assert_eq!(totals.usage.total(), 6);
+        assert_eq!(totals.cost_usd, 0.5);
+        let restored = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
+        restored.attach_journal(journal).unwrap();
+        assert_eq!(restored.usage_totals(), Some(totals));
+    }
 }

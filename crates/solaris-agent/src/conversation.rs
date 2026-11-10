@@ -19,14 +19,17 @@
 use crate::{SessionJournal, SessionRecord, StoreError};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use solaris_backend::{Message, Role, tokens_for_characters};
+use solaris_backend::{Message, Role};
 
 /// The messages a turn is built from and appends to.
 #[derive(Default)]
 pub(crate) struct Conversation {
     messages: Mutex<Vec<Message>>,
+    headers: Mutex<Vec<crate::projection::Header>>,
+    published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
     failure: Mutex<Option<String>>,
+    billing: Mutex<crate::UsageTotals>,
 }
 
 impl Conversation {
@@ -43,12 +46,15 @@ impl Conversation {
                 return Err(error);
             }
         };
+        let billing = crate::UsageTotals::restore(&journal.store().records(journal.id())?);
+        *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
         *self.lock() = context;
         *self
             .journal
             .write()
             .map_err(|_| StoreError::Invalid("journal lock poisoned".into()))? = Some(journal);
         self.repair();
+        self.publish();
         if let Some(error) = self.error() {
             return Err(StoreError::Invalid(error));
         }
@@ -111,16 +117,26 @@ impl Conversation {
         }) {
             messages.push(message);
         }
+        drop(messages);
+        self.publish();
     }
 
     /// Replace everything, which is what compaction does.
-    pub(crate) fn replace_with(&self, messages: Vec<Message>) {
+    pub(crate) fn replace_with(&self, mut messages: Vec<Message>) {
+        for message in &mut messages {
+            message.context = None;
+        }
+        if let Some(first) = messages.first_mut() {
+            first.context = Some(solaris_backend::MessageContext::Boundary);
+        }
         let mut current = self.lock();
         if self.persist(SessionRecord::Context {
             messages: messages.clone(),
         }) {
             *current = messages;
         }
+        drop(current);
+        self.publish();
     }
 
     /// Forget the conversation, for `/clear`.
@@ -129,6 +145,7 @@ impl Conversation {
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
         self.replace_with(Vec::new());
+        *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
     }
 
     /// Complete missing results in the latest assistant round without replaying
@@ -160,14 +177,94 @@ impl Conversation {
                 messages.push(message);
             }
         }
+        drop(messages);
+        self.publish();
     }
 
-    /// Roughly what the conversation costs the model, by character count.
-    ///
-    /// Only a fallback and a budget: a provider that reports usage gives the real
-    /// number, and this is what is left when none has been heard from yet.
-    pub(crate) fn estimated_tokens(&self) -> u32 {
-        tokens_for_characters(self.lock().iter().map(Message::characters).sum())
+    pub(crate) fn record_billing(
+        &self,
+        usage: solaris_backend::Usage,
+        cost_usd: f64,
+        kind: crate::UsageKind,
+    ) -> bool {
+        if usage.is_empty() && cost_usd == 0.0 {
+            return true;
+        }
+        self.billing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(usage, cost_usd);
+        self.persist(SessionRecord::Usage {
+            usage,
+            cost_usd,
+            kind,
+        })
+    }
+
+    pub(crate) fn usage_totals(&self) -> Option<crate::UsageTotals> {
+        self.billing.try_lock().ok().map(|totals| *totals)
+    }
+
+    pub(crate) fn set_headers(&self, headers: Vec<crate::projection::Header>) {
+        *self.headers.lock().unwrap_or_else(|p| p.into_inner()) = headers;
+        self.publish();
+    }
+
+    pub(crate) fn update_request_header(&self, header: crate::projection::Header) {
+        {
+            let mut headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(current) = headers
+                .iter_mut()
+                .find(|current| current.base_id == header.base_id)
+            {
+                if current.request_id == header.request_id {
+                    return;
+                }
+                *current = header;
+            } else {
+                headers.push(header);
+            }
+        }
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let messages = self.lock();
+        let headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshots = headers
+            .iter()
+            .map(|header| {
+                (
+                    header.base_id.clone(),
+                    crate::projection::estimate(&messages, header, 0).1,
+                )
+            })
+            .collect();
+        *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshots;
+    }
+
+    pub(crate) fn context_usage(
+        &self,
+        base_id: &str,
+        window: u32,
+    ) -> solaris_backend::ContextUsage {
+        let unknown = solaris_backend::ContextUsage {
+            tokens: None,
+            window,
+            estimated: true,
+        };
+        self.published
+            .try_lock()
+            .ok()
+            .and_then(|snapshots| snapshots.get(base_id).copied())
+            .map_or(unknown, |context| solaris_backend::ContextUsage {
+                window,
+                ..context
+            })
+    }
+
+    pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
+        crate::projection::estimate(&self.lock(), header, 0).0
     }
 
     /// The lock, recovering from a panic in another holder rather than panicking
@@ -184,6 +281,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use solaris_backend::{ToolCall, ToolResult};
+
+    fn tokens(conversation: &Conversation) -> u32 {
+        let header = crate::projection::Header {
+            base_id: String::new(),
+            request_id: String::new(),
+            overhead: 0,
+        };
+        conversation.projected_tokens(&header)
+    }
 
     fn call(id: &str) -> ToolCall {
         ToolCall::new(id, "read", json!({ "path": "a.txt" }))
@@ -212,7 +318,7 @@ mod tests {
 
         assert_eq!(conversation.len(), 0);
         assert!(conversation.snapshot().is_empty());
-        assert_eq!(conversation.estimated_tokens(), 0);
+        assert_eq!(tokens(&conversation), 0);
     }
 
     #[test]
@@ -259,7 +365,8 @@ mod tests {
     fn a_reused_id_is_repaired_without_changing_older_or_current_results() {
         let conversation = Conversation::new();
         let before = interrupted_reused_id_history();
-        conversation.replace_with(before.clone());
+        conversation.replace_with(before);
+        let before = conversation.snapshot();
         conversation.repair();
         let after = conversation.snapshot();
         assert_eq!(after.len(), before.len() + 1);
@@ -284,9 +391,10 @@ mod tests {
             &call("reused"),
             "current result",
         )));
-        conversation.replace_with(complete.clone());
+        conversation.replace_with(complete);
+        let before = conversation.snapshot();
         conversation.repair();
-        assert_eq!(conversation.snapshot(), complete);
+        assert_eq!(conversation.snapshot(), before);
     }
 
     #[test]
@@ -363,9 +471,63 @@ mod tests {
     fn the_estimate_grows_with_what_is_in_it() {
         let conversation = Conversation::new();
         conversation.push(Message::user("x".repeat(400)));
-        let small = conversation.estimated_tokens();
+        let small = tokens(&conversation);
 
         conversation.push(Message::assistant("y".repeat(400)));
-        assert!(conversation.estimated_tokens() > small);
+        assert!(tokens(&conversation) > small);
+    }
+    #[test]
+    fn tool_changes_reestimate_the_same_projection_for_ui_and_budget() {
+        let conversation = Conversation::new();
+        let initial = crate::projection::Header::new("model", "system", &[]);
+        conversation.set_headers(vec![initial.clone()]);
+        let mut measured = Message::assistant("previous response");
+        initial.annotate(&mut measured, solaris_backend::Usage::new(9000, 100));
+        conversation.push(measured);
+        for schema in [r#"{"type":"string"}"#, r#"{"type":"number"}"#, "null"] {
+            let tools = if schema == "null" {
+                vec![]
+            } else {
+                vec![solaris_backend::ToolSpec {
+                    name: "lookup".into(),
+                    description: "Find an item".into(),
+                    parameters: serde_json::from_str(schema).expect("schema"),
+                }]
+            };
+            let mut header = crate::projection::Header::new("model", "system", &tools);
+            header.base_id.clone_from(&initial.base_id);
+            conversation.update_request_header(header.clone());
+            let display = conversation.context_usage(&initial.base_id, 10000);
+            assert_eq!(display.tokens, Some(conversation.projected_tokens(&header)));
+            assert!(display.estimated);
+            assert!(display.tokens.expect("estimate") < 9000);
+            let mut reply = Message::assistant("new response");
+            header.annotate(&mut reply, solaris_backend::Usage::new(200, 20));
+            conversation.push(reply);
+            let display = conversation.context_usage(&initial.base_id, 10000);
+            assert_eq!(display.tokens, Some(220));
+            assert!(!display.estimated);
+        }
+    }
+
+    #[test]
+    fn ui_reads_published_projection_without_waiting_for_message_lock() {
+        let conversation = Arc::new(Conversation::new());
+        let header = crate::projection::Header::new("model", "system", &[]);
+        let base = header.base_id.clone();
+        conversation.set_headers(vec![header.clone()]);
+        let mut message = Message::assistant("reply");
+        header.annotate(&mut message, solaris_backend::Usage::new(100, 10));
+        conversation.push(message);
+        let lock = conversation.lock();
+        let reader = Arc::clone(&conversation);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(reader.context_usage(&base, 1000)).expect("send");
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(lock);
+        thread.join().expect("reader");
+        assert_eq!(result.expect("nonblocking snapshot").tokens, Some(110));
     }
 }
