@@ -210,6 +210,24 @@ impl Conversation {
         self.publish();
     }
 
+    pub(crate) fn update_request_header(&self, header: crate::projection::Header) {
+        {
+            let mut headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(current) = headers
+                .iter_mut()
+                .find(|current| current.base_id == header.base_id)
+            {
+                if current.request_id == header.request_id {
+                    return;
+                }
+                *current = header;
+            } else {
+                headers.push(header);
+            }
+        }
+        self.publish();
+    }
+
     fn publish(&self) {
         let messages = self.lock();
         let headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
@@ -218,7 +236,7 @@ impl Conversation {
             .map(|header| {
                 (
                     header.base_id.clone(),
-                    crate::projection::estimate(&messages, header, false, 0).1,
+                    crate::projection::estimate(&messages, header, 0).1,
                 )
             })
             .collect();
@@ -246,7 +264,7 @@ impl Conversation {
     }
 
     pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
-        crate::projection::estimate(&self.lock(), header, true, 0).0
+        crate::projection::estimate(&self.lock(), header, 0).0
     }
 
     /// The lock, recovering from a panic in another holder rather than panicking
@@ -458,6 +476,40 @@ mod tests {
         conversation.push(Message::assistant("y".repeat(400)));
         assert!(tokens(&conversation) > small);
     }
+    #[test]
+    fn tool_changes_reestimate_the_same_projection_for_ui_and_budget() {
+        let conversation = Conversation::new();
+        let initial = crate::projection::Header::new("model", "system", &[]);
+        conversation.set_headers(vec![initial.clone()]);
+        let mut measured = Message::assistant("previous response");
+        initial.annotate(&mut measured, solaris_backend::Usage::new(9000, 100));
+        conversation.push(measured);
+        for schema in [r#"{"type":"string"}"#, r#"{"type":"number"}"#, "null"] {
+            let tools = if schema == "null" {
+                vec![]
+            } else {
+                vec![solaris_backend::ToolSpec {
+                    name: "lookup".into(),
+                    description: "Find an item".into(),
+                    parameters: serde_json::from_str(schema).expect("schema"),
+                }]
+            };
+            let mut header = crate::projection::Header::new("model", "system", &tools);
+            header.base_id.clone_from(&initial.base_id);
+            conversation.update_request_header(header.clone());
+            let display = conversation.context_usage(&initial.base_id, 10000);
+            assert_eq!(display.tokens, Some(conversation.projected_tokens(&header)));
+            assert!(display.estimated);
+            assert!(display.tokens.expect("estimate") < 9000);
+            let mut reply = Message::assistant("new response");
+            header.annotate(&mut reply, solaris_backend::Usage::new(200, 20));
+            conversation.push(reply);
+            let display = conversation.context_usage(&initial.base_id, 10000);
+            assert_eq!(display.tokens, Some(220));
+            assert!(!display.estimated);
+        }
+    }
+
     #[test]
     fn ui_reads_published_projection_without_waiting_for_message_lock() {
         let conversation = Arc::new(Conversation::new());

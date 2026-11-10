@@ -43,14 +43,8 @@ impl Header {
     }
 }
 
-/// `strict` validates the actual tool loadout before a request. Display uses the
-/// last loadout belonging to the same base prompt, including lazily activated tools.
-pub(crate) fn estimate(
-    messages: &[Message],
-    header: &Header,
-    strict: bool,
-    window: u32,
-) -> (u32, ContextUsage) {
+/// Reuse measurements only for the current request configuration.
+pub(crate) fn estimate(messages: &[Message], header: &Header, window: u32) -> (u32, ContextUsage) {
     let mut after_boundary = false;
     for (index, message) in messages.iter().enumerate().rev() {
         match &message.context {
@@ -64,7 +58,7 @@ pub(crate) fn estimate(
                 request_id,
             }) => {
                 if base_id == &header.base_id
-                    && (!strict || request_id == &header.request_id)
+                    && request_id == &header.request_id
                     && !usage.estimated
                     && !usage.is_empty()
                 {
@@ -111,7 +105,7 @@ mod tests {
         let mut second = Message::assistant("second");
         header.annotate(&mut second, Usage::new(200, 30).with_cache(2000, 0));
         let messages = [first, second, Message::user("x".repeat(4000))];
-        let (_, context) = estimate(&messages, &header, true, 10000);
+        let (_, context) = estimate(&messages, &header, 10000);
         assert_eq!(context.tokens, Some(3230));
         assert!(context.estimated);
     }
@@ -121,14 +115,10 @@ mod tests {
         let mut measured = Message::assistant("reply");
         header.annotate(&mut measured, Usage::new(10000, 20));
         let changed = Header::new("other", "system", &[]);
-        assert!(
-            estimate(&[measured.clone()], &changed, true, 1000)
-                .1
-                .estimated
-        );
+        assert!(estimate(&[measured.clone()], &changed, 1000).1.estimated);
         let mut boundary = Message::user("summary");
         boundary.context = Some(MessageContext::Boundary);
-        let (budget, display) = estimate(&[measured, boundary], &header, true, 1000);
+        let (budget, display) = estimate(&[measured, boundary], &header, 1000);
         assert_eq!(display.tokens, None);
         assert!(budget < 100);
     }
@@ -140,6 +130,6 @@ mod tests {
         let decoded: Vec<Message> =
             serde_json::from_str(&serde_json::to_string(&vec![message]).expect("encode"))
                 .expect("decode");
-        assert_eq!(estimate(&decoded, &header, false, 1000).1.tokens, Some(110));
+        assert_eq!(estimate(&decoded, &header, 1000).1.tokens, Some(110));
     }
 }

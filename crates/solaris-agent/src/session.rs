@@ -577,6 +577,8 @@ impl Runner {
     }
 
     fn emit_context(&self, tx: &UnboundedSender<AgentEvent>) {
+        self.conversation
+            .update_request_header(self.request_header());
         let window = self
             .inner
             .capabilities()

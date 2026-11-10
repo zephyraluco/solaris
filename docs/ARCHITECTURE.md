@@ -753,6 +753,17 @@ invalidates retained annotations. The same estimator drives pre-request compacti
 and published UI snapshots. Restoration reads the ordinary message projection;
 there are no asynchronous checkpoint-validation writes or history-prefix hashes.
 
+Tool activation, removal, or schema changes update the current request header and
+publish a full estimate before context events and budget checks. Measurements must
+match both the base prompt and the actual request header. No tool-change journal is
+required; restored sessions estimate against the currently available tool loadout.
+
+Compaction cuts only before user turns or assistant messages, retaining tool calls
+with all their results. When the retained tail begins inside a task, the preceding
+history and the current task prefix are summarized separately. Both summaries must
+succeed before replacing history, preserving the original task and constraints
+without publishing a partial compaction after failure.
+
 `AccountingBackend` journals each request's usage before forwarding its completion.
 Model and child charges are separate from context annotations. Billing restore
 supports legacy cumulative completions and manual summary charges without counting
