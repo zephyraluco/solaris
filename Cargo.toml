@@ -28,6 +28,7 @@ solaris-tui = { path = "crates/solaris-tui", version = "0.1.0" }
 
 # External crates
 ratatui = "0.30"
+tui-markdown = { version = "0.3.13", default-features = false }
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"

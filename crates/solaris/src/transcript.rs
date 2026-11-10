@@ -895,6 +895,57 @@ mod tests {
     }
 
     #[test]
+    fn themed_markdown_and_selection_share_display_rows_after_resize() {
+        let mut session = SessionState::new();
+        session.turns.push(Turn {
+            prompt: "question".into(),
+            reply: "## Result\n\n- **中文** é 👩‍💻 tail\n\n```rust\n    let value = 1234567890;\n```"
+                .into(),
+            complete: true,
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let mut remembered = None;
+        for width in [80, 16, 32] {
+            view.lines(&session, area(width, 24), &Theme::dark(), None, &welcome());
+            let document = view.document();
+            let rows = document.rows();
+            assert_eq!(
+                rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>(),
+                view.lines.iter().map(line_text).collect::<Vec<_>>()
+            );
+            assert!(
+                view.lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width))
+            );
+            let start_row = rows
+                .iter()
+                .position(|row| row.text == "Result")
+                .expect("heading without prefix");
+            assert!(rows.iter().any(|row| row.text.starts_with("- ")));
+            let last = rows
+                .iter()
+                .rposition(|row| !row.text.is_empty())
+                .expect("last row");
+            let start = document.anchor(start_row, 0).expect("heading anchor");
+            let end = document.anchor(last, u16::MAX).expect("end anchor");
+            let selected = document.selected_text(start, end).expect("selection");
+            assert!(selected.contains("👩‍💻") && selected.contains("```rust"));
+            assert!(selected.replace('\n', "").contains("1234567890;"));
+            if let Some(anchor) = remembered {
+                assert_eq!(
+                    document
+                        .locate(anchor)
+                        .map(|(row, column, _)| (row, column)),
+                    Some((start_row, 0))
+                );
+            }
+            remembered = Some(start);
+        }
+    }
+
+    #[test]
     fn empty_session_shows_the_welcome_box() {
         let session = SessionState::new();
         let lines = build(&session, area(80, 20), &Theme::dark(), None, &welcome());
