@@ -627,3 +627,47 @@ async fn a_truncated_stream_is_not_retried_after_visible_output_or_reported_as_s
         AgentEvent::Status(_) | AgentEvent::TurnComplete { .. }
     )));
 }
+
+#[tokio::test]
+async fn rejected_stream_options_are_removed_once_without_changing_prompt() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            bodies.push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+            socket
+                .write_all(
+                    response(
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"unsupported stream_options"}}"#,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        bodies
+    });
+    let error = match tokio::time::timeout(PATIENCE, backend(addr).run_turn(turn()))
+        .await
+        .unwrap()
+    {
+        Err(error) => error,
+        Ok(_) => panic!("repeated rejection must stop"),
+    };
+    assert!(error.to_string().contains("stream_options"));
+    let bodies = tokio::time::timeout(PATIENCE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(bodies[0].get("stream_options").is_some());
+    assert!(bodies[1].get("stream_options").is_none());
+    let mut expected = bodies[0].clone();
+    expected.as_object_mut().unwrap().remove("stream_options");
+    assert_eq!(expected, bodies[1]);
+}

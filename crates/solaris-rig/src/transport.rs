@@ -12,6 +12,7 @@ pub(crate) struct SolarisTransport {
     session_header: Option<&'static str>,
     session: &'static str,
     capabilities: solaris_backend::ModelCapabilities,
+    repairs: Vec<crate::policy::Repair>,
 }
 impl SolarisTransport {
     pub fn new(
@@ -20,6 +21,7 @@ impl SolarisTransport {
         session_header: Option<&'static str>,
         session: &'static str,
         capabilities: solaris_backend::ModelCapabilities,
+        repairs: Vec<crate::policy::Repair>,
     ) -> Self {
         Self {
             http: client.into(),
@@ -27,6 +29,7 @@ impl SolarisTransport {
             session_header,
             session,
             capabilities,
+            repairs,
         }
     }
 }
@@ -52,7 +55,8 @@ impl<W: Wire<Payload = Encoded, Frame = WireFrame>> Transport<W> for SolarisTran
             );
         }
         use solaris_backend::Support;
-        let enforce_policy = self.capabilities.streaming_usage == Support::Unsupported
+        let enforce_policy = !self.repairs.is_empty()
+            || self.capabilities.streaming_usage == Support::Unsupported
             || self.capabilities.prompt_caching == Support::Unsupported
             || self.capabilities.structured_output == Support::Supported;
         if enforce_policy && let rig_core::wire::Body::Bytes(bytes) = payload.request.body_mut() {
@@ -61,6 +65,9 @@ impl<W: Wire<Payload = Encoded, Frame = WireFrame>> Transport<W> for SolarisTran
                 Err(error) => return Opening::failed(ProviderError::request(error.to_string())),
             };
             crate::policy::apply_capabilities(&mut body, &self.capabilities);
+            for repair in &self.repairs {
+                crate::policy::apply_repair(&mut body, *repair);
+            }
             *bytes = match serde_json::to_vec(&body) {
                 Ok(bytes) => bytes,
                 Err(error) => return Opening::failed(ProviderError::request(error.to_string())),

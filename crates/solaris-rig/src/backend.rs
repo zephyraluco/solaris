@@ -11,7 +11,7 @@ use solaris_backend::{
     AgentBackend, AgentEvent, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage,
     Wire,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -301,7 +301,7 @@ impl AgentBackend for RigBackend {
         if !params.is_empty() {
             converted = converted.additional_params(Value::Object(params));
         }
-        let model = self.rig_model()?;
+        let model = self.rig_model(&[])?;
         let stream = model
             .stream(converted.clone())
             .map_err(|error| self.rig_error(&error))?;
@@ -316,6 +316,8 @@ impl AgentBackend for RigBackend {
             done: false,
             input_characters: request_characters(&request),
             output_characters: 0,
+            parts: HashMap::new(),
+            repairs: Vec::new(),
         };
         let mut opening = VecDeque::new();
         loop {
@@ -457,7 +459,10 @@ fn request_characters(request: &TurnRequest) -> usize {
 }
 
 impl RigBackend {
-    fn rig_model(&self) -> Result<DynModel<Completion>, BackendError> {
+    fn rig_model(
+        &self,
+        repairs: &[crate::policy::Repair],
+    ) -> Result<DynModel<Completion>, BackendError> {
         use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
         use rig_core::providers::registry::ProviderId;
         use rig_core::providers::{
@@ -470,6 +475,7 @@ impl RigBackend {
             self.endpoint.session_header,
             session_id(),
             self.capabilities.clone(),
+            repairs.to_vec(),
         );
         // Bind Solaris metadata under a declared identity so every Rig dialect
         // consults the supplied facts, including aliased gateway model names.
@@ -567,6 +573,8 @@ struct Engine {
     done: bool,
     input_characters: usize,
     output_characters: usize,
+    parts: HashMap<rig_core::streaming::Part, String>,
+    repairs: Vec<crate::policy::Repair>,
 }
 impl Engine {
     async fn next(&mut self) -> Option<AgentEvent> {
@@ -584,12 +592,45 @@ impl Engine {
                     // even before Solaris can publish a complete tool call.
                     self.visible = true;
                     let event = match event {
-                        StreamEvent::Text { text, .. } => {
+                        StreamEvent::Text { part, text } => {
+                            self.parts.entry(part).or_default().push_str(&text);
                             self.output_characters += text.chars().count();
                             Some(AgentEvent::TextDelta(text))
                         }
-                        StreamEvent::Reasoning { text, .. } => {
+                        StreamEvent::Reasoning { part, text } => {
+                            self.parts.entry(part).or_default().push_str(&text);
                             Some(AgentEvent::ThinkingDelta(text))
+                        }
+                        StreamEvent::End {
+                            part,
+                            content: AssistantContent::Text(text),
+                        } => {
+                            let previous = self.parts.remove(&part).unwrap_or_default();
+                            match final_suffix(&previous, &text.text) {
+                                Ok(Some(text)) => {
+                                    self.output_characters += text.chars().count();
+                                    Some(AgentEvent::TextDelta(text))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    self.done = true;
+                                    Some(AgentEvent::Error(error.to_string()))
+                                }
+                            }
+                        }
+                        StreamEvent::End {
+                            part,
+                            content: AssistantContent::Reasoning(reasoning),
+                        } => {
+                            let previous = self.parts.remove(&part).unwrap_or_default();
+                            match final_suffix(&previous, &reasoning.text) {
+                                Ok(Some(text)) => Some(AgentEvent::ThinkingDelta(text)),
+                                Ok(None) => None,
+                                Err(error) => {
+                                    self.done = true;
+                                    Some(AgentEvent::Error(error.to_string()))
+                                }
+                            }
                         }
                         StreamEvent::End {
                             content: AssistantContent::ToolCall(call),
@@ -624,6 +665,34 @@ impl Engine {
                     let partial = stream.partial();
                     let usage_received = partial.usage.input_tokens.is_some()
                         || partial.usage.output_tokens.is_some();
+                    if !self.visible
+                        && !usage_received
+                        && error.report().http_status == Some(400)
+                        && self.backend.endpoint.wire == Wire::OpenAiChat
+                        && let Some(repair) = crate::policy::repair_for(
+                            error.provider_response_body().unwrap_or_default(),
+                        )
+                        && !self.repairs.contains(&repair)
+                    {
+                        self.repairs.push(repair);
+                        let reopened = self.backend.rig_model(&self.repairs).and_then(|model| {
+                            let stream = model
+                                .stream(self.request.clone())
+                                .map_err(|error| self.backend.rig_error(&error))?;
+                            self.model = model;
+                            Ok(stream)
+                        });
+                        match reopened {
+                            Ok(stream) => {
+                                self.stream = Some(stream);
+                                continue;
+                            }
+                            Err(error) => {
+                                self.done = true;
+                                return Some(AgentEvent::Error(error.to_string()));
+                            }
+                        }
+                    }
                     if !self.visible
                         && !usage_received
                         && retryable
@@ -690,5 +759,25 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+// End snapshots may contain text without deltas, or repeat already emitted text.
+fn final_suffix(previous: &str, final_text: &str) -> Result<Option<String>, BackendError> {
+    let suffix = final_text
+        .strip_prefix(previous)
+        .ok_or_else(|| BackendError::new("provider changed previously streamed text"))?;
+    Ok((!suffix.is_empty()).then(|| suffix.to_owned()))
+}
+
+#[cfg(test)]
+mod final_text_tests {
+    use super::final_suffix;
+    #[test]
+    fn snapshots_emit_only_missing_text() {
+        assert_eq!(final_suffix("", "hello").unwrap(), Some("hello".into()));
+        assert_eq!(final_suffix("hello", "hello").unwrap(), None);
+        assert_eq!(final_suffix("你", "你好").unwrap(), Some("好".into()));
+        assert!(final_suffix("hello", "other").is_err());
     }
 }
