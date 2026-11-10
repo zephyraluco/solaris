@@ -6,16 +6,16 @@
 
 ## 1. 总览
 
-solaris 是一个用 Rust 编写的终端 AI 助手。Cargo workspace 使用 edition 2024，最低支持 Rust 1.88，由八个 crate 组成。应用负责组装各层，依赖保持单向：
+solaris 是一个用 Rust 编写的终端 AI 助手。Cargo workspace 使用 edition 2024，最低支持 Rust 1.97.1，由九个 crate 组成。应用负责组装各层，依赖保持单向：
 
 ```text
 solaris                  应用组装、配置、认证、TUI 与 CLI
 ├── solaris-tui          可复用终端 UI 框架
 ├── solaris-provider     provider 目录、鉴权、模型与价格、后端解析
-│   ├── solaris-backend
+│   ├── solaris-rig      官方 Rig 模型调用 → solaris-backend
 │   └── solaris-types
 ├── solaris-agent        会话、多轮工具循环、审批与子代理
-│   ├── solaris-backend  后端接口与传输协议 → solaris-types
+│   ├── solaris-backend  后端接口与消息类型 → solaris-types
 │   └── solaris-tools    工具接口、内建工具与注册表 → solaris-types
 ├── solaris-mcp          MCP 连接、发现与工具适配 → solaris-tools
 └── solaris-tools        应用显式注册 MCP 返回的工具
@@ -29,9 +29,10 @@ solaris                  应用组装、配置、认证、TUI 与 CLI
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
-| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`reqwest`（rustls）、`bytes`、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 统一接口、`HttpBackend`（三条协议的请求体与流解析）、SSE 解码、重试与计费；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`/`Price`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
+| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `solaris-types`、`async-trait`、`futures`、`serde` | 稳定后端契约、消息、工具声明、事件、用量与价格类型；不依赖 HTTP 或模型 SDK。 |
+| `solaris-rig` | [`crates/solaris-rig`](../crates/solaris-rig) | `solaris-backend`、官方 `rig-core` / `rig-reqwest` | 模型请求与流事件转换、取消、重试、端点与能力策略、模型发现；协议编码和流解码交给 Rig。 |
 | `solaris-tools` | [`crates/solaris-tools`](../crates/solaris-tools) | `async-trait`、`futures`、`tokio`（`process`/`io-util`/`fs`）、`serde_json`、`thiserror`、`libc`（仅 Unix） | 工具层：八个内建工具（`read`/`write`/`edit`/`ls`/`grep`/`find` 与所在平台的 shell）、`ToolRegistry`、命令 runner、截断与文件写入串行化、`edit` 的 diff。不依赖工作区里任何其他 crate。 |
-| `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
+| `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`solaris-rig`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
 | `solaris-agent` | [`crates/solaris-agent`](../crates/solaris-agent) | `solaris-backend`、`solaris-tools`、`async-trait`、`futures`、`serde`、`tokio` | agent 会话：`Agent`（把解析好的后端包进多轮工具循环）、`Mode` 与它声明给一轮的默认工具集、`Approver` 审批钩子，并把应用需要的词汇（消息、事件、工具、用量、注册表与选择）再导出。 |
 | `solaris-tui` | [`crates/solaris-tui`](../crates/solaris-tui) | `ratatui`、`crossterm`、`unicode-width`、`unicode-segmentation` | 终端 UI 框架：组件模型、类 flex 布局、浮层、主题、按键匹配、组件集、终端生命周期。 |
 | `solaris-mcp` | [`crates/solaris-mcp`](../crates/solaris-mcp) | `solaris-tools`、`rmcp`、`tokio`、`reqwest` | 连接 MCP 服务器、发现工具与资源/提示词操作，返回工具适配器和状态；不负责注册。 |
@@ -39,11 +40,11 @@ solaris                  应用组装、配置、认证、TUI 与 CLI
 
 ---
 
-## 2. solaris-backend：传输层与对话词汇
+## 2. 后端契约与 Rig 传输
 
 ### 2.1 一轮对话的词汇
 
-传输层同时持有「一轮对话是用什么写的」——这些类型正是三条 wire 要序列化的东西，所以它们住在讲协议的同一个 crate 里，而不是另起一层：
+`solaris-backend` 保存会话及工具使用的公共词汇；`solaris-rig` 将这些类型转换为官方 SDK 类型，Rig 类型不进入 agent 或会话日志：
 
 | 模块 | 内容 |
 | --- | --- |
@@ -86,26 +87,14 @@ pub trait AgentBackend: Send + Sync {
 ```
 
 - 一次 `run_turn` 返回一个装箱的 `Send` 流，UI 侧通过 channel 逐块消费。
-- **`HttpBackend`** 是真实客户端。它只认识 `Wire`，于是三条协议各一个模块，统一放在 [`protocols/`](../crates/solaris-backend/src/protocols) 下：
-  - [`anthropic`](../crates/solaris-backend/src/protocols/anthropic.rs) —— Messages API（`POST /v1/messages`，`x-api-key` + `anthropic-version`）。注意 system 提示词必须提到顶层 `system` 字段，不能留在 `messages` 里，所以历史里的 system 条目会被摘出去。另外最后一条消息会带一个 `cache_control: {type:"ephemeral"}` 断点：缓存是逐块开关的，断点会把它之前的一切（系统提示词 + 已发出的轮次）缓存下来，于是第二轮起不变的前缀按缓存读计价。低于 provider 的最小可缓存长度时它会被忽略，短对话不多花钱。
-  - [`openai`](../crates/solaris-backend/src/protocols/openai.rs) —— Chat Completions（`POST /chat/completions`，Bearer），兼容性下限。New API、OpenRouter、Google 的兼容端点、本机 Ollama 与 llama.cpp 走的都是这条。因为「OpenAI 兼容」描述的是**响应**形状而请求字段各家不同，这个模块还带一张**修补表**：服务端用 400 指名它不认识的字段（`stream_options`、`max_tokens`）时，改一次请求体重发，而不是预先猜——每条修补每轮最多应用一次。
-  - [`responses`](../crates/solaris-backend/src/protocols/responses.rs) —— Responses API（`POST /responses`，Bearer），OpenAI 自己走这条。system 提示词与 Messages API 一样提到顶层，但字段名是 `instructions`，转录是 `input` 条目列表，长度上限叫 `max_output_tokens`（不是 `max_tokens`）。请求带 `store: false`：终端会话不该把转录留在服务端。它比 Chat Completions 宽进严出——每条事件既在 `event:` 上命名、又在负载的 `type` 里重述一遍，所以网关丢掉前者也读得出来。
-  - 顺带：`reasoning_content` / `reasoning`（Chat Completions）与 `response.reasoning_text.delta` / `response.reasoning_summary_text.delta`（Responses）若出现就映射成思考分片，不出现就跳过；`thinking` 参数本身不下发，因为不支持的模型会直接 400。
-- 三条协议共用的部分：
-  - [`sse`](../crates/solaris-backend/src/sse.rs) —— 跨 chunk 的 SSE 帧解码，**按字节**缓冲，所以帧切在多字节字符中间也不会损坏。
-  - [`http`](../crates/solaris-backend/src/http.rs) —— 共享的 `reqwest` 客户端（10s 连接超时，无整请求超时，因为一轮本来就要流几分钟）、状态码 → 可操作的错误文案、退避重试。
-  - [`wire`](../crates/solaris-backend/src/wire.rs) —— 按 `Wire` 分发请求体构造与流解析。跨协议但**只有 OpenAI 需要**的字段在这里补上：`prompt_cache_key` 只在 `Wire::is_openai()` 且端点主机就是 `api.openai.com` 时发送（OpenAI 的缓存本来就是自动的，这个键只影响路由，而兼容网关可能因为不认识它而拒掉整个请求，不值得冒险）。
-  - **工具调用**：请求体里的 `tools` 只在调用方声明过工具时出现——空列表连字段都不写，所以不用工具的那条路径逐字节不变。三条协议各写各的形状（Anthropic 是 `input_schema`，Chat Completions 在 `function` 里包一层，Responses 是扁平的 `name`/`parameters`）。**调用一律在流结束时一次性交付**：三条 wire 都把一次调用拆成片段（名字先到，参数作为 JSON 文本分片随后抵达），解析器因此各自按索引或条目累积，只在流末 `flush` 出去，被执行的总是一个完整调用；流中途报错则不交付。历史里的 `ToolUse`/`ToolResult` 也按对方形状转换：Chat Completions 拆成 `tool_calls` 与 `role:"tool"` 消息，Responses 拆成 `function_call`/`function_call_output` 条目，Messages API 把结果并进紧随其后的 **user** 消息，并在合并同角色消息时把 `tool_result` 排在最前——那边的 API 两件事都不允许：角色不能重复，结果必须领起它所在的那条消息。
-  - 参数文本解析不出 JSON 时进 `null`，工具层会把它当作「参数不是对象」回给模型，而不是静默地当成空参数——一个能自我纠正的模型需要知道它写错了什么。
-- **模型发现**：`AgentBackend::models()` 是可选能力（默认实现直接报「本后端不会列模型」），`HttpBackend` 用 `Endpoint::models_url()`（Messages API 走 `/v1/models?limit=1000`，OpenAI 兼容走 `/models`）发一次 GET，复用同一套认证；`parse_models` 从 `{"data":[{"id":…}]}` 里取 id——两条 wire 的清单形状相同。**不重试**：它只喂选择器，慢或不可达的代价应当是退回目录，而不是让用户等。**网关的 `/v1` 在解析层补齐**：OpenAI 兼容网关的 API 挂在 `/v1` 下，而 `/connect` 收集来的 URL 常常只写到主机，于是请求打到的是网关的网页前端——它用 200 + HTML 回答，`parse_models` 读不出任何 id，于是「没有模型」而不是一个看得见的错误。所以 `resolve()` 会给没有路径的 base URL 补上 `/v1`（带路径的一律按原样使用：只有部署者知道 API 挂在哪），Messages API 不在其列——它的 base 就是主机本身。**200 但不成清单的回复是一种要报出来的失败**：`parse_models` 返回 `Option`，`None` 表示这压根不是清单（代理的 HTML 页、被包进 200 的错误），此时错误信息指名 URL 并转述网关自己的说法，而不是当成一个没有模型的 provider。真正空的清单（`{"data":[]}`）则是答案——网关在说这个凭据够不到任何模型；没有目录可退时这一条也会告知用户。这两者必须分得开，否则「URL 打错地方」和「网关不给模型」看起来一模一样。
-- **重试只在第一个事件发出之前**（429 / 5xx / 传输错误；指数退避并尊重 `Retry-After`，最多 3 次）。已经吐过字就绝不再试，否则会重复输出。中断靠丢掉接收端：app 放弃 `rx` 后 `send` 失败、任务结束、`reqwest` 的流随之被 drop，请求被取消。
-- **计费**：`Usage` 把各家的报告归一成四个互不重叠的桶（两家 OpenAI 协议都把缓存读计入 `input_tokens` / `prompt_tokens`，会被减掉）；提供商什么都没报时退回按字符估算并置位 `estimated`，`/stats` 会据此显示 `≈`。价格来自 `provider` 表的内置快照，未知模型不收费。生成的 token 还是 0 的 `usage` 块不算「报告过」。
-- **上下文 vs 会话总量**：`SessionState::total_tokens()` 是全会话累计（帧脚把它和累计费用并排显示），`SessionState::context_tokens()` 才是「窗口有多满」——取最后一轮有上报的 usage，加上其后新提交内容的估算；没有任何上报时退化为对提示词取估算。把累计量拿去比窗口是错的，因为窗口是每请求的，而累计会无限增长。
-- **没有可用凭据时**，`solaris-provider` 的 `UnconnectedBackend` 接管：它不发任何请求，而是把每一轮直接变成一条可操作的错误（「run /connect」，或指名该 provider 的环境变量），页脚也会写 `unconnected`。这样既不会假装有回复，也不会发一个必然 401 的请求。
-- [`solaris-provider/src/choose.rs`](../crates/solaris-provider/src/choose.rs) 的 `choose_backend(auth, model, options)` 是解析凭据的入口（应用通过 `backend_factory` 调它，`solaris` 的 `AppOptions::new()` 则把这个工厂钉成一个固定后端）：按「环境变量 > `auth.json` > 本机运行时无需凭据」解析出一个 `BackendChoice`（后端 + provider id + 端点 + 凭据来源）。解析不出可用凭据就交给 `UnconnectedBackend`（`CredentialSource::Missing`）。模型名为空时（用户还没选过模型）换成该 provider 提供的第一个模型；用户明确给过的名字则原样送出。**目录里也没有名字时**（网关与自定义端点就是这样）凭据一样解析出端点，只是包成 `NamelessBackend`：turn 照旧拒绝——空模型名只会换来 400——但 `models()` 直通真正的客户端，因为那份清单正是名字的唯一来源，否则 `/model` 会永远空着（`CredentialSource::NoModel`，provider id 仍然给出来）。`BackendOptions` 里的 `environment` 可注入，测试因此既不继承 shell 里的 key、也碰不到网络。
-- `AgentBackend` 是唯一扩展点：再实现一个即可接入新协议，UI 零改动。
+- **`RigBackend`** 位于 [`solaris-rig`](../crates/solaris-rig)。官方 `rig-core` 负责 Chat Completions、Responses 和 Anthropic Messages 的编码、流解码及厂商方言。Solaris 只转换自身消息与事件，不保留旧 SSE 解码器和协议编码模块。
+- `Endpoint` / `TurnPlan` 由 provider 解析。轻量 transport 保留配置中的准确 URL 和会话头，避免 SDK 路径规范化改变网关挂载路径。模型发现保持现有 `/models`、ChatGPT Codex 清单及错误诊断行为。
+- 模型能力、请求别名、输出预算与价格继续由 `solaris-provider` 决定。每个请求将参数快照绑定为 Rig 的模型事实，不启用 Rig 内置目录覆盖。能力策略仍控制缓存、流式用量及严格工具 schema。
+- 文本和思考分片转换成现有事件；工具参数由 Rig 重组后交付，执行和审批仍在 Solaris。未声明任何工具时，Rig 将历史工具调用和结果规范化为文本。
+- 重试只发生在没有收到模型内容、工具片段或用量之前，尊重 `Retry-After` 并退避，最多三次；已有输出后不重播。丢弃流会取消底层 HTTP 读取。缺失结束帧或流中途断开会报错，不伪造成功。
+- Rig 的输入计数包含缓存读写；适配器减去这两个子集后写入 Solaris 四个互不重叠的用量桶。费用使用 Solaris 的价格和上下文分层计算，由现有请求账本持久化。无用量时保留字符估算回退。
+- 登录、OAuth 刷新、凭据存储、模型清单缓存与后端选择继续在 provider / 应用层。ChatGPT 请求使用 Rig 方言，但不注入 SDK 的默认系统指令，保留 Solaris 提示词与 `store: false`。
 
----
 
 ## 3. solaris-agent：agent 会话
 
@@ -322,7 +311,7 @@ pub trait Tool: Send + Sync {
 两条约定决定了这一层的形状：
 
 - **工具不会让一轮失败**。文件不存在、命令退出码非零、模型给的参数不合规，全部变成 `ToolOutput::error` 回到模型手里——能处置它的是模型，不是 UI。
-- **工具只认自己**。声明是 JSON Schema，执行在本地；工具不知道模型、消息或 provider 的存在，连自己会被声明给谁都不知道。把声明翻成某条 wire 的请求形状是 `solaris-backend` 的事，把两者接起来是 `solaris-agent` 的事。
+- **工具只认自己**。声明是 JSON Schema，执行在本地；工具不知道模型、消息或 provider 的存在，连自己会被声明给谁都不知道。把声明翻成某条 wire 的请求形状是 `solaris-rig` 与 Rig 的事，把两者接起来是 `solaris-agent` 的事。
 
 `ToolContext` 带三样东西：`cwd`（相对路径的解析基准）、`temp_dir`（被截断的命令输出落在这里）与 `Cancel`（应用取消一轮时，正在跑的命令要被杀掉，而不是留给一个已经没人听的模型）。`Tool::execution_mode()` 决定它能否与同一批调用并行：默认 `Parallel`；`write`/`edit`/shell 声明 `Sequential`，因为它们改动的东西正是同批其他调用可能读到的。
 
@@ -675,9 +664,9 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 | 调整工具的输出上限 | [`truncate.rs`](../crates/solaris-tools/src/truncate.rs) 的 `DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`，或给单个工具 `with_limits`。 |
 | 限制一次工具往返的次数 | 没有上限：循环跑到模型不再请求为止（见 §3.3）。要加回来就在 [`solaris-agent/src/session.rs`](../crates/solaris-agent/src/session.rs) 的 `drive` 循环里计数并在 `AgentOptions` 上加一个字段。 |
 | 换掉 ripgrep / fd | 实现 `CommandRunner` 并传给 `ToolRegistry::with_runners`（`grep` 与 `find` 都经它起子进程）。 |
-| 接入新的 wire 协议 | 在 [`wire.rs`](../crates/solaris-backend/src/wire.rs) 的 `Wire` 加一个变体，在同一个 `wire.rs` 的 `request_body` / `WireStream` 各加一个分支，照 [`protocols/`](../crates/solaris-backend/src/protocols) 里既有的三个模块写一个只做「请求体 + 流解析」的模块，最后让 `PROVIDERS` 里对应的条目指向它——provider 自己的 `wire` 管它没列出的模型，模型的 `wire` 管它自己。UI 与 `choose_backend` 的调用方都不用动。 |
+| 接入新的 wire 协议 | 在 `solaris-rig` 配置官方 Rig 对应 wire，增加 Solaris 类型映射和契约测试，再扩展 provider 的配置选择；不另写 SSE 或厂商协议解析器。 |
 | 增删 provider 目录项 / 模型 | [`solaris-provider/src/providers.rs`](../crates/solaris-provider/src/providers.rs) 的 `PROVIDERS`（向导步骤、模型选择器、端点、环境变量、价格表，以及每个模型自己的 wire 都从这里读）。 |
-| 调整重试 / 超时策略 | [`solaris-backend/src/http.rs`](../crates/solaris-backend/src/http.rs)：`BACKOFF`、`IDLE_TIMEOUT`、`CONNECT_TIMEOUT`。 |
+| 调整重试 / 超时策略 | [`solaris-rig/src/http.rs`](../crates/solaris-rig/src/http.rs)：`BACKOFF`、`IDLE_TIMEOUT`、`CONNECT_TIMEOUT`。 |
 | 新增斜杠命令 | [`crates/solaris/src/commands.rs`](../crates/solaris/src/commands.rs) 的命令表 + `App::execute_command` 加一个分支；补全、面板、帮助会自动跟随。 |
 | 新增浮层对话框 | 在 [`dialogs.rs`](../crates/solaris/src/dialogs.rs) 实现 `Component`，经 `DialogMessage` 回传结果，再用 `push_overlay` 打开。 |
 | 换一个后端实现 | 为你的类型实现 `AgentBackend`（`run_turn` 加可选的 `label` / `models`），在 `backend_factory` 里把它包成 `BackendChoice`；`Agent` 与 UI 都不用动。 |
@@ -693,8 +682,8 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 工作区共 **700 个测试**，分三层：
 
-- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 49、`solaris-backend` 107、`solaris-tools` 108、`solaris-agent` 102、`solaris-tui` 135、`solaris` 库 202），覆盖纯逻辑、布局、按键、渲染（含补全弹窗的列对齐与 `(n/总数)` 计数、三处列表共用的 `window_start` 及其顶 / 底 / 越界边界）、SSE 解码、三条 wire 的请求体与流解析（用录制回放，不联网）、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`Agent` 的多轮与调用顺序、按模式选工具与选择增删、提示词的组装（身份 / 模式 / 只有本轮工具贡献指南 / 技能清单及其缺省 / 平台说明 / 无指南工具不加段）、技能的发现与递归边界（含「含 `SKILL.md` 的目录不再深入」）、frontmatter 的引号 / 注释 / 块标量 / 续行 / 嵌套结构跳过、描述缺失与名字撞车的处置、steering 的入队与排空顺序、压缩的触发与安全裁切点（含摘要失败时原样发送）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
-- **回路测试** [`crates/solaris-backend/tests/loopback.rs`](../crates/solaris-backend/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
+- **单元测试**贴着被测代码放在各模块内（`solaris-provider` 49、`solaris-backend` 107、`solaris-tools` 108、`solaris-agent` 102、`solaris-tui` 135、`solaris` 库 202），覆盖纯逻辑、布局、按键、渲染（含补全弹窗的列对齐与 `(n/总数)` 计数、三处列表共用的 `window_start` 及其顶 / 底 / 越界边界）、Rig 适配器的请求/流契约、取消与用量转换、工具声明的下发布局与调用片段的重组、截断边界（含多字节字符不被切断）、`edit` 的 BOM/CRLF/多处匹配/重叠拒绝、`Agent` 的多轮与调用顺序、按模式选工具与选择增删、提示词的组装（身份 / 模式 / 只有本轮工具贡献指南 / 技能清单及其缺省 / 平台说明 / 无指南工具不加段）、技能的发现与递归边界（含「含 `SKILL.md` 的目录不再深入」）、frontmatter 的引号 / 注释 / 块标量 / 续行 / 嵌套结构跳过、描述缺失与名字撞车的处置、steering 的入队与排空顺序、压缩的触发与安全裁切点（含摘要失败时原样发送）、缓存断点与 `prompt_cache_key` 的门控、模型清单的解析与 URL、上下文与累计口径、凭据存取与脱敏、选后端 / 选模型与状态机。需要外部程序的工具（`grep`/`find`/shell）走可注入的 runner，所以测试既不需要装了 ripgrep 与 fd，也不会真的执行命令。
+- **回路测试** [`crates/solaris-rig/tests/loopback.rs`](../crates/solaris-rig/tests/loopback.rs)（10 个）：在 loopback 上起一个真的 `TcpListener`，用真的 `reqwest` 去请求它。请求头、`Content-Length` 读取、SSE 分帧、用量结算、模型清单的 GET 与 Bearer 头、401 的报错文案、429 的退避重试，这一整条链路都由真 socket 验证过 —— 仍然不碰外网。
 - **工具往返的回路测试** [`crates/solaris-agent/tests/loopback.rs`](../crates/solaris-agent/tests/loopback.rs)（2 个）：同一套真 socket 手法，但服务端先回一个 `tool_call`、再回最终文本，于是「请求体带上了 `tools` → 调用被解析出来 → 真的 `read` 工具跑了 → 结果作为 `role:"tool"` 回到第二次请求」整条链路被端到端验证 —— 它住在 agent 里，因为只有那一层同时认识工具与 wire。仍然不碰外网。
 - **端到端冒烟测试** [`crates/solaris/tests/tui_smoke.rs`](../crates/solaris/tests/tui_smoke.rs)（28 个）：驱动真实技术栈（`Tui` 事件循环 + `App` + 框架组件 + 真实 `Agent`），渲染到 ratatui 的 `TestBackend`，因此整条 UI 链路无需真实终端即可断言。它自带一个只回显提示词的 `FakeBackend` 顶替真实 provider，并把 `environment` 换成空表，所以既不会继承 shell 里的 key，也不会联网；另有一个先请求一个不存在工具的后端，用来验证工具步骤确实进了转录，而不会真的碰文件或执行命令。
 

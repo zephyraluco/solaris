@@ -25,6 +25,7 @@ sha2 = "0.10"
 jsonschema = { version = "0.33", default-features = false }
 
 [dev-dependencies]
+solaris-rig = { workspace = true }
 tempfile = "3"
 # The unit tests build tool-call arguments, and the loopback test binds a real
 # socket and drives the real HTTP client.

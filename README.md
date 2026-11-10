@@ -17,7 +17,7 @@
 
 ---
 
-solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a transport crate that speaks three wire protocols and nothing else, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that runs conversations over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
+solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend contract crate and an official Rig transport adapter, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that runs conversations over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
 
 The interface is complete, and a connected provider really is called. Connect a provider — or just export an API key — and every turn streams from the real model over SSE, with retries before the first token and per-turn token and cost accounting.
 
@@ -54,7 +54,7 @@ The interface is complete, and a connected provider really is called. Connect a 
 ## Requirements
 
 - **Bash and standard utilities** (`cat`, `head`, `cp`, `ls`, `chmod`, `mkdir`, `mktemp`, `mv`, `rm`, `readlink`, `sync`) on Linux/macOS; included in the Windows runtime.
-- **Rust 1.88 or newer** — the workspace uses the 2024 edition.
+- **Rust 1.97.1 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
 
@@ -272,7 +272,7 @@ Every user gets a terminal companion, shown in the welcome box and animated betw
 
 `/connect` opens an inline wizard that takes over the prompt region instead of opening an overlay. It walks through picking a provider and supplying whatever that provider authenticates with: an API key, an OpenAI-compatible base URL plus key, or nothing at all for a runtime on your machine. The catalogue covers Anthropic, OpenCode Go, OpenAI, Google, OpenRouter, a self-hosted New API gateway and a local Ollama/llama.cpp runtime. Most entries list the models they offer; a gateway and a custom endpoint collect their own URL and key instead, and are then asked what they have. Credentials are stored in `auth.json` and masked wherever they are displayed.
 
-Three wire protocols cover the whole catalogue, and the *model* decides which one carries it: the Anthropic Messages API reaches the Claude models, the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak, and OpenAI's models use the newer Responses API. A provider's own wire is the floor for whatever its table does not list, which is what lets a single OpenCode Go key answer GPT models on the Responses API, Claude models on the Messages API and everything else on the compatibility floor. The key travels the way the wire carrying it asks: `x-api-key` on the Messages API, a bearer token on the OpenAI ones — opencode's Go gateway included, whose `/v1/messages` takes `x-api-key` while its OpenAI-compatible paths take a bearer token. A platform that routes by conversation is also told which one this is, which is how Go attributes a turn to the plan rather than to a pay-as-you-go balance.
+Rig-backed wire protocols cover the whole catalogue, and the *model* decides which one carries it: the Anthropic Messages API reaches the Claude models, the OpenAI Chat Completions API is the compatibility floor that Google, OpenRouter, New API, a local Ollama/llama.cpp runtime and any custom endpoint speak, and OpenAI's models use the newer Responses API. A provider's own wire is the floor for whatever its table does not list, which is what lets a single OpenCode Go key answer GPT models on the Responses API, Claude models on the Messages API and everything else on the compatibility floor. The key travels the way the wire carrying it asks: `x-api-key` on the Messages API, a bearer token on the OpenAI ones — opencode's Go gateway included, whose `/v1/messages` takes `x-api-key` while its OpenAI-compatible paths take a bearer token. A platform that routes by conversation is also told which one this is, which is how Go attributes a turn to the plan rather than to a pay-as-you-go balance.
 
 ### Environment variables
 
@@ -557,7 +557,7 @@ MCP image content follows the same capability check.
 ## Toolchain and validation
 
 Development uses the Rust 1.99.1 toolchain pinned in `rust-toolchain.toml`; the
-minimum supported Rust version is 1.88. CI checks formatting, strict Clippy and
+minimum supported Rust version is 1.97.1. CI checks formatting, strict Clippy and
 tests on Linux, macOS and Windows, plus a separate MSRV compilation check. Tags
 and manually dispatched CI runs build downloadable release artifacts without
 automatically publishing a GitHub release.

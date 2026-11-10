@@ -1,33 +1,16 @@
-//! Backend abstraction and the conversation vocabulary for solaris.
+//! Stable model contract and persisted conversation vocabulary for Solaris.
 //!
-//! One client serves every platform: it is handed an endpoint, a model, and
-//! whatever the caller knows about pricing, and it streams a turn back over
-//! whichever wire that endpoint speaks. **Which platform an endpoint belongs to,
-//! how its credentials were found, and which models it offers are all the
-//! caller's business** — that is `solaris-provider`'s job, and this crate never
-//! learns any of it.
-//!
-//! What it does own is the vocabulary a turn is written in: the messages and
-//! their content blocks ([`Message`], [`Content`], [`Role`]), the tool
-//! declarations, calls and results the wire carries ([`ToolSpec`], [`ToolCall`],
-//! [`ToolResult`]), what a turn consumes and costs ([`Usage`], [`Price`]), and
-//! the events a backend streams back ([`AgentEvent`]). Those types are the wire's
-//! own shape — every protocol here serialises them — so they live beside the
-//! protocols that speak them rather than in a layer of their own.
+//! This crate owns messages, tools, events, capabilities and accounting types.
+//! Official Rig integration and HTTP policy live in solaris-rig; the agent does
+//! not depend on a provider SDK or on provider configuration.
 
-mod client;
 mod event;
-mod http;
 mod message;
-mod protocols;
-mod sse;
 mod tool;
 mod usage;
 mod wire;
 
-pub use client::{Endpoint, HttpBackend, TurnPlan};
 pub use event::{AgentEvent, BackendError, TurnRequest};
-pub use http::IDLE_TIMEOUT;
 pub use message::{Content, Message, MessageContext, Role};
 pub use tool::{ToolCall, ToolResult, ToolSpec};
 pub use usage::{Price, PriceTier, Usage, tokens_for_characters};
@@ -78,6 +61,3 @@ pub trait AgentBackend: Send + Sync {
 pub use solaris_types::{ContextUsage, ModelCapabilities, Support};
 
 pub use solaris_types::InlineImage;
-
-#[cfg(test)]
-mod image_tests;

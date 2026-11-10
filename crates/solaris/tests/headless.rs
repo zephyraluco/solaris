@@ -4,6 +4,19 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::Duration;
 
+fn message_contains(message: &serde_json::Value, expected: &str) -> bool {
+    message["content"]
+        .as_str()
+        .is_some_and(|text| text.contains(expected))
+        || message["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(expected))
+            })
+        })
+}
+
 fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_solaris"));
     command
@@ -175,14 +188,14 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
             .as_array()
             .expect("history")
             .iter()
-            .any(|message| message["content"] == "first prompt")
+            .any(|message| message_contains(message, "first prompt"))
     );
     assert!(
         !requests[1]["messages"]
             .as_array()
             .expect("history")
             .iter()
-            .any(|message| message["content"] == "isolated child history")
+            .any(|message| message_contains(message, "isolated child history"))
     );
 }
 

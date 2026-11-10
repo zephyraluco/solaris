@@ -3150,6 +3150,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "solaris-backend",
+ "solaris-rig",
  "solaris-tools",
  "tempfile",
  "thiserror 2.0.21",
@@ -3161,14 +3162,11 @@ name = "solaris-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "futures",
- "reqwest",
  "serde",
  "serde_json",
  "solaris-types",
  "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

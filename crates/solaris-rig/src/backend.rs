@@ -471,15 +471,10 @@ impl RigBackend {
             session_id(),
             self.capabilities.clone(),
         );
-        let provider = if self.endpoint.wire == Wire::AnthropicMessages {
-            "anthropic"
-        } else if self.chatgpt.is_some() {
-            "chatgpt"
-        } else {
-            "openai"
-        };
-        let id = ProviderId::catalog(provider)
-            .ok_or_else(|| BackendError::new("Rig provider unavailable"))?;
+        // Bind Solaris metadata under a declared identity so every Rig dialect
+        // consults the supplied facts, including aliased gateway model names.
+        let id =
+            ProviderId::declare("solaris").map_err(|error| BackendError::new(error.to_string()))?;
         let mut spec = ModelSpec::new(id, &self.model)
             .with_tools(self.capabilities.tool_calling != Support::Unsupported);
         spec.input.image = self.capabilities.image_input != Support::Unsupported;
@@ -637,7 +632,8 @@ impl Engine {
                         let wait = error
                             .report()
                             .retry_after(SystemTime::now())
-                            .unwrap_or_else(|| http::backoff(self.retries, None))
+                            .unwrap_or_default()
+                            .max(http::backoff(self.retries, None))
                             .min(Duration::from_secs(30));
                         self.retries += 1;
                         tokio::time::sleep(wait).await;
