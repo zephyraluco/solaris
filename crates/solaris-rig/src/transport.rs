@@ -11,6 +11,7 @@ pub(crate) struct SolarisTransport {
     url: String,
     session_header: Option<&'static str>,
     session: &'static str,
+    capabilities: solaris_backend::ModelCapabilities,
 }
 impl SolarisTransport {
     pub fn new(
@@ -18,12 +19,14 @@ impl SolarisTransport {
         url: String,
         session_header: Option<&'static str>,
         session: &'static str,
+        capabilities: solaris_backend::ModelCapabilities,
     ) -> Self {
         Self {
             http: client.into(),
             url,
             session_header,
             session,
+            capabilities,
         }
     }
 }
@@ -47,6 +50,21 @@ impl<W: Wire<Payload = Encoded, Frame = WireFrame>> Transport<W> for SolarisTran
                 name,
                 reqwest::header::HeaderValue::from_static(self.session),
             );
+        }
+        use solaris_backend::Support;
+        let enforce_policy = self.capabilities.streaming_usage == Support::Unsupported
+            || self.capabilities.prompt_caching == Support::Unsupported
+            || self.capabilities.structured_output == Support::Supported;
+        if enforce_policy && let rig_core::wire::Body::Bytes(bytes) = payload.request.body_mut() {
+            let mut body: serde_json::Value = match serde_json::from_slice(bytes) {
+                Ok(value) => value,
+                Err(error) => return Opening::failed(ProviderError::request(error.to_string())),
+            };
+            crate::policy::apply_capabilities(&mut body, &self.capabilities);
+            *bytes = match serde_json::to_vec(&body) {
+                Ok(bytes) => bytes,
+                Err(error) => return Opening::failed(ProviderError::request(error.to_string())),
+            };
         }
         <rig_reqwest::ReqwestClient as Transport<W>>::send(&self.http, payload, exchange)
     }

@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{
-    AgentBackend, AgentEventStream, BackendError, Endpoint, HttpBackend, TurnPlan, TurnRequest,
-};
+use solaris_backend::{AgentBackend, AgentEventStream, BackendError, TurnRequest};
+
+use solaris_rig::{Endpoint, RigBackend, TurnPlan};
 
 use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, provider_spec};
 use crate::{AuthStore, Credential};
@@ -221,7 +221,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         endpoint,
     };
 
-    match HttpBackend::new(plan) {
+    match RigBackend::new(plan) {
         Ok(backend) => {
             let backend = backend
                 .with_capabilities(capabilities.clone())
@@ -297,7 +297,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 /// model list is still fetched.
 struct NamelessBackend {
     /// The client the credential resolved to, used for the model list.
-    endpoint: HttpBackend,
+    endpoint: RigBackend,
     /// What a turn says instead of being sent.
     message: String,
 }

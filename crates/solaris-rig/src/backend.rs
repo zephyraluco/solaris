@@ -469,6 +469,7 @@ impl RigBackend {
             self.endpoint.url(),
             self.endpoint.session_header,
             session_id(),
+            self.capabilities.clone(),
         );
         let provider = if self.endpoint.wire == Wire::AnthropicMessages {
             "anthropic"
@@ -522,16 +523,16 @@ impl RigBackend {
                         .with_idle_timeout(Some(http::IDLE_TIMEOUT))
                         .erase()
                 } else {
-                    Model::new(
+                    let mut wire =
                         rig_core::providers::openai::responses_api::wire::Responses::new(
                             config,
                             &self.model,
                         )
-                        .with_facts(facts),
-                        transport,
-                    )
-                    .with_idle_timeout(Some(http::IDLE_TIMEOUT))
-                    .erase()
+                        .with_facts(facts);
+                    wire.strict_tools = false;
+                    Model::new(wire, transport)
+                        .with_idle_timeout(Some(http::IDLE_TIMEOUT))
+                        .erase()
                 }
             }
         };
@@ -584,6 +585,9 @@ impl Engine {
             let stream = self.stream.as_mut()?;
             match stream.next().await {
                 Some(Ok(Item::Event(event))) => {
+                    // Opening or growing a tool part is provider output too,
+                    // even before Solaris can publish a complete tool call.
+                    self.visible = true;
                     let event = match event {
                         StreamEvent::Text { text, .. } => {
                             self.output_characters += text.chars().count();
@@ -622,7 +626,14 @@ impl Engine {
                         .http_status
                         .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
                         .map_or_else(|| error.is_retryable(), http::is_retryable);
-                    if !self.visible && retryable && self.retries < http::max_retries() {
+                    let partial = stream.partial();
+                    let usage_received = partial.usage.input_tokens.is_some()
+                        || partial.usage.output_tokens.is_some();
+                    if !self.visible
+                        && !usage_received
+                        && retryable
+                        && self.retries < http::max_retries()
+                    {
                         let wait = error
                             .report()
                             .retry_after(SystemTime::now())

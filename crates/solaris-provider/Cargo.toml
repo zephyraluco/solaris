@@ -13,6 +13,7 @@ workspace = true
 solaris-types = { workspace = true }
 tempfile = "3"
 solaris-backend = { workspace = true }
+solaris-rig = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
