@@ -473,6 +473,10 @@ while !quit {
 
 ### 5.5 组件集、主题与终端
 
+Markdown 直接使用 crates.io 官方 `tui-markdown`，无本地副本、分支或 Cargo 补丁。通过公开的 `StyleSheet` 配置主题颜色，并隐藏标题的 `#` 前缀。无序列表、引用、代码围栏和分隔线使用官方默认标记（`-`、`>`、代码围栏、`---`）；不通过字符串替换修改正文。不启用代码语法高亮、代码块控件或独立查看器。
+
+通用布局层仅按终端宽度换行，保留样式、空格和完整字素簇，Tab 按四列制表位展开。显示行同时构建 `TextDocument`，供滚动、选择和复制使用，最终绘制不二次换行；不推断列表结构来重建悬挂缩进。助手回复、子代理报告和 Markdown 弹窗使用同一个渲染入口，继续沿用现有 Transcript 缓存。
+
 - 组件集（[`components`](../crates/solaris-tui/src/components)）：`Editor`、`SelectList`（带模糊过滤）、`Markdown` 渲染、`ScrollView`、`Collapsible`（折叠内容）、`Panel`、`Text`、`Spacer`、`Loader`、`Welcome`（欢迎框）以及 `fuzzy` 匹配。
 - 列表滚动（[`util::window_start`](../crates/solaris-tui/src/util.rs)）：三处会滚动的列表 —— 编辑器的 `/` 补全弹窗、`/model` 与 `/connect` 用的 [`InlineSelect`](../crates/solaris-tui/src/components/inline_select.rs)、Ctrl+K 面板与 `/theme` 用的 [`SelectList`](../crates/solaris-tui/src/components/select_list.rs) —— 共用这一个窗口函数，所以高亮不可能走出任何一处。差别只在「要不要记住窗口起点」：前两者每次都从高亮重算（`offset = 0`，往上走时窗口立刻跟回），`SelectList` 把上一次的起点传回来，所以窗口在回调路上会先停住。
 - 拖选（[`selection`](../crates/solaris-tui/src/selection.rs)）：`Selection` 记锚点 / 焦点、按 `selection_bg` / `selection_fg` 给单元格上色、抽取文本；`Tui::selection()` 把句柄交给应用层。
