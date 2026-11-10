@@ -765,6 +765,9 @@ succeed before replacing history, preserving the original task and constraints
 without publishing a partial compaction after failure.
 
 `AccountingBackend` journals each request's usage before forwarding its completion.
+Child requests write to the parent ledger before forwarding their completion, so
+parent failure or cancellation cannot discard already consumed usage. Absorbing
+a child report updates turn totals without charging the ledger again.
 Model and child charges are separate from context annotations. Billing restore
 supports legacy cumulative completions and manual summary charges without counting
 new request records twice. Successful task completion remains a cumulative API

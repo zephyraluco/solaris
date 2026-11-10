@@ -332,11 +332,6 @@ impl Runner {
             let results = results
                 .into_iter()
                 .map(|outcome| {
-                    self.conversation.record_billing(
-                        outcome.usage,
-                        outcome.cost_usd,
-                        crate::UsageKind::Child,
-                    );
                     total = total.merge(outcome.usage);
                     cost_usd += outcome.cost_usd;
                     Content::ToolResult {
@@ -442,11 +437,6 @@ impl Runner {
         let Completion {
             task_id, result, ..
         } = completion;
-        self.conversation.record_billing(
-            result.totals.usage,
-            result.totals.cost_usd,
-            crate::UsageKind::Child,
-        );
         *total = total.merge(result.totals.usage);
         *cost_usd += result.totals.cost_usd;
         // A launch was already answered. A plain data notification preserves

@@ -619,6 +619,7 @@ impl Agent {
                 Arc::new(SubagentRunner {
                     choice: self.choice.clone(),
                     parent: self.journal(),
+                    billing: Arc::clone(&self.conversation),
                     registry: Arc::clone(&self.registry),
                     options: turn_options.clone(),
                     resources: resources.clone(),
