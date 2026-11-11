@@ -2,6 +2,7 @@
 name = "solaris-agent"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.97.1"
 license.workspace = true
 description = "The agent session for solaris: tools declared to a model and run for it"
 
@@ -9,6 +10,8 @@ description = "The agent session for solaris: tools declared to a model and run 
 workspace = true
 
 [dependencies]
+rig-agent.workspace = true
+rig-core.workspace = true
 solaris-backend = { workspace = true }
 solaris-tools = { workspace = true }
 async-trait = { workspace = true }

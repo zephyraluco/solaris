@@ -222,9 +222,11 @@ impl Runner {
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
 
+        let mut execution = crate::execution::Execution::new("session task");
+        let mut pending_reply: Option<RoundReply> = None;
         loop {
             if let Some(error) = self.conversation.error() {
-                let _ = tx.send(AgentEvent::Error(error));
+                self.give_up(error, &tx);
                 return;
             }
             if self.cancel.is_cancelled() {
@@ -234,120 +236,127 @@ impl Runner {
             if tx.is_closed() {
                 return;
             }
-
-            self.absorb_background(&mut total, &mut cost_usd);
-            self.absorb_steering(&tx);
-            self.emit_context(&tx);
-            self.compact(false, &tx, &mut total, &mut cost_usd).await;
-
-            // One round, with one chance to recover from a window that turned out
-            // to be full: the conversation is summarized and the same round asked
-            // again, which is the difference between an error the user can do
-            // nothing about and a turn that finishes.
-            let mut recovered = false;
-            let reply = loop {
-                match self.ask(&tx, &mut total).await {
-                    Round::Answered(reply) => break reply,
-                    Round::Failed => {
-                        self.conversation.repair();
-                        return;
-                    }
-                    Round::Overflow(message) => {
-                        if recovered || !self.compaction.enabled {
-                            self.give_up(message, &tx);
-                            return;
-                        }
-                        recovered = true;
-                        if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
-                            self.give_up(message, &tx);
-                            return;
-                        }
-                    }
-                }
-            };
-
-            cost_usd += reply.cost_usd;
-
-            if reply.calls.is_empty() {
-                // The answer belongs to the conversation as much as the question
-                // does: without it the next turn would read every prompt the user
-                // ever sent with nothing in between.
-                self.record_reply(&reply.text, reply.usage);
-                self.emit_context(&tx);
-
-                if self.absorb_background(&mut total, &mut cost_usd) {
-                    continue;
-                }
-
-                // A message that arrived while the model was answering is a
-                // reason to keep going rather than to finish.
-                if self.absorb_steering(&tx) {
-                    continue;
-                }
-                // Do not end the stream (or poll the model) while a child still
-                // owes a report. Other work ran normally up to this point.
-                if !self.background.is_empty() {
-                    if !self
-                        .wait_for_background(&tx, &mut total, &mut cost_usd)
-                        .await
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                if self.take_follow_ups(&tx) {
-                    continue;
-                }
-                if let Some(error) = self.conversation.error() {
-                    let _ = tx.send(AgentEvent::Error(error));
+            let step = match execution.next() {
+                Ok(step) => step,
+                Err(error) => {
+                    self.give_up(error.to_string(), &tx);
                     return;
                 }
-                let _ = tx.send(AgentEvent::TurnComplete {
-                    usage: total,
-                    cost_usd,
-                });
-                return;
-            }
-
-            let mut message =
-                Message::with_content(Role::Assistant, assistant_blocks(reply.text, &reply.calls));
-            self.request_header().annotate(&mut message, reply.usage);
-            self.conversation.push(message);
-            self.emit_context(&tx);
-
-            // A message the model stopped writing early may carry half-written
-            // calls, so none of them run: it is told to ask again with whole
-            // arguments rather than have a guess acted on.
-            let results = if reply.truncated {
-                self.refuse_calls(&reply.calls, &tx)
-            } else {
-                self.run_round(&reply.calls, &tx).await
             };
-            let Some(results) = results else {
-                // The caller stopped listening mid-round; take back the request
-                // whose answers never arrived so the conversation stays valid.
-                self.conversation.repair();
-                return;
-            };
-            let results = results
-                .into_iter()
-                .map(|outcome| {
-                    total = total.merge(outcome.usage);
-                    cost_usd += outcome.cost_usd;
-                    Content::ToolResult {
-                        result: outcome.result,
+            match step {
+                crate::execution::Step::Model => {
+                    self.absorb_background(&mut total, &mut cost_usd);
+                    self.absorb_steering(&tx);
+                    self.emit_context(&tx);
+                    self.compact(false, &tx, &mut total, &mut cost_usd).await;
+                    let mut recovered = false;
+                    let reply = loop {
+                        match self.ask(&tx, &mut total).await {
+                            Round::Answered(reply) => break reply,
+                            Round::Failed => {
+                                self.conversation.repair();
+                                return;
+                            }
+                            Round::Overflow(message) => {
+                                if recovered || !self.compaction.enabled {
+                                    self.give_up(message, &tx);
+                                    return;
+                                }
+                                recovered = true;
+                                if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
+                                    self.give_up(message, &tx);
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    cost_usd += reply.cost_usd;
+                    if let Err(error) = execution.accept(&reply.text, &reply.calls) {
+                        self.give_up(error.to_string(), &tx);
+                        return;
                     }
-                })
-                .collect();
-            self.conversation
-                .push(Message::with_content(Role::User, results));
-            self.emit_context(&tx);
-
-            // A stop during the round ends the turn here: asking the model again
-            // would only queue work for nobody.
-            if self.cancel.is_cancelled() {
-                self.give_up("the turn was cancelled".to_string(), &tx);
-                return;
+                    pending_reply = Some(reply);
+                }
+                crate::execution::Step::Tools(calls) => {
+                    let Some(reply) = pending_reply.take() else {
+                        self.give_up("missing accepted model response".into(), &tx);
+                        return;
+                    };
+                    let mut message = Message::with_content(
+                        Role::Assistant,
+                        assistant_blocks(reply.text, &calls),
+                    );
+                    self.request_header().annotate(&mut message, reply.usage);
+                    self.conversation.push(message);
+                    self.emit_context(&tx);
+                    // Output truncation is a host safety rule: even valid-looking
+                    // tool arguments must not run when the response was cut off.
+                    let results = if reply.truncated {
+                        self.refuse_calls(&calls, &tx)
+                    } else {
+                        self.run_round(&calls, &tx).await
+                    };
+                    let Some(results) = results else {
+                        self.conversation.repair();
+                        return;
+                    };
+                    let answers: Vec<_> = results
+                        .iter()
+                        .map(|outcome| outcome.result.clone())
+                        .collect();
+                    if let Err(error) = execution.answer(&answers) {
+                        self.give_up(error.to_string(), &tx);
+                        return;
+                    }
+                    let results = results
+                        .into_iter()
+                        .map(|outcome| {
+                            total = total.merge(outcome.usage);
+                            cost_usd += outcome.cost_usd;
+                            Content::ToolResult {
+                                result: outcome.result,
+                            }
+                        })
+                        .collect();
+                    self.conversation
+                        .push(Message::with_content(Role::User, results));
+                    self.emit_context(&tx);
+                }
+                crate::execution::Step::Done => {
+                    let Some(reply) = pending_reply.take() else {
+                        self.give_up("missing final model response".into(), &tx);
+                        return;
+                    };
+                    self.record_reply(&reply.text, reply.usage);
+                    self.emit_context(&tx);
+                    let mut resume = self.absorb_background(&mut total, &mut cost_usd);
+                    resume |= self.absorb_steering(&tx);
+                    if !resume && !self.background.is_empty() {
+                        if !self
+                            .wait_for_background(&tx, &mut total, &mut cost_usd)
+                            .await
+                        {
+                            return;
+                        }
+                        resume = true;
+                    }
+                    if !resume {
+                        resume = self.take_follow_ups(&tx);
+                    }
+                    if resume {
+                        execution = crate::execution::Execution::new("continue session");
+                        continue;
+                    }
+                    if let Some(error) = self.conversation.error() {
+                        let _ = tx.send(AgentEvent::Error(error));
+                        return;
+                    }
+                    let _ = tx.send(AgentEvent::TurnComplete {
+                        usage: total,
+                        cost_usd,
+                    });
+                    return;
+                }
             }
         }
     }

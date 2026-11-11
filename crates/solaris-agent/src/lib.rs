@@ -25,6 +25,7 @@ mod billing;
 pub use billing::{UsageKind, UsageTotals};
 mod compaction;
 mod conversation;
+mod execution;
 mod input;
 mod mode;
 mod overflow;
