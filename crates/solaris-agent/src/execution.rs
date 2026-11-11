@@ -54,6 +54,22 @@ impl Execution {
         }
     }
 
+    /// Drop the SDK's ephemeral history after host compaction, at an already
+    /// opened model boundary. Accounting ceilings remain in the shared budget.
+    pub fn rebase(&mut self) -> Result<(), BackendError> {
+        if !self.pending.is_empty() {
+            return Err(BackendError::new(
+                "cannot replace context with unanswered tool calls",
+            ));
+        }
+        let mut fresh = Self::new("compacted session");
+        if !matches!(fresh.next()?, Step::Model) {
+            return Err(BackendError::new("could not prepare compacted execution"));
+        }
+        *self = fresh;
+        Ok(())
+    }
+
     pub fn accept(&mut self, text: &str, calls: &[ToolCall]) -> Result<(), BackendError> {
         let mut content = Vec::new();
         if !text.is_empty() {
@@ -145,6 +161,28 @@ mod tests {
         run.accept("done", &[]).unwrap();
         assert!(matches!(run.next().unwrap(), Step::Done));
     }
+    #[test]
+    fn compaction_discards_working_history_after_tools_are_answered() {
+        let mut run = Execution::new("read");
+        run.next().unwrap();
+        let call = ToolCall::new("1", "read", json!({"path":"a"}));
+        run.accept("", std::slice::from_ref(&call)).unwrap();
+        run.next().unwrap();
+        assert!(run.rebase().is_err());
+        run.answer(&[ToolResult::ok(&call, "large tool output")])
+            .unwrap();
+        run.next().unwrap();
+        run.rebase().unwrap();
+        assert!(
+            run.run
+                .full_history()
+                .iter()
+                .all(|message| !format!("{message:?}").contains("large tool output"))
+        );
+        run.accept("summary-based answer", &[]).unwrap();
+        assert!(matches!(run.next().unwrap(), Step::Done));
+    }
+
     #[test]
     fn malformed_arguments_cannot_be_answered_as_success() {
         let mut run = Execution::new("read");

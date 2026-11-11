@@ -1,4 +1,4 @@
-//! Protocol selection shared with provider configuration. Execution belongs to solaris-rig.
+//! Protocol selection shared with provider configuration. Execution is private to the backend.
 
 /// The wire protocol an endpoint speaks.
 ///

@@ -217,12 +217,12 @@ impl Runner {
         // that is cancelled or fails still leaves what the user actually said.
         // It also settles the one ordering that matters here: anything steered in
         // afterwards is read *after* the words it answers.
+        let mut execution = crate::execution::Execution::new(&prompt);
         self.conversation.push(Message::user(prompt));
 
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
 
-        let mut execution = crate::execution::Execution::new("session task");
         let mut pending_reply: Option<RoundReply> = None;
         loop {
             if let Some(error) = self.conversation.error() {
@@ -248,7 +248,12 @@ impl Runner {
                     self.absorb_background(&mut total, &mut cost_usd);
                     self.absorb_steering(&tx);
                     self.emit_context(&tx);
-                    self.compact(false, &tx, &mut total, &mut cost_usd).await;
+                    if self.compact(false, &tx, &mut total, &mut cost_usd).await
+                        && let Err(error) = execution.rebase()
+                    {
+                        self.give_up(error.to_string(), &tx);
+                        return;
+                    }
                     let mut recovered = false;
                     let reply = loop {
                         match self.ask(&tx, &mut total).await {
@@ -265,6 +270,10 @@ impl Runner {
                                 recovered = true;
                                 if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
                                     self.give_up(message, &tx);
+                                    return;
+                                }
+                                if let Err(error) = execution.rebase() {
+                                    self.give_up(error.to_string(), &tx);
                                     return;
                                 }
                             }
@@ -701,6 +710,13 @@ impl Runner {
 
     /// Run one call, or explain why it did not run.
     async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
+        // The SDK classifies non-object arguments as malformed. Reject them
+        // before schema validation: an extension may advertise a permissive
+        // schema, but malformed model arguments must never reach side effects.
+        if !call.input.is_object() {
+            return ToolResult::error(call, "invalid tool arguments: expected a JSON object")
+                .into();
+        }
         if let Err(error) = self.budget.check() {
             return ToolResult::error(call, error).into();
         }
@@ -1810,6 +1826,43 @@ mod tests {
             panic!("a cut-short stream must not read as a finished turn: {events:?}");
         };
         assert!(message.contains("without completing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_never_run_a_tool_with_a_permissive_schema() {
+        struct Permissive(AtomicUsize);
+        #[async_trait]
+        impl Tool for Permissive {
+            fn name(&self) -> &str {
+                "permissive"
+            }
+            fn description(&self) -> &str {
+                "Any schema"
+            }
+            fn parameters(&self) -> Value {
+                json!({})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ToolOutput::ok("side effect")
+            }
+        }
+        let tool = Arc::new(Permissive(AtomicUsize::new(0)));
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(ToolCall::new(
+                "bad",
+                "permissive",
+                json!("incomplete"),
+            ))]),
+            round(vec![AgentEvent::TextDelta("corrected".into())]),
+        ]);
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+        assert_eq!(tool.0.load(Ordering::SeqCst), 0);
+        assert!(results_seen(&inner)[0].is_error);
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
     }
 
     #[tokio::test]
