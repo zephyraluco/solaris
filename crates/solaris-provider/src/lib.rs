@@ -12,6 +12,7 @@
 //! and another.
 
 pub mod choose;
+mod credentials;
 pub mod oauth;
 pub mod providers;
 mod refreshing;

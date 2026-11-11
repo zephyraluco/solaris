@@ -9,6 +9,8 @@ description = "Provider catalogue, credentials and platform resolution for solar
 workspace = true
 
 [dependencies]
+rig-core.workspace = true
+rig-reqwest = { version = "0.46.0", default-features = false, features = ["rustls"] }
 solaris-types = { workspace = true }
 tempfile = "3"
 solaris-backend = { workspace = true }
@@ -24,6 +26,7 @@ getrandom = "0.3"
 url = "2"
 
 [dev-dependencies]
+rig-core = { workspace = true, features = ["test-utils"] }
 futures = { workspace = true }
 # The resolution tests drive the async entry point.
 tokio = { workspace = true }

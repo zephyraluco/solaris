@@ -25,6 +25,8 @@ pub enum OAuthError {
     Random,
     #[error("OpenAI login timed out; run /connect to retry")]
     Timeout,
+    #[error("OpenAI authorization expired; run /connect again")]
+    SignInRequired,
     #[error("OpenAI authorization was denied or returned no code")]
     Denied,
     #[error("OpenAI token request failed; check your network and run /connect again")]
@@ -206,21 +208,7 @@ pub fn needs_refresh(credential: &Credential) -> bool {
 
 /// Exchange only with OpenAI's fixed issuer; never a configurable API endpoint.
 pub async fn refresh(credential: &Credential) -> Result<Credential, OAuthError> {
-    let Credential::ChatGpt {
-        refresh_token,
-        id_token,
-        account_id,
-        ..
-    } = credential
-    else {
-        return Err(OAuthError::InvalidTokens);
-    };
-    let response = token_request(&[
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-    ])
-    .await?;
-    response.credential(Some((refresh_token, id_token, account_id)))
+    crate::credentials::refresh(credential).await
 }
 
 #[derive(Deserialize)]
@@ -264,10 +252,6 @@ fn account_id(jwt: &str) -> Option<String> {
     claims["https://api.openai.com/auth"]["chatgpt_account_id"]
         .as_str()
         .map(str::to_string)
-}
-
-async fn token_request(fields: &[(&str, &str)]) -> Result<Tokens, OAuthError> {
-    token_request_at(TOKEN_URL, fields).await
 }
 
 async fn token_request_at(endpoint: &str, fields: &[(&str, &str)]) -> Result<Tokens, OAuthError> {

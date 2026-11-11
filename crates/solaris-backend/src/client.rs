@@ -434,16 +434,14 @@ fn parse_codex_models(body: &str) -> Option<Vec<String>> {
 /// An empty `data` array is a list: the provider answered, and its answer is
 /// that this credential can reach no models.
 fn parse_models(body: &str) -> Option<Vec<String>> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let entries = value["data"].as_array()?;
-
-    Some(
-        entries
-            .iter()
-            .filter_map(|entry| entry["id"].as_str())
-            .map(str::to_owned)
-            .collect(),
-    )
+    // Require the envelope: the SDK's permissive default would otherwise
+    // turn gateway errors wrapped in HTTP 200 into an empty model picker.
+    #[derive(serde::Deserialize)]
+    struct ModelList {
+        data: Vec<rig_core::providers::openai::wire::ModelEntry>,
+    }
+    let reply: ModelList = serde_json::from_str(body).ok()?;
+    Some(reply.data.into_iter().map(|entry| entry.id).collect())
 }
 
 /// Characters of prompt and history, for the estimate fallback.
