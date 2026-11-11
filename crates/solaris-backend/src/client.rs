@@ -1,23 +1,19 @@
-//! The HTTP client every platform is reached through.
-
-use std::collections::VecDeque;
+//! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
+use crate::{
+    AgentBackend, AgentEvent, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage,
+    Wire,
+};
+use crate::{convert, http, transport::SolarisTransport};
+use futures::StreamExt;
+use rig_core::completion::{CompletionRequest, FinishReason};
+use rig_core::driver::{DynModel, Model};
+use rig_core::message::AssistantContent;
+use rig_core::operation::Completion;
+use rig_core::streaming::{Item, StreamEvent, Streamed};
+use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::BoxStream;
-use reqwest::{Response, StatusCode};
-use serde_json::Value;
-
-use crate::{AgentEvent, BackendError, Price, TurnRequest, Usage};
-
-use crate::http;
-use crate::protocols::anthropic;
-use crate::protocols::openai::{self, Repair};
-use crate::sse::{SseDecoder, SseEvent};
-use crate::wire::{self, Wire, WireStream};
-use crate::{AgentBackend, AgentEventStream};
 
 // This is the Codex catalog protocol version, not Solaris's package version.
 // The service gates models by client version; 0.1.0 returns an empty catalog.
@@ -111,7 +107,7 @@ pub struct TurnPlan {
 
 /// Streams one turn from an HTTP endpoint, over whichever wire it speaks.
 #[derive(Clone)]
-pub struct HttpBackend {
+pub struct Backend {
     client: reqwest::Client,
     endpoint: Endpoint,
     model: String,
@@ -123,7 +119,7 @@ pub struct HttpBackend {
     capabilities: crate::ModelCapabilities,
 }
 
-impl HttpBackend {
+impl Backend {
     /// A backend for `plan`.
     pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
         Ok(Self {
@@ -204,13 +200,13 @@ impl HttpBackend {
             request
         };
         let request = match self.endpoint.wire {
-            Wire::AnthropicMessages => request.header("anthropic-version", anthropic::API_VERSION),
+            Wire::AnthropicMessages => request.header("anthropic-version", "2023-06-01"),
             Wire::OpenAiChat | Wire::OpenAiResponses => request,
         };
 
         let request = match &self.endpoint.secret {
             Some(secret) if self.endpoint.wire.is_openai() => request.bearer_auth(secret),
-            Some(secret) => request.header(anthropic::API_KEY_HEADER, secret),
+            Some(secret) => request.header("x-api-key", secret),
             None => request,
         };
 
@@ -221,14 +217,6 @@ impl HttpBackend {
             Some(header) => request.header(header, session_id()),
             None => request,
         }
-    }
-
-    /// Post one request, authenticating the way `wire` wants.
-    async fn send(&self, url: &str, body: &Value) -> Result<Response, reqwest::Error> {
-        self.authorize(self.client.post(url).json(body))
-            .header("accept", "text/event-stream")
-            .send()
-            .await
     }
 
     /// A status line for an attempt that is about to be retried.
@@ -264,127 +252,90 @@ impl HttpBackend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for HttpBackend {
+impl AgentBackend for Backend {
     fn capabilities(&self) -> crate::ModelCapabilities {
         self.capabilities.clone()
     }
+    fn label(&self) -> &str {
+        self.endpoint.label
+    }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        if self.capabilities.image_input != crate::Support::Supported
-            && request
-                .history
-                .iter()
-                .any(|message| message.images().next().is_some())
-        {
-            return Err(BackendError::new(
-                "image input is not confirmed for this model; configure models.json or choose a vision model",
-            ));
-        }
-        if self.capabilities.tool_calling == crate::Support::Unsupported
-            && !request.tools.is_empty()
-        {
+        if self.capabilities.tool_calling == Support::Unsupported && !request.tools.is_empty() {
             return Err(BackendError::new(
                 "this model does not support tool calling; choose another model or disable tools",
             ));
         }
-        if let Some((_, expires_at)) = &self.chatgpt {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |t| t.as_secs());
-            if *expires_at <= now {
-                return Err(BackendError::new(
-                    "OpenAI authorization expired — run /connect again",
-                ));
-            }
+        if self.capabilities.image_input == Support::Unsupported
+            && request.history.iter().any(|message| {
+                message.content.iter().any(|part| match part {
+                    crate::Content::Image { .. } => true,
+                    crate::Content::ToolResult { result } => !result.metadata.images.is_empty(),
+                    _ => false,
+                })
+            })
+        {
+            return Err(BackendError::new("this model does not support image input"));
         }
-        let url = self.endpoint.url();
-        let mut body = wire::request_body(
-            self.endpoint.wire,
-            &request,
-            &self.model,
-            self.max_tokens,
-            self.prompt_cache_key,
-        );
-        apply_capabilities(&mut body, &self.capabilities);
-        let mut repaired: Vec<Repair> = Vec::new();
-        if self.chatgpt.is_some() {
-            body.as_object_mut()
-                .map(|body| body.remove("max_output_tokens"));
-            if body.get("instructions").is_none() {
-                body["instructions"] = Value::String(String::new());
-            }
+        if let Some((_, expires)) = &self.chatgpt
+            && *expires
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |time| time.as_secs())
+        {
+            return Err(BackendError::new(
+                "OpenAI authorization expired — run /connect again",
+            ));
         }
-        let mut pending: VecDeque<AgentEvent> = VecDeque::new();
-        let mut attempt = 0usize;
-
-        let response = loop {
-            match self.send(&url, &body).await {
-                Ok(response) if response.status().is_success() => break response,
-                Ok(response) => {
-                    let status = response.status();
-                    let retry_after = response.headers().clone();
-                    let text = describe_body(response).await;
-
-                    // A compatible server that names the field it dislikes is
-                    // cheaper to obey than to guess about up front.
-                    if status == StatusCode::BAD_REQUEST
-                        && self.endpoint.wire == Wire::OpenAiChat
-                        && let Some(repair) = openai::repair_for(&text)
-                        && !repaired.contains(&repair)
-                    {
-                        openai::apply(&mut body, repair);
-                        repaired.push(repair);
-                        continue;
-                    }
-
-                    if http::is_retryable(status) && attempt < http::max_retries() {
-                        let wait = http::backoff(attempt, Some(&retry_after));
-                        // Nothing has been streamed yet, so a retry cannot
-                        // duplicate anything the user has already read.
-                        pending.push_back(self.retrying(wait));
-                        attempt += 1;
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
-
-                    return Err(BackendError::new(http::describe(
-                        status,
-                        &text,
-                        self.endpoint.name,
-                        self.endpoint.env_keys,
-                    )));
-                }
-                Err(error) if http::is_transient(&error) && attempt < http::max_retries() => {
-                    let wait = http::backoff(attempt, None);
-                    pending.push_back(self.retrying(wait));
-                    attempt += 1;
-                    tokio::time::sleep(wait).await;
-                }
-                Err(error) => return Err(self.unreachable(&error)),
-            }
-        };
-
-        let engine = StreamEngine {
-            stream: Box::pin(response.bytes_stream()),
-            decoder: SseDecoder::new(),
-            parser: WireStream::new(self.endpoint.wire),
-            pending,
+        let mut converted = convert::request(&request, self.max_tokens)?;
+        let mut params = serde_json::Map::new();
+        if self.endpoint.wire == Wire::OpenAiResponses {
+            params.insert("store".into(), Value::Bool(false));
+        }
+        if let Some(key) = self.prompt_cache_key
+            && self.capabilities.prompt_caching != Support::Unsupported
+        {
+            params.insert("prompt_cache_key".into(), Value::String(key.into()));
+        }
+        if !params.is_empty() {
+            converted = converted.additional_params(Value::Object(params));
+        }
+        let model = self.completion_model(&[])?;
+        let stream = model
+            .stream(converted.clone())
+            .map_err(|error| self.provider_error(&error))?;
+        let mut engine = Engine {
+            backend: self.clone(),
+            model,
+            request: converted,
+            stream: Some(stream),
+            pending: VecDeque::new(),
+            retries: 0,
+            visible: false,
+            done: false,
             input_characters: request_characters(&request),
             output_characters: 0,
-            price: self.price,
-            price_tiers: self.price_tiers.clone(),
-            done: false,
+            parts: HashMap::new(),
+            repairs: Vec::new(),
         };
-
+        let mut opening = VecDeque::new();
+        loop {
+            match engine.next().await {
+                Some(AgentEvent::Error(error)) => return Err(BackendError::new(error)),
+                Some(event @ AgentEvent::Status(_)) => opening.push_back(event),
+                Some(event) => {
+                    opening.push_back(event);
+                    break;
+                }
+                None => return Err(BackendError::new("provider returned no completion")),
+            }
+        }
+        opening.append(&mut engine.pending);
+        engine.pending = opening;
         Ok(Box::pin(futures::stream::unfold(
             engine,
-            |mut engine| async move { engine.next_event().await.map(|event| (event, engine)) },
+            |mut engine| async move { engine.next().await.map(|event| (event, engine)) },
         )))
     }
-
-    fn label(&self) -> &str {
-        self.endpoint.label
-    }
-
     /// Ask the provider which models it offers.
     ///
     /// One attempt, no retries: this feeds a picker, so a slow or unreachable
@@ -438,7 +389,6 @@ impl AgentBackend for HttpBackend {
         Ok(models)
     }
 }
-
 fn parse_codex_models(body: &str) -> Option<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct Catalog {
@@ -496,14 +446,6 @@ fn parse_models(body: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Read a failed response's body for the provider's own explanation.
-async fn describe_body(response: Response) -> String {
-    match response.bytes().await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
 /// Characters of prompt and history, for the estimate fallback.
 fn request_characters(request: &TurnRequest) -> usize {
     request.prompt.chars().count()
@@ -514,22 +456,126 @@ fn request_characters(request: &TurnRequest) -> usize {
             .sum::<usize>()
 }
 
-/// Drives one response body: bytes in, [`AgentEvent`]s out.
-struct StreamEngine {
-    stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    decoder: SseDecoder,
-    parser: WireStream,
-    pending: VecDeque<AgentEvent>,
-    input_characters: usize,
-    output_characters: usize,
-    price: Option<Price>,
-    price_tiers: Vec<crate::PriceTier>,
-    done: bool,
+impl Backend {
+    fn completion_model(
+        &self,
+        repairs: &[crate::policy::Repair],
+    ) -> Result<DynModel<Completion>, BackendError> {
+        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
+        use rig_core::providers::registry::ProviderId;
+        use rig_core::providers::{
+            anthropic::AnthropicConfig,
+            openai::{OpenAIConfig, wire},
+        };
+        let transport = SolarisTransport::new(
+            self.client.clone(),
+            self.endpoint.url(),
+            self.endpoint.session_header,
+            session_id(),
+            self.capabilities.clone(),
+            repairs.to_vec(),
+        );
+        // Bind Solaris metadata under a declared identity so every Rig dialect
+        // consults the supplied facts, including aliased gateway model names.
+        let id =
+            ProviderId::declare("solaris").map_err(|error| BackendError::new(error.to_string()))?;
+        let mut spec = ModelSpec::new(id, &self.model)
+            .with_tools(self.capabilities.tool_calling != Support::Unsupported);
+        spec.input.image = self.capabilities.image_input != Support::Unsupported;
+        spec.context_window = self.capabilities.context_window;
+        spec.max_input_tokens = self.capabilities.max_input;
+        spec.max_output_tokens = self.capabilities.max_output;
+        let facts = ModelFacts::new(spec).with_catalog(&Catalog::default());
+        let key = self.endpoint.secret.clone().unwrap_or_default();
+        let model = match self.endpoint.wire {
+            Wire::AnthropicMessages => {
+                let config = AnthropicConfig::new(key).with_base_url(&self.endpoint.base_url);
+                let mut wire = config.completion(&self.model).with_facts(facts);
+                if self.capabilities.prompt_caching != Support::Unsupported {
+                    wire = wire.with_prompt_caching();
+                }
+                Model::new(wire, transport)
+                    .with_idle_timeout(Some(http::IDLE_TIMEOUT))
+                    .erase()
+            }
+            wire_kind => {
+                let dialect = if self.chatgpt.is_some() {
+                    &rig_core::providers::chatgpt::DIALECT
+                } else {
+                    wire::by_name(self.endpoint.label).unwrap_or(&wire::OPENAI)
+                };
+                let mut config =
+                    OpenAIConfig::with_key(dialect, key).with_base_url(&self.endpoint.base_url);
+                config.instructions = None;
+                if self.endpoint.secret.is_none() {
+                    config.auth = wire::Auth::OptionalBearer;
+                }
+                if let Some((account, _)) = &self.chatgpt {
+                    config.account_id = Some(account.clone());
+                    config.identity = Some(wire::CallerIdentity {
+                        originator: "solaris".into(),
+                        user_agent: concat!("solaris/", env!("CARGO_PKG_VERSION")).into(),
+                    });
+                }
+                if wire_kind == Wire::OpenAiChat {
+                    Model::new(config.chat(&self.model).with_facts(facts), transport)
+                        .with_idle_timeout(Some(http::IDLE_TIMEOUT))
+                        .erase()
+                } else {
+                    let mut wire =
+                        rig_core::providers::openai::responses_api::wire::Responses::new(
+                            config,
+                            &self.model,
+                        )
+                        .with_facts(facts);
+                    wire.strict_tools = false;
+                    Model::new(wire, transport)
+                        .with_idle_timeout(Some(http::IDLE_TIMEOUT))
+                        .erase()
+                }
+            }
+        };
+        Ok(model)
+    }
+    fn provider_error(&self, error: &rig_core::error::ProviderError) -> BackendError {
+        let report = error.report();
+        let text = if let Some(status) = report
+            .http_status
+            .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+        {
+            http::describe(
+                status,
+                error.provider_response_body().unwrap_or(&report.message),
+                self.endpoint.name,
+                self.endpoint.env_keys,
+            )
+        } else {
+            format!("could not reach {}: {}", self.endpoint.name, report.message)
+        };
+        if error.report().is_context_overflow() {
+            BackendError::new(format!("context length exceeded: {text}"))
+        } else {
+            BackendError::new(text)
+        }
+    }
 }
 
-impl StreamEngine {
-    /// The next event, pulling chunks until one is ready or the turn ends.
-    async fn next_event(&mut self) -> Option<AgentEvent> {
+struct Engine {
+    backend: Backend,
+    model: DynModel<Completion>,
+    request: CompletionRequest,
+    stream: Option<Streamed<Completion>>,
+    pending: VecDeque<AgentEvent>,
+    retries: usize,
+    visible: bool,
+    done: bool,
+    input_characters: usize,
+    output_characters: usize,
+    parts: HashMap<rig_core::streaming::Part, String>,
+    repairs: Vec<crate::policy::Repair>,
+}
+impl Engine {
+    async fn next(&mut self) -> Option<AgentEvent> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
@@ -537,584 +583,202 @@ impl StreamEngine {
             if self.done {
                 return None;
             }
-
-            match tokio::time::timeout(http::IDLE_TIMEOUT, self.stream.next()).await {
-                Ok(Some(Ok(chunk))) => self.ingest(&chunk),
-                Ok(Some(Err(error))) => {
-                    self.fail(format!(
-                        "the response was cut short: {}",
-                        http::root_cause(&error)
-                    ));
-                }
-                Ok(None) => {
-                    let mut tail = Vec::new();
-                    self.decoder.finish(&mut tail);
-                    for event in &tail {
-                        self.parse(event);
+            let stream = self.stream.as_mut()?;
+            match stream.next().await {
+                Some(Ok(Item::Event(event))) => {
+                    // Opening or growing a tool part is provider output too,
+                    // even before Solaris can publish a complete tool call.
+                    self.visible = true;
+                    let event = match event {
+                        StreamEvent::Text { part, text } => {
+                            self.parts.entry(part).or_default().push_str(&text);
+                            self.output_characters += text.chars().count();
+                            Some(AgentEvent::TextDelta(text))
+                        }
+                        StreamEvent::Reasoning { part, text } => {
+                            self.parts.entry(part).or_default().push_str(&text);
+                            Some(AgentEvent::ThinkingDelta(text))
+                        }
+                        StreamEvent::End {
+                            part,
+                            content: AssistantContent::Text(text),
+                        } => {
+                            let previous = self.parts.remove(&part).unwrap_or_default();
+                            match final_suffix(&previous, &text.text) {
+                                Ok(Some(text)) => {
+                                    self.output_characters += text.chars().count();
+                                    Some(AgentEvent::TextDelta(text))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    self.done = true;
+                                    Some(AgentEvent::Error(error.to_string()))
+                                }
+                            }
+                        }
+                        StreamEvent::End {
+                            part,
+                            content: AssistantContent::Reasoning(reasoning),
+                        } => {
+                            let previous = self.parts.remove(&part).unwrap_or_default();
+                            match final_suffix(&previous, &reasoning.text) {
+                                Ok(Some(text)) => Some(AgentEvent::ThinkingDelta(text)),
+                                Ok(None) => None,
+                                Err(error) => {
+                                    self.done = true;
+                                    Some(AgentEvent::Error(error.to_string()))
+                                }
+                            }
+                        }
+                        StreamEvent::End {
+                            content: AssistantContent::ToolCall(call),
+                            ..
+                        } => {
+                            let arguments = if let Some(invalid) = &call.function.invalid_arguments
+                            {
+                                Value::String(invalid.clone())
+                            } else {
+                                call.function.arguments_value()
+                            };
+                            Some(AgentEvent::ToolCall(crate::ToolCall::new(
+                                call.id.wire().into_owned(),
+                                call.function.name.as_str(),
+                                arguments,
+                            )))
+                        }
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        self.visible = true;
+                        return Some(event);
                     }
-                    self.finish();
                 }
-                Err(_) => self.fail(format!(
-                    "the provider stopped sending for {}s",
-                    http::IDLE_TIMEOUT.as_secs()
-                )),
-            }
-        }
-    }
-
-    /// Decode one chunk of body bytes.
-    fn ingest(&mut self, chunk: &[u8]) {
-        let mut events = Vec::new();
-        self.decoder.push(chunk, &mut events);
-
-        for event in &events {
-            if self.done {
-                return;
-            }
-            self.parse(event);
-        }
-
-        // A server that announced the end of the stream does not necessarily
-        // close the connection straight away.
-        if self.parser.finished() {
-            self.finish();
-        }
-    }
-
-    /// Hand one decoded frame to the wire parser.
-    fn parse(&mut self, event: &SseEvent) {
-        let mut produced = Vec::new();
-        self.parser.handle(event, &mut produced);
-        for event in produced {
-            self.push(event);
-        }
-    }
-
-    /// Queue an event, counting reply text for the estimate fallback.
-    fn push(&mut self, event: AgentEvent) {
-        if let AgentEvent::TextDelta(text) = &event {
-            self.output_characters += text.chars().count();
-        }
-        self.pending.push_back(event);
-    }
-
-    /// Queue a terminal error and stop reading.
-    fn fail(&mut self, message: String) {
-        self.done = true;
-        self.pending.push_back(AgentEvent::Error(message));
-    }
-
-    /// Emit the terminal event, exactly once.
-    fn finish(&mut self) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-
-        // A message the model stopped writing because it ran out of room may
-        // carry tool calls with half-written arguments, so the readers are told
-        // before the calls themselves go out.
-        if self.parser.truncated() {
-            self.pending.push_back(AgentEvent::OutputTruncated);
-        }
-
-        // A stream only knows a tool call is complete once it ends, so the
-        // calls go out here — before the terminal event, so the turn reads as
-        // text, then calls, then completion.
-        let mut calls = Vec::new();
-        self.parser.flush(&mut calls);
-        for event in calls {
-            self.push(event);
-        }
-
-        // A provider that reports nothing at all still gets a token count, so
-        // the footer gauge says something rather than nothing.
-        let usage = self
-            .parser
-            .usage()
-            .unwrap_or_else(|| Usage::estimate(self.input_characters, self.output_characters));
-        let cost_usd = self
-            .price
-            .map(|price| price.cost_with_tiers(&usage, &self.price_tiers))
-            .unwrap_or(0.0);
-
-        self.pending
-            .push_back(AgentEvent::TurnComplete { usage, cost_usd });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Message;
-
-    #[test]
-    fn each_wire_has_its_own_path() {
-        // The base carries the API version, so a wire appends only what is its
-        // own.
-        let endpoint = |wire| Endpoint {
-            wire,
-            session_header: None,
-            base_url: "https://example.test/v1/".to_string(),
-            secret: None,
-            name: "Test",
-            label: "Test",
-            env_keys: &[],
-        };
-
-        assert_eq!(
-            endpoint(Wire::AnthropicMessages).url(),
-            "https://example.test/v1/messages"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiChat).url(),
-            "https://example.test/v1/chat/completions"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiResponses).url(),
-            "https://example.test/v1/responses"
-        );
-
-        // The Messages API pages its list, so the largest page is asked for.
-        assert_eq!(
-            endpoint(Wire::AnthropicMessages).models_url(),
-            "https://example.test/v1/models?limit=1000"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiChat).models_url(),
-            "https://example.test/v1/models"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiResponses).models_url(),
-            "https://example.test/v1/models"
-        );
-    }
-
-    #[test]
-    fn one_gateway_root_serves_every_wire() {
-        // opencode's Go plan answers all three protocols beneath one root,
-        // `/zen/go/v1`, which is why the version lives in the base and each wire
-        // appends only the path that is its own.
-        let endpoint = |wire| Endpoint {
-            wire,
-            session_header: Some("x-opencode-session"),
-            base_url: "https://opencode.ai/zen/go/v1".to_string(),
-            secret: None,
-            name: "opencode go",
-            label: "opencode",
-            env_keys: &[],
-        };
-
-        assert_eq!(
-            endpoint(Wire::OpenAiChat).url(),
-            "https://opencode.ai/zen/go/v1/chat/completions"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiResponses).url(),
-            "https://opencode.ai/zen/go/v1/responses"
-        );
-        assert_eq!(
-            endpoint(Wire::AnthropicMessages).url(),
-            "https://opencode.ai/zen/go/v1/messages"
-        );
-        assert_eq!(
-            endpoint(Wire::OpenAiChat).models_url(),
-            "https://opencode.ai/zen/go/v1/models"
-        );
-    }
-
-    #[test]
-    fn a_platform_that_routes_by_conversation_is_told_which_one() {
-        let endpoint = Endpoint {
-            wire: Wire::OpenAiChat,
-            session_header: Some("x-opencode-session"),
-            base_url: "https://opencode.ai/zen/go/v1".to_string(),
-            secret: Some("sk-go".to_string()),
-            name: "opencode go",
-            label: "opencode",
-            env_keys: &[],
-        };
-        let backend = HttpBackend::new(TurnPlan {
-            endpoint,
-            model: "m".to_string(),
-            max_tokens: 1,
-            price: None,
-            prompt_cache_key: None,
-        })
-        .expect("a client");
-
-        let headers = backend
-            .authorize(
-                backend
-                    .client
-                    .post("https://opencode.ai/zen/go/v1/chat/completions"),
-            )
-            .build()
-            .expect("a request")
-            .headers()
-            .clone();
-
-        let session = headers
-            .get("x-opencode-session")
-            .expect("a session id")
-            .to_str()
-            .expect("an ascii id");
-        assert!(session.starts_with("solaris-"), "{session}");
-        // Stable for the run, so the gateway can group a conversation.
-        assert_eq!(session, session_id());
-        // And the key still goes where the gateway asked for it.
-        assert_eq!(headers.get("authorization").expect("a key"), "Bearer sk-go");
-    }
-
-    #[test]
-    fn a_key_travels_the_way_its_wire_asks_for_it() {
-        let headers = |wire| {
-            let backend = HttpBackend::new(TurnPlan {
-                endpoint: Endpoint {
-                    wire,
-                    session_header: None,
-                    base_url: "https://example.test/v1".to_string(),
-                    secret: Some("sk-1".to_string()),
-                    name: "Test",
-                    label: "Test",
-                    env_keys: &[],
-                },
-                model: "m".to_string(),
-                max_tokens: 1,
-                price: None,
-                prompt_cache_key: None,
-            })
-            .expect("a client");
-
-            backend
-                .authorize(backend.client.post("https://example.test/x"))
-                .build()
-                .expect("a request")
-                .headers()
-                .clone()
-        };
-
-        // Anthropic wants its key in its own header, with its version beside it.
-        let anthropic = headers(Wire::AnthropicMessages);
-        assert_eq!(anthropic.get("x-api-key").expect("a key"), "sk-1");
-        assert!(anthropic.get("authorization").is_none());
-        assert!(anthropic.get("anthropic-version").is_some());
-
-        // The OpenAI wires take a bearer token, and know no Anthropic version.
-        for wire in [Wire::OpenAiChat, Wire::OpenAiResponses] {
-            let sent = headers(wire);
-            assert_eq!(sent.get("authorization").expect("a key"), "Bearer sk-1");
-            assert!(sent.get("x-api-key").is_none());
-            assert!(sent.get("anthropic-version").is_none());
-        }
-    }
-
-    #[test]
-    fn model_ids_are_read_from_both_list_shapes() {
-        // An OpenAI-compatible server.
-        assert_eq!(
-            parse_models(r#"{"object":"list","data":[{"id":"glm-5.3"},{"id":"kimi-k3"}]}"#),
-            Some(vec!["glm-5.3".to_string(), "kimi-k3".to_string()])
-        );
-
-        // The Messages API answers with the same `data[].id`, surrounded by
-        // paging fields this does not care about.
-        assert_eq!(
-            parse_models(
-                r#"{"data":[{"id":"claude-sonnet-4-5","display_name":"Sonnet"}],"has_more":false}"#
-            ),
-            Some(vec!["claude-sonnet-4-5".to_string()])
-        );
-    }
-
-    #[test]
-    fn anything_that_is_not_a_model_list_reads_as_none() {
-        assert_eq!(parse_models(""), None);
-        assert_eq!(parse_models("<html>a proxy said no</html>"), None);
-        assert_eq!(
-            parse_models(r#"{"error":{"message":"invalid api key"}}"#),
-            None
-        );
-        assert_eq!(parse_models(r#"{"data":"not a list"}"#), None);
-        // An entry without an id is skipped rather than invented.
-        assert_eq!(
-            parse_models(r#"{"data":[{"object":"model"},{"id":"ok"}]}"#),
-            Some(vec!["ok".to_string()])
-        );
-        // An empty list is a list: the provider answered, with nothing.
-        assert_eq!(
-            parse_models(r#"{"object":"list","data":[]}"#),
-            Some(Vec::new())
-        );
-    }
-
-    fn engine(chunks: Vec<Result<Bytes, reqwest::Error>>, wire: Wire) -> StreamEngine {
-        StreamEngine {
-            stream: Box::pin(futures::stream::iter(chunks)),
-            decoder: SseDecoder::new(),
-            parser: WireStream::new(wire),
-            pending: VecDeque::new(),
-            input_characters: 40,
-            output_characters: 0,
-            price_tiers: Vec::new(),
-            price: Some(Price::per_million(3.0, 15.0, 0.0, 0.0)),
-            done: false,
-        }
-    }
-
-    async fn drain(engine: &mut StreamEngine) -> Vec<AgentEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = engine.next_event().await {
-            events.push(event);
-        }
-        events
-    }
-
-    #[tokio::test]
-    async fn a_reported_turn_completes_with_the_reported_usage() {
-        let mut engine = engine(
-            vec![Ok(Bytes::from(
-                "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n\
-                 event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
-                 event: message_delta\ndata: {\"usage\":{\"output_tokens\":500}}\n\n\
-                 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-            ))],
-            Wire::AnthropicMessages,
-        );
-
-        let events = drain(&mut engine).await;
-        assert_eq!(events[0], AgentEvent::TextDelta("hi".to_string()));
-        assert_eq!(
-            events.last(),
-            Some(&AgentEvent::TurnComplete {
-                usage: Usage::new(1000, 500),
-                // 1000 input at $3/M plus 500 output at $15/M.
-                cost_usd: 0.003 + 0.0075,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn a_turn_that_reports_nothing_is_estimated() {
-        let mut engine = engine(vec![Ok(Bytes::from("data: [DONE]\n\n"))], Wire::OpenAiChat);
-
-        let events = drain(&mut engine).await;
-        let Some(AgentEvent::TurnComplete { usage, cost_usd }) = events.last() else {
-            panic!("no terminal event: {events:?}");
-        };
-        assert!(usage.estimated, "an unreported turn must be flagged");
-        assert_eq!(usage.input_tokens, 10, "40 characters → 10 tokens");
-        assert!(*cost_usd > 0.0);
-    }
-
-    #[tokio::test]
-    async fn a_stream_that_just_ends_still_completes_the_turn() {
-        // No `message_stop`, no `[DONE]`: the connection simply closes.
-        let mut engine = engine(
-            vec![Ok(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            ))],
-            Wire::OpenAiChat,
-        );
-
-        let events = drain(&mut engine).await;
-        assert_eq!(events[0], AgentEvent::TextDelta("hi".to_string()));
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_frame_split_across_chunks_is_still_read() {
-        let mut engine = engine(
-            vec![
-                Ok(Bytes::from(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"one",
-                )),
-                Ok(Bytes::from(" two\"}}]}\n\ndata: [DONE]\n\n")),
-            ],
-            Wire::OpenAiChat,
-        );
-
-        let events = drain(&mut engine).await;
-        assert_eq!(events[0], AgentEvent::TextDelta("one two".to_string()));
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_broken_connection_ends_in_an_error_not_a_silent_completion() {
-        let mut engine = engine(vec![Ok(Bytes::from("data: [DONE]\n\n"))], Wire::OpenAiChat);
-        engine.fail("the response was cut short".to_string());
-
-        let events = drain(&mut engine).await;
-        assert!(
-            matches!(events.first(), Some(AgentEvent::Error(_))),
-            "{events:?}"
-        );
-        // An error is terminal on its own: no completion follows it.
-        assert!(events.iter().all(|event| event.is_terminal()));
-    }
-
-    #[tokio::test]
-    async fn retry_notes_are_delivered_before_the_reply() {
-        let mut engine = engine(vec![Ok(Bytes::from("data: [DONE]\n\n"))], Wire::OpenAiChat);
-        engine
-            .pending
-            .push_front(AgentEvent::Status("busy".to_string()));
-
-        let events = drain(&mut engine).await;
-        assert_eq!(events[0], AgentEvent::Status("busy".to_string()));
-    }
-
-    #[tokio::test]
-    async fn an_unknown_model_costs_nothing_and_says_so() {
-        let mut engine = engine(vec![Ok(Bytes::from("data: [DONE]\n\n"))], Wire::OpenAiChat);
-        engine.price = None;
-
-        let events = drain(&mut engine).await;
-        let Some(AgentEvent::TurnComplete { cost_usd, .. }) = events.last() else {
-            panic!("no terminal event");
-        };
-        assert_eq!(*cost_usd, 0.0);
-    }
-
-    #[test]
-    fn the_request_length_is_counted_for_estimation() {
-        let request = TurnRequest {
-            history: vec![Message::system("12345"), Message::user("1234567890")],
-            prompt: "123".to_string(),
-            tools: Vec::new(),
-        };
-        assert_eq!(request_characters(&request), 18);
-    }
-
-    #[test]
-    fn the_backend_repeats_what_it_was_handed() {
-        let backend = HttpBackend::new(TurnPlan {
-            endpoint: Endpoint {
-                wire: Wire::OpenAiChat,
-                session_header: None,
-                base_url: "https://openrouter.ai/api/v1".to_string(),
-                secret: None,
-                name: "OpenRouter",
-                label: "openrouter",
-                env_keys: &["OPENROUTER_API_KEY"],
-            },
-            model: "auto".to_string(),
-            max_tokens: 8_192,
-            price: None,
-            prompt_cache_key: None,
-        })
-        .expect("client");
-
-        // A transport crate decides none of this; it only carries it.
-        assert_eq!(backend.label(), "openrouter");
-        assert_eq!(backend.model(), "auto");
-        assert_eq!(backend.max_tokens, 8_192);
-        assert!(backend.price.is_none());
-    }
-}
-
-fn strict_schema(schema: &Value) -> bool {
-    if schema["type"] != "object" {
-        return false;
-    }
-    let Some(properties) = schema["properties"].as_object() else {
-        return false;
-    };
-    let Some(required) = schema["required"].as_array() else {
-        return false;
-    };
-    schema["additionalProperties"] == false
-        && properties
-            .keys()
-            .all(|name| required.iter().any(|value| value.as_str() == Some(name)))
-        && properties.values().all(strict_member)
-}
-fn strict_member(schema: &Value) -> bool {
-    if schema.get("$ref").is_some() || schema.get("oneOf").is_some() {
-        return false;
-    }
-    if let Some(variants) = schema["anyOf"].as_array() {
-        return variants.iter().all(strict_member);
-    }
-    match schema["type"].as_str() {
-        Some("object") => strict_schema(schema),
-        Some("array") => schema.get("items").is_some_and(strict_member),
-        Some("string" | "number" | "integer" | "boolean" | "null") => true,
-        _ => false,
-    }
-}
-
-fn apply_capabilities(body: &mut Value, capabilities: &crate::ModelCapabilities) {
-    if capabilities.streaming_usage == crate::Support::Unsupported
-        && let Some(body) = body.as_object_mut()
-    {
-        body.remove("stream_options");
-    }
-    if capabilities.prompt_caching == crate::Support::Unsupported {
-        if let Some(body) = body.as_object_mut() {
-            body.remove("prompt_cache_key");
-        }
-        if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut) {
-            for block in system {
-                if let Some(block) = block.as_object_mut() {
-                    block.remove("cache_control");
-                }
-            }
-        }
-        if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-            for message in messages {
-                if let Some(blocks) = message["content"].as_array_mut() {
-                    for block in blocks {
-                        if let Some(block) = block.as_object_mut() {
-                            block.remove("cache_control");
+                Some(Ok(Item::Unknown(_))) => {}
+                Some(Err(error)) => {
+                    let retryable = error
+                        .report()
+                        .http_status
+                        .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                        .map_or_else(|| error.is_retryable(), http::is_retryable);
+                    let partial = stream.partial();
+                    let usage_received = partial.usage.input_tokens.is_some()
+                        || partial.usage.output_tokens.is_some();
+                    if !self.visible
+                        && !usage_received
+                        && error.report().http_status == Some(400)
+                        && self.backend.endpoint.wire == Wire::OpenAiChat
+                        && let Some(repair) = crate::policy::repair_for(
+                            error.provider_response_body().unwrap_or_default(),
+                        )
+                        && !self.repairs.contains(&repair)
+                    {
+                        self.repairs.push(repair);
+                        let reopened =
+                            self.backend
+                                .completion_model(&self.repairs)
+                                .and_then(|model| {
+                                    let stream = model
+                                        .stream(self.request.clone())
+                                        .map_err(|error| self.backend.provider_error(&error))?;
+                                    self.model = model;
+                                    Ok(stream)
+                                });
+                        match reopened {
+                            Ok(stream) => {
+                                self.stream = Some(stream);
+                                continue;
+                            }
+                            Err(error) => {
+                                self.done = true;
+                                return Some(AgentEvent::Error(error.to_string()));
+                            }
                         }
                     }
+                    if !self.visible
+                        && !usage_received
+                        && retryable
+                        && self.retries < http::max_retries()
+                    {
+                        let wait = error
+                            .report()
+                            .retry_after(SystemTime::now())
+                            .unwrap_or_default()
+                            .max(http::backoff(self.retries, None))
+                            .min(Duration::from_secs(30));
+                        self.retries += 1;
+                        tokio::time::sleep(wait).await;
+                        match self.model.stream(self.request.clone()) {
+                            Ok(stream) => {
+                                self.stream = Some(stream);
+                                return Some(self.backend.retrying(wait));
+                            }
+                            Err(error) => {
+                                self.done = true;
+                                return Some(AgentEvent::Error(
+                                    self.backend.provider_error(&error).to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    self.done = true;
+                    return Some(AgentEvent::Error(
+                        self.backend.provider_error(&error).to_string(),
+                    ));
                 }
-            }
-        }
-    }
-    if capabilities.structured_output == crate::Support::Supported
-        && let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut)
-    {
-        for tool in tools {
-            let definition = if tool.get("function").is_some() {
-                &mut tool["function"]
-            } else {
-                tool
-            };
-            let schema = definition
-                .get("parameters")
-                .or_else(|| definition.get("input_schema"));
-            if schema.is_some_and(strict_schema) {
-                definition["strict"] = Value::Bool(true);
+                None => {
+                    self.done = true;
+                    let response = match self.stream.take()?.finish().await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return Some(AgentEvent::Error(
+                                self.backend.provider_error(&error).to_string(),
+                            ));
+                        }
+                    };
+                    if let Some(error) = &response.error {
+                        return Some(AgentEvent::Error(error.clone()));
+                    }
+                    if let Some(error) = &response.aborted {
+                        return Some(AgentEvent::Error(error.clone()));
+                    }
+                    let measured = response.usage.input_tokens.is_some()
+                        || response.usage.output_tokens.is_some();
+                    let usage = if measured {
+                        convert::usage(response.usage)
+                    } else {
+                        Usage::estimate(self.input_characters, self.output_characters)
+                    };
+                    let cost_usd = self.backend.price.map_or(0.0, |price| {
+                        price.cost_with_tiers(&usage, &self.backend.price_tiers)
+                    });
+                    let complete = AgentEvent::TurnComplete { usage, cost_usd };
+                    if matches!(response.finish_reason(), Some(FinishReason::Length)) {
+                        self.pending.push_back(complete);
+                        return Some(AgentEvent::OutputTruncated);
+                    }
+                    return Some(complete);
+                }
             }
         }
     }
 }
 
+// End snapshots may contain text without deltas, or repeat already emitted text.
+fn final_suffix(previous: &str, final_text: &str) -> Result<Option<String>, BackendError> {
+    let suffix = final_text
+        .strip_prefix(previous)
+        .ok_or_else(|| BackendError::new("provider changed previously streamed text"))?;
+    Ok((!suffix.is_empty()).then(|| suffix.to_owned()))
+}
+
 #[cfg(test)]
-mod capability_tests {
-    use super::*;
+mod final_text_tests {
+    use super::final_suffix;
     #[test]
-    fn strict_sampling_is_only_enabled_for_explicit_support_and_compatible_schemas() {
-        let mut body = serde_json::json!({"tools":[{"type":"function","function":{"name":"test","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}}}],"stream_options":{"include_usage":true}});
-        apply_capabilities(&mut body, &crate::ModelCapabilities::default());
-        assert!(body["tools"][0]["function"].get("strict").is_none());
-        apply_capabilities(
-            &mut body,
-            &crate::ModelCapabilities {
-                structured_output: crate::Support::Supported,
-                streaming_usage: crate::Support::Unsupported,
-                ..Default::default()
-            },
-        );
-        assert_eq!(body["tools"][0]["function"]["strict"], true);
-        assert!(body.get("stream_options").is_none());
+    fn snapshots_emit_only_missing_text() {
+        assert_eq!(final_suffix("", "hello").unwrap(), Some("hello".into()));
+        assert_eq!(final_suffix("hello", "hello").unwrap(), None);
+        assert_eq!(final_suffix("你", "你好").unwrap(), Some("好".into()));
+        assert!(final_suffix("hello", "other").is_err());
     }
 }

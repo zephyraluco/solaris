@@ -34,7 +34,7 @@ pub(crate) struct LiveModel {
     pub catalog: Arc<ModelCatalog>,
     pub provider: &'static str,
     pub model: String,
-    pub prototype: solaris_backend::HttpBackend,
+    pub prototype: solaris_backend::Backend,
     pub account_authorized: bool,
 }
 impl LiveModel {
@@ -47,7 +47,7 @@ impl LiveModel {
         }
         resolved
     }
-    fn backend(&self) -> solaris_backend::HttpBackend {
+    fn backend(&self) -> solaris_backend::Backend {
         let resolved = self.resolved();
         self.prototype.clone().with_model_parameters(
             resolved.request_id,

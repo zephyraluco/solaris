@@ -66,11 +66,6 @@ pub fn is_retryable(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-/// Whether a transport error is worth retrying.
-pub fn is_transient(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect()
-}
-
 /// The innermost message of a reqwest error.
 ///
 /// The top-level display repeats the URL and the method; the root cause is the

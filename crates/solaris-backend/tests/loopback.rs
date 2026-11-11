@@ -11,10 +11,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{
-    AgentBackend, AgentEvent, Endpoint, HttpBackend, Message, Price, TurnPlan, TurnRequest, Usage,
-    Wire,
-};
+use solaris_backend::{AgentBackend, AgentEvent, Message, Price, TurnRequest, Usage, Wire};
+use solaris_backend::{Backend, Endpoint, TurnPlan};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -94,7 +92,7 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
 }
 
 /// A backend pointing at `addr`, named the way the local runtime is.
-fn backend(addr: SocketAddr) -> HttpBackend {
+fn backend(addr: SocketAddr) -> Backend {
     backend_with(addr, Wire::OpenAiChat, "llama3.2", 32_768, None)
 }
 
@@ -106,8 +104,8 @@ fn backend_with(
     model: &str,
     max_tokens: u32,
     price: Option<Price>,
-) -> HttpBackend {
-    HttpBackend::new(TurnPlan {
+) -> Backend {
+    Backend::new(TurnPlan {
         endpoint: Endpoint {
             wire,
             session_header: None,
@@ -198,6 +196,7 @@ async fn chatgpt_model_discovery_reads_codex_slugs_instead_of_public_api_ids() {
 async fn a_streamed_reply_arrives_over_a_real_socket() {
     let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
                 data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
+                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2}}\n\n\
                 data: [DONE]\n\n";
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
@@ -243,7 +242,7 @@ async fn a_streamed_reply_arrives_over_a_real_socket() {
     assert!(request.contains("\"model\":\"llama3.2\""), "{request}");
     assert!(request.contains("\"stream\":true"), "{request}");
     assert!(request.contains("include_usage"), "{request}");
-    assert!(request.contains("\"content\":\"hello\""), "{request}");
+    assert!(request.contains("\"text\":\"hello\""), "{request}");
 }
 
 #[tokio::test]
@@ -252,9 +251,9 @@ async fn a_responses_turn_streams_over_a_real_socket() {
     // real request, a real streamed body, and the usage its closing event
     // carries. `gpt-5` is priced in the catalogue, so this also proves the
     // price lookup and the usage buckets line up.
-    let body = "event: response.output_text.delta\ndata: {\"delta\":\"Hel\"}\n\n\
-                event: response.output_text.delta\ndata: {\"delta\":\"lo\"}\n\n\
-                event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}}\n\n";
+    let body = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\"}\n\n\
+                event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo\"}\n\n\
+                event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}}\n\n";
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
 
     let events: Vec<AgentEvent> = backend_with(
@@ -448,7 +447,7 @@ async fn a_rate_limited_request_is_retried_before_it_streams() {
         let second = response(
             "200 OK",
             "text/event-stream",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"at last\"}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"at last\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         );
         let (mut socket, _) = listener.accept().await.expect("second accept");
         let _ = read_request(&mut socket).await;
@@ -492,4 +491,183 @@ async fn a_connection_that_answers_nothing_fails_before_it_streams() {
         message.contains("could not reach Local runtime"),
         "{message}"
     );
+}
+
+fn completion(wire: Wire) -> String {
+    match wire {
+        Wire::OpenAiChat => "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n".into(),
+        Wire::OpenAiResponses => "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n".into(),
+        Wire::AnthropicMessages => concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"vision\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ).into(),
+    }
+}
+
+#[tokio::test]
+async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_metadata() {
+    use solaris_backend::{Content, InlineImage, MessageContext, ToolCall, ToolResult};
+    for wire in [
+        Wire::OpenAiChat,
+        Wire::OpenAiResponses,
+        Wire::AnthropicMessages,
+    ] {
+        let image = InlineImage {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        for tool_image in [false, true] {
+            let mut history = if tool_image {
+                let call = ToolCall::new(
+                    "image-call",
+                    "read",
+                    serde_json::json!({"path":"image.png"}),
+                );
+                let mut result = ToolResult::ok(&call, "image result");
+                result.metadata.images.push(image.clone());
+                vec![Message::tool_use(call), Message::tool_result(result)]
+            } else {
+                vec![Message::with_content(
+                    solaris_backend::Role::User,
+                    vec![
+                        Content::text("inspect"),
+                        Content::Image {
+                            image: image.clone(),
+                        },
+                    ],
+                )]
+            };
+            history[0].context = Some(MessageContext::Measurement {
+                usage: Usage::new(99999, 1),
+                base_id: "private-base".into(),
+                request_id: "private-request".into(),
+            });
+            let (addr, seen) =
+                serve(response("200 OK", "text/event-stream", &completion(wire))).await;
+            let mut input = TurnRequest::new(history, "");
+            if tool_image {
+                input.tools.push(solaris_backend::ToolSpec::new(
+                    "read",
+                    "Read an image",
+                    serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                ));
+            }
+            let events: Vec<_> = backend_with(addr, wire, "vision", 1000, None)
+                .run_turn(input)
+                .await
+                .expect("start")
+                .collect()
+                .await;
+            assert!(
+                matches!(events.last(), Some(AgentEvent::TurnComplete { usage, .. }) if usage.total() == 12),
+                "{wire:?}: {events:?}"
+            );
+            let request = seen.await.expect("request");
+            let body = request.split_once("\r\n\r\n").expect("body").1;
+            assert!(body.contains("aW1hZ2U="), "{wire:?}: {body}");
+            assert!(
+                !body.contains("private-base")
+                    && !body.contains("private-request")
+                    && !body.contains("99999")
+            );
+            if tool_image {
+                assert!(
+                    body.contains("image-call") && body.contains("image result"),
+                    "{body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_a_model_stream_closes_the_pending_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 999999\r\n\r\n{frame}").as_bytes()).await.unwrap();
+        let mut byte = [0];
+        socket.read(&mut byte).await.unwrap()
+    });
+    let mut stream = backend(addr).run_turn(turn()).await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(AgentEvent::TextDelta(_))
+    ));
+    drop(stream);
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_stream_is_not_retried_after_visible_output_or_reported_as_success() {
+    let (addr, _) = serve("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 999999\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".into()).await;
+    let events: Vec<_> = backend(addr)
+        .run_turn(turn())
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(matches!(events.first(), Some(AgentEvent::TextDelta(text)) if text == "partial"));
+    assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Status(_) | AgentEvent::TurnComplete { .. }
+    )));
+}
+
+#[tokio::test]
+async fn rejected_stream_options_are_removed_once_without_changing_prompt() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            bodies.push(serde_json::from_str::<serde_json::Value>(body).unwrap());
+            socket
+                .write_all(
+                    response(
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"unsupported stream_options"}}"#,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        bodies
+    });
+    let error = match tokio::time::timeout(PATIENCE, backend(addr).run_turn(turn()))
+        .await
+        .unwrap()
+    {
+        Err(error) => error,
+        Ok(_) => panic!("repeated rejection must stop"),
+    };
+    assert!(error.to_string().contains("stream_options"));
+    let bodies = tokio::time::timeout(PATIENCE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(bodies[0].get("stream_options").is_some());
+    assert!(bodies[1].get("stream_options").is_none());
+    let mut expected = bodies[0].clone();
+    expected.as_object_mut().unwrap().remove("stream_options");
+    assert_eq!(expected, bodies[1]);
 }

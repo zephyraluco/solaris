@@ -16,7 +16,8 @@ use futures::StreamExt;
 use solaris_agent::{
     Agent, AgentBackendConfig, AgentEvent, AgentOptions, Mode, Tool, ToolRegistry, ToolSelection,
 };
-use solaris_backend::{Endpoint, HttpBackend, TurnPlan, Wire};
+use solaris_backend::Wire;
+use solaris_backend::{Backend, Endpoint, TurnPlan};
 use solaris_tools::tools::read::ReadTool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -113,14 +114,16 @@ fn tool_call_body() -> String {
 
 /// The second answer: the model writes what it found.
 fn text_body(text: &str) -> String {
-    sse(&[&format!(
-        r#"{{"choices":[{{"delta":{{"content":"{text}"}}}}]}}"#
-    )])
+    let delta = serde_json::json!({"choices":[{"delta":{"content":text}}]}).to_string();
+    sse(&[
+        &delta,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])
 }
 
 /// A backend pointed at `addr` speaking Chat Completions.
-fn backend(addr: SocketAddr) -> HttpBackend {
-    HttpBackend::new(TurnPlan {
+fn backend(addr: SocketAddr) -> Backend {
+    Backend::new(TurnPlan {
         endpoint: Endpoint {
             wire: Wire::OpenAiChat,
             session_header: None,

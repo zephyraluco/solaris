@@ -187,7 +187,7 @@ async fn request_alias_and_output_budget_reach_the_http_wire() {
                 if request.len() >= end + 4 + length {
                     let body: serde_json::Value =
                         serde_json::from_slice(&request[end + 4..end + 4 + length]).expect("body");
-                    let response = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+                    let response = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         response.len()
@@ -266,10 +266,10 @@ fn requested_output_budget_is_separate_from_model_limits() {
 
 #[test]
 fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
-    use solaris_backend::{AgentBackend, Endpoint, HttpBackend, TurnPlan, Wire};
+    use solaris_backend::{AgentBackend, Backend, Endpoint, TurnPlan, Wire};
     use std::sync::Arc;
     let catalog = Arc::new(ModelCatalog::default());
-    let prototype = HttpBackend::new(TurnPlan {
+    let prototype = Backend::new(TurnPlan {
         endpoint: Endpoint {
             wire: Wire::OpenAiChat,
             session_header: None,
