@@ -17,6 +17,15 @@
 
 八个 crate 和单向依赖保持不变，应用继续负责组装。`solaris-tools`、`solaris-tui`、`solaris-mcp`、`solaris-types` 无需修改。公开接口沿用业务名称；SDK 类型与实现封装在内部。
 
+## Provider / backend 收敛
+
+- 每次请求准备明确的原生连接，固定模型 ID、协议、认证、能力、输出预算和价格。UI 请求投影、模型调用、摘要规划和费用结算使用连接的固定事实。
+- 删除旧 Engine。原生执行和业务事件兼容入口共用官方模型与统一请求策略；重试依据 SDK 原生错误，收到输出或未知载荷后不重放。
+- 标准模型发现使用官方 ModelListing 与游标驱动；仅补充严格列表 envelope 检查、稀疏网关标签和 SDK 未覆盖的 Codex 订阅 schema。
+- 浏览器登录及刷新使用官方 Authenticator，删除 Solaris 自建 PKCE、回调 HTTP 服务和授权码交换。UI 异步接收 URL，凭据继续按原格式保存。
+- 移除 `model_client() -> Option<_>` 和 provider trait 上的 `observe_usage`。事件源必须显式注入；预算、账本、子任务用量作为连接观察器保留。
+- 官方 HTTP middleware 负责产品会话头及请求选项；只为非标准网关路径保留精确 completion URL 适配。没有 vendor、SDK 分叉或新 crate。
+
 ## 运行与持久化语义
 
 - 模型响应直接进入 SDK，保留原生消息、reasoning、finish reason 和 usage。业务消息转换只用于显示、旧会话导入及注入式测试后端。

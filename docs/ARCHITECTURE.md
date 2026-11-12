@@ -29,7 +29,7 @@ solaris                  应用组装、配置、认证、TUI 与 CLI
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
-| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`rig-core`、`rig-reqwest`、`reqwest`（rustls）、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 统一接口、`Backend`（SDK 模型执行）、事件转换、重试与计费；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`/`Price`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
+| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`rig-core`、`rig-reqwest`、`reqwest`（rustls）、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 连接准备接口、`Backend`（SDK 模型连接）、事件适配与请求策略；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`/`Price`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
 | `solaris-tools` | [`crates/solaris-tools`](../crates/solaris-tools) | `async-trait`、`futures`、`tokio`（`process`/`io-util`/`fs`）、`serde_json`、`thiserror`、`libc`（仅 Unix） | 工具层：八个内建工具（`read`/`write`/`edit`/`ls`/`grep`/`find` 与所在平台的 shell）、`ToolRegistry`、命令 runner、截断与文件写入串行化、`edit` 的 diff。不依赖工作区里任何其他 crate。 |
 | `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
 | `solaris-agent` | [`crates/solaris-agent`](../crates/solaris-agent) | `solaris-backend`、`solaris-tools`、`rig-agent`、`rig-core`、`async-trait`、`futures`、`serde`、`tokio` | agent 会话：`Agent`（持有对话并驱动 SDK 多轮状态机）、`Mode` 与它声明给一轮的默认工具集、`Approver` 审批钩子，并把应用需要的词汇（消息、事件、工具、用量、注册表与选择）再导出。 |
@@ -73,29 +73,25 @@ enum AgentEvent {
 
 **`prompt` 为空时协议层不追加 user 消息**：这是给工具往返用的——第 2 轮起，用户的提示词已经在 `history` 里了，接着往下写的是「助手请求调用 → 工具结果」这一串，而不是把同一句话再问一遍。
 
-### 2.2 协议与客户端
+### 2.2 模型连接与官方实现
 
-```rust
-pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
+`AgentBackend::model_client(self: Arc<Self>)` 必须返回明确的 `ModelClient` 或错误，不再通过 `None` 隐式选择事件执行路径。`Backend` 是唯一的生产模型实现；内部使用官方 `rig-core` / `rig-reqwest` 的厂商配置、Model、ModelAdapter 和 ErasedHandler。
 
-#[async_trait]
-pub trait AgentBackend: Send + Sync {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError>;
-    fn label(&self) -> &str { "backend" }   // 状态栏显示
-}
-```
+- [`client.rs`](../crates/solaris-backend/src/client.rs) 从已解析配置建立官方模型和厂商方言。`ModelClient` 固定本次模型、协议、认证、能力、输出上限及价格；目录刷新不修改在途连接。SDK 的较小输出预算会被保留。
+- [`request.rs`](../crates/solaris-backend/src/request.rs) 在官方 handler 上集中实现有限重试和网关兼容修正，使用 Rig 的 ErrorReport 分类和 Retry-After。任何已解码内容或未知载荷到达后都不重放。不存在独立的旧 Engine。
+- [`transport.rs`](../crates/solaris-backend/src/transport.rs) 使用官方 HTTP middleware 添加产品会话头及必要字段策略。唯一的传输适配是保留网关精确 completion URL；HTTP、分帧和协议解码全部由 SDK 实现。
+- [`discovery.rs`](../crates/solaris-backend/src/discovery.rs) 使用官方 ModelListing 和游标驱动读取模型，Anthropic 分页全部跟随。薄适配保留 HTTP 200 错误/HTML 校验和仅含 ID 的网关条目；Codex 的订阅专用 slug、可见性及优先级 schema 通过 SDK Wire 扩展点处理。
+- `run_turn()` 只保留业务事件兼容入口，复用相同连接和请求策略。[`events.rs`](../crates/solaris-backend/src/events.rs) 只转换显示事件，不发 HTTP 请求、不独立重试。正常 agent 与摘要直接消费原生响应。
+- 测试或应用注入的事件源必须显式调用 `ModelClient::from_events`；适配集中在 [`injected.rs`](../crates/solaris-backend/src/injected.rs)，agent 不再重建响应或维护第二套摘要调用路径。
+- 计费观察器属于请求连接上的产品策略，不属于 provider trait。agent 附着预算、账本和子任务观察器，收到结果后统一结算。价格使用连接快照，context 测量与计费独立。
 
-- 一次 `run_turn` 返回一个装箱的 `Send` 流，UI 侧通过 channel 逐块消费。
-- **`Backend`** 是唯一的生产模型客户端。内部使用官方 `rig-core` / `rig-reqwest` 完成 Chat Completions、Responses、Anthropic Messages 的请求编码、流解析及厂商方言处理。公开 API 使用业务类型，不暴露 SDK 类型。
-- [`convert.rs`](../crates/solaris-backend/src/convert.rs) 负责业务消息、工具、图片和用量转换；日志中的上下文注解、显示元数据不进入模型请求。工具结果的图片作为模型内容单独转换。
-- [`client.rs`](../crates/solaris-backend/src/client.rs) 负责单次模型执行、取消、有限重试和结束状态；[`transport.rs`](../crates/solaris-backend/src/transport.rs) 保留配置的精确端点与会话头，将传输委托给官方 SDK。没有第二套协议编码器或 SSE 解析器。
-- [`policy.rs`](../crates/solaris-backend/src/policy.rs) 保留 Solaris 的能力策略和网关字段兼容修正。仅在 HTTP 400 明确指明字段时修正，每种修正最多一次；收到输出、工具片段或用量后不自动重试。
-- 文本、思考、完整工具调用映射为现有事件；最终文本快照只补发未输出的后缀。损坏的工具参数保留为无效值，不能变成空对象执行。流缺少正常结束标记时报告失败。
-- 模型能力、输出预算和价格继续由 provider 解析为不可变快照，注入 SDK 模型事实；不让 SDK 内置目录覆盖应用配置。SDK 输入用量中的缓存读写被拆为现有四个互不重叠的计费桶，保留上下文阶梯价格及缺失用量时的估算标记。
-- 模型发现保持单次、有超时的 GET：标准清单条目使用 SDK 模型类型解析，同时要求 `data` 包装，避免将 HTTP 200 错误当成空清单。ChatGPT 的 Codex 清单版本、slug、可见性和优先级属于服务特定发现策略，仍在内部处理。
-- Provider 内部通过 Rig 官方 ChatGPT `Authenticator` 执行到固定 issuer 的令牌刷新；交互式设备登录在请求期间被禁用。现有凭据格式、共享刷新锁、轮换令牌保存失败后的重试落盘逻辑保持不变。初次浏览器登录继续使用应用现有 PKCE/回调入口，配合现有 UI。
+### 2.3 Provider 配置与认证
 
----
+`solaris-provider` 保留厂商选择、凭据存储、外部模型目录、用户覆盖、价格和列表缓存。每次请求从目录解析实际模型 ID，同时选择对应协议；不只更换模型名称而沿用旧协议。模型能力映射为官方 ModelFacts / ModelSpec，agent 只消费连接提供的固定能力。
+
+浏览器登录和刷新使用官方 ChatGPT `Authenticator`：SDK 负责 PKCE、state、回调监听及固定 issuer 的令牌交换；Solaris 显示登录 URL、限制五分钟期限并保存既有凭据格式。SDK 尝试本机 1455、1457 端口；取消会停止监听。后台刷新禁用交互式设备登录。
+
+父子连接共享刷新协调。轮换凭据保存失败时保留新令牌，后续重试落盘，不重复使用已失效的旧刷新令牌。HTTP 连接池继续复用。外部模型目录和价格属于 Solaris 产品配置，不被 SDK 内置目录替换。
 
 ## 3. solaris-agent：agent 会话
 
@@ -723,7 +719,8 @@ Compaction uses the official memory policy, summarizer and persisted summary sta
 It preserves legal tool boundaries and applies a summary only after successful generation.
 Automatic compaction runs between SDK tasks; there is no hidden overflow replay.
 
-`AccountingBackend` journals each request's usage before forwarding its completion.
+`AccountingBackend` attaches a ledger observer to each prepared connection and
+journals usage when its result is settled.
 Child requests write to the parent ledger before forwarding their completion, so
 parent failure or cancellation cannot discard already consumed usage. Absorbing
 a child report updates turn totals without charging the ledger again.
