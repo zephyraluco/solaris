@@ -137,6 +137,14 @@ struct RefreshingBackend {
 
 #[async_trait]
 impl AgentBackend for RefreshingBackend {
+    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+        self.credentials
+            .backend(&self.model)
+            .await?
+            .model_client()
+            .await
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         self.credentials
             .backend(&self.model)

@@ -108,18 +108,36 @@ pub struct TurnPlan {
 /// Streams one turn from an HTTP endpoint, over whichever wire it speaks.
 #[derive(Clone)]
 pub struct Backend {
-    client: reqwest::Client,
-    endpoint: Endpoint,
-    model: String,
-    max_tokens: u32,
-    price: Option<Price>,
-    price_tiers: Vec<crate::PriceTier>,
-    prompt_cache_key: Option<&'static str>,
-    chatgpt: Option<(String, u64)>,
-    capabilities: crate::ModelCapabilities,
+    pub(super) client: reqwest::Client,
+    pub(super) endpoint: Endpoint,
+    pub(super) model: String,
+    pub(super) max_tokens: u32,
+    pub(super) price: Option<Price>,
+    pub(super) price_tiers: Vec<crate::PriceTier>,
+    pub(super) prompt_cache_key: Option<&'static str>,
+    pub(super) chatgpt: Option<(String, u64)>,
+    pub(super) capabilities: crate::ModelCapabilities,
 }
 
 impl Backend {
+    pub(super) fn usage_cost(&self, usage: Usage) -> f64 {
+        self.price.map_or(0.0, |price| {
+            price.cost_with_tiers(&usage, &self.price_tiers)
+        })
+    }
+    pub(super) fn check_credentials(&self) -> Result<(), BackendError> {
+        if let Some((_, expires)) = &self.chatgpt
+            && *expires
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |time| time.as_secs())
+        {
+            return Err(BackendError::new(
+                "OpenAI authorization expired — run /connect again",
+            ));
+        }
+        Ok(())
+    }
     /// A backend for `plan`.
     pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
         Ok(Self {
@@ -253,6 +271,14 @@ impl Backend {
 
 #[async_trait::async_trait]
 impl AgentBackend for Backend {
+    async fn model_client(&self) -> Result<Option<crate::ModelClient>, BackendError> {
+        self.check_credentials()?;
+        let adapter = std::sync::Arc::new(self.model_adapter()?);
+        Ok(Some(crate::ModelClient {
+            backend: self.clone(),
+            adapter,
+        }))
+    }
     fn capabilities(&self) -> crate::ModelCapabilities {
         self.capabilities.clone()
     }
@@ -276,16 +302,7 @@ impl AgentBackend for Backend {
         {
             return Err(BackendError::new("this model does not support image input"));
         }
-        if let Some((_, expires)) = &self.chatgpt
-            && *expires
-                <= SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |time| time.as_secs())
-        {
-            return Err(BackendError::new(
-                "OpenAI authorization expired — run /connect again",
-            ));
-        }
+        self.check_credentials()?;
         let mut converted = convert::request(&request, self.max_tokens)?;
         let mut params = serde_json::Map::new();
         if self.endpoint.wire == Wire::OpenAiResponses {
@@ -455,7 +472,7 @@ fn request_characters(request: &TurnRequest) -> usize {
 }
 
 impl Backend {
-    fn completion_model(
+    pub(super) fn completion_model(
         &self,
         repairs: &[crate::policy::Repair],
     ) -> Result<DynModel<Completion>, BackendError> {

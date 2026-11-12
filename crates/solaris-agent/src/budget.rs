@@ -84,6 +84,10 @@ pub(crate) struct BudgetedBackend {
 }
 #[async_trait]
 impl AgentBackend for BudgetedBackend {
+    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+        self.inner.model_client().await
+    }
+
     fn capabilities(&self) -> solaris_backend::ModelCapabilities {
         self.inner.capabilities()
     }

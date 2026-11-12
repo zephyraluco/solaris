@@ -272,3 +272,51 @@ async fn a_turn_with_no_tool_call_is_a_single_request() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn native_connection_preserves_full_response_in_the_complete_executor() {
+    use solaris_backend::AgentBackend;
+    let (addr, seen) = serve(vec![sse(&[
+        r#"{"id":"native-response","choices":[{"index":0,"delta":{"content":"native result"},"finish_reason":null}]}"#,
+        r#"{"id":"native-response","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3}}"#,
+    ])]).await;
+    let backend = Backend::new(TurnPlan {
+        endpoint: Endpoint {
+            wire: Wire::OpenAiChat,
+            session_header: None,
+            base_url: format!("http://{addr}/v1"),
+            secret: Some("test".into()),
+            name: "Test",
+            label: "local",
+            env_keys: &[],
+        },
+        model: "native-model".into(),
+        max_tokens: 1234,
+        price: None,
+        prompt_cache_key: None,
+    })
+    .unwrap();
+    let handlers = rig_agent::handlers::Handlers::default();
+    handlers
+        .register("model", backend.model_client().await.unwrap().unwrap())
+        .unwrap();
+    let (run, events) = rig_agent::AgentBuilder::over_handlers(handlers, "native", "model".into())
+        .build()
+        .prompt("hello")
+        .run_channel();
+    drop(events);
+    let result = run.await.unwrap();
+    assert_eq!(result.output(), "native result");
+    assert_eq!(result.usage.input_tokens, Some(12));
+    assert_eq!(result.usage.output_tokens, Some(3));
+    assert_eq!(
+        result.completion_calls()[0].finish_reason,
+        Some(rig_core::completion::FinishReason::Stop)
+    );
+    assert!(!result.completion_calls()[0].raw.is_null());
+    let requests = tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["model"], "native-model");
+    assert_eq!(body["max_tokens"], 1234);
+}

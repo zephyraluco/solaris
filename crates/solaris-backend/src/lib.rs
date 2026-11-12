@@ -6,6 +6,8 @@
 //! provider layer, while conversation and execution policy belong to the agent.
 
 mod client;
+mod connection;
+pub use connection::ModelClient;
 mod convert;
 mod event;
 mod http;
@@ -37,6 +39,12 @@ pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
 /// platform into one of these, and the UI only ever sees this.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
+    /// Resolve a native model connection for the task executor. A backend that
+    /// only supplies synthetic business events can leave this unset.
+    async fn model_client(&self) -> Result<Option<ModelClient>, BackendError> {
+        Ok(None)
+    }
+
     /// Explicit model metadata, with unknown values kept distinct from refusal.
     fn capabilities(&self) -> solaris_types::ModelCapabilities {
         solaris_types::ModelCapabilities::default()

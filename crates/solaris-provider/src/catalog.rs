@@ -125,6 +125,13 @@ impl CatalogBackend {
 }
 #[async_trait]
 impl AgentBackend for CatalogBackend {
+    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+        match &self.live {
+            Some(live) => live.backend().model_client().await,
+            None => self.inner.model_client().await,
+        }
+    }
+
     fn label(&self) -> &str {
         self.inner.label()
     }

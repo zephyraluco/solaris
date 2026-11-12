@@ -68,6 +68,10 @@ pub(crate) struct AccountingBackend {
 }
 #[async_trait]
 impl AgentBackend for AccountingBackend {
+    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+        self.inner.model_client().await
+    }
+
     fn label(&self) -> &str {
         self.inner.label()
     }
