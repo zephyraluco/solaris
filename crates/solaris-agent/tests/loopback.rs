@@ -320,3 +320,49 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
     assert_eq!(body["model"], "native-model");
     assert_eq!(body["max_tokens"], 1234);
 }
+
+#[tokio::test]
+async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let denied = "{\"error\":{\"message\":\"request denied\"}}";
+    let error = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        denied.len(),
+        denied
+    );
+    let (addr, seen) = serve(vec![text_body("remembered"), error]).await;
+    let store =
+        solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+    let journal = store.create(directory.path(), "test-model", None).unwrap();
+    let agent = agent(addr, directory.path());
+    agent.attach_journal(Arc::clone(&journal)).unwrap();
+    let events = drain(&agent, "remember this").await;
+    assert!(
+        matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+        "{events:?}"
+    );
+    let saved = journal.context().unwrap();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[1].text(), "remembered");
+    let records = store.records(journal.id()).unwrap();
+    assert!(!records.iter().any(|record| matches!(
+        record,
+        solaris_agent::SessionRecord::Message { .. } | solaris_agent::SessionRecord::Context { .. }
+    )));
+    assert!(
+        directory
+            .path()
+            .join("memory")
+            .join(journal.id())
+            .join("logs/conversation.jsonl")
+            .is_file()
+    );
+    let events = drain(&agent, "unsaved failed task").await;
+    assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+    assert_eq!(
+        journal.context().unwrap(),
+        saved,
+        "SDK memory saves successful tasks only"
+    );
+    tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
+}

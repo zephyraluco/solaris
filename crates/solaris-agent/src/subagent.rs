@@ -444,6 +444,30 @@ struct BoundedBackend {
 
 #[async_trait]
 impl AgentBackend for BoundedBackend {
+    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+        let client = self.inner.model_client().await?;
+        if client.is_some() && self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
+            return Err(BackendError::new(
+                "subagent exceeded its 20 model-request budget",
+            ));
+        }
+        Ok(client)
+    }
+    fn observe_usage(&self, usage: Usage, cost: f64) -> Result<(), BackendError> {
+        {
+            let mut totals = self.totals.lock().unwrap_or_else(|p| p.into_inner());
+            totals.usage = totals.usage.merge(usage);
+            totals.cost_usd += cost;
+        }
+        if let Some(tx) = &self.usage_tx {
+            let _ = tx.send(AgentEvent::SubagentUsage {
+                usage,
+                cost_usd: cost,
+            });
+        }
+        self.inner.observe_usage(usage, cost)
+    }
+
     fn capabilities(&self) -> solaris_backend::ModelCapabilities {
         self.inner.capabilities()
     }

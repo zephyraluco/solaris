@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 rig-agent.workspace = true
+rig-memory = { version = "0.46.0", features = ["fs"] }
 rig-core.workspace = true
 solaris-backend = { workspace = true }
 solaris-tools = { workspace = true }

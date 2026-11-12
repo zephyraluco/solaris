@@ -17,14 +17,13 @@
 //! exactly the parts that really happened.
 
 use crate::{SessionJournal, SessionRecord, StoreError};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use solaris_backend::{Message, Role};
 
 /// The messages a turn is built from and appends to.
-#[derive(Default)]
 pub(crate) struct Conversation {
-    messages: Mutex<Vec<Message>>,
+    storage: RwLock<Arc<dyn rig_memory::Store + Send + Sync>>,
     headers: Mutex<Vec<crate::projection::Header>>,
     published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
@@ -32,6 +31,18 @@ pub(crate) struct Conversation {
     billing: Mutex<crate::UsageTotals>,
 }
 
+impl Default for Conversation {
+    fn default() -> Self {
+        Self {
+            storage: RwLock::new(Arc::new(rig_memory::MemoryStore::default())),
+            headers: Mutex::new(Vec::new()),
+            published: Mutex::new(Default::default()),
+            journal: RwLock::new(None),
+            failure: Mutex::new(None),
+            billing: Mutex::new(Default::default()),
+        }
+    }
+}
 impl Conversation {
     /// An empty conversation.
     pub(crate) fn new() -> Self {
@@ -48,7 +59,23 @@ impl Conversation {
         };
         let billing = crate::UsageTotals::restore(&journal.store().records(journal.id())?);
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
-        *self.lock() = context;
+        let directory = journal
+            .store()
+            .artifact_dir()
+            .parent()
+            .ok_or_else(|| StoreError::Invalid("missing session directory".into()))?
+            .join("memory")
+            .join(journal.id());
+        let storage = rig_memory::DirStore::open(directory)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        let imported = rig_memory::Store::logs(&storage)
+            .map_err(StoreError::Io)?
+            .iter()
+            .any(|name| name == "conversation");
+        *self.storage.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(storage);
+        if !imported {
+            self.replace_with(context);
+        }
         *self
             .journal
             .write()
@@ -100,42 +127,159 @@ impl Conversation {
     /// A copy rather than a guard because the caller goes on to await with it,
     /// and holding the lock across that would let one turn block the next for as
     /// long as a command takes to run.
+    pub(crate) fn storage(&self) -> Arc<dyn rig_memory::Store + Send + Sync> {
+        Arc::clone(&self.storage.read().unwrap_or_else(|p| p.into_inner()))
+    }
+    pub(crate) fn native(
+        &self,
+    ) -> Result<rig_core::conversation::Conversation, rig_memory::SessionError> {
+        rig_memory::load(&self.storage(), "conversation")
+    }
+    fn failed(&self, error: impl std::fmt::Display) {
+        *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+    }
     pub(crate) fn snapshot(&self) -> Vec<Message> {
-        self.lock().clone()
-    }
-
-    /// How many messages there are.
-    pub(crate) fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    /// Append one message.
-    pub(crate) fn push(&self, message: Message) {
-        let mut messages = self.lock();
-        if self.persist(SessionRecord::Message {
-            message: message.clone(),
-        }) {
-            messages.push(message);
+        match self.native() {
+            Ok(conversation) => {
+                let saved: std::collections::BTreeMap<_, _> = conversation
+                    .asides()
+                    .filter_map(|(_, aside)| {
+                        (aside.kind == "solaris.context")
+                            .then(|| {
+                                aside.after.zip(
+                                    serde_json::from_value::<solaris_backend::MessageContext>(
+                                        aside.value.clone(),
+                                    )
+                                    .ok(),
+                                )
+                            })
+                            .flatten()
+                    })
+                    .collect();
+                conversation
+                    .messages()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| {
+                        let mut message = Message::from(message.as_ref());
+                        message.context = conversation
+                            .id(index)
+                            .and_then(|id| saved.get(&id).cloned());
+                        message
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                self.failed(error);
+                Vec::new()
+            }
         }
-        drop(messages);
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.snapshot().len()
+    }
+    pub(crate) fn push(&self, message: Message) {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut conversation = self.native()?;
+            conversation.extend([rig_core::message::Message::try_from(&message)?]);
+            if let Some(context) = &message.context {
+                let after = conversation.id(conversation.messages().len() - 1);
+                conversation.add_aside(
+                    rig_core::conversation::Aside::new(
+                        "solaris.context",
+                        rig_core::conversation::Author::plugin("solaris"),
+                        serde_json::to_value(context)?,
+                    )
+                    .after(after),
+                );
+            }
+            rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed(error);
+        }
         self.publish();
     }
-
-    /// Replace everything, which is what compaction does.
-    pub(crate) fn replace_with(&self, mut messages: Vec<Message>) {
-        for message in &mut messages {
-            message.context = None;
+    pub(crate) fn replace_with(&self, messages: Vec<Message>) {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut conversation = self.native()?;
+            let converted = messages
+                .iter()
+                .map(rig_core::message::Message::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            conversation.splice(
+                ..,
+                converted
+                    .into_iter()
+                    .map(rig_core::conversation::Entry::new),
+                rig_core::conversation::Author::plugin("solaris"),
+            );
+            for (index, message) in messages.iter().enumerate() {
+                if let Some(context) = &message.context {
+                    conversation.add_aside(
+                        rig_core::conversation::Aside::new(
+                            "solaris.context",
+                            rig_core::conversation::Author::plugin("solaris"),
+                            serde_json::to_value(context)?,
+                        )
+                        .after(conversation.id(index)),
+                    );
+                }
+            }
+            rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed(error);
         }
-        if let Some(first) = messages.first_mut() {
-            first.context = Some(solaris_backend::MessageContext::Boundary);
+        self.publish();
+    }
+    pub(crate) fn annotate_completed(
+        &self,
+        measurements: &[(Message, solaris_backend::MessageContext)],
+    ) {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut conversation = self.native()?;
+            let mut end = conversation.messages().len();
+            for (message, context) in measurements.iter().rev() {
+                let index = conversation.messages()[..end].iter().rposition(|native| {
+                    let candidate = Message::from(native.as_ref());
+                    candidate.role == message.role && candidate.content == message.content
+                });
+                if let Some(index) = index {
+                    conversation.add_aside(
+                        rig_core::conversation::Aside::new(
+                            "solaris.context",
+                            rig_core::conversation::Author::plugin("solaris"),
+                            serde_json::to_value(context)?,
+                        )
+                        .after(conversation.id(index)),
+                    );
+                    end = index;
+                }
+            }
+            rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed(error);
         }
-        let mut current = self.lock();
-        if self.persist(SessionRecord::Context {
-            messages: messages.clone(),
-        }) {
-            *current = messages;
-        }
-        drop(current);
+        self.publish();
+    }
+    pub(crate) fn publish_projection(
+        &self,
+        messages: &[Message],
+        header: &crate::projection::Header,
+    ) -> solaris_backend::ContextUsage {
+        let context = crate::projection::estimate(messages, header, 0).1;
+        self.published
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(header.base_id.clone(), context);
+        context
+    }
+    pub(crate) fn refresh(&self) {
         self.publish();
     }
 
@@ -145,6 +289,9 @@ impl Conversation {
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
         self.replace_with(Vec::new());
+        self.persist(SessionRecord::Context {
+            messages: Vec::new(),
+        });
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
     }
 
@@ -152,33 +299,29 @@ impl Conversation {
     /// tools. Older rounds may reuse the same call IDs, so only results after
     /// this assistant message count as answers.
     pub(crate) fn repair(&self) {
-        let mut messages = self.lock();
-        let Some(round) = messages.iter().rposition(|m| m.role == Role::Assistant) else {
+        let messages = self.snapshot();
+        let Some(round) = messages
+            .iter()
+            .rposition(|message| message.role == Role::Assistant)
+        else {
             return;
         };
-        let calls: Vec<_> = messages[round].tool_calls().cloned().collect();
         let answered: std::collections::HashSet<_> = messages[round + 1..]
             .iter()
-            .flat_map(|m| m.tool_results())
-            .map(|r| r.id.as_str())
+            .flat_map(|message| message.tool_results())
+            .map(|result| result.id.as_str())
             .collect();
-        let missing: Vec<_> = calls
-            .into_iter()
+        let missing: Vec<_> = messages[round]
+            .tool_calls()
             .filter(|call| !answered.contains(call.id.as_str()))
+            .cloned()
             .collect();
         for call in missing {
-            let message = Message::tool_result(solaris_backend::ToolResult::error(
+            self.push(Message::tool_result(solaris_backend::ToolResult::error(
                 &call,
                 "interrupted; execution outcome is unknown; verify side effects before retrying",
-            ));
-            if self.persist(SessionRecord::Message {
-                message: message.clone(),
-            }) {
-                messages.push(message);
-            }
+            )));
         }
-        drop(messages);
-        self.publish();
     }
 
     pub(crate) fn record_billing(
@@ -229,7 +372,7 @@ impl Conversation {
     }
 
     fn publish(&self) {
-        let messages = self.lock();
+        let messages = self.snapshot();
         let headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
         let snapshots = headers
             .iter()
@@ -264,15 +407,7 @@ impl Conversation {
     }
 
     pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
-        crate::projection::estimate(&self.lock(), header, 0).0
-    }
-
-    /// The lock, recovering from a panic in another holder rather than panicking
-    /// here: a poisoned conversation must not take down the turn that is running.
-    fn lock(&self) -> MutexGuard<'_, Vec<Message>> {
-        self.messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::projection::estimate(&self.snapshot(), header, 0).0
     }
 }
 
@@ -519,7 +654,7 @@ mod tests {
         let mut message = Message::assistant("reply");
         header.annotate(&mut message, solaris_backend::Usage::new(100, 10));
         conversation.push(message);
-        let lock = conversation.lock();
+        let lock = conversation.storage.write().unwrap();
         let reader = Arc::clone(&conversation);
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {

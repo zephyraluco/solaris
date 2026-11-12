@@ -43,6 +43,38 @@ impl Backend {
             return Err(BackendError::new("expected a model request"));
         };
         self.check_credentials()?;
+        if self.capabilities.tool_calling == crate::Support::Unsupported
+            && !request.tools.is_empty()
+        {
+            return Err(BackendError::new(
+                "this model does not support tool calling; choose another model or disable tools",
+            ));
+        }
+        if self.capabilities.image_input == crate::Support::Unsupported
+            && request
+                .chat_history
+                .iter()
+                .any(|message| match message.as_ref() {
+                    rig_core::message::Message::User { content } => {
+                        content.iter().any(|part| match part {
+                            rig_core::message::UserContent::Image(_) => true,
+                            rig_core::message::UserContent::ToolResult(result) => {
+                                result.content.iter().any(|part| {
+                                    matches!(part, rig_core::message::ToolResultContent::Image(_))
+                                })
+                            }
+                            _ => false,
+                        })
+                    }
+                    rig_core::message::Message::Assistant(message) => message
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, rig_core::message::AssistantContent::Image(_))),
+                    _ => false,
+                })
+        {
+            return Err(BackendError::new("this model does not support image input"));
+        }
         let mut request = std::sync::Arc::unwrap_or_clone(request);
         request.max_tokens = Some(u64::from(self.max_tokens));
         let mut params = request

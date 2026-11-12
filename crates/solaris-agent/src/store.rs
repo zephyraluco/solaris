@@ -346,6 +346,20 @@ impl SessionJournal {
 
     /// Latest model context, independent of how the UI displays the journal.
     pub fn context(&self) -> Result<Vec<Message>, StoreError> {
+        let memory = rig_memory::DirStore::open(self.store.directory.join("memory").join(&self.id))
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        if rig_memory::Store::logs(&memory)?
+            .iter()
+            .any(|name| name == "conversation")
+        {
+            let conversation = rig_memory::load(&memory, "conversation")
+                .map_err(|error| StoreError::Invalid(error.to_string()))?;
+            return Ok(conversation
+                .messages()
+                .iter()
+                .map(|message| Message::from(message.as_ref()))
+                .collect());
+        }
         let data: Option<String> = self
             .store
             .lock()?

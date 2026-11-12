@@ -1140,7 +1140,7 @@ mod tests {
                 },
             ]
         };
-        let inner = Scripted::new(vec![completion(), completion()]);
+        let inner = Scripted::new(vec![completion(), completion(), completion()]);
         let agent = Agent::new(
             choice(inner.clone()),
             Arc::new(ToolRegistry::builtin()),
@@ -1157,7 +1157,7 @@ mod tests {
             .expect("follow-up");
         drain(agent.run_turn("/skill:pdf initial", Mode::Plan)).await;
         let requests = inner.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let user_text: Vec<_> = requests
             .last()
             .expect("request")
@@ -1516,6 +1516,11 @@ mod tests {
             .push(solaris_backend::Message::user("new question"));
         assert!(agent.compact().await.is_some());
         assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
-        assert_eq!(agent.context_usage(Mode::Build).tokens, None);
+        let context = agent.context_usage(Mode::Build);
+        assert!(
+            context.estimated,
+            "summary billing is not a context measurement"
+        );
+        assert_ne!(context.tokens, Some(550));
     }
 }

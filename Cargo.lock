@@ -3220,6 +3220,7 @@ dependencies = [
  "jsonschema",
  "rig-agent",
  "rig-core",
+ "rig-memory",
  "rusqlite",
  "serde",
  "serde_json",

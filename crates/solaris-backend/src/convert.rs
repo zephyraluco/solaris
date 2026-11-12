@@ -104,6 +104,107 @@ fn tool_content(result: &crate::ToolResult) -> Result<Vec<rig::ToolResultContent
     Ok(content)
 }
 
+impl TryFrom<&crate::Message> for rig::Message {
+    type Error = BackendError;
+    fn try_from(message: &crate::Message) -> Result<Self, Self::Error> {
+        let converted = request(&TurnRequest::new(vec![message.clone()], ""), 1)?;
+        converted
+            .chat_history
+            .into_iter()
+            .next()
+            .map(std::sync::Arc::unwrap_or_clone)
+            .ok_or_else(|| BackendError::new("message conversion produced no message"))
+    }
+}
+
+// This is a display/legacy-import projection only. The native message, including
+// reasoning signatures and provider metadata, stays intact in official memory.
+impl From<&rig::Message> for crate::Message {
+    fn from(message: &rig::Message) -> Self {
+        match message {
+            rig::Message::System { content } => Self::system(content),
+            rig::Message::Assistant(message) => Self::with_content(
+                Role::Assistant,
+                message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        AssistantContent::Text(text) => Some(Content::text(&text.text)),
+                        AssistantContent::ToolCall(call) => Some(Content::ToolUse {
+                            call: crate::ToolCall::new(
+                                call.id.wire().into_owned(),
+                                call.function.name.as_str(),
+                                call.function.arguments_value(),
+                            ),
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            rig::Message::User { content } => Self::with_content(
+                Role::User,
+                content
+                    .iter()
+                    .filter_map(|part| match part {
+                        UserContent::Text(text) => Some(Content::text(&text.text)),
+                        UserContent::ToolResult(result) => {
+                            let mut output = String::new();
+                            let mut images = Vec::new();
+                            for part in &result.content {
+                                match part {
+                                    rig::ToolResultContent::Text(text) => {
+                                        output.push_str(&text.text)
+                                    }
+                                    rig::ToolResultContent::Json { value } => {
+                                        output.push_str(&value.to_string())
+                                    }
+                                    rig::ToolResultContent::Image(image) => {
+                                        if let Some(image) = inline_image(image) {
+                                            images.push(image);
+                                        }
+                                    }
+                                }
+                            }
+                            let call = crate::ToolCall::new(
+                                result.call.wire().into_owned(),
+                                result.name.as_str(),
+                                serde_json::json!({}),
+                            );
+                            let mut result = if result.is_error {
+                                crate::ToolResult::error(&call, output)
+                            } else {
+                                crate::ToolResult::ok(&call, output)
+                            };
+                            result.metadata.images = images;
+                            Some(Content::ToolResult { result })
+                        }
+                        UserContent::Image(image) => {
+                            inline_image(image).map(|image| Content::Image { image })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+fn inline_image(image: &rig::Image) -> Option<crate::InlineImage> {
+    let rig::DocumentSourceKind::Base64(data) = &image.data else {
+        return None;
+    };
+    let media_type = match image.media_type.as_ref()? {
+        rig::ImageMediaType::PNG => "image/png",
+        rig::ImageMediaType::JPEG => "image/jpeg",
+        rig::ImageMediaType::GIF => "image/gif",
+        rig::ImageMediaType::WEBP => "image/webp",
+        _ => return None,
+    };
+    Some(crate::InlineImage {
+        media_type: media_type.into(),
+        data: data.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

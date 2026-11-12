@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, Content, Message, Role, ToolCall, ToolResult,
-    ToolSpec, TurnRequest, Usage,
+    AgentBackend, AgentEvent, AgentEventStream, Message, ToolCall, ToolResult, ToolSpec,
+    TurnRequest, Usage,
 };
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -31,7 +31,6 @@ use crate::approver::{Approval, Approver};
 use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
-use crate::overflow::is_overflow;
 use crate::prompt::{
     COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
 };
@@ -126,7 +125,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
             .map(|spec| spec.name.clone())
             .collect(),
     );
-    let runner = Runner {
+    let runner = Arc::new(Runner {
         active_tools,
         inner,
         budget: Arc::clone(&budget),
@@ -147,7 +146,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         system,
         subagent,
         background: BackgroundTasks::default(),
-    };
+    });
 
     let (tx, rx) = unbounded_channel();
     let cancel = runner.cancel.clone();
@@ -205,6 +204,9 @@ struct Runner {
     background: BackgroundTasks,
 }
 
+#[path = "driver.rs"]
+mod driver;
+
 impl Runner {
     /// Ask the model, run what it asks for, and repeat until it stops asking.
     ///
@@ -212,234 +214,11 @@ impl Runner {
     /// nothing, fails, or the caller stops the turn. Cancelling is therefore the
     /// only bound on how much a turn may spend, which is why it is checked
     /// before every round and again after each round's calls have run.
-    async fn drive(&self, prompt: String, tx: UnboundedSender<AgentEvent>) {
-        // The prompt joins the conversation before anything is asked, so a turn
-        // that is cancelled or fails still leaves what the user actually said.
-        // It also settles the one ordering that matters here: anything steered in
-        // afterwards is read *after* the words it answers.
-        let mut execution = crate::execution::Execution::new(&prompt);
-        self.conversation.push(Message::user(prompt));
-
-        let mut total = Usage::default();
-        let mut cost_usd = 0.0;
-
-        let mut pending_reply: Option<RoundReply> = None;
-        loop {
-            if let Some(error) = self.conversation.error() {
-                self.give_up(error, &tx);
-                return;
-            }
-            if self.cancel.is_cancelled() {
-                self.give_up("the turn was cancelled".to_string(), &tx);
-                return;
-            }
-            if tx.is_closed() {
-                return;
-            }
-            let step = match execution.next() {
-                Ok(step) => step,
-                Err(error) => {
-                    self.give_up(error.to_string(), &tx);
-                    return;
-                }
-            };
-            match step {
-                crate::execution::Step::Model => {
-                    self.absorb_background(&mut total, &mut cost_usd);
-                    self.absorb_steering(&tx);
-                    self.emit_context(&tx);
-                    if self.compact(false, &tx, &mut total, &mut cost_usd).await
-                        && let Err(error) = execution.rebase()
-                    {
-                        self.give_up(error.to_string(), &tx);
-                        return;
-                    }
-                    let mut recovered = false;
-                    let reply = loop {
-                        match self.ask(&tx, &mut total).await {
-                            Round::Answered(reply) => break reply,
-                            Round::Failed => {
-                                self.conversation.repair();
-                                return;
-                            }
-                            Round::Overflow(message) => {
-                                if recovered || !self.compaction.enabled {
-                                    self.give_up(message, &tx);
-                                    return;
-                                }
-                                recovered = true;
-                                if !self.compact(true, &tx, &mut total, &mut cost_usd).await {
-                                    self.give_up(message, &tx);
-                                    return;
-                                }
-                                if let Err(error) = execution.rebase() {
-                                    self.give_up(error.to_string(), &tx);
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    cost_usd += reply.cost_usd;
-                    if let Err(error) = execution.accept(&reply.text, &reply.calls) {
-                        self.give_up(error.to_string(), &tx);
-                        return;
-                    }
-                    pending_reply = Some(reply);
-                }
-                crate::execution::Step::Tools(calls) => {
-                    let Some(reply) = pending_reply.take() else {
-                        self.give_up("missing accepted model response".into(), &tx);
-                        return;
-                    };
-                    let mut message = Message::with_content(
-                        Role::Assistant,
-                        assistant_blocks(reply.text, &calls),
-                    );
-                    self.request_header().annotate(&mut message, reply.usage);
-                    self.conversation.push(message);
-                    self.emit_context(&tx);
-                    // Output truncation is a host safety rule: even valid-looking
-                    // tool arguments must not run when the response was cut off.
-                    let results = if reply.truncated {
-                        self.refuse_calls(&calls, &tx)
-                    } else {
-                        self.run_round(&calls, &tx).await
-                    };
-                    let Some(results) = results else {
-                        self.conversation.repair();
-                        return;
-                    };
-                    let answers: Vec<_> = results
-                        .iter()
-                        .map(|outcome| outcome.result.clone())
-                        .collect();
-                    if let Err(error) = execution.answer(&answers) {
-                        self.give_up(error.to_string(), &tx);
-                        return;
-                    }
-                    let results = results
-                        .into_iter()
-                        .map(|outcome| {
-                            total = total.merge(outcome.usage);
-                            cost_usd += outcome.cost_usd;
-                            Content::ToolResult {
-                                result: outcome.result,
-                            }
-                        })
-                        .collect();
-                    self.conversation
-                        .push(Message::with_content(Role::User, results));
-                    self.emit_context(&tx);
-                }
-                crate::execution::Step::Done => {
-                    let Some(reply) = pending_reply.take() else {
-                        self.give_up("missing final model response".into(), &tx);
-                        return;
-                    };
-                    self.record_reply(&reply.text, reply.usage);
-                    self.emit_context(&tx);
-                    let mut resume = self.absorb_background(&mut total, &mut cost_usd);
-                    resume |= self.absorb_steering(&tx);
-                    if !resume && !self.background.is_empty() {
-                        if !self
-                            .wait_for_background(&tx, &mut total, &mut cost_usd)
-                            .await
-                        {
-                            return;
-                        }
-                        resume = true;
-                    }
-                    if !resume {
-                        resume = self.take_follow_ups(&tx);
-                    }
-                    if resume {
-                        execution = crate::execution::Execution::new("continue session");
-                        continue;
-                    }
-                    if let Some(error) = self.conversation.error() {
-                        let _ = tx.send(AgentEvent::Error(error));
-                        return;
-                    }
-                    let _ = tx.send(AgentEvent::TurnComplete {
-                        usage: total,
-                        cost_usd,
-                    });
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Ask the model once, forwarding what it produces.
-    async fn ask(&self, tx: &UnboundedSender<AgentEvent>, total: &mut Usage) -> Round {
-        let request = TurnRequest {
-            history: with_system(&self.system, &self.conversation.snapshot()),
-            // The prompt is already in the conversation: this loop records it
-            // before it asks anything.
-            prompt: String::new(),
-            tools: self.request_tools(),
-        };
-
-        let result = tokio::select! {
-            biased;
-            _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
-            _ = tx.closed() => return Round::Failed,
-            result = self.inner.run_turn(request) => result,
-        };
-        let stream = match result {
-            Ok(stream) => stream,
-            Err(error) => return self.report_failure(error.to_string(), tx),
-        };
-        self.consume(stream, tx, total).await
-    }
-
-    /// Decide what a failure means: an overflow can be recovered from, the rest
-    /// cannot.
-    fn report_failure(&self, message: String, tx: &UnboundedSender<AgentEvent>) -> Round {
-        if is_overflow(&message) {
-            Round::Overflow(message)
-        } else {
-            let _ = tx.send(AgentEvent::Error(message));
-            Round::Failed
-        }
-    }
-
     /// End a turn without a completion, leaving the conversation consistent.
     fn give_up(&self, message: String, tx: &UnboundedSender<AgentEvent>) {
         self.conversation.repair();
         self.emit_context(tx);
         let _ = tx.send(AgentEvent::Error(message));
-    }
-
-    /// Record the model's own words, when it said anything.
-    ///
-    /// An empty message is left out rather than sent: some wires reject a blank
-    /// text block outright, and a turn that answered nothing has nothing to add.
-    fn record_reply(&self, text: &str, usage: Usage) {
-        if text.trim().is_empty() {
-            return;
-        }
-        let mut message = Message::assistant(text);
-        self.request_header().annotate(&mut message, usage);
-        self.conversation.push(message);
-    }
-
-    /// Fold everything the user steered in into the conversation.
-    ///
-    /// Returns whether anything arrived, which is what tells the caller that a
-    /// turn the model considered finished is not finished after all. Each message
-    /// is reported as it is taken, so the caller that writes the transcript down
-    /// learns that the model has now read it.
-    fn absorb_steering(&self, tx: &UnboundedSender<AgentEvent>) -> bool {
-        let steered = self.steering.drain();
-        if steered.is_empty() {
-            return false;
-        }
-        for text in steered {
-            let _ = tx.send(AgentEvent::Steered { text: text.clone() });
-            self.conversation.push(Message::user(text));
-        }
-        true
     }
 
     fn absorb_background(&self, total: &mut Usage, cost_usd: &mut f64) -> bool {
@@ -501,24 +280,6 @@ impl Runner {
                 }
             }
         }
-    }
-
-    /// Take anything queued for after this turn, and say so.
-    ///
-    /// Returns whether the turn has more to do — a follow-up is a new turn inside
-    /// the same loop, so the conversation carries on rather than being rebuilt.
-    fn take_follow_ups(&self, tx: &UnboundedSender<AgentEvent>) -> bool {
-        let queued = self.follow_up.drain();
-        if queued.is_empty() {
-            return false;
-        }
-        for prompt in queued {
-            let _ = tx.send(AgentEvent::FollowUp {
-                prompt: prompt.clone(),
-            });
-            self.conversation.push(Message::user(prompt));
-        }
-        true
     }
 
     /// Summarize the older part of the conversation, if there is a reason to.
@@ -624,90 +385,6 @@ impl Runner {
     ///
     /// A failed round has already had its error sent by the time `Failed`
     /// returns; `total` has this round's usage added to it either way.
-    async fn consume(
-        &self,
-        mut stream: AgentEventStream,
-        tx: &UnboundedSender<AgentEvent>,
-        total: &mut Usage,
-    ) -> Round {
-        let mut text = String::new();
-        let mut calls = Vec::new();
-        let mut cost_usd = 0.0;
-        let mut usage = Usage::default();
-        let mut truncated = false;
-        let mut completed = false;
-
-        loop {
-            let event = tokio::select! {
-                biased;
-                _ = wait_for_cancel(&self.cancel) => return self.report_failure("the turn was cancelled".into(), tx),
-                _ = tx.closed() => return Round::Failed,
-                event = stream.next() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            match event {
-                AgentEvent::TextDelta(chunk) => {
-                    text.push_str(&chunk);
-                    if tx.send(AgentEvent::TextDelta(chunk)).is_err() {
-                        return Round::Failed;
-                    }
-                }
-                // The call is forwarded so a caller can show it while it runs;
-                // the result follows once it is done.
-                AgentEvent::ToolCall(call) => {
-                    if tx.send(AgentEvent::ToolCall(call.clone())).is_err() {
-                        return Round::Failed;
-                    }
-                    calls.push(call);
-                }
-                // A cut-off message: remembered so the calls it carries are
-                // refused rather than run, and passed on so the caller can say
-                // so on screen.
-                AgentEvent::OutputTruncated => {
-                    truncated = true;
-                    if tx.send(AgentEvent::OutputTruncated).is_err() {
-                        return Round::Failed;
-                    }
-                }
-                AgentEvent::TurnComplete {
-                    usage: reported,
-                    cost_usd: cost,
-                } => {
-                    *total = total.merge(reported);
-                    usage = reported;
-                    cost_usd = cost;
-                    completed = true;
-                }
-                AgentEvent::Error(message) => return self.report_failure(message, tx),
-                other => {
-                    if tx.send(other).is_err() {
-                        return Round::Failed;
-                    }
-                }
-            }
-        }
-
-        // A stream that ends without a completion was cut short — the transport
-        // dropped, a proxy closed the connection — and reading that as a
-        // finished turn would report half an answer as the whole one.
-        if !completed {
-            let _ = tx.send(AgentEvent::Error(
-                "the model's response ended without completing".to_string(),
-            ));
-            return Round::Failed;
-        }
-
-        Round::Answered(RoundReply {
-            text,
-            calls,
-            usage,
-            cost_usd,
-            truncated,
-        })
-    }
-
     /// Run one call, or explain why it did not run.
     async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
         // The SDK classifies non-object arguments as malformed. Reject them
@@ -863,54 +540,6 @@ impl Runner {
         }
     }
 
-    /// Run one round's calls and answer with the blocks the next round carries.
-    ///
-    /// Calls that may run together do, up to the parallel cap; results come back
-    /// in the order the model asked for them, which is what pairs each answer
-    /// with its call. `None` means the caller stopped listening.
-    async fn run_round(
-        &self,
-        calls: &[ToolCall],
-        tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<CallOutcome>> {
-        if self.runs_one_at_a_time(calls) {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.run_and_report(call, tx).await?);
-            }
-            return Some(results);
-        }
-
-        // Calls run in batches of the cap, so nothing waits on more than the
-        // batch it is in and no closure has to name the futures' lifetimes.
-        let mut results = Vec::with_capacity(calls.len());
-        for batch in calls.chunks(self.max_parallel) {
-            let mut pending = Vec::with_capacity(batch.len());
-            for call in batch {
-                pending.push(self.run_and_report(call, tx));
-            }
-            results.extend(futures::future::join_all(pending).await);
-        }
-        results.into_iter().collect()
-    }
-
-    /// Whether this round has to run one call at a time.
-    ///
-    /// True when the cap says so, or when any call in it is for a tool that
-    /// asked to run alone: one such call settles the whole round, because the
-    /// point of running alone is that nothing else overlaps it.
-    fn runs_one_at_a_time(&self, calls: &[ToolCall]) -> bool {
-        if self.max_parallel <= 1 {
-            return true;
-        }
-        calls.iter().any(|call| {
-            self.tools
-                .iter()
-                .find(|tool| tool.name() == call.name)
-                .is_some_and(|tool| tool.execution_mode() == ExecutionMode::Sequential)
-        })
-    }
-
     /// Run one call and report it, answering with the block to send back.
     async fn run_and_report(
         &self,
@@ -941,33 +570,6 @@ impl Runner {
         .ok()?;
 
         Some(result)
-    }
-
-    /// Refuse every call in a message the model never finished writing.
-    ///
-    /// The arguments may be half a JSON object, so running them would mean
-    /// acting on a guess. The model is told instead, and can ask again with the
-    /// arguments written out in full.
-    fn refuse_calls(
-        &self,
-        calls: &[ToolCall],
-        tx: &UnboundedSender<AgentEvent>,
-    ) -> Option<Vec<CallOutcome>> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            let result = ToolResult::error(
-                call,
-                "the reply hit the output limit before this call was complete, so it did not \
-                 run — ask again with the arguments written out in full",
-            );
-            tx.send(AgentEvent::ToolResult {
-                result: result.clone(),
-                duration_ms: 0,
-            })
-            .ok()?;
-            results.push(result.into());
-        }
-        Some(results)
     }
 }
 
@@ -1142,49 +744,6 @@ pub(crate) async fn compact_now(
     replaced.extend_from_slice(&messages[cut..]);
     conversation.replace_with(replaced);
     Some(cut)
-}
-
-/// The conversation with the system prompt ahead of it, as a request carries it.
-fn with_system(system: &str, conversation: &[Message]) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(conversation.len() + 1);
-    messages.push(Message::system(system));
-    messages.extend_from_slice(conversation);
-    messages
-}
-
-/// How one round ended.
-enum Round {
-    /// The model finished its message, which may ask for calls.
-    Answered(RoundReply),
-    /// The round failed. The error has already been sent to the caller.
-    Failed,
-    /// The window was full. The caller decides whether to summarize and retry.
-    Overflow(String),
-}
-
-/// What one model call produced.
-struct RoundReply {
-    /// The text the model wrote, which belongs in the conversation so later
-    /// rounds see what it said around its calls.
-    text: String,
-    /// The calls it asked for.
-    calls: Vec<ToolCall>,
-    /// What this round alone consumed, which is how full the window now is.
-    usage: Usage,
-    /// What the call cost.
-    cost_usd: f64,
-    /// Whether the output limit cut the message off.
-    truncated: bool,
-}
-
-/// The assistant message for a round: its text, then its calls.
-fn assistant_blocks(text: String, calls: &[ToolCall]) -> Vec<Content> {
-    let mut blocks = Vec::with_capacity(calls.len() + 1);
-    if !text.is_empty() {
-        blocks.push(Content::text(text));
-    }
-    blocks.extend(calls.iter().cloned().map(|call| Content::ToolUse { call }));
-    blocks
 }
 
 /// A stream over the loop's channel.
@@ -1888,17 +1447,14 @@ mod tests {
                 .any(|event| matches!(event, AgentEvent::OutputTruncated))
         );
 
-        let results = results_seen(&inner);
-        assert!(results[0].is_error);
-        assert!(
-            results[0].output.contains("output limit"),
-            "{}",
-            results[0].output
+        assert_eq!(
+            inner.requests().len(),
+            1,
+            "no hidden retry of a truncated tool turn"
         );
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("output limit"))
+        );
     }
 
     #[tokio::test]
@@ -2580,7 +2136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_window_that_turns_out_to_be_full_is_recovered_from() {
+    async fn an_overflow_preserves_saved_history_and_ends_the_sdk_task() {
         let inner = Scripted::new(vec![
             // The round the provider refuses.
             vec![AgentEvent::Error(
@@ -2609,28 +2165,18 @@ mod tests {
             .run("do it")
             .await;
 
-        // The overflow did not become the turn's answer: it was summarized away
-        // and the same round asked again.
         assert!(
-            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
-            "the turn finished rather than failing: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Compacted { .. })),
-            "and it says what it did: {events:?}"
+            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("too long"))
         );
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::Error(_))),
-            "the overflow never reached the user: {events:?}"
+                .any(|event| matches!(event, AgentEvent::Compacted { .. }))
         );
         assert_eq!(
             inner.requests().len(),
-            3,
-            "refused, summarized, asked again"
+            1,
+            "SDK failures do not silently restart tasks"
         );
     }
 
@@ -2659,9 +2205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_conversation_that_grows_past_the_window_is_summarized_mid_turn() {
-        // The provider reports a usage that fills the window, which is the one
-        // signal an over-long request that was accepted anyway leaves behind.
+    async fn automatic_compaction_happens_between_sdk_tasks() {
         let inner = Scripted::new(vec![
             vec![
                 AgentEvent::ToolCall(call("call-1", "record")),
@@ -2670,9 +2214,16 @@ mod tests {
                     cost_usd: 0.0,
                 },
             ],
-            round(vec![AgentEvent::TextDelta("a summary".to_string())]),
-            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
-            round(vec![AgentEvent::TextDelta("done".to_string())]),
+            vec![
+                AgentEvent::TextDelta("finished first task".into()),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(190_000, 100),
+                    cost_usd: 0.0,
+                },
+            ],
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            round(vec![AgentEvent::TextDelta("task prefix".into())]),
+            round(vec![AgentEvent::TextDelta("finished second task".into())]),
         ]);
         let options = AgentOptions {
             compaction: Compaction {
@@ -2682,19 +2233,32 @@ mod tests {
             },
             ..Default::default()
         };
-
-        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
-            .options(options)
+        let first = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options.clone())
             .context_window(200_000)
-            .history(long_history(12))
-            .run("do it")
-            .await;
-
+            .history(long_history(12));
+        let conversation = Arc::clone(&first.conversation);
+        let events = first.run("do it").await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted { .. }))
+        );
+        assert_eq!(inner.requests().len(), 2);
+        let mut second = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(200_000);
+        second.conversation = conversation;
+        let events = second.run("next task").await;
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Compacted { .. })),
-            "the reported usage was enough to trigger it: {events:?}"
+            "{events:?}"
         );
         assert!(matches!(
             events.last(),
