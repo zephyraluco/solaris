@@ -366,3 +366,113 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
     );
     tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn manual_native_compaction_obeys_the_deadline_and_releases_the_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let mut byte = [0];
+        tokio::time::timeout(PATIENCE, socket.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let store =
+        solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+    let journal = store.create(directory.path(), "test-model", None).unwrap();
+    let saved = vec![
+        solaris_backend::Message::user("earlier request"),
+        solaris_backend::Message::assistant("earlier answer"),
+        solaris_backend::Message::user("new request"),
+    ];
+    journal
+        .append(&solaris_agent::SessionRecord::Context {
+            messages: saved.clone(),
+        })
+        .unwrap();
+    let mut options = AgentOptions::in_directory(directory.path());
+    options.execution.budget.max_seconds = 1;
+    options.compaction.keep_recent_tokens = 1;
+    let agent = Agent::new(
+        AgentBackendConfig {
+            backend: Arc::new(backend(addr)),
+            model: "test-model".into(),
+            provider_id: None,
+            fallback_context_window: 128_000,
+            instructions: None,
+        },
+        registry(),
+        options,
+    );
+    agent.attach_journal(Arc::clone(&journal)).unwrap();
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, agent.compact())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(journal.context().unwrap(), saved);
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let (addr, seen) = serve(vec![text_body("keep the parser constraints")]).await;
+    let store =
+        solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+    let journal = store.create(directory.path(), "test-model", None).unwrap();
+    journal
+        .append(&solaris_agent::SessionRecord::Context {
+            messages: vec![
+                solaris_backend::Message::user("old request"),
+                solaris_backend::Message::assistant("old answer"),
+                solaris_backend::Message::user("new request"),
+            ],
+        })
+        .unwrap();
+    let model = backend(addr).with_capabilities(solaris_backend::ModelCapabilities {
+        context_window: Some(8192),
+        max_output: Some(4096),
+        ..Default::default()
+    });
+    let mut options = AgentOptions::in_directory(directory.path());
+    options.compaction.keep_recent_tokens = 1;
+    let agent = Agent::new(
+        AgentBackendConfig {
+            backend: Arc::new(model),
+            model: "test-model".into(),
+            provider_id: None,
+            fallback_context_window: 8192,
+            instructions: None,
+        },
+        registry(),
+        options,
+    );
+    agent.attach_journal(Arc::clone(&journal)).unwrap();
+    assert_eq!(agent.compact().await, Some(2));
+    let memory =
+        rig_memory::DirStore::open(directory.path().join("memory").join(journal.id())).unwrap();
+    let conversation = rig_memory::load(&memory, "conversation").unwrap();
+    assert_eq!(
+        rig_memory::summary_state(&conversation).summary,
+        "keep the parser constraints"
+    );
+    assert_eq!(conversation.messages().len(), 2);
+    assert!(rig_core::conversation::pairing::validate(conversation.messages()).is_ok());
+    let requests = tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["max_tokens"], 2048);
+    assert!(body.get("tools").is_none());
+}

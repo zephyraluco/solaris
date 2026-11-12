@@ -17,7 +17,7 @@
 //!   number of messages for the same reason: eight messages can be a paragraph or
 //!   a whole file.
 
-use solaris_backend::{Message, Role, tokens_for_characters};
+use solaris_backend::Message;
 
 /// Tokens held back from the window for the reply itself.
 pub const DEFAULT_RESERVE_TOKENS: u32 = 16_384;
@@ -47,18 +47,6 @@ impl Default for Compaction {
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CutPlan {
-    pub first_kept: usize,
-    pub turn_start: Option<usize>,
-}
-
-fn is_turn_start(message: &Message) -> bool {
-    message.role == Role::User
-        && !message.is_tool_results()
-        && !message.text().starts_with(crate::prompt::SUMMARY_PREFIX)
 }
 
 impl Compaction {
@@ -104,39 +92,35 @@ impl Compaction {
 
     /// Keep a legal message boundary; oversized tool results retain their call.
     pub fn cut_point(self, messages: &[Message]) -> usize {
-        self.plan(messages).first_kept
-    }
-
-    pub(crate) fn plan(self, messages: &[Message]) -> CutPlan {
-        let legal: Vec<usize> = messages
+        let native: Vec<_> = match messages
             .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                (is_turn_start(message) || message.role == Role::Assistant).then_some(index)
-            })
-            .collect();
-        let mut cut = legal.first().copied().unwrap_or(0);
-        let mut kept = 0u32;
-        for index in (0..messages.len()).rev() {
-            kept = kept.saturating_add(tokens_for_characters(messages[index].characters()));
-            if kept >= self.keep_recent_tokens {
-                cut = legal
-                    .iter()
-                    .copied()
-                    .find(|candidate| *candidate >= index)
-                    .or_else(|| legal.last().copied())
-                    .unwrap_or(0);
-                break;
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<_, _>>()
+        {
+            Ok(messages) => messages,
+            Err(_) => {
+                return 0;
             }
-        }
-        let turn_start = messages
-            .get(cut)
-            .filter(|message| !is_turn_start(message))
-            .and_then(|_| messages[..cut].iter().rposition(is_turn_start));
-        CutPlan {
-            first_kept: cut,
-            turn_start,
-        }
+        };
+        let policy = rig_memory::CompactionPolicy {
+            keep_recent: self.keep_recent_tokens as usize,
+            keep_asked: self.keep_recent_tokens as usize,
+            ..Default::default()
+        };
+        policy
+            .cut(
+                &native
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                0,
+                &rig_memory::CompactReason::Asked {
+                    focus: String::new(),
+                },
+                None,
+            )
+            .unwrap_or(0)
     }
 }
 
@@ -144,6 +128,7 @@ impl Compaction {
 mod tests {
     use super::*;
     use serde_json::json;
+    use solaris_backend::Role;
     use solaris_backend::{ToolCall, ToolResult};
 
     fn call(id: &str) -> ToolCall {
@@ -266,9 +251,7 @@ mod tests {
             Message::tool_result(ToolResult::ok(&call("one"), "x".repeat(4000))),
             Message::tool_result(ToolResult::ok(&call("two"), "y".repeat(4000))),
         ];
-        let plan = policy.plan(&messages);
-        assert_eq!(plan.first_kept, 1);
-        assert_eq!(plan.turn_start, Some(0));
-        assert_eq!(messages[plan.first_kept..].len(), 3);
+        assert_eq!(policy.cut_point(&messages), 1);
+        assert_eq!(messages[policy.cut_point(&messages)..].len(), 3);
     }
 }

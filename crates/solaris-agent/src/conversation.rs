@@ -135,7 +135,7 @@ impl Conversation {
     ) -> Result<rig_core::conversation::Conversation, rig_memory::SessionError> {
         rig_memory::load(&self.storage(), "conversation")
     }
-    fn failed(&self, error: impl std::fmt::Display) {
+    pub(crate) fn failed(&self, error: impl std::fmt::Display) {
         *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
     }
     pub(crate) fn snapshot(&self) -> Vec<Message> {

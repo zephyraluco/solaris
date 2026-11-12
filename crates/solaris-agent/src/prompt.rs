@@ -24,7 +24,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use solaris_backend::{Content, Message, Role};
+use solaris_backend::Message;
 use solaris_tools::Tool;
 
 use crate::mode::Mode;
@@ -107,6 +107,7 @@ pub(crate) const SUMMARY_PREFIX: &str =
     "[Summary of the earlier conversation, replaced to stay inside the context window]";
 
 /// The message a summary travels in.
+#[cfg(test)]
 pub(crate) fn summary_message(summary: &str) -> Message {
     Message::user(format!("{SUMMARY_PREFIX}\n{summary}"))
 }
@@ -241,62 +242,6 @@ pub(crate) fn build_system_prompt(
 /// tell them apart misreports the session. Tool blocks are included but their
 /// bodies are cut short: a summary needs to know *that* a file was read, not the
 /// thousand lines it contained.
-pub(crate) fn conversation_text(history: &[Message]) -> String {
-    let mut text = String::new();
-    for message in history {
-        for block in &message.content {
-            match block {
-                Content::Image { image } => {
-                    text.push_str(&format!("[{} image attachment; binary content omitted from this textual checkpoint]\n", image.media_type));
-                }
-                Content::Text { text: body } => {
-                    let _ = writeln!(text, "{}: {body}", role_label(message.role));
-                }
-                Content::ToolUse { call } => {
-                    let _ = writeln!(
-                        text,
-                        "{}: called `{}` with {}",
-                        role_label(message.role),
-                        call.name,
-                        clipped(&call.input.to_string(), 400)
-                    );
-                }
-                Content::ToolResult { result } => {
-                    let _ = writeln!(
-                        text,
-                        "tool `{}` returned{}: {}",
-                        result.name,
-                        if result.is_error { " an error" } else { "" },
-                        clipped(&result.output, 600)
-                    );
-                }
-            }
-        }
-    }
-    text
-}
-
-/// What a role is called in the text handed to a summarizer.
-fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-    }
-}
-
-/// `text`, cut to `limit` characters with a marker when it was longer.
-///
-/// Counted in characters rather than bytes so a multi-byte character is never
-/// split in half.
-fn clipped(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(limit).collect();
-    format!("{head}… [cut here]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,47 +390,6 @@ mod tests {
         assert!(
             !prompt.contains("# Using the tools"),
             "no section when no tool has guidance: {prompt}"
-        );
-    }
-
-    #[test]
-    fn the_summary_input_names_every_speaker() {
-        let history = vec![
-            Message::user("add a flag"),
-            Message::assistant("I will read the parser."),
-            Message::tool_use(solaris_backend::ToolCall::new(
-                "call-1",
-                "read",
-                serde_json::json!({ "path": "src/parser.rs" }),
-            )),
-            Message::tool_result(solaris_backend::ToolResult::ok(
-                &solaris_backend::ToolCall::new("call-1", "read", serde_json::json!({})),
-                "fn main() {}",
-            )),
-        ];
-
-        let text = conversation_text(&history);
-        assert!(text.contains("user: add a flag"), "{text}");
-        assert!(text.contains("assistant: I will read"), "{text}");
-        assert!(text.contains("called `read`"), "{text}");
-        assert!(text.contains("tool `read` returned"), "{text}");
-        assert!(text.contains("src/parser.rs"), "{text}");
-    }
-
-    #[test]
-    fn a_long_tool_body_is_cut_rather_than_repeated_in_full() {
-        let call = solaris_backend::ToolCall::new("call-1", "read", serde_json::json!({}));
-        let output = "é".repeat(700);
-        let history = vec![Message::tool_result(solaris_backend::ToolResult::ok(
-            &call, &output,
-        ))];
-
-        let text = conversation_text(&history);
-        assert!(text.contains("[cut here]"), "{text}");
-        assert!(
-            text.chars().count() < 700,
-            "the body was clipped: {}",
-            text.chars().count()
         );
     }
 }

@@ -36,7 +36,7 @@ struct Policy {
 fn failure(error: impl std::fmt::Display) -> ErrorReport {
     ErrorReport::new(ErrorKind::Provider, error.to_string())
 }
-fn usage(value: rig_core::completion::Usage) -> Usage {
+pub(super) fn usage(value: rig_core::completion::Usage) -> Usage {
     let read = value.cached_input_tokens.unwrap_or(0);
     let write = value.cache_creation_input_tokens.unwrap_or(0);
     let bounded = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);

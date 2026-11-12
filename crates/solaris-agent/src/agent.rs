@@ -358,6 +358,7 @@ impl Agent {
     pub async fn compact(&self) -> Option<usize> {
         let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))?;
         let cancel = self.cancel.begin_turn();
+        let budget = crate::ExecutionBudget::new(self.options.execution.budget.clone());
         let inner: Arc<dyn solaris_backend::AgentBackend> =
             Arc::new(crate::budget::BudgetedBackend {
                 inner: Arc::new(crate::billing::AccountingBackend {
@@ -365,9 +366,13 @@ impl Agent {
                     conversation: Arc::clone(&self.conversation),
                     kind: crate::UsageKind::Manual,
                 }),
-                budget: crate::ExecutionBudget::new(self.options.execution.budget.clone()),
+                budget: Arc::clone(&budget),
             });
-        session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel).await
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(budget.deadline()) => { cancel.cancel(); None },
+            result = session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel) => result,
+        }
     }
 
     /// Short human-readable label shown in the status bar.

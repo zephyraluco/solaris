@@ -31,9 +31,7 @@ use crate::approver::{Approval, Approver};
 use crate::background::{BackgroundTasks, Completion};
 use crate::compaction::Compaction;
 use crate::conversation::Conversation;
-use crate::prompt::{
-    COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, conversation_text, existing_summary, summary_message,
-};
+use crate::prompt::{COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, existing_summary};
 use crate::queue::Queue;
 use crate::subagent::{SUBAGENT_TOOL, SubagentRunner};
 
@@ -301,27 +299,23 @@ impl Runner {
             return false;
         }
 
-        let messages = self.conversation.snapshot();
-        let plan = self.compaction_policy().plan(&messages);
-        let cut = plan.first_kept;
-        if cut == 0 {
-            return false;
-        }
-        let outcome = summarize_plan(&self.inner, &self.cancel, &messages, plan).await;
+        let outcome = compact_memory(
+            &self.inner,
+            &self.cancel,
+            &self.conversation,
+            self.compaction_policy(),
+            self.context_window,
+            force,
+        )
+        .await;
         *total = total.merge(outcome.usage);
         *cost_usd += outcome.cost_usd;
-        let Some(summary) = outcome.text else {
-            // Summarizing failed. Sending the conversation as it stands is worse
-            // than asking for less, but far better than sending nothing.
+        if outcome.text.is_none() {
             return false;
-        };
-
-        let mut replaced = Vec::with_capacity(messages.len() - cut + 1);
-        replaced.push(summary_message(&summary));
-        replaced.extend_from_slice(&messages[cut..]);
-        self.conversation.replace_with(replaced);
-
-        let _ = tx.send(AgentEvent::Compacted { dropped: cut });
+        }
+        let _ = tx.send(AgentEvent::Compacted {
+            dropped: outcome.dropped,
+        });
         self.emit_context(tx);
         true
     }
@@ -595,155 +589,196 @@ pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
     }
 }
 
-/// Summarize `older`, given the summary it replaces when there is one.
-///
-/// The summary call is the plainest request the loop can make: no tools, one
-/// system message saying what is wanted, and an answer read here instead of being
-/// forwarded — the caller asked for a turn's answer, not for the notes taken
-/// along the way. It observes the turn's cancel, because a summary of a long
-/// conversation is not something to sit through after the user has given up.
+/// Compaction uses the official cut policy, request builder, validation and
+/// summary splice. It runs only between SDK tasks, so no live runner is mutated.
 #[derive(Default)]
-pub(crate) struct SummaryOutcome {
+struct SummaryOutcome {
     text: Option<String>,
     usage: Usage,
     cost_usd: f64,
+    dropped: usize,
 }
-
-pub(crate) async fn summarize(
+async fn compact_memory(
     inner: &Arc<dyn AgentBackend>,
     cancel: &Cancel,
-    older: &[Message],
-    previous: Option<&str>,
-    purpose: Option<&str>,
+    conversation: &Conversation,
+    config: Compaction,
+    fallback_window: u32,
+    force: bool,
 ) -> SummaryOutcome {
-    let (system, prompt) = match previous {
-        Some(existing) => (
-            UPDATE_COMPACT_PROMPT,
-            format!(
-                "{}\n\n--- Summary to update ---\n{existing}",
-                conversation_text(older)
-            ),
-        ),
-        None => (COMPACT_PROMPT, conversation_text(older)),
-    };
-
-    let prompt = if let Some(purpose) = purpose {
-        format!("{purpose}\n\n{prompt}")
-    } else {
-        prompt
-    };
-    let request = TurnRequest {
-        history: vec![Message::system(system)],
-        prompt,
-        tools: Vec::new(),
+    use rig_core::{
+        effect::{Answered, EffectId, EffectKind},
+        serve::{Dispatch, Serve},
     };
     let mut outcome = SummaryOutcome::default();
-    let mut stream = tokio::select! {
+    if cancel.is_cancelled() {
+        return outcome;
+    }
+    let mut native = match conversation.native() {
+        Ok(native) => native,
+        Err(_) => return outcome,
+    };
+    let caps = inner.capabilities();
+    let provider = match rig_core::providers::registry::ProviderId::declare("solaris") {
+        Ok(provider) => provider,
+        Err(_) => return outcome,
+    };
+    let mut spec = rig_core::catalog::ModelSpec::new(provider, "session");
+    spec.context_window = caps
+        .context_window
+        .or((fallback_window > 0).then_some(fallback_window));
+    spec.max_input_tokens = caps.max_input;
+    spec.max_output_tokens = caps.max_output.or(caps.output_budget);
+    let mut policy = rig_memory::CompactionPolicy {
+        keep_recent: config.keep_recent_tokens as usize,
+        keep_asked: config.keep_recent_tokens as usize,
+        ..Default::default()
+    };
+    let mut state = rig_memory::summary_state(&native);
+    if state.summary.is_empty() {
+        state.summary = existing_summary(&conversation.snapshot()).unwrap_or_default();
+    }
+    policy.summarizer.prompts.system = if state.summary.is_empty() {
+        COMPACT_PROMPT.into()
+    } else {
+        UPDATE_COMPACT_PROMPT.into()
+    };
+    let reason = if force {
+        rig_memory::CompactReason::Asked {
+            focus: String::new(),
+        }
+    } else {
+        rig_memory::CompactReason::Threshold
+    };
+    let from = rig_memory::summarized_prefix(&native);
+    let Some(cut) = policy.cut(native.messages(), from, &reason, Some(&spec)) else {
+        return outcome;
+    };
+    let (mut state, request) =
+        match policy.plan(&state, native.messages(), from, cut, &spec, &reason) {
+            Ok(plan) => plan,
+            Err(_) => return outcome,
+        };
+    let client = tokio::select! {
         biased;
         _ = wait_for_cancel(cancel) => return outcome,
-        result = inner.run_turn(request) => match result { Ok(stream) => stream, Err(_) => return outcome },
+        result = inner.model_client() => match result { Ok(client) => client, Err(_) => return outcome },
     };
-
-    let mut summary = String::new();
-    let mut completed = false;
-    let mut truncated = false;
-    loop {
-        let event = tokio::select! {
+    let summary = if let Some(client) = client {
+        let input = request
+            .chat_history
+            .iter()
+            .map(|message| Message::from(message.as_ref()).characters())
+            .sum();
+        let kind = EffectKind::Completion {
+            request: Arc::new(request),
+            stream: true,
+        };
+        let answer = tokio::select! {
             biased;
             _ = wait_for_cancel(cancel) => return outcome,
-            event = stream.next() => event,
+            result = async { client.serve(kind, Dispatch::new(EffectId::from_raw(0), true)).await.into_outcome().await } => result,
         };
-        let Some(event) = event else {
-            break;
+        let Ok(Answered::Completion(response)) = answer else {
+            return outcome;
         };
-        match event {
-            AgentEvent::TextDelta(chunk) => summary.push_str(&chunk),
-            AgentEvent::Error(_) => return outcome,
-            AgentEvent::TurnComplete { usage, cost_usd } => {
-                outcome.usage = usage;
-                outcome.cost_usd = cost_usd;
-                completed = true;
-            }
-            AgentEvent::OutputTruncated => truncated = true,
-            // Thinking, status and anything else are not the summary.
-            _ => {}
+        outcome.usage =
+            if response.usage.input_tokens.is_some() || response.usage.output_tokens.is_some() {
+                driver::usage(response.usage)
+            } else {
+                Usage::estimate(input, response.text().chars().count())
+            };
+        outcome.cost_usd = client.cost(outcome.usage);
+        if inner
+            .observe_usage(outcome.usage, outcome.cost_usd)
+            .is_err()
+        {
+            return outcome;
         }
+        match rig_memory::Summarizer::summary_text(&response) {
+            Ok(summary) => summary,
+            Err(_) => return outcome,
+        }
+    } else {
+        let mut messages: Vec<_> = request
+            .chat_history
+            .iter()
+            .map(|message| Message::from(message.as_ref()))
+            .collect();
+        let prompt = messages
+            .pop()
+            .map(|message| message.text())
+            .unwrap_or_default();
+        let mut stream = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => return outcome,
+            result = inner.run_turn(TurnRequest::new(messages, prompt)) => match result { Ok(stream) => stream, Err(_) => return outcome },
+        };
+        let mut summary = String::new();
+        let mut complete = false;
+        let mut rejected = false;
+        while let Some(event) = tokio::select! { biased; _ = wait_for_cancel(cancel) => return outcome, event = stream.next() => event }
+        {
+            match event {
+                AgentEvent::TextDelta(text) => summary.push_str(&text),
+                AgentEvent::TurnComplete { usage, cost_usd } => {
+                    outcome.usage = usage;
+                    outcome.cost_usd = cost_usd;
+                    complete = true;
+                    break;
+                }
+                AgentEvent::OutputTruncated | AgentEvent::ToolCall(_) => rejected = true,
+                AgentEvent::Error(_) => return outcome,
+                _ => {}
+            }
+        }
+        if !complete || rejected || summary.trim().is_empty() {
+            return outcome;
+        }
+        summary
+    };
+    state.summary = summary.clone();
+    let keep = native.id(cut);
+    if rig_memory::apply_summary(&mut native, keep, &state).is_none() {
+        return outcome;
     }
-    outcome.text = (completed && !truncated && !summary.trim().is_empty()).then_some(summary);
+    let old_measurements: Vec<_> = native
+        .asides()
+        .filter(|(_, aside)| aside.kind == "solaris.context")
+        .map(|(id, _)| id)
+        .collect();
+    for id in old_measurements {
+        native.remove_aside(id);
+    }
+    native.add_aside(
+        rig_core::conversation::Aside::new(
+            "solaris.context",
+            rig_core::conversation::Author::plugin("solaris"),
+            serde_json::to_value(solaris_backend::MessageContext::Boundary).unwrap_or_default(),
+        )
+        .after(native.id(0)),
+    );
+    if let Err(error) = rig_memory::save(&conversation.storage(), "conversation", &mut native) {
+        conversation.failed(error);
+        return outcome;
+    }
+    conversation.refresh();
+    outcome.text = Some(summary);
+    outcome.dropped = cut;
     outcome
 }
 
-/// Prepare all summary parts before publishing any replacement history.
-async fn summarize_plan(
-    inner: &Arc<dyn AgentBackend>,
-    cancel: &Cancel,
-    messages: &[Message],
-    plan: crate::compaction::CutPlan,
-) -> SummaryOutcome {
-    let history_end = plan.turn_start.unwrap_or(plan.first_kept);
-    let mut result = SummaryOutcome::default();
-    let mut parts = Vec::new();
-    if history_end > 0 {
-        let previous = existing_summary(&messages[..history_end]);
-        let history = summarize(
-            inner,
-            cancel,
-            &messages[..history_end],
-            previous.as_deref(),
-            None,
-        )
-        .await;
-        result.usage = result.usage.merge(history.usage);
-        result.cost_usd += history.cost_usd;
-        let Some(text) = history.text else {
-            return result;
-        };
-        parts.push(text);
-    }
-    if let Some(start) = plan.turn_start {
-        let prefix = summarize(inner, cancel, &messages[start..plan.first_kept], None,
-            Some("Summarize only the current task prefix. Preserve the original user request, constraints, completed work, and remaining work so the retained tool-call/result tail can continue the task. Do not infer later results.")).await;
-        result.usage = result.usage.merge(prefix.usage);
-        result.cost_usd += prefix.cost_usd;
-        let Some(text) = prefix.text else {
-            return result;
-        };
-        parts.push(format!("Current task context:\n{text}"));
-    }
-    result.text = (!parts.is_empty()).then(|| parts.join("\n\n---\n\n"));
-    result
-}
-
-/// Summarize the conversation now, at the user's request.
-///
-/// Not the loop's path: there is no turn to protect here, so nothing is forced
-/// and nothing is retried, and a conversation with nothing worth summarizing
-/// answers `None` rather than making a pointless call. Returns how many messages
-/// the summary replaced.
 pub(crate) async fn compact_now(
     inner: &Arc<dyn AgentBackend>,
     conversation: &Conversation,
-    compaction: Compaction,
+    config: Compaction,
     cancel: &Cancel,
 ) -> Option<usize> {
-    if !compaction.enabled {
+    if !config.enabled {
         return None;
     }
-    let messages = conversation.snapshot();
-    let caps = inner.capabilities();
-    let policy = compaction.for_window(caps.context_window.unwrap_or(0), caps.output_budget);
-    let plan = policy.plan(&messages);
-    let cut = plan.first_kept;
-    if cut == 0 {
-        return None;
-    }
-    let summary = summarize_plan(inner, cancel, &messages, plan).await.text?;
-
-    let mut replaced = Vec::with_capacity(messages.len() - cut + 1);
-    replaced.push(summary_message(&summary));
-    replaced.extend_from_slice(&messages[cut..]);
-    conversation.replace_with(replaced);
-    Some(cut)
+    let outcome = compact_memory(inner, cancel, conversation, config, 0, true).await;
+    outcome.text.map(|_| outcome.dropped)
 }
 
 /// A stream over the loop's channel.
@@ -781,6 +816,7 @@ impl Stream for EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::summary_message;
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
@@ -1813,7 +1849,7 @@ mod tests {
     /// Shared by the tests that look for it and the one that must not find it,
     /// so a change to the wording cannot make one of them pass for the wrong
     /// reason.
-    const SUMMARY_MARKER: &str = crate::prompt::SUMMARY_PREFIX;
+    const SUMMARY_MARKER: &str = "The conversation before this point was compacted";
 
     /// A conversation long enough to outgrow a small budget.
     ///
@@ -1836,7 +1872,6 @@ mod tests {
             // The summarizer answers first, because compaction runs before the
             // round it is there to protect.
             round(vec![AgentEvent::TextDelta("we added a flag".to_string())]),
-            round(vec![AgentEvent::TextDelta("task prefix".to_string())]),
             round(vec![AgentEvent::TextDelta("done".to_string())]),
         ]);
         let options = AgentOptions {
@@ -1856,11 +1891,7 @@ mod tests {
             .await;
 
         let seen = inner.requests();
-        assert_eq!(
-            seen.len(),
-            3,
-            "history summary, task prefix, then the round"
-        );
+        assert_eq!(seen.len(), 2, "official summary request, then the SDK task");
 
         // The summary call is a plain question: it declares no tools.
         assert!(seen[0].tools.is_empty());
@@ -1873,7 +1904,7 @@ mod tests {
         );
 
         // The round that follows reads the summary where the messages were.
-        let round = &seen[2];
+        let round = &seen[1];
         assert!(
             round.history[0].text().contains("You are solaris"),
             "the system prompt still leads: {}",
@@ -2278,9 +2309,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_task_keeps_tool_tail_and_summarizes_its_prefix_separately() {
+    async fn official_compaction_summarizes_task_constraints_and_keeps_a_paired_tool_tail() {
         let scripted = Scripted::new(vec![
-            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            round(vec![AgentEvent::TextDelta(
+                "history summary: preserve parser flags".into(),
+            )]),
             round(vec![AgentEvent::TextDelta("preserve parser flags".into())]),
         ]);
         let inner: Arc<dyn AgentBackend> = scripted.clone();
@@ -2296,13 +2329,15 @@ mod tests {
             Some(5)
         );
         let seen = scripted.requests();
-        assert_eq!(seen.len(), 2);
-        assert!(!seen[0].prompt.contains("current target"));
-        assert!(seen[1].prompt.contains("current target: parser.rs"));
-        assert!(seen[1].prompt.contains("current task prefix"));
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].prompt.contains("current target: parser.rs"));
+        assert!(seen[0].prompt.contains("preserve flags"));
         let kept = conversation.snapshot();
         assert!(kept[0].text().contains("history summary"));
-        assert!(kept[0].text().contains("Current task context"));
+        assert!(
+            rig_core::conversation::pairing::validate(conversation.native().unwrap().messages())
+                .is_ok()
+        );
         assert_eq!(
             kept[1].tool_calls().next().expect("retained call").id,
             "last"
@@ -2314,11 +2349,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_task_prefix_summary_does_not_publish_a_partial_compaction() {
-        let inner: Arc<dyn AgentBackend> = Scripted::new(vec![
-            round(vec![AgentEvent::TextDelta("history summary".into())]),
-            vec![AgentEvent::Error("prefix failed".into())],
-        ]);
+    async fn a_failed_official_summary_does_not_change_saved_context() {
+        let inner: Arc<dyn AgentBackend> =
+            Scripted::new(vec![vec![AgentEvent::Error("summary failed".into())]]);
         let conversation = Conversation::new();
         conversation.replace_with(split_task_history());
         let before = conversation.snapshot();

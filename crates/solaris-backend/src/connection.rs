@@ -76,7 +76,12 @@ impl Backend {
             return Err(BackendError::new("this model does not support image input"));
         }
         let mut request = std::sync::Arc::unwrap_or_clone(request);
-        request.max_tokens = Some(u64::from(self.max_tokens));
+        request.max_tokens = Some(
+            request
+                .max_tokens
+                .unwrap_or(u64::from(self.max_tokens))
+                .min(u64::from(self.max_tokens)),
+        );
         let mut params = request
             .additional_params
             .take()
