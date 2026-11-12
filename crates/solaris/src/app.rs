@@ -358,6 +358,7 @@ pub struct App {
 }
 
 struct OAuthPending {
+    url_rx: Option<UnboundedReceiver<String>>,
     rx: oneshot::Receiver<Result<Credential, String>>,
     task: tokio::task::JoinHandle<()>,
     action: OAuthAction,
@@ -2078,28 +2079,31 @@ impl App {
                 .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
-        self.oauth = Some(OAuthPending { rx, task, action });
+        self.oauth = Some(OAuthPending {
+            url_rx: None,
+            rx,
+            task,
+            action,
+        });
     }
 
     fn begin_openai_login(&mut self) {
         self.oauth = None;
-        let login = match solaris_provider::oauth::Login::bind() {
-            Ok(login) => login,
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                self.close_inline();
-                return;
-            }
-        };
         if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
-            flow.enter_browser_auth(login.url().to_string());
+            flow.enter_browser_auth("Starting browser authorization…".into());
         }
+        let (url_tx, url_rx) = unbounded_channel();
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let result = login.complete().await.map_err(|e| e.to_string());
+            let result = solaris_provider::oauth::login(|url| {
+                let _ = url_tx.send(url);
+            })
+            .await
+            .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
         self.oauth = Some(OAuthPending {
+            url_rx: Some(url_rx),
             rx,
             task,
             action: OAuthAction::Login,
@@ -2107,12 +2111,25 @@ impl App {
     }
 
     fn poll_oauth(&mut self) -> bool {
+        let mut updated = false;
+        if let Some(urls) = self
+            .oauth
+            .as_mut()
+            .and_then(|pending| pending.url_rx.as_mut())
+        {
+            while let Ok(url) = urls.try_recv() {
+                if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
+                    flow.enter_browser_auth(url);
+                    updated = true;
+                }
+            }
+        }
         let result = match self.oauth.as_mut().map(|pending| pending.rx.try_recv()) {
             Some(Ok(result)) => result,
             Some(Err(oneshot::error::TryRecvError::Closed)) => {
                 Err("OpenAI authorization was interrupted".into())
             }
-            _ => return false,
+            _ => return updated,
         };
         let mut pending = match self.oauth.take() {
             Some(pending) => pending,
@@ -4921,6 +4938,7 @@ mod tests {
             let _ = tx.send(Ok(chatgpt_credential()));
         });
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
             action: OAuthAction::Models,
@@ -4943,6 +4961,7 @@ mod tests {
             let _ = tx.send(Ok(chatgpt_credential()));
         });
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
             action: OAuthAction::Login,
@@ -4972,6 +4991,7 @@ mod tests {
             let _ = tx.send(Ok(chatgpt_credential()));
         });
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
             action: OAuthAction::Turn("hello".into(), "hello".into()),
@@ -4992,6 +5012,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(std::future::pending());
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
             action: OAuthAction::Login,
