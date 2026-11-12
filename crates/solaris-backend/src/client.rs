@@ -174,6 +174,17 @@ impl Backend {
         self
     }
 
+    /// The protocol selected for this immutable request configuration.
+    pub fn wire(&self) -> Wire {
+        self.endpoint.wire
+    }
+
+    /// Select the protocol from the same resolution as the request model ID.
+    pub fn with_wire(mut self, wire: Wire) -> Self {
+        self.endpoint.wire = wire;
+        self
+    }
+
     /// Apply provider-specific context pricing tiers.
     pub fn with_price_tiers(mut self, tiers: Vec<crate::PriceTier>) -> Self {
         self.price_tiers = tiers;

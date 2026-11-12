@@ -11,6 +11,11 @@ pub struct ModelClient {
     pub(crate) adapter: std::sync::Arc<ModelAdapter<rig_core::operation::Completion>>,
 }
 impl ModelClient {
+    /// Capabilities fixed with the model, credentials and price for this request.
+    pub fn capabilities(&self) -> crate::ModelCapabilities {
+        self.backend.capabilities.clone()
+    }
+
     /// Price a completed request using this connection's immutable metadata.
     pub fn cost(&self, usage: Usage) -> f64 {
         self.backend.usage_cost(usage)
@@ -82,10 +87,15 @@ impl Backend {
                 .unwrap_or(u64::from(self.max_tokens))
                 .min(u64::from(self.max_tokens)),
         );
-        let mut params = request
-            .additional_params
-            .take()
-            .unwrap_or_else(|| serde_json::json!({}));
+        let mut params = match request.additional_params.take() {
+            None | Some(serde_json::Value::Null) => serde_json::json!({}),
+            Some(value @ serde_json::Value::Object(_)) => value,
+            Some(_) => {
+                return Err(BackendError::new(
+                    "additional request parameters must be an object",
+                ));
+            }
+        };
         if self.endpoint.wire == crate::Wire::OpenAiResponses {
             params["store"] = false.into();
         }
@@ -99,5 +109,38 @@ impl Backend {
             request: std::sync::Arc::new(request),
             stream,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_extra_parameters_fail_before_network_instead_of_panicking() {
+        let backend = Backend::new(crate::TurnPlan {
+            endpoint: crate::Endpoint {
+                wire: crate::Wire::OpenAiResponses,
+                session_header: None,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                secret: None,
+                name: "test",
+                label: "test",
+                env_keys: &[],
+            },
+            model: "test".into(),
+            max_tokens: 100,
+            price: None,
+            prompt_cache_key: None,
+        })
+        .unwrap();
+        let request = rig_core::completion::CompletionRequest::new("hello")
+            .additional_params(serde_json::json!(["invalid"]));
+        let error = backend
+            .prepare_effect(EffectKind::Completion {
+                request: std::sync::Arc::new(request),
+                stream: true,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("must be an object"));
     }
 }

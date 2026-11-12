@@ -360,3 +360,42 @@ fn small_models_have_a_safe_default_reply_budget() {
     assert_eq!(resolved.output_tokens, 2048);
     assert_eq!(resolved.capabilities.output_budget, Some(2048));
 }
+
+#[tokio::test]
+async fn request_alias_selects_its_protocol_and_connection_keeps_metadata() {
+    use solaris_backend::{AgentBackend, Backend, Endpoint, TurnPlan, Wire};
+    use std::sync::Arc;
+    let catalog = ModelCatalog::from_json(r#"{"models":[{
+        "provider":"opencode","id":"alias","request_id":"grok-4.7",
+        "capabilities":{"context_window":32000},"price":{"input":1,"output":2,"cache_read":0,"cache_write":0}
+    }]}"#).unwrap();
+    let provider = crate::provider_spec("opencode").unwrap();
+    let live = super::LiveModel {
+        catalog: Arc::new(catalog),
+        provider: provider.id,
+        model: "alias".into(),
+        account_authorized: false,
+        prototype: Backend::new(TurnPlan {
+            endpoint: Endpoint {
+                wire: Wire::OpenAiChat,
+                session_header: None,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                secret: None,
+                name: "test",
+                label: "test",
+                env_keys: &[],
+            },
+            model: "alias".into(),
+            max_tokens: 8192,
+            price: None,
+            prompt_cache_key: None,
+        })
+        .unwrap(),
+    };
+    let resolved = live.backend();
+    assert_eq!(resolved.model(), "grok-4.7");
+    assert_eq!(resolved.wire(), Wire::OpenAiResponses);
+    let client = resolved.model_client().await.unwrap().unwrap();
+    assert_eq!(client.capabilities().context_window, Some(32000));
+    assert_eq!(client.cost(solaris_backend::Usage::new(1_000_000, 0)), 1.0);
+}

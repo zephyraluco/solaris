@@ -49,13 +49,23 @@ impl LiveModel {
     }
     fn backend(&self) -> solaris_backend::Backend {
         let resolved = self.resolved();
-        self.prototype.clone().with_model_parameters(
-            resolved.request_id,
-            resolved.output_tokens,
-            resolved.capabilities,
-            resolved.price,
-            resolved.price_tiers,
-        )
+        let wire = if self.account_authorized {
+            solaris_backend::Wire::OpenAiResponses
+        } else {
+            crate::provider_spec(self.provider)
+                .map(|provider| provider.wire_for(&resolved.request_id))
+                .unwrap_or_else(|| self.prototype.wire())
+        };
+        self.prototype
+            .clone()
+            .with_wire(wire)
+            .with_model_parameters(
+                resolved.request_id,
+                resolved.output_tokens,
+                resolved.capabilities,
+                resolved.price,
+                resolved.price_tiers,
+            )
     }
 }
 

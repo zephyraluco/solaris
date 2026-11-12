@@ -88,6 +88,17 @@ impl AgentHook for Policy {
             phase.client = None;
             phase.synthetic = None;
         }
+        // Resolve exactly once, before projecting the request. The same client
+        // supplies capabilities, the actual model call and its price snapshot.
+        let client = match self.runner.inner.model_client().await {
+            Ok(client) => client,
+            Err(error) => return CompletionCallAction::stop(error.to_string()),
+        };
+        let capabilities = client.as_ref().map_or_else(
+            || self.runner.inner.capabilities(),
+            solaris_backend::ModelClient::capabilities,
+        );
+        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = client;
         let header = self.runner.request_header();
         let mut messages: Vec<_> = event
             .history
@@ -111,10 +122,7 @@ impl AgentHook for Policy {
             .runner
             .conversation
             .publish_projection(&messages, &header);
-        context.window = self
-            .runner
-            .inner
-            .capabilities()
+        context.window = capabilities
             .context_window
             .unwrap_or(self.runner.context_window);
         let _ = self.tx.send(AgentEvent::ContextUsageUpdated { context });
@@ -326,13 +334,15 @@ impl Serve for Policy {
             .iter()
             .map(|message| Message::from(message.as_ref()).characters())
             .sum();
-        match self.runner.inner.model_client().await {
-            Ok(Some(client)) => {
-                self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client.clone());
-                client.serve(kind, dispatch).await
-            }
-            Ok(None) => self.synthetic(request).await,
-            Err(error) => Reply::Outcome(Err(failure(error))),
+        let client = self
+            .phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .client
+            .clone();
+        match client {
+            Some(client) => client.serve(kind, dispatch).await,
+            None => self.synthetic(request).await,
         }
     }
 }
