@@ -376,8 +376,9 @@ changes so subsequent resume restores that choice unless explicitly overridden.
 Official SDK memory stores model messages and compaction state under
 `sessions/memory/<SESSION_ID>`. The SQLite journal retains the transcript, tool
 intents, usage, child activity and executor metadata. Legacy message journals are
-imported once when no SDK memory exists. Only successful SDK tasks commit messages;
-failed or cancelled tasks retain earlier committed context. Tool side effects and
+imported once when no SDK memory exists. Successful SDK tasks and explicit
+safe-boundary handoffs commit messages; failed or cancelled phases retain earlier
+committed context. Tool side effects and
 billed usage can still occur before failure. Verify side effects before retrying;
 interrupted tools are never automatically replayed. Treat both stores as private.
 Credentials and authentication headers are not intentionally recorded.

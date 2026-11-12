@@ -12,8 +12,9 @@
 //! agent writes one per turn, so it can never be summarized away), and nothing
 //! here knows about turns at all.
 //!
-//! Official memory owns messages and saves successful SDK tasks. Failed or
-//! cancelled tasks leave the previous committed conversation unchanged. Product
+//! Official memory owns messages and saves successful SDK tasks and explicit
+//! safe-boundary handoffs. Failed or cancelled phases leave previously committed
+//! history unchanged. Product
 //! records (including tool intents and billing) are persisted independently.
 
 use crate::{SessionJournal, SessionRecord, StoreError};

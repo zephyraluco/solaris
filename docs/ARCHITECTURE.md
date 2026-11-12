@@ -127,7 +127,7 @@ impl Agent {
 
 每次模型调用通过后端提供的原生连接直接进入 SDK，保留原始响应、reasoning、finish reason 和 usage。钩子负责能力与预算检查、UI 投影、参数校验、权限、审批及用量结算。工具通过官方 ToolServer 注册，仍复用现有工具和子代理业务策略。
 
-SDK 任务成功后保存消息。失败或取消不追加该任务未提交的消息；此前成功阶段仍保留。已经产生的工具副作用不会回滚，其意图、转录和费用记录独立保留。恢复时不会自动重放工具。
+SDK 任务成功后保存消息；请求前安全交接也会保存已经配对完成的 SDK 原生历史。普通失败或取消不追加当前未提交阶段的消息；此前成功或已交接阶段仍保留。已经产生的工具副作用不会回滚，其意图、转录和费用记录独立保留。恢复时不会自动重放工具。
 
 系统提示词来自当前资源，不存入待摘要的消息。上下文查询读取内存投影；模型请求使用 SDK 自己的工作历史。
 
@@ -169,10 +169,10 @@ Mode::Plan   →  read + grep + find + ls
 
 ### 3.3 一轮的流程
 
-1. Solaris 检查取消、存储状态和共享预算，在任务开始前按需压缩官方 memory。
+1. Solaris 检查取消、存储状态和共享预算，在阶段开始前按需压缩官方 memory。
 2. 创建官方 runner，注入模型连接、工具服务、策略钩子、memory 和 Recorder。
-3. SDK 接收新 prompt，自动执行模型与工具循环。Solaris 排空 `run_channel()` 的事件，并同时监听取消和消费端关闭。
-4. 成功后 SDK 保存本任务消息，Solaris 保存请求测量注解、发布上下文投影并累计用量。
+3. SDK 接收新 prompt，自动执行模型与工具循环。Solaris 排空 `run_channel()` 的事件，并同时监听取消和消费端关闭。请求前 hook 检查 steering、后台结果和上下文预算；需要变更正式历史时才停止旧阶段，校验并保存其原生历史后交接。
+4. 成功后 SDK 保存本任务消息，Solaris 使用进程内官方请求锚点发布上下文投影并累计用量。无工具回复后的 steering 可用 retry_with_feedback 在同一 runner 内继续。
 5. 处理已完成的后台任务、steering 和 follow-up；存在新输入时启动下一 SDK 任务，共享预算与计费继续累计。
 
 任务内不设置固定模型轮数上限；取消、请求预算、费用预算、执行期限和子代理限制仍有效。SDK 或厂商错误直接返回，不靠错误文本猜测上下文溢出并隐式重放请求。
@@ -181,7 +181,7 @@ Mode::Plan   →  read + grep + find + ls
 
 **调用默认并行**：上限是 `max_parallel`（`DEFAULT_MAX_PARALLEL = 4`），结果按模型请求的顺序回填给模型；只要该批里任一工具声明了 `execution_mode() == Sequential`（`write`、`edit` 与 shell 都是），整批退回逐个执行——写入类工具的按文件锁保证的是不互相踩，串行保证的是「同一批里能读到刚写下的东西」。
 
-**被输出上限截断的调用不执行**：协议层把 `stop_reason` 为 `length` / `max_tokens` / `incomplete` 变成 `AgentEvent::OutputTruncated`，执行钩子据此停止任务，这一批全部调用均不执行；用户可以调整输出预算后重试；残缺参数被解析成 `null` 时那句含糊的「参数不是 JSON 对象」不再是唯一线索。
+**被输出上限截断的调用不执行**：协议层把 `stop_reason` 为 `length` / `max_tokens` / `incomplete` 变成 `AgentEvent::OutputTruncated`，执行钩子据此拒绝整批调用，返回配对错误结果，由 SDK 继续请求完整参数；所有调用仍受共享预算约束；残缺参数被解析成 `null` 时那句含糊的「参数不是 JSON 对象」不再是唯一线索。
 
 **取消按轮次隔离**：`Cancel` 在每次 `run_turn` 开始时 `reset()`，上一轮的取消不会波及下一轮；应用层持有 `Agent::cancel_handle()`，`Ctrl+C` 因此能杀掉正在跑的命令，而不只是不再读事件。循环在独立任务里跑，返回的流被丢弃（用户取消）就等于取消这一轮——任务发现发送端已关闭便不再继续。
 
@@ -192,7 +192,7 @@ Mode::Plan   →  read + grep + find + ls
 | | steering | follow-up |
 | --- | --- | --- |
 | 意思 | 「不对，是另一个文件」 | 「这轮弄完再跑测试」 |
-| 何时被读 | 当前 SDK 任务成功结束后，或等待后台结果时 | steering 和后台工作处理完后 |
+| 何时被读 | 下一次模型请求前、无工具回复完成后，或等待后台结果时 | 当前工作、steering 和后台结果处理完后 |
 | 落在哪里 | 并进正在跑的这一轮 | 成为**下一轮**（转录里另起一个 Turn） |
 
 ```rust
@@ -206,7 +206,7 @@ impl Queue {
 同一个类型，两个实例（`Agent::steering_handle()` / `follow_up_handle()`）——区分它们的是**agent 何时去读**，多一个类型只会把这四个方法再抄一遍。
 
 - **共享队列而不是 channel**：句柄的生命周期比任何一轮都长（应用整个会话持有一份），而排空它的一方只活一轮，并且必须能**不阻塞地看一眼**。
-- **steering 在任务边界交付**：SDK 保存当前任务后再读队列，否则「别结束了，改成 X」会被丢在刚结束的那一轮里。
+- **steering 在安全边界交付**：工具结果配对完成后交接；无工具回复可通过官方反馈重试继续，否则「别结束了，改成 X」会被丢在刚结束的那一轮里。
 - **follow-up 让循环继续跑**：它不是「等这一轮结束应用再发一次请求」，而是同一个循环里接着下一轮，所以对话是接着长的。循环为此报 `AgentEvent::FollowUp { prompt }`，应用据此把上一轮标记完成、并为这个提示词新开一个 Turn——从这一刻起流出来的东西都属于它。
 - **记录由循环回报**：`AgentEvent::Steered { text }` 在消息**真正被读到**时发出，应用据此写进当前轮的 `Turn.steering`（附 `after_steps`，即当时已完成的调用数）。如果按「用户按下回车时」记录，那么刚好在模型收尾时到达的插话——读到它的可能是**下一轮**——就会在转录里挂错轮次。
 - **显示位置**：[`state.rs`](../crates/solaris/src/state.rs) 用 `after_steps` 把消息画在它当时的位置（`↳ steered …`），因为「纠正落在哪里」才是这件事的重点。
@@ -217,9 +217,9 @@ impl Queue {
 
 Solaris 保留 `Compaction` 的启用、预留回复空间和近期上下文配置；实现委托给官方 `rig-memory` 的 `CompactionPolicy`、`Summarizer`、`apply_summary` 和 `summary_state`。合法切点、工具调用/结果配对及增量摘要状态由 SDK 管理，不再维护自定义历史序列化和两次摘要算法。
 
-自动压缩发生在 SDK 任务之间，手动 `/compact` 使用同一路径。摘要调用通过当前原生模型连接，遵守 SDK 摘要输出上限、模型输出上限、共享计费和取消期限。Solaris 提供面向编程任务的结构化摘要提示词。摘要为空、被截断、包含工具调用或请求失败时，不替换原始 memory。
+自动压缩可在工具轮次之间通过 SDK 阶段交接执行，手动 `/compact` 使用同一路径。摘要调用通过当前原生模型连接，遵守 SDK 摘要输出上限、模型输出上限、共享计费和取消期限。Solaris 提供面向编程任务的结构化摘要提示词。摘要为空、被截断、包含工具调用或请求失败时，不替换原始 memory。
 
-只有摘要成功并应用后才保存新的官方 conversation、使旧测量失效并发布 `Compacted`。系统提示词始终在摘要范围之外。长时间单个 SDK 任务内部尚不执行压缩；上下文溢出会结束任务，不自动重发已经可能产生副作用的操作。
+只有摘要成功并应用后才保存新的官方 conversation、使旧测量失效并发布 `Compacted`。系统提示词始终在摘要范围之外。清理旧工具输出与摘要规划使用官方 ClearToolOutputs 和 plan_summary；只有有效摘要产生后才一起保存。上下文溢出不靠猜测错误文案自动重发已可能产生副作用的操作。
 
 ### 3.7 审批
 
@@ -664,11 +664,11 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 - **工具调用已经打通，但工具集是固定的八个**。`Agent` 会跑「模型 → 工具 → 模型」直到模型不再请求，用量与费用按轮累计；应用也可注册 MCP 工具及其资源/提示词操作，沿用同一执行策略。
 - **确认对话框只在 `--confirm-tools` 下出现**。默认是 `AlwaysApprove`（终端 agent 已经在替你动手，为一次 `read` 弹框只是噪音）；打开后，改动型调用会弹一个确认框，被拒绝的调用作为错误结果回到模型。
 - **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
-- **插话在 SDK 任务之间生效**。steering 的消息由循环在当前 SDK 任务成功保存后读入，所以正在跑的那条命令不会被它打断；要立刻停下只有 `Ctrl+C`。
+- **插话在请求安全边界生效**。steering 在下一次模型请求前交付；正在执行的工具不会被它打断，要立即停止仍使用 `Ctrl+C`。
 - **follow-up 只能靠 `/queue`**。流式期间回车是 steering（默认、也最常用），想在当前这一轮之后另起一轮得打 `/queue <prompt>`——`alt+enter` 已被换行占用，而命令表顺带让 `/help` 与补全能发现它。
 - **资源更新需要 `/reload`**。新增/删除技能、名称与描述修改、项目规则及追加说明修改通过 `/reload` 更新；显式调用每次读取当前正文。运行中的 stream（含后续队列）和压缩结束后才应用重载，已展开的排队消息保留入队时内容。
-- **失败任务的消息不保存**。官方 memory 仅提交成功的 SDK 任务；产品转录、工具意图和已发生费用独立持久化。
-- **压缩的触发靠真数，裁切靠估算**。是否超预算看 provider 上一轮报的 usage；**从哪里裁**只能按字符估算每个消息（`字符数 / 4`），与 provider 的分词器有出入——所以预留的 16384 token 同时是回复的空间和这个误差的余量。
+- **失败阶段的未提交消息不保存**。官方 memory 提交成功任务及安全交接的历史；普通失败保留此前已提交阶段。产品转录、工具意图和已发生费用独立持久化。
+- **上下文使用官方估算与请求锚点**。可兼容的请求使用已报告用量加新增消息估算；模型、提示词、工具、历史变化和恢复会话后回退完整估算。合法切点由官方压缩策略管理。
 - **摘要是有损的**。被替换掉的那些消息只剩模型写的那段摘要，原文不再发给 provider；摘要本身是一次模型调用，因此压缩只在必要时发生（或用户 `/compact` 时）。转录里会留一行说明压掉了几条。
 - **`grep` 与 `find` 需要外部程序**。它们 shell out 到 ripgrep 与 fd；缺失时工具会明确报错并给出安装提示，而不是退化成另一个实现。
 - **工具输出是截断的**。读类保留前 2000 行或 50KB，命令类保留末尾并把完整输出写进临时文件；被截断的那部分只有通过报告出来的路径才读得到。
@@ -702,22 +702,17 @@ not invoke resource loaders or prompt builders. Reload workers run serially and
 publish resources only when the session is idle; session navigation cannot overtake
 a pending loader.
 
-Official memory asides attach single-request measurements and projection boundaries
-to native message IDs; these annotations are excluded from model requests. `projection`
-uses the most recent compatible measurement plus trailing message estimates, with
-a full in-memory estimate when the request configuration changes. Replacement
-invalidates retained annotations. The same estimator drives pre-request compaction
-and published UI snapshots. Restoration reads the ordinary message projection;
-there are no asynchronous checkpoint-validation writes or history-prefix hashes.
+`rig-memory::Prepared`, `RequestStart`, `Anchor` and `next_request_tokens`
+provide the common estimator for budgets and published UI snapshots. The projection
+keeps shared native messages from the active SDK history, never authors memory,
+and preserves process-local identities while that history grows. Tool changes
+reestimate that working view, rather than the last saved conversation. Request
+anchors are not restored from persisted usage records; restored sessions estimate.
 
-Tool activation, removal, or schema changes update the current request header and
-publish a full estimate before context events and budget checks. Measurements must
-match both the base prompt and the actual request header. No tool-change journal is
-required; restored sessions estimate against the currently available tool loadout.
-
-Compaction uses the official memory policy, summarizer and persisted summary state.
-It preserves legal tool boundaries and applies a summary only after successful generation.
-Automatic compaction runs between SDK tasks; there is no hidden overflow replay.
+Compaction uses the official clearing policy, summary planner and persisted summary
+state. Cleaning and summarizing are committed together after a valid summary.
+Automatic compaction can hand off at a request boundary after a completed tool batch.
+There is no hidden overflow replay or restart of every model round.
 
 `AccountingBackend` attaches a ledger observer to each prepared connection and
 journals usage when its result is settled.
