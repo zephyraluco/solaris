@@ -30,12 +30,13 @@ impl Backend {
                 let wire = rig_core::providers::anthropic::modality::Models {
                     provider: self.anthropic_config(),
                 };
-                Model::new(StrictModels(wire), http).list().await
+                Model::new(StrictModels(wire, true), http).list().await
             } else {
                 Model::new(
-                    StrictModels(rig_core::providers::openai::wire::Models::new(
-                        self.openai_config(),
-                    )),
+                    StrictModels(
+                        rig_core::providers::openai::wire::Models::new(self.openai_config()),
+                        false,
+                    ),
                     http,
                 )
                 .list()
@@ -56,12 +57,12 @@ impl Backend {
 // The official OpenAI envelope defaults a missing `data` to an empty list.
 // A gateway's HTTP-200 error must remain an error, not a successful empty picker.
 #[derive(Clone)]
-struct StrictModels<W>(W);
+struct StrictModels<W>(W, bool);
 enum Checked<E> {
     Native(E),
     Invalid(String),
 }
-struct StrictDecoder<D>(D);
+struct StrictDecoder<D>(D, bool);
 impl<W: Wire<Op = ModelListing, Payload = Encoded, Frame = WireFrame>> Wire for StrictModels<W> {
     type Op = ModelListing;
     type Payload = Encoded;
@@ -76,7 +77,7 @@ impl<W: Wire<Op = ModelListing, Payload = Encoded, Frame = WireFrame>> Wire for 
         self.0.encode(cursor, mode)
     }
     fn decoder<'id>(&self) -> Self::Decoder<'id> {
-        StrictDecoder(self.0.decoder())
+        StrictDecoder(self.0.decoder(), self.1)
     }
 }
 impl<'id, D: Decoder<'id, ModelListing>> Decoder<'id, ModelListing> for StrictDecoder<D> {
@@ -88,14 +89,38 @@ impl<'id, D: Decoder<'id, ModelListing>> Decoder<'id, ModelListing> for StrictDe
                 "answered with a web page, not a model list".into(),
             ));
         }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
-            && !value.get("data").is_some_and(serde_json::Value::is_array)
-        {
-            let detail =
-                crate::http::provider_message(&body).unwrap_or_else(|| "missing data array".into());
-            return WireEvent::Known(Checked::Invalid(format!(
-                "did not answer with a model list: {detail}"
-            )));
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) {
+            if !value.get("data").is_some_and(serde_json::Value::is_array) {
+                let detail = crate::http::provider_message(&body)
+                    .unwrap_or_else(|| "missing data array".into());
+                return WireEvent::Known(Checked::Invalid(format!(
+                    "did not answer with a model list: {detail}"
+                )));
+            }
+            // Compatible Messages gateways may list only IDs. Keep the official
+            // entry decoder and paging; the missing display label falls back to ID.
+            let mut changed = false;
+            if self.1
+                && let Some(entries) = value
+                    .get_mut("data")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                for entry in entries {
+                    if let Some(entry) = entry.as_object_mut()
+                        && !entry.contains_key("display_name")
+                        && let Some(id) = entry.get("id").filter(|id| id.is_string()).cloned()
+                    {
+                        entry.insert("display_name".into(), id);
+                        changed = true;
+                    }
+                }
+            }
+            if changed && let Ok(bytes) = serde_json::to_vec(&value) {
+                return self
+                    .0
+                    .classify(WireFrame::Bytes(bytes))
+                    .map(Checked::Native);
+            }
         }
         self.0.classify(frame).map(Checked::Native)
     }

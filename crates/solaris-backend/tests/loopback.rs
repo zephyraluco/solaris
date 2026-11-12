@@ -733,7 +733,7 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
     let server = tokio::spawn(async move {
         let mut requests = Vec::new();
         for page in [
-            r#"{"data":[{"id":"first","display_name":"First"}],"has_more":true,"last_id":"first"}"#,
+            r#"{"data":[{"id":"first"}],"has_more":true,"last_id":"first"}"#,
             r#"{"data":[{"id":"second","display_name":"Second"}],"has_more":false,"last_id":"second"}"#,
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();
