@@ -14,6 +14,7 @@ use rig_core::{
 };
 use std::sync::Mutex;
 
+const TRUNCATED_CALL: &str = "model output was truncated; emit complete tool arguments again";
 const PHASE_BOUNDARY: &str = "solaris internal phase boundary";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Boundary {
@@ -25,6 +26,7 @@ enum Boundary {
 #[derive(Default)]
 struct Phase {
     boundary: Option<Boundary>,
+    reject_truncated: bool,
     totals: crate::UsageTotals,
     client: Option<solaris_backend::ModelClient>,
     text: String,
@@ -70,11 +72,16 @@ impl AgentHook for Policy {
                 Ok(input) => input,
                 Err(error) => return rig_agent::agent::DispatchAction::deny(failure(error)),
             };
-            self.phase
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .calls
-                .insert(event.id, ToolCall::new(id.wire().into_owned(), name, input));
+            let call = ToolCall::new(id.wire().into_owned(), name, input);
+            let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            if phase.reject_truncated {
+                let _ = self.tx.send(AgentEvent::ToolResult {
+                    result: ToolResult::error(&call, TRUNCATED_CALL),
+                    duration_ms: 0,
+                });
+                return rig_agent::agent::DispatchAction::skip(TRUNCATED_CALL);
+            }
+            phase.calls.insert(event.id, call);
         }
         rig_agent::agent::DispatchAction::proceed()
     }
@@ -94,6 +101,7 @@ impl AgentHook for Policy {
             phase.text.clear();
             phase.thinking.clear();
             phase.client = None;
+            phase.reject_truncated = false;
         }
         let header = self.runner.request_header();
         let mut messages: Vec<_> = event
@@ -238,18 +246,10 @@ impl AgentHook for Policy {
         ) {
             let _ = self.tx.send(AgentEvent::OutputTruncated);
         }
-        if matches!(
+        phase.reject_truncated = matches!(
             event.finish_reason,
             Some(rig_core::completion::FinishReason::Length)
-        ) && event
-            .content
-            .iter()
-            .any(|part| matches!(part, AssistantContent::ToolCall(_)))
-        {
-            return ModelTurnAction::stop(
-                "model output limit reached; incomplete tool calls were not executed",
-            );
-        }
+        );
         if !event
             .content
             .iter()
@@ -312,15 +312,24 @@ impl AgentHook for Policy {
             &event.tool_name,
             serde_json::Value::String(event.args.clone().unwrap_or_default()),
         );
-        let reason = match event.reason {
-            rig_agent::run::policy::InvalidToolCallReason::UnknownTool => format!(
-                "there is no tool called `{}` in this session",
-                event.tool_name
-            ),
-            _ => format!(
-                "invalid tool call `{}`: {:?}",
-                event.tool_name, event.reason
-            ),
+        let reason = if self
+            .phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reject_truncated
+        {
+            TRUNCATED_CALL.to_string()
+        } else {
+            match event.reason {
+                rig_agent::run::policy::InvalidToolCallReason::UnknownTool => format!(
+                    "there is no tool called `{}` in this session",
+                    event.tool_name
+                ),
+                _ => format!(
+                    "invalid tool call `{}`: {:?}",
+                    event.tool_name, event.reason
+                ),
+            }
         };
         let _ = self.tx.send(AgentEvent::ToolCall(call.clone()));
         let _ = self.tx.send(AgentEvent::ToolResult {
@@ -563,7 +572,11 @@ impl Runner {
                     chat_history,
                     reason,
                 }) if boundary.is_some() && reason == PHASE_BOUNDARY => {
-                    if self.cancel.is_cancelled() || tx.is_closed() {
+                    if self.cancel.is_cancelled() {
+                        self.give_up("the turn was cancelled".into(), &tx);
+                        return;
+                    }
+                    if tx.is_closed() {
                         return;
                     }
                     if let Err(error) = self.conversation.commit_phase(&mut base, chat_history) {

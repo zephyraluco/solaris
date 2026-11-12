@@ -1484,12 +1484,16 @@ mod tests {
 
         assert_eq!(
             inner.requests().len(),
-            1,
-            "no hidden retry of a truncated tool turn"
+            2,
+            "SDK continues with explicit rejection feedback"
         );
         assert!(
-            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("output limit"))
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:?}"
         );
+        let results = results_seen(&inner);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error && results[0].output.contains("truncated"));
     }
 
     #[tokio::test]

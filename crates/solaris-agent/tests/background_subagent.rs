@@ -411,7 +411,13 @@ async fn completion_notifies_immediately_even_while_the_parent_request_is_pendin
         "notification must not be duplicated at delivery"
     );
     let requests = model.requests();
-    assert_eq!(notifications(requests.last().unwrap()).len(), 1);
+    let parent: Vec<_> = requests.iter().filter(|request| !child(request)).collect();
+    assert_eq!(
+        parent.len(),
+        3,
+        "the result must reach the next tool-round request, without a redundant parent completion"
+    );
+    assert_eq!(notifications(parent[2]).len(), 1);
 }
 
 #[tokio::test]
