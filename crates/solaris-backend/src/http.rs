@@ -55,29 +55,6 @@ pub fn backoff(attempt: usize, headers: Option<&HeaderMap>) -> Duration {
     asked.clamp(scheduled, MAX_RETRY_AFTER)
 }
 
-/// The innermost message of a reqwest error.
-///
-/// The top-level display repeats the URL and the method; the root cause is the
-/// one that names what actually went wrong — DNS, TLS, a refused connection.
-pub fn root_cause(error: &reqwest::Error) -> String {
-    let mut source: &dyn std::error::Error = error;
-    while let Some(next) = source.source() {
-        source = next;
-    }
-    source.to_string()
-}
-
-/// A transport failure in the user's terms.
-pub fn describe_transport(error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        "the request timed out".to_string()
-    } else if error.is_connect() {
-        format!("could not connect ({})", root_cause(error))
-    } else {
-        root_cause(error)
-    }
-}
-
 /// A message the user can act on, preferring the provider's own wording.
 pub fn describe(status: StatusCode, body: &str, provider: &str, env_keys: &[&str]) -> String {
     let hint = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {

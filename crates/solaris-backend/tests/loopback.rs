@@ -722,3 +722,52 @@ async fn native_executor_connection_uses_the_same_retry_policy() {
         requests[1].split_once("\r\n\r\n").unwrap().1
     );
 }
+
+#[tokio::test]
+async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for page in [
+            r#"{"data":[{"id":"first","display_name":"First"}],"has_more":true,"last_id":"first"}"#,
+            r#"{"data":[{"id":"second","display_name":"Second"}],"has_more":false,"last_id":"second"}"#,
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            socket
+                .write_all(response("200 OK", "application/json", page).as_bytes())
+                .await
+                .unwrap();
+        }
+        requests
+    });
+    let backend = Backend::new(TurnPlan {
+        endpoint: Endpoint {
+            wire: Wire::AnthropicMessages,
+            session_header: Some("x-opencode-session"),
+            base_url: format!("http://{addr}/gateway/v1"),
+            secret: Some("test-key".into()),
+            name: "Gateway",
+            label: "custom",
+            env_keys: &[],
+        },
+        model: "test".into(),
+        max_tokens: 100,
+        price: None,
+        prompt_cache_key: None,
+    })
+    .unwrap();
+    let ids = tokio::time::timeout(PATIENCE, backend.models())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ids, ["first", "second"]);
+    let requests = server.await.unwrap();
+    assert!(requests[0].starts_with("GET /gateway/v1/models HTTP/1.1"));
+    assert!(requests[1].starts_with("GET /gateway/v1/models?after_id=first HTTP/1.1"));
+    for request in requests {
+        assert!(request.contains("x-api-key: test-key"));
+        assert!(request.contains("x-opencode-session:"));
+    }
+}

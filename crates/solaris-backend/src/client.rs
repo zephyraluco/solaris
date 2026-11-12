@@ -2,16 +2,12 @@
 use crate::{
     AgentBackend, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage, Wire,
 };
-use crate::{convert, http, transport::SolarisTransport};
+use crate::{convert, http, transport::CompletionRoute};
 use futures::StreamExt;
 use rig_core::driver::{DynModel, Model};
 use rig_core::operation::Completion;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-// This is the Codex catalog protocol version, not Solaris's package version.
-// The service gates models by client version; 0.1.0 returns an empty catalog.
-const CODEX_CATALOG_VERSION: &str = "0.162.1";
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where one turn goes, how it authenticates, and which protocol to speak.
 ///
@@ -68,7 +64,7 @@ impl Endpoint {
 ///
 /// One process is one conversation here, which is exactly the granularity a
 /// platform routing by session asks for.
-fn session_id() -> &'static str {
+pub(super) fn session_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
         let nanos = SystemTime::now()
@@ -207,62 +203,6 @@ impl Backend {
     pub fn model(&self) -> &str {
         &self.model
     }
-
-    /// Attach the credential and the headers the wire wants.
-    ///
-    /// A key travels the way the protocol carrying it does: `x-api-key` on the
-    /// Messages API, a bearer token on the OpenAI ones — opencode's Go gateway
-    /// included, whose `/v1/messages` takes `x-api-key` while its
-    /// OpenAI-compatible paths take a bearer token.
-    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = if let Some((account, _)) = &self.chatgpt {
-            request
-                .header("ChatGPT-Account-Id", account)
-                .header("originator", "solaris")
-        } else {
-            request
-        };
-        let request = match self.endpoint.wire {
-            Wire::AnthropicMessages => request.header("anthropic-version", "2023-06-01"),
-            Wire::OpenAiChat | Wire::OpenAiResponses => request,
-        };
-
-        let request = match &self.endpoint.secret {
-            Some(secret) if self.endpoint.wire.is_openai() => request.bearer_auth(secret),
-            Some(secret) => request.header("x-api-key", secret),
-            None => request,
-        };
-
-        // A platform that routes by conversation is told which one this is, so
-        // the turn lands on the plan it belongs to rather than on whichever
-        // balance the gateway would otherwise guess at.
-        match self.endpoint.session_header {
-            Some(header) => request.header(header, session_id()),
-            None => request,
-        }
-    }
-
-    /// A transport failure in the user's terms.
-    fn unreachable(&self, error: &reqwest::Error) -> BackendError {
-        BackendError::new(format!(
-            "could not reach {}: {}",
-            self.endpoint.name,
-            http::describe_transport(error)
-        ))
-    }
-
-    /// Why a successful response carried no model list.
-    fn not_a_model_list(&self, url: &str, body: &str) -> String {
-        let name = self.endpoint.name;
-        if body.trim_start().starts_with('<') {
-            return format!("{name} answered {url} with a web page, not a model list");
-        }
-
-        let reason = http::provider_message(body)
-            .map(|message| format!(": {message}"))
-            .unwrap_or_default();
-        format!("{name} did not answer with a model list at {url}{reason}")
-    }
 }
 
 #[async_trait::async_trait]
@@ -321,107 +261,8 @@ impl AgentBackend for Backend {
     /// One attempt, no retries: this feeds a picker, so a slow or unreachable
     /// provider reports an error rather than leaving the picker loading forever.
     async fn models(&self) -> Result<Vec<String>, BackendError> {
-        let url = if self.chatgpt.is_some() {
-            format!(
-                "{}?client_version={}",
-                self.endpoint.models_url(),
-                CODEX_CATALOG_VERSION
-            )
-        } else {
-            self.endpoint.models_url()
-        };
-        let response = self
-            .authorize(self.client.get(&url))
-            .header("accept", "application/json")
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|error| self.unreachable(&error))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| self.unreachable(&error))?;
-
-        if !status.is_success() {
-            return Err(BackendError::new(http::describe(
-                status,
-                &body,
-                self.endpoint.name,
-                self.endpoint.env_keys,
-            )));
-        }
-
-        // A 200 that is not a model list is a failure, not an empty provider: a
-        // base URL that stops short of a gateway's API gets its web front end
-        // back, which answers 200 with a page, and reading that as "no models"
-        // would hide a wrong URL behind a plausible-looking answer.
-        let models = if self.chatgpt.is_some() {
-            parse_codex_models(&body)
-        } else {
-            parse_models(&body)
-        };
-        let Some(models) = models else {
-            return Err(BackendError::new(self.not_a_model_list(&url, &body)));
-        };
-
-        Ok(models)
+        self.discover_models().await
     }
-}
-fn parse_codex_models(body: &str) -> Option<Vec<String>> {
-    #[derive(serde::Deserialize)]
-    struct Catalog {
-        models: Vec<Model>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Model {
-        slug: String,
-        #[serde(default)]
-        visibility: Option<String>,
-        #[serde(default)]
-        priority: i64,
-    }
-    let mut catalog: Catalog = serde_json::from_str(body).ok()?;
-    if catalog
-        .models
-        .iter()
-        .any(|model| model.slug.trim().is_empty())
-    {
-        return None;
-    }
-    catalog.models.sort_by_key(|model| model.priority);
-    Some(
-        catalog
-            .models
-            .into_iter()
-            .filter(|model| {
-                model
-                    .visibility
-                    .as_deref()
-                    .is_none_or(|visibility| visibility == "list")
-            })
-            .map(|model| model.slug)
-            .collect(),
-    )
-}
-
-/// Model ids out of a `{"data": [{"id": …}]}` list.
-///
-/// Both wires answer with this shape. `None` means the body was not a model
-/// list at all — a proxy's HTML page, an error wrapped in a 200 — which the
-/// caller reports instead of passing off as a provider with nothing to offer.
-/// An empty `data` array is a list: the provider answered, and its answer is
-/// that this credential can reach no models.
-fn parse_models(body: &str) -> Option<Vec<String>> {
-    // Require the envelope: the SDK's permissive default would otherwise
-    // turn gateway errors wrapped in HTTP 200 into an empty model picker.
-    #[derive(serde::Deserialize)]
-    struct ModelList {
-        data: Vec<rig_core::providers::openai::wire::ModelEntry>,
-    }
-    let reply: ModelList = serde_json::from_str(body).ok()?;
-    Some(reply.data.into_iter().map(|entry| entry.id).collect())
 }
 
 /// Characters of prompt and history, for the estimate fallback.
@@ -441,18 +282,7 @@ impl Backend {
     ) -> Result<DynModel<Completion>, BackendError> {
         use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
         use rig_core::providers::registry::ProviderId;
-        use rig_core::providers::{
-            anthropic::AnthropicConfig,
-            openai::{OpenAIConfig, wire},
-        };
-        let transport = SolarisTransport::new(
-            self.client.clone(),
-            self.endpoint.url(),
-            self.endpoint.session_header,
-            session_id(),
-            self.capabilities.clone(),
-            repairs.to_vec(),
-        );
+        let transport = CompletionRoute::new(self.request_http(repairs), self.endpoint.url());
         // Bind Solaris metadata under a declared identity so every Rig dialect
         // consults the supplied facts, including aliased gateway model names.
         let id =
@@ -464,10 +294,9 @@ impl Backend {
         spec.max_input_tokens = self.capabilities.max_input;
         spec.max_output_tokens = self.capabilities.max_output;
         let facts = ModelFacts::new(spec).with_catalog(&Catalog::default());
-        let key = self.endpoint.secret.clone().unwrap_or_default();
         let model = match self.endpoint.wire {
             Wire::AnthropicMessages => {
-                let config = AnthropicConfig::new(key).with_base_url(&self.endpoint.base_url);
+                let config = self.anthropic_config();
                 let mut wire = config.completion(&self.model).with_facts(facts);
                 if self.capabilities.prompt_caching != Support::Unsupported {
                     wire = wire.with_prompt_caching();
@@ -477,24 +306,7 @@ impl Backend {
                     .erase()
             }
             wire_kind => {
-                let dialect = if self.chatgpt.is_some() {
-                    &rig_core::providers::chatgpt::DIALECT
-                } else {
-                    wire::by_name(self.endpoint.label).unwrap_or(&wire::OPENAI)
-                };
-                let mut config =
-                    OpenAIConfig::with_key(dialect, key).with_base_url(&self.endpoint.base_url);
-                config.instructions = None;
-                if self.endpoint.secret.is_none() {
-                    config.auth = wire::Auth::OptionalBearer;
-                }
-                if let Some((account, _)) = &self.chatgpt {
-                    config.account_id = Some(account.clone());
-                    config.identity = Some(wire::CallerIdentity {
-                        originator: "solaris".into(),
-                        user_agent: concat!("solaris/", env!("CARGO_PKG_VERSION")).into(),
-                    });
-                }
+                let config = self.openai_config();
                 if wire_kind == Wire::OpenAiChat {
                     Model::new(config.chat(&self.model).with_facts(facts), transport)
                         .with_idle_timeout(Some(http::IDLE_TIMEOUT))
@@ -515,6 +327,37 @@ impl Backend {
         };
         Ok(model)
     }
+    pub(crate) fn anthropic_config(&self) -> rig_core::providers::anthropic::AnthropicConfig {
+        rig_core::providers::anthropic::AnthropicConfig::new(
+            self.endpoint.secret.clone().unwrap_or_default(),
+        )
+        .with_base_url(&self.endpoint.base_url)
+    }
+
+    pub(crate) fn openai_config(&self) -> rig_core::providers::openai::OpenAIConfig {
+        use rig_core::providers::openai::{OpenAIConfig, wire};
+        let dialect = if self.chatgpt.is_some() {
+            &rig_core::providers::chatgpt::DIALECT
+        } else {
+            wire::by_name(self.endpoint.label).unwrap_or(&wire::OPENAI)
+        };
+        let mut config =
+            OpenAIConfig::with_key(dialect, self.endpoint.secret.clone().unwrap_or_default())
+                .with_base_url(&self.endpoint.base_url);
+        config.instructions = None;
+        if self.endpoint.secret.is_none() {
+            config.auth = wire::Auth::OptionalBearer;
+        }
+        if let Some((account, _)) = &self.chatgpt {
+            config.account_id = Some(account.clone());
+            config.identity = Some(wire::CallerIdentity {
+                originator: "solaris".into(),
+                user_agent: concat!("solaris/", env!("CARGO_PKG_VERSION")).into(),
+            });
+        }
+        config
+    }
+
     pub(crate) fn describe_error(&self, report: &rig_core::error::ErrorReport) -> BackendError {
         let text = if let Some(status) = report
             .http_status

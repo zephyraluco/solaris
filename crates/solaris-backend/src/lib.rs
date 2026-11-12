@@ -7,6 +7,7 @@
 
 mod client;
 mod connection;
+mod discovery;
 pub use connection::ModelClient;
 mod convert;
 mod event;
