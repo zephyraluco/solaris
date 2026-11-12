@@ -33,8 +33,6 @@ struct Phase {
     thinking: String,
     input_characters: usize,
     sequential: Option<Arc<tokio::sync::Semaphore>>,
-    measurements: Vec<(Message, solaris_backend::MessageContext)>,
-    last_usage: Option<Usage>,
     calls: std::collections::HashMap<rig_core::effect::EffectId, ToolCall>,
 }
 #[derive(Clone)]
@@ -104,28 +102,12 @@ impl AgentHook for Policy {
             phase.reject_truncated = false;
         }
         let header = self.runner.request_header();
-        let mut messages: Vec<_> = event
-            .history
-            .iter()
-            .map(|message| Message::from(message.as_ref()))
-            .collect();
-        messages.push(Message::from(event.prompt));
-        if let Some((measured, context)) = self
-            .phase
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .measurements
-            .last()
-            && let Some(message) = messages.iter_mut().rev().find(|message| {
-                message.role == measured.role && message.content == measured.content
-            })
-        {
-            message.context = Some(context.clone());
-        }
+        let mut messages = event.history.to_vec();
+        messages.push(Arc::new(event.prompt.clone()));
         let mut context = self
             .runner
             .conversation
-            .publish_projection(&messages, &header);
+            .publish_projection(&messages, &header, false);
         context.window = self
             .runner
             .inner
@@ -157,6 +139,10 @@ impl AgentHook for Policy {
         };
         let capabilities = client.capabilities();
         self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
+        let context = self
+            .runner
+            .conversation
+            .publish_projection(&messages, &header, true);
         let _ = self.tx.send(AgentEvent::ContextUsageUpdated {
             context: solaris_backend::ContextUsage {
                 window: capabilities
@@ -227,19 +213,6 @@ impl AgentHook for Policy {
             }
         }
         phase.sequential = sequential.then(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        if let Some(usage) = phase.last_usage
-            && !usage.estimated
-            && !usage.is_empty()
-        {
-            let mut message = Message::from(&native::Message::Assistant(
-                native::AssistantMessage::new(event.content.clone()),
-            ));
-            self.runner.request_header().annotate(&mut message, usage);
-            if let Some(context) = message.context.take() {
-                phase.measurements.push((message, context));
-            }
-        }
-
         if matches!(
             event.finish_reason,
             Some(rig_core::completion::FinishReason::Length)
@@ -293,7 +266,9 @@ impl AgentHook for Policy {
                 Ok(cost) => cost,
                 Err(error) => return OutcomeAction::replace(Err(failure(error))),
             };
-            phase.last_usage = Some(measured);
+            self.runner
+                .conversation
+                .observe_usage(&self.runner.request_header(), measured);
             phase.totals.add(measured, cost);
         }
         OutcomeAction::proceed()
@@ -549,6 +524,7 @@ impl Runner {
             }
             builder = builder.tool_server_handle(server);
             let agent = builder.build();
+            let projection_guard = self.conversation.projecting();
             let (run, mut events) = agent
                 .prompt(&prompt)
                 .max_turns(usize::MAX)
@@ -587,19 +563,19 @@ impl Runner {
                     true
                 }
                 Err(error) => {
+                    drop(projection_guard);
                     self.conversation.refresh();
                     self.give_up(error.to_string(), &tx);
                     return;
                 }
             };
+            drop(projection_guard);
             force_compaction = handed_off && boundary == Some(Boundary::Compaction);
             {
                 let phase = phase.lock().unwrap_or_else(|p| p.into_inner());
                 total = total.merge(phase.totals.usage);
                 cost_usd += phase.totals.cost_usd;
             }
-            self.conversation
-                .annotate_completed(&phase.lock().unwrap_or_else(|p| p.into_inner()).measurements);
             self.conversation.refresh();
             self.emit_context(&tx);
             let mut background = self.absorb_background(&mut total, &mut cost_usd);

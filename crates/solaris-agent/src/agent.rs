@@ -436,7 +436,7 @@ impl Agent {
                     .collect();
                 let initial =
                     crate::projection::Header::new(&self.model_key(mode), &text, &declared);
-                header.overhead = initial.overhead;
+                header.tools = initial.tools;
                 header.request_id = initial.request_id;
             }
             prompts.push(CachedPrompt { text, header });
@@ -1421,7 +1421,7 @@ mod tests {
         assert!(message.contains("cancelled"), "{message}");
     }
     #[tokio::test]
-    async fn restored_projection_reports_usage_without_background_validation_or_model_calls() {
+    async fn restored_projection_estimates_without_background_validation_or_model_calls() {
         let directory = tempfile::tempdir().expect("directory");
         let store =
             crate::SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
@@ -1440,7 +1440,14 @@ mod tests {
         let backend = Scripted::new(vec![]);
         let restored = agent(backend.clone());
         restored.attach_journal(journal).expect("restore");
-        assert_eq!(restored.context_usage(Mode::Build).tokens, Some(110));
+        let context = restored.context_usage(Mode::Build);
+        assert!(context.estimated);
+        assert!(context.tokens.is_some_and(|tokens| tokens > 0));
+        assert_ne!(
+            context.tokens,
+            Some(110),
+            "request anchors cannot survive restoration"
+        );
         assert!(backend.requests().is_empty());
     }
 

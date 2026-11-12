@@ -17,7 +17,10 @@
 //! records (including tool intents and billing) are persisted independently.
 
 use crate::{SessionJournal, SessionRecord, StoreError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use solaris_backend::{Message, Role};
 
@@ -25,10 +28,20 @@ use solaris_backend::{Message, Role};
 pub(crate) struct Conversation {
     storage: RwLock<Arc<dyn rig_memory::Store + Send + Sync>>,
     headers: Mutex<Vec<crate::projection::Header>>,
+    projections: Mutex<std::collections::BTreeMap<String, crate::projection::Projection>>,
+    projecting: AtomicBool,
     published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
     failure: Mutex<Option<String>>,
     billing: Mutex<crate::UsageTotals>,
+}
+
+pub(crate) struct ProjectionGuard<'a>(&'a Conversation);
+impl Drop for ProjectionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.projecting.store(false, Ordering::Release);
+        self.0.publish();
+    }
 }
 
 impl Default for Conversation {
@@ -37,6 +50,8 @@ impl Default for Conversation {
             storage: RwLock::new(Arc::new(rig_memory::MemoryStore::default())),
             headers: Mutex::new(Vec::new()),
             published: Mutex::new(Default::default()),
+            projections: Mutex::new(Default::default()),
+            projecting: AtomicBool::new(false),
             journal: RwLock::new(None),
             failure: Mutex::new(None),
             billing: Mutex::new(Default::default()),
@@ -49,7 +64,15 @@ impl Conversation {
         Self::default()
     }
 
+    pub(crate) fn projecting(&self) -> ProjectionGuard<'_> {
+        self.projecting.store(true, Ordering::Release);
+        ProjectionGuard(self)
+    }
     pub(crate) fn attach(&self, journal: Arc<SessionJournal>) -> Result<(), StoreError> {
+        self.projections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let context = match journal.context() {
             Ok(context) => context,
             Err(error) => {
@@ -230,6 +253,10 @@ impl Conversation {
         self.publish();
     }
     pub(crate) fn replace_with(&self, messages: Vec<Message>) {
+        self.projections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut conversation = self.native()?;
             let converted = messages
@@ -263,49 +290,35 @@ impl Conversation {
         }
         self.publish();
     }
-    pub(crate) fn annotate_completed(
-        &self,
-        measurements: &[(Message, solaris_backend::MessageContext)],
-    ) {
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let mut conversation = self.native()?;
-            let mut end = conversation.messages().len();
-            for (message, context) in measurements.iter().rev() {
-                let index = conversation.messages()[..end].iter().rposition(|native| {
-                    let candidate = Message::from(native.as_ref());
-                    candidate.role == message.role && candidate.content == message.content
-                });
-                if let Some(index) = index {
-                    conversation.add_aside(
-                        rig_core::conversation::Aside::new(
-                            "solaris.context",
-                            rig_core::conversation::Author::plugin("solaris"),
-                            serde_json::to_value(context)?,
-                        )
-                        .after(conversation.id(index)),
-                    );
-                    end = index;
-                }
-            }
-            rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.failed(error);
-        }
-        self.publish();
-    }
     pub(crate) fn publish_projection(
         &self,
-        messages: &[Message],
+        messages: &[Arc<rig_core::message::Message>],
         header: &crate::projection::Header,
+        sent: bool,
     ) -> solaris_backend::ContextUsage {
-        let context = crate::projection::estimate(messages, header, 0).1;
+        let mut projections = self.projections.lock().unwrap_or_else(|p| p.into_inner());
+        let projection = projections.entry(header.base_id.clone()).or_default();
+        projection.sync(messages);
+        let context = projection.context(header, sent);
         self.published
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(header.base_id.clone(), context);
         context
+    }
+    pub(crate) fn observe_usage(
+        &self,
+        header: &crate::projection::Header,
+        usage: solaris_backend::Usage,
+    ) {
+        if let Some(projection) = self
+            .projections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&header.base_id)
+        {
+            projection.observe(usage);
+        }
     }
     pub(crate) fn refresh(&self) {
         self.publish();
@@ -377,6 +390,10 @@ impl Conversation {
     }
 
     pub(crate) fn set_headers(&self, headers: Vec<crate::projection::Header>) {
+        self.projections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| headers.iter().any(|header| &header.base_id == key));
         *self.headers.lock().unwrap_or_else(|p| p.into_inner()) = headers;
         self.publish();
     }
@@ -400,15 +417,23 @@ impl Conversation {
     }
 
     fn publish(&self) {
-        let messages = self.snapshot();
+        let native = match self.native() {
+            Ok(native) => native,
+            Err(error) => {
+                self.failed(error);
+                return;
+            }
+        };
         let headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
+        let mut projections = self.projections.lock().unwrap_or_else(|p| p.into_inner());
         let snapshots = headers
             .iter()
             .map(|header| {
-                (
-                    header.base_id.clone(),
-                    crate::projection::estimate(&messages, header, 0).1,
-                )
+                let projection = projections.entry(header.base_id.clone()).or_default();
+                if !self.projecting.load(Ordering::Acquire) || !projection.initialized() {
+                    projection.sync(native.messages());
+                }
+                (header.base_id.clone(), projection.context(header, false))
             })
             .collect();
         *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshots;
@@ -435,7 +460,8 @@ impl Conversation {
     }
 
     pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
-        crate::projection::estimate(&self.snapshot(), header, 0).0
+        self.update_request_header(header.clone());
+        self.context_usage(&header.base_id, 0).tokens.unwrap_or(0)
     }
 }
 
@@ -446,11 +472,7 @@ mod tests {
     use solaris_backend::{ToolCall, ToolResult};
 
     fn tokens(conversation: &Conversation) -> u32 {
-        let header = crate::projection::Header {
-            base_id: String::new(),
-            request_id: String::new(),
-            overhead: 0,
-        };
+        let header = crate::projection::Header::new("", "", &[]);
         conversation.projected_tokens(&header)
     }
 
@@ -662,9 +684,9 @@ mod tests {
         let conversation = Conversation::new();
         let initial = crate::projection::Header::new("model", "system", &[]);
         conversation.set_headers(vec![initial.clone()]);
-        let mut measured = Message::assistant("previous response");
-        initial.annotate(&mut measured, solaris_backend::Usage::new(9000, 100));
-        conversation.push(measured);
+        conversation.publish_projection(&[], &initial, true);
+        conversation.observe_usage(&initial, solaris_backend::Usage::new(9000, 100));
+        conversation.push(Message::assistant("previous response"));
         for schema in [r#"{"type":"string"}"#, r#"{"type":"number"}"#, "null"] {
             let tools = if schema == "null" {
                 vec![]
@@ -682,13 +704,54 @@ mod tests {
             assert_eq!(display.tokens, Some(conversation.projected_tokens(&header)));
             assert!(display.estimated);
             assert!(display.tokens.expect("estimate") < 9000);
-            let mut reply = Message::assistant("new response");
-            header.annotate(&mut reply, solaris_backend::Usage::new(200, 20));
-            conversation.push(reply);
+            conversation.publish_projection(
+                conversation.native().unwrap().messages(),
+                &header,
+                true,
+            );
+            conversation.observe_usage(&header, solaris_backend::Usage::new(200, 20));
+            conversation.push(Message::assistant("new response"));
             let display = conversation.context_usage(&initial.base_id, 10000);
             assert_eq!(display.tokens, Some(220));
             assert!(!display.estimated);
         }
+    }
+
+    #[test]
+    fn changing_tools_during_a_run_uses_sdk_working_messages_not_saved_memory() {
+        let conversation = Conversation::new();
+        let initial = crate::projection::Header::new("model", "system", &[]);
+        conversation.set_headers(vec![initial.clone()]);
+        let guard = conversation.projecting();
+        let working = vec![Arc::new(rig_core::message::Message::user(
+            "x".repeat(20_000),
+        ))];
+        conversation.publish_projection(&working, &initial, true);
+        let tools = [solaris_backend::ToolSpec::new(
+            "read",
+            "Read",
+            json!({"type":"object"}),
+        )];
+        let mut changed = crate::projection::Header::new("model", "system", &tools);
+        changed.base_id.clone_from(&initial.base_id);
+        conversation.update_request_header(changed.clone());
+        let live = conversation.context_usage(&initial.base_id, 10000);
+        assert!(live.estimated && live.tokens.unwrap() > 1000);
+        assert_eq!(live.tokens, Some(conversation.projected_tokens(&changed)));
+        assert_eq!(
+            conversation.len(),
+            0,
+            "a projection does not author memory messages"
+        );
+        drop(guard);
+        assert!(
+            conversation
+                .context_usage(&initial.base_id, 10000)
+                .tokens
+                .unwrap()
+                < 1000,
+            "cancellation restores the saved view"
+        );
     }
 
     #[test]
@@ -697,9 +760,9 @@ mod tests {
         let header = crate::projection::Header::new("model", "system", &[]);
         let base = header.base_id.clone();
         conversation.set_headers(vec![header.clone()]);
-        let mut message = Message::assistant("reply");
-        header.annotate(&mut message, solaris_backend::Usage::new(100, 10));
-        conversation.push(message);
+        conversation.publish_projection(&[], &header, true);
+        conversation.observe_usage(&header, solaris_backend::Usage::new(100, 10));
+        conversation.push(Message::assistant("reply"));
         let lock = conversation.storage.write().unwrap();
         let reader = Arc::clone(&conversation);
         let (tx, rx) = std::sync::mpsc::channel();
