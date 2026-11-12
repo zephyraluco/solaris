@@ -12,6 +12,9 @@
 //! still stands on the next turn, and a message the user steered in is simply
 //! there rather than having to be reconstructed from the transcript.
 
+#[cfg(test)]
+use solaris_backend::TurnRequest;
+
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,8 +23,7 @@ use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, Message, ToolCall, ToolResult, ToolSpec,
-    TurnRequest, Usage,
+    AgentBackend, AgentEvent, AgentEventStream, Message, ToolCall, ToolResult, ToolSpec, Usage,
 };
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -651,6 +653,25 @@ async fn compact_memory(
         rig_memory::CompactReason::Threshold
     };
     let from = rig_memory::summarized_prefix(&native);
+    if policy
+        .cut(native.messages(), from, &reason, Some(&spec))
+        .is_none()
+    {
+        return outcome;
+    }
+    let client = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return outcome,
+        result = Arc::clone(inner).model_client() => match result { Ok(client) => client, Err(_) => return outcome },
+    };
+    // A catalog or credential refresh may have happened while preparing the
+    // connection. Build the actual summary from that connection's fixed facts.
+    let caps = client.capabilities();
+    spec.context_window = caps
+        .context_window
+        .or((fallback_window > 0).then_some(fallback_window));
+    spec.max_input_tokens = caps.max_input;
+    spec.max_output_tokens = caps.max_output.or(caps.output_budget);
     let Some(cut) = policy.cut(native.messages(), from, &reason, Some(&spec)) else {
         return outcome;
     };
@@ -659,12 +680,7 @@ async fn compact_memory(
             Ok(plan) => plan,
             Err(_) => return outcome,
         };
-    let client = tokio::select! {
-        biased;
-        _ = wait_for_cancel(cancel) => return outcome,
-        result = inner.model_client() => match result { Ok(client) => client, Err(_) => return outcome },
-    };
-    let summary = if let Some(client) = client {
+    let summary = {
         let input = request
             .chat_history
             .iter()
@@ -688,54 +704,15 @@ async fn compact_memory(
             } else {
                 Usage::estimate(input, response.text().chars().count())
             };
-        outcome.cost_usd = client.cost(outcome.usage);
-        if inner
-            .observe_usage(outcome.usage, outcome.cost_usd)
-            .is_err()
-        {
-            return outcome;
-        }
+        outcome.usage = client.usage(outcome.usage);
+        outcome.cost_usd = match client.settle(outcome.usage) {
+            Ok(cost) => cost,
+            Err(_) => return outcome,
+        };
         match rig_memory::Summarizer::summary_text(&response) {
             Ok(summary) => summary,
             Err(_) => return outcome,
         }
-    } else {
-        let mut messages: Vec<_> = request
-            .chat_history
-            .iter()
-            .map(|message| Message::from(message.as_ref()))
-            .collect();
-        let prompt = messages
-            .pop()
-            .map(|message| message.text())
-            .unwrap_or_default();
-        let mut stream = tokio::select! {
-            biased;
-            _ = wait_for_cancel(cancel) => return outcome,
-            result = inner.run_turn(TurnRequest::new(messages, prompt)) => match result { Ok(stream) => stream, Err(_) => return outcome },
-        };
-        let mut summary = String::new();
-        let mut complete = false;
-        let mut rejected = false;
-        while let Some(event) = tokio::select! { biased; _ = wait_for_cancel(cancel) => return outcome, event = stream.next() => event }
-        {
-            match event {
-                AgentEvent::TextDelta(text) => summary.push_str(&text),
-                AgentEvent::TurnComplete { usage, cost_usd } => {
-                    outcome.usage = usage;
-                    outcome.cost_usd = cost_usd;
-                    complete = true;
-                    break;
-                }
-                AgentEvent::OutputTruncated | AgentEvent::ToolCall(_) => rejected = true,
-                AgentEvent::Error(_) => return outcome,
-                _ => {}
-            }
-        }
-        if !complete || rejected || summary.trim().is_empty() {
-            return outcome;
-        }
-        summary
     };
     state.summary = summary.clone();
     let keep = native.id(cut);
@@ -815,6 +792,15 @@ impl Stream for EventStream {
 }
 #[cfg(test)]
 mod tests {
+    fn request_text(request: &solaris_backend::TurnRequest) -> String {
+        request
+            .history
+            .iter()
+            .map(solaris_backend::Message::text)
+            .chain(std::iter::once(request.prompt.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
     use super::*;
     use crate::prompt::summary_message;
     use std::collections::VecDeque;
@@ -953,6 +939,12 @@ mod tests {
 
     #[async_trait]
     impl AgentBackend for Scripted {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+            Ok(solaris_backend::ModelClient::from_events(self))
+        }
+
         async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.seen.lock().expect("lock").push(request);
             let events = self
@@ -1349,6 +1341,12 @@ mod tests {
 
         #[async_trait]
         impl AgentBackend for Endless {
+            async fn model_client(
+                self: std::sync::Arc<Self>,
+            ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+                Ok(solaris_backend::ModelClient::from_events(self))
+            }
+
             async fn run_turn(
                 &self,
                 _request: TurnRequest,
@@ -1505,6 +1503,12 @@ mod tests {
 
         #[async_trait]
         impl AgentBackend for Endless {
+            async fn model_client(
+                self: std::sync::Arc<Self>,
+            ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+                Ok(solaris_backend::ModelClient::from_events(self))
+            }
+
             async fn run_turn(
                 &self,
                 _request: TurnRequest,
@@ -1718,6 +1722,12 @@ mod tests {
 
     #[async_trait]
     impl AgentBackend for SteersOnFirstRound {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+            Ok(solaris_backend::ModelClient::from_events(self))
+        }
+
         async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.seen.lock().expect("lock").push(request);
             let events = if self.steered.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2156,9 +2166,9 @@ mod tests {
             seen[0].history[0].text()
         );
         assert!(
-            seen[0].prompt.contains("what came before"),
+            request_text(&seen[0]).contains("what came before"),
             "and is handed the summary it is updating: {}",
-            seen[0].prompt
+            request_text(&seen[0])
         );
         assert!(matches!(
             events.last(),
@@ -2330,8 +2340,8 @@ mod tests {
         );
         let seen = scripted.requests();
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].prompt.contains("current target: parser.rs"));
-        assert!(seen[0].prompt.contains("preserve flags"));
+        assert!(request_text(&seen[0]).contains("current target: parser.rs"));
+        assert!(request_text(&seen[0]).contains("preserve flags"));
         let kept = conversation.snapshot();
         assert!(kept[0].text().contains("history summary"));
         assert!(

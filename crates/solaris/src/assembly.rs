@@ -33,6 +33,12 @@ mod tests {
     struct Backend;
     #[async_trait::async_trait]
     impl AgentBackend for Backend {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+            Ok(solaris_agent::ModelClient::from_events(self))
+        }
+
         async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             Ok(Box::pin(futures::stream::empty()))
         }

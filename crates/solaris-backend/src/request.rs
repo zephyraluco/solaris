@@ -1,11 +1,10 @@
 //! One retry/compatibility policy over official model adapters, for every caller.
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use rig_core::effect::EffectKind;
 use rig_core::error::ErrorReport;
-use rig_core::serve::{Dispatch, Reply, Serve, adapters::ModelAdapter};
+use rig_core::serve::{Dispatch, ErasedHandler, Reply, adapters::ModelAdapter};
 use rig_core::streaming::{Relayed, StreamEvents};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -13,13 +12,14 @@ use crate::{AgentEvent, ModelClient, Wire, http, policy::Repair};
 
 pub(crate) fn execute(
     client: ModelClient,
+    backend: crate::Backend,
     kind: EffectKind,
     dispatch: Dispatch,
     status: Option<UnboundedSender<AgentEvent>>,
 ) -> Reply {
     let state = Request {
-        adapter: Arc::clone(&client.adapter),
-        client,
+        adapter: client.adapter,
+        backend,
         kind,
         dispatch,
         status,
@@ -35,8 +35,8 @@ pub(crate) fn execute(
     )))
 }
 struct Request {
-    client: ModelClient,
-    adapter: Arc<ModelAdapter<rig_core::operation::Completion>>,
+    backend: crate::Backend,
+    adapter: ErasedHandler,
     kind: EffectKind,
     dispatch: Dispatch,
     status: Option<UnboundedSender<AgentEvent>>,
@@ -55,7 +55,7 @@ impl Request {
             if self.stream.is_none() {
                 self.stream = Some(
                     self.adapter
-                        .serve(self.kind.clone(), {
+                        .handle(self.kind.clone(), {
                             let mut dispatch =
                                 Dispatch::new(self.dispatch.id(), self.dispatch.is_stream());
                             for scope in self.dispatch.scopes() {
@@ -81,16 +81,17 @@ impl Request {
                 Some(Err(error)) => {
                     if !self.delivered
                         && error.http_status == Some(400)
-                        && self.client.backend.wire() == Wire::OpenAiChat
+                        && self.backend.wire() == Wire::OpenAiChat
                         && let Some(repair) = crate::policy::repair_for(
                             error.provider_response_body().unwrap_or_default(),
                         )
                         && !self.repairs.contains(&repair)
                     {
                         self.repairs.push(repair);
-                        match self.client.backend.completion_model(&self.repairs) {
+                        match self.backend.completion_model(&self.repairs) {
                             Ok(model) => {
-                                self.adapter = Arc::new(ModelAdapter::new("default", model));
+                                self.adapter =
+                                    ErasedHandler::new(ModelAdapter::new("default", model));
                                 self.stream = None;
                                 continue;
                             }
@@ -115,7 +116,7 @@ impl Request {
                         if let Some(status) = &self.status {
                             let _ = status.send(AgentEvent::Status(format!(
                                 "{} is busy — retrying in {:.1}s",
-                                self.client.backend.endpoint.name,
+                                self.backend.endpoint.name,
                                 wait.as_secs_f32()
                             )));
                         }

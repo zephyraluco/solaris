@@ -13,6 +13,7 @@ mod convert;
 mod event;
 mod events;
 mod http;
+mod injected;
 mod message;
 mod policy;
 mod request;
@@ -42,16 +43,9 @@ pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
 /// platform into one of these, and the UI only ever sees this.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
-    /// Observe native executor usage through the same accounting policy chain.
-    fn observe_usage(&self, _usage: Usage, _cost: f64) -> Result<(), BackendError> {
-        Ok(())
-    }
-
-    /// Resolve a native model connection for the task executor. A backend that
-    /// only supplies synthetic business events can leave this unset.
-    async fn model_client(&self) -> Result<Option<ModelClient>, BackendError> {
-        Ok(None)
-    }
+    /// Prepare one immutable model connection. Injected event sources must
+    /// explicitly opt into `ModelClient::from_events`; there is no fallback.
+    async fn model_client(self: std::sync::Arc<Self>) -> Result<ModelClient, BackendError>;
 
     /// Explicit model metadata, with unknown values kept distinct from refusal.
     fn capabilities(&self) -> solaris_types::ModelCapabilities {

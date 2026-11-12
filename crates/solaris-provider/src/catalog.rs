@@ -135,10 +135,10 @@ impl CatalogBackend {
 }
 #[async_trait]
 impl AgentBackend for CatalogBackend {
-    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         match &self.live {
-            Some(live) => live.backend().model_client().await,
-            None => self.inner.model_client().await,
+            Some(live) => Arc::new(live.backend()).model_client().await,
+            None => Arc::clone(&self.inner).model_client().await,
         }
     }
 
@@ -214,6 +214,12 @@ mod model_list_tests {
         struct Missing;
         #[async_trait]
         impl AgentBackend for Missing {
+            async fn model_client(
+                self: std::sync::Arc<Self>,
+            ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+                Ok(solaris_backend::ModelClient::from_events(self))
+            }
+
             async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
                 Err(BackendError::new("unused"))
             }

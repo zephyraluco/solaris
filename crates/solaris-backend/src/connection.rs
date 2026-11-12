@@ -4,21 +4,82 @@ use rig_core::serve::{Dispatch, Reply, Serve, adapters::ModelAdapter};
 
 use crate::{Backend, BackendError, Usage};
 
-/// An opaque model connection. Provider configuration and SDK details stay internal.
+pub(crate) type ReportedUsage = std::sync::Arc<std::sync::Mutex<Option<(Usage, f64)>>>;
+
+type UsageObserver = std::sync::Arc<dyn Fn(Usage, f64) -> Result<(), BackendError> + Send + Sync>;
+
+/// An immutable request connection. Providers and SDK details stay internal.
 #[derive(Clone)]
 pub struct ModelClient {
-    pub(crate) backend: Backend,
-    pub(crate) adapter: std::sync::Arc<ModelAdapter<rig_core::operation::Completion>>,
+    pub(crate) backend: Option<Backend>,
+    pub(crate) adapter: rig_core::serve::ErasedHandler,
+    capabilities: crate::ModelCapabilities,
+    reported: Option<ReportedUsage>,
+    observers: Vec<UsageObserver>,
 }
 impl ModelClient {
-    /// Capabilities fixed with the model, credentials and price for this request.
-    pub fn capabilities(&self) -> crate::ModelCapabilities {
-        self.backend.capabilities.clone()
+    pub(crate) fn native(backend: Backend) -> Result<Self, BackendError> {
+        backend.check_credentials()?;
+        let adapter = rig_core::serve::ErasedHandler::new(backend.model_adapter()?);
+        Ok(Self {
+            capabilities: backend.capabilities.clone(),
+            backend: Some(backend),
+            adapter,
+            reported: None,
+            observers: Vec::new(),
+        })
     }
-
-    /// Price a completed request using this connection's immutable metadata.
+    /// Explicit adapter for application-injected event sources and test doubles.
+    pub fn from_events<T: crate::AgentBackend + ?Sized + 'static>(
+        backend: std::sync::Arc<T>,
+    ) -> Self {
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(None));
+        Self {
+            capabilities: backend.capabilities(),
+            backend: None,
+            adapter: rig_core::serve::ErasedHandler::new(crate::injected::EventModel {
+                backend,
+                reported: std::sync::Arc::clone(&reported),
+            }),
+            reported: Some(reported),
+            observers: Vec::new(),
+        }
+    }
+    pub fn capabilities(&self) -> crate::ModelCapabilities {
+        self.capabilities.clone()
+    }
     pub fn cost(&self, usage: Usage) -> f64 {
-        self.backend.usage_cost(usage)
+        match &self.backend {
+            Some(backend) => backend.usage_cost(usage),
+            None => self
+                .reported
+                .as_ref()
+                .and_then(|report| *report.lock().unwrap_or_else(|p| p.into_inner()))
+                .map_or(0.0, |(_, cost)| cost),
+        }
+    }
+    /// Preserve an injected source's estimate marker, which SDK counters do not carry.
+    pub fn usage(&self, measured: Usage) -> Usage {
+        self.reported
+            .as_ref()
+            .and_then(|report| *report.lock().unwrap_or_else(|p| p.into_inner()))
+            .map_or(measured, |(usage, _)| usage)
+    }
+    /// Add a product accounting policy without adding it to the provider trait.
+    pub fn with_usage_observer(
+        mut self,
+        observer: impl Fn(Usage, f64) -> Result<(), BackendError> + Send + Sync + 'static,
+    ) -> Self {
+        self.observers.insert(0, std::sync::Arc::new(observer));
+        self
+    }
+    /// Settle completed usage through the policies attached to this request.
+    pub fn settle(&self, usage: Usage) -> Result<f64, BackendError> {
+        let cost = self.cost(usage);
+        for observer in &self.observers {
+            observer(usage, cost)?;
+        }
+        Ok(cost)
     }
 }
 impl Serve for ModelClient {
@@ -26,10 +87,14 @@ impl Serve for ModelClient {
     fn descriptor(&self) -> rig_core::effect::HandlerDescriptor {
         self.adapter.descriptor()
     }
-
     async fn serve(&self, kind: EffectKind, dispatch: Dispatch) -> Reply {
-        match self.backend.prepare_effect(kind) {
-            Ok(kind) => crate::request::execute(self.clone(), kind, dispatch, None),
+        let Some(backend) = &self.backend else {
+            return self.adapter.handle(kind, dispatch).await;
+        };
+        match backend.prepare_effect(kind) {
+            Ok(kind) => {
+                crate::request::execute(self.clone(), backend.clone(), kind, dispatch, None)
+            }
             Err(error) => Reply::Outcome(Err(rig_core::error::ErrorReport::new(
                 rig_core::error::ErrorKind::Request,
                 error.to_string(),

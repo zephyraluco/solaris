@@ -79,6 +79,12 @@ fn is_child(request: &TurnRequest) -> bool {
 
 #[async_trait]
 impl AgentBackend for Model {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+        Ok(solaris_backend::ModelClient::from_events(self))
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = is_child(&request);
         let answered = request

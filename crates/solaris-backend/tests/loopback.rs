@@ -694,7 +694,10 @@ async fn native_executor_connection_uses_the_same_retry_policy() {
         }
         requests
     });
-    let client = backend(addr).model_client().await.unwrap().unwrap();
+    let client = std::sync::Arc::new(backend(addr))
+        .model_client()
+        .await
+        .unwrap();
     let reply = client
         .serve(
             EffectKind::Completion {

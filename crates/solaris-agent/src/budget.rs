@@ -84,24 +84,22 @@ pub(crate) struct BudgetedBackend {
 }
 #[async_trait]
 impl AgentBackend for BudgetedBackend {
-    fn observe_usage(&self, usage: solaris_backend::Usage, cost: f64) -> Result<(), BackendError> {
-        self.budget.charge(cost);
-        self.inner.observe_usage(usage, cost)
-    }
-    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         self.budget.check().map_err(BackendError::new)?;
-        let client = self.inner.model_client().await?;
-        if client.is_some() {
-            if self.budget.limits.max_cost_usd.is_some()
-                && self.inner.capabilities().price_known == Some(false)
-            {
-                return Err(BackendError::new(
-                    "cost budget requires known model pricing; configure models.json or omit --max-cost",
-                ));
-            }
-            self.budget.request()?;
+        let client = Arc::clone(&self.inner).model_client().await?;
+        if self.budget.limits.max_cost_usd.is_some()
+            && client.capabilities().price_known == Some(false)
+        {
+            return Err(BackendError::new(
+                "cost budget requires known model pricing; configure models.json or omit --max-cost",
+            ));
         }
-        Ok(client)
+        self.budget.request()?;
+        let budget = Arc::clone(&self.budget);
+        Ok(client.with_usage_observer(move |_, cost| {
+            budget.charge(cost);
+            Ok(())
+        }))
     }
 
     fn capabilities(&self) -> solaris_backend::ModelCapabilities {

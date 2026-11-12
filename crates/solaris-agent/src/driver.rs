@@ -18,7 +18,6 @@ use std::sync::Mutex;
 struct Phase {
     totals: crate::UsageTotals,
     client: Option<solaris_backend::ModelClient>,
-    synthetic: Option<(Usage, f64)>,
     text: String,
     thinking: String,
     input_characters: usize,
@@ -86,19 +85,15 @@ impl AgentHook for Policy {
             phase.text.clear();
             phase.thinking.clear();
             phase.client = None;
-            phase.synthetic = None;
         }
         // Resolve exactly once, before projecting the request. The same client
         // supplies capabilities, the actual model call and its price snapshot.
-        let client = match self.runner.inner.model_client().await {
+        let client = match Arc::clone(&self.runner.inner).model_client().await {
             Ok(client) => client,
             Err(error) => return CompletionCallAction::stop(error.to_string()),
         };
-        let capabilities = client.as_ref().map_or_else(
-            || self.runner.inner.capabilities(),
-            solaris_backend::ModelClient::capabilities,
-        );
-        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = client;
+        let capabilities = client.capabilities();
+        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
         let header = self.runner.request_header();
         let mut messages: Vec<_> = event
             .history
@@ -224,32 +219,28 @@ impl AgentHook for Policy {
     async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
         if let Some(response) = event.completion() {
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-            let (measured, cost) = if let Some(client) = &phase.client {
-                let measured = if response.usage.input_tokens.is_some()
-                    || response.usage.output_tokens.is_some()
-                {
-                    usage(response.usage)
-                } else {
-                    let output = response
-                        .choice
-                        .iter()
-                        .filter_map(|part| match part {
-                            AssistantContent::Text(text) => Some(text.text.chars().count()),
-                            _ => None,
-                        })
-                        .sum();
-                    Usage::estimate(phase.input_characters, output)
-                };
-                let cost = client.cost(measured);
-                if let Err(error) = self.runner.inner.observe_usage(measured, cost) {
-                    return OutcomeAction::replace(Err(failure(error)));
-                }
-                (measured, cost)
+            let Some(client) = &phase.client else {
+                return OutcomeAction::replace(Err(failure("model connection was not prepared")));
+            };
+            let measured = if response.usage.input_tokens.is_some()
+                || response.usage.output_tokens.is_some()
+            {
+                usage(response.usage)
             } else {
-                phase
-                    .synthetic
-                    .take()
-                    .unwrap_or_else(|| (usage(response.usage), 0.0))
+                let output = response
+                    .choice
+                    .iter()
+                    .filter_map(|part| match part {
+                        AssistantContent::Text(text) => Some(text.text.chars().count()),
+                        _ => None,
+                    })
+                    .sum();
+                Usage::estimate(phase.input_characters, output)
+            };
+            let measured = client.usage(measured);
+            let cost = match client.settle(measured) {
+                Ok(cost) => cost,
+                Err(error) => return OutcomeAction::replace(Err(failure(error))),
             };
             phase.last_usage = Some(measured);
             phase.totals.add(measured, cost);
@@ -298,7 +289,6 @@ fn business_call(call: &native::ToolCall) -> ToolCall {
 impl Serve for Policy {
     type Family = family::Completion;
     fn descriptor(&self) -> HandlerDescriptor {
-        let caps = self.runner.inner.capabilities();
         HandlerDescriptor {
             key: "model".into(),
             family: FamilyDescriptor::Completion {
@@ -307,10 +297,7 @@ impl Serve for Policy {
                     ..Default::default()
                 },
             },
-            layers: {
-                let _ = caps;
-                Vec::new()
-            },
+            layers: Vec::new(),
         }
     }
     async fn serve(&self, kind: EffectKind, dispatch: Dispatch) -> Reply {
@@ -342,110 +329,8 @@ impl Serve for Policy {
             .clone();
         match client {
             Some(client) => client.serve(kind, dispatch).await,
-            None => self.synthetic(request).await,
+            None => Reply::Outcome(Err(failure("model connection was not prepared"))),
         }
-    }
-}
-impl Policy {
-    // Compatibility for injected business-event backends (tests and application
-    // extensions). Production providers always take the native connection path.
-    async fn synthetic(&self, request: &rig_core::completion::CompletionRequest) -> Reply {
-        let history = request
-            .chat_history
-            .iter()
-            .map(|message| Message::from(message.as_ref()))
-            .collect();
-        let tools = request
-            .tools
-            .iter()
-            .map(|tool| {
-                ToolSpec::new(
-                    tool.name.as_str(),
-                    &tool.description,
-                    tool.parameters.clone(),
-                )
-            })
-            .collect();
-        let result = self
-            .runner
-            .inner
-            .run_turn(TurnRequest {
-                history,
-                prompt: String::new(),
-                tools,
-            })
-            .await;
-        let mut stream = match result {
-            Ok(stream) => stream,
-            Err(error) => return Reply::Outcome(Err(failure(error))),
-        };
-        let mut content = Vec::new();
-        let mut text = String::new();
-        let mut truncated = false;
-        while let Some(event) = stream.next().await {
-            match event {
-                AgentEvent::TextDelta(delta) => {
-                    text.push_str(&delta);
-                    self.phase
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .text
-                        .push_str(&delta);
-                    let _ = self.tx.send(AgentEvent::TextDelta(delta));
-                }
-                AgentEvent::ToolCall(call) => {
-                    let name = match native::ToolName::new(call.name) {
-                        Ok(name) => name,
-                        Err(error) => return Reply::Outcome(Err(failure(error))),
-                    };
-                    content.push(AssistantContent::tool_call(call.id, name, call.input));
-                }
-                AgentEvent::OutputTruncated => {
-                    truncated = true;
-                }
-                AgentEvent::Error(error) => return Reply::Outcome(Err(failure(error))),
-                AgentEvent::TurnComplete {
-                    usage: measured,
-                    cost_usd,
-                } => {
-                    if !text.is_empty() {
-                        content.insert(0, AssistantContent::text(text));
-                    }
-                    self.phase
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .synthetic = Some((measured, cost_usd));
-                    let mut native_usage = rig_core::completion::Usage::new();
-                    native_usage.input_tokens = Some(
-                        u64::from(measured.input_tokens)
-                            + u64::from(measured.cache_read_tokens)
-                            + u64::from(measured.cache_write_tokens),
-                    );
-                    native_usage.output_tokens = Some(u64::from(measured.output_tokens));
-                    native_usage.cached_input_tokens = Some(u64::from(measured.cache_read_tokens));
-                    native_usage.cache_creation_input_tokens =
-                        Some(u64::from(measured.cache_write_tokens));
-                    let response = rig_core::completion::CompletionResponse::new(
-                        content,
-                        native_usage,
-                        native::Origin::new("synthetic", "synthetic", "synthetic"),
-                        serde_json::Value::Null,
-                    )
-                    .with_finish_reason(if truncated {
-                        rig_core::completion::FinishReason::Length
-                    } else {
-                        rig_core::completion::FinishReason::Stop
-                    });
-                    return Reply::Outcome(Ok(Answered::Completion(Arc::new(response))));
-                }
-                other => {
-                    let _ = self.tx.send(other);
-                }
-            }
-        }
-        Reply::Outcome(Err(failure(
-            "the model's response ended without completing",
-        )))
     }
 }
 struct ToolBridge {

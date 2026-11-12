@@ -264,8 +264,8 @@ fn requested_output_budget_is_separate_from_model_limits() {
     );
 }
 
-#[test]
-fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
+#[tokio::test]
+async fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
     use solaris_backend::{AgentBackend, Backend, Endpoint, TurnPlan, Wire};
     use std::sync::Arc;
     let catalog = Arc::new(ModelCatalog::default());
@@ -294,9 +294,10 @@ fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
     };
     let first = live.backend();
     assert_eq!(first.capabilities().context_window, Some(128000));
+    let connection = Arc::new(first.clone()).model_client().await.unwrap();
     let updated = CatalogSnapshot::from_json(
         r#"{"providers":{"test":{"test":{
-        "name":"Test","capabilities":{"context_window":32000},"price":null
+        "name":"Test","capabilities":{"context_window":32000},"price":{"input":2,"output":0,"cache_read":0,"cache_write":0}
     }}}}"#,
     )
     .expect("updated snapshot");
@@ -308,6 +309,14 @@ fn live_backends_adopt_new_metadata_without_mutating_an_inflight_snapshot() {
         .insert("cache:models.dev".into(), updated);
     assert_eq!(live.backend().capabilities().context_window, Some(32000));
     assert_eq!(first.capabilities().context_window, Some(128000));
+    let next = Arc::new(live.backend()).model_client().await.unwrap();
+    assert_eq!(connection.capabilities().context_window, Some(128000));
+    assert_eq!(next.capabilities().context_window, Some(32000));
+    assert_eq!(
+        connection.cost(solaris_backend::Usage::new(1_000_000, 0)),
+        0.0
+    );
+    assert_eq!(next.cost(solaris_backend::Usage::new(1_000_000, 0)), 2.0);
 }
 
 #[test]
@@ -395,7 +404,7 @@ async fn request_alias_selects_its_protocol_and_connection_keeps_metadata() {
     let resolved = live.backend();
     assert_eq!(resolved.model(), "grok-4.7");
     assert_eq!(resolved.wire(), Wire::OpenAiResponses);
-    let client = resolved.model_client().await.unwrap().unwrap();
+    let client = std::sync::Arc::new(resolved).model_client().await.unwrap();
     assert_eq!(client.capabilities().context_window, Some(32000));
     assert_eq!(client.cost(solaris_backend::Usage::new(1_000_000, 0)), 1.0);
 }

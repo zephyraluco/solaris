@@ -207,13 +207,8 @@ impl Backend {
 
 #[async_trait::async_trait]
 impl AgentBackend for Backend {
-    async fn model_client(&self) -> Result<Option<crate::ModelClient>, BackendError> {
-        self.check_credentials()?;
-        let adapter = std::sync::Arc::new(self.model_adapter()?);
-        Ok(Some(crate::ModelClient {
-            backend: self.clone(),
-            adapter,
-        }))
+    async fn model_client(self: std::sync::Arc<Self>) -> Result<crate::ModelClient, BackendError> {
+        crate::ModelClient::native((*self).clone())
     }
     fn capabilities(&self) -> crate::ModelCapabilities {
         self.capabilities.clone()
@@ -223,10 +218,7 @@ impl AgentBackend for Backend {
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         // Compatibility display API; every request uses the native connection.
-        let client = self
-            .model_client()
-            .await?
-            .ok_or_else(|| BackendError::new("model connection unavailable"))?;
+        let client = crate::ModelClient::native(self.clone())?;
         let input_characters = request_characters(&request);
         let request = convert::request(&request, self.max_tokens)?;
         let kind = self.prepare_effect(rig_core::effect::EffectKind::Completion {
@@ -236,6 +228,7 @@ impl AgentBackend for Backend {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let reply = crate::request::execute(
             client.clone(),
+            self.clone(),
             kind,
             rig_core::serve::Dispatch::new(rig_core::effect::EffectId::from_raw(0), true),
             Some(tx),

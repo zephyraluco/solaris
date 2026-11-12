@@ -53,7 +53,8 @@ pub use subagent::{SUBAGENT_TOOL, agent_tool_registry};
 // The conversation: what a turn is written in and what it streams back.
 pub use solaris_backend::{
     AgentBackend, AgentEvent, AgentEventStream, BackendError, Content, ContextUsage, Message,
-    Price, Role, ToolCall, ToolResult, ToolSpec, TurnRequest, Usage, tokens_for_characters,
+    ModelClient, Price, Role, ToolCall, ToolResult, ToolSpec, TurnRequest, Usage,
+    tokens_for_characters,
 };
 // The tools, as the application sees them: what to hold, and what to hand in.
 pub use solaris_tools::{

@@ -298,7 +298,10 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
     .unwrap();
     let handlers = rig_agent::handlers::Handlers::default();
     handlers
-        .register("model", backend.model_client().await.unwrap().unwrap())
+        .register(
+            "model",
+            std::sync::Arc::new(backend).model_client().await.unwrap(),
+        )
         .unwrap();
     let (run, events) = rig_agent::AgentBuilder::over_handlers(handlers, "native", "model".into())
         .build()

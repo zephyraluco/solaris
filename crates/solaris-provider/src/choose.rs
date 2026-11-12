@@ -37,6 +37,10 @@ impl UnconnectedBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for UnconnectedBackend {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
+        Err(BackendError::new(self.message.clone()))
+    }
+
     async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         Err(BackendError::new(self.message.clone()))
     }
@@ -304,6 +308,10 @@ struct NamelessBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for NamelessBackend {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
+        Err(BackendError::new(self.message.clone()))
+    }
+
     async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         Err(BackendError::new(self.message.clone()))
     }

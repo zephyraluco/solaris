@@ -141,9 +141,10 @@ impl Events {
                 Some(Ok(_)) => {}
                 Some(Err(error)) => {
                     self.done = true;
-                    return Some(AgentEvent::Error(
-                        self.client.backend.describe_error(&error).to_string(),
-                    ));
+                    return Some(AgentEvent::Error(self.client.backend.as_ref().map_or_else(
+                        || error.to_string(),
+                        |backend| backend.describe_error(&error).to_string(),
+                    )));
                 }
                 None => {
                     self.done = true;

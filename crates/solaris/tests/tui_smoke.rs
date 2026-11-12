@@ -50,6 +50,12 @@ struct FakeBackend;
 
 #[async_trait::async_trait]
 impl AgentBackend for FakeBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::ModelClient::from_events(self))
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
@@ -83,6 +89,12 @@ struct ToolBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for ToolBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::ModelClient::from_events(self))
+    }
+
     async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let round = self.round.fetch_add(1, Ordering::Relaxed);
         let events = if round == 0 {
@@ -128,6 +140,12 @@ struct InspectingBackend;
 
 #[async_trait::async_trait]
 impl AgentBackend for InspectingBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::ModelClient::from_events(self))
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let answered = request
             .history
@@ -169,6 +187,12 @@ impl AgentBackend for InspectingBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for DelegatingBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::ModelClient::from_events(self))
+    }
+
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = asked(&request).starts_with("You are an isolated");
         let answered = request

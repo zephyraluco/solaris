@@ -137,7 +137,7 @@ struct RefreshingBackend {
 
 #[async_trait]
 impl AgentBackend for RefreshingBackend {
-    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         self.credentials
             .backend(&self.model)
             .await?
@@ -198,6 +198,12 @@ mod tests {
     }
     #[async_trait]
     impl AgentBackend for Recording {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+            Ok(solaris_backend::ModelClient::from_events(self))
+        }
+
         async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.calls.lock().expect("calls").push(self.token.clone());
             Ok(Box::pin(futures::stream::empty()))
@@ -233,6 +239,37 @@ mod tests {
     }
     fn request() -> TurnRequest {
         TurnRequest::new(Vec::new(), "prompt")
+    }
+
+    #[tokio::test]
+    async fn preparing_parent_and_child_connections_shares_one_refresh_without_model_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        let (shared, calls) = setup(
+            directory.path().join("auth.json"),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    tokio::task::yield_now().await;
+                    Ok(credential("fresh", u64::MAX))
+                })
+            }),
+        );
+        let parent = shared.choice("parent");
+        let child = shared.choice("child");
+        let (one, two) = tokio::join!(parent.backend.model_client(), child.backend.model_client());
+        assert!(one.is_ok() && two.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(calls.lock().unwrap().is_empty());
+        let saved = AuthStore::from_json(
+            &std::fs::read_to_string(directory.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved.credential("openai"),
+            Some(&credential("fresh", u64::MAX))
+        );
     }
 
     #[tokio::test]

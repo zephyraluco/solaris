@@ -68,17 +68,19 @@ pub(crate) struct AccountingBackend {
 }
 #[async_trait]
 impl AgentBackend for AccountingBackend {
-    fn observe_usage(&self, usage: Usage, cost: f64) -> Result<(), BackendError> {
-        if !self.conversation.record_billing(usage, cost, self.kind) {
-            return Err(BackendError::new(
-                "cannot persist request usage; session stopped",
-            ));
-        }
-        self.inner.observe_usage(usage, cost)
-    }
-
-    async fn model_client(&self) -> Result<Option<solaris_backend::ModelClient>, BackendError> {
-        self.inner.model_client().await
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
+        let client = Arc::clone(&self.inner).model_client().await?;
+        let conversation = Arc::clone(&self.conversation);
+        let kind = self.kind;
+        Ok(client.with_usage_observer(move |usage, cost| {
+            if conversation.record_billing(usage, cost, kind) {
+                Ok(())
+            } else {
+                Err(BackendError::new(
+                    "cannot persist request usage; session stopped",
+                ))
+            }
+        }))
     }
 
     fn label(&self) -> &str {
