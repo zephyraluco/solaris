@@ -43,6 +43,11 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionRecord {
+    /// Executor lifecycle observations; messages live exclusively in memory.
+    Execution {
+        task: String,
+        detail: serde_json::Value,
+    },
     #[serde(alias = "auxiliary_usage")]
     Usage {
         usage: solaris_backend::Usage,

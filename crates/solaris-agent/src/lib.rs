@@ -30,6 +30,7 @@ mod mode;
 mod projection;
 mod prompt;
 mod queue;
+mod recording;
 mod resources;
 mod session;
 mod skills;

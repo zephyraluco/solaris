@@ -309,6 +309,15 @@ impl Serve for Policy {
         let EffectKind::Completion { request, .. } = &kind else {
             return Reply::Outcome(Err(failure("expected model request")));
         };
+        if let Some(error) = self.runner.conversation.error() {
+            return Reply::Outcome(Err(failure(error)));
+        }
+        if self.runner.cancel.is_cancelled() {
+            return Reply::Outcome(Err(ErrorReport::new(
+                ErrorKind::Cancelled,
+                "the turn was cancelled",
+            )));
+        }
         self.phase
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -443,6 +452,9 @@ impl Serve for ToolBridge {
         )
     }
     async fn serve(&self, _: EffectKind, dispatch: Dispatch) -> Reply {
+        if let Some(error) = self.policy.runner.conversation.error() {
+            return Reply::Outcome(Err(failure(error)));
+        }
         let call = self
             .policy
             .phase
@@ -547,7 +559,10 @@ impl Runner {
                 .preamble(&self.system)
                 .memory(self.conversation.storage())
                 .conversation("conversation")
-                .add_hook(policy);
+                .add_hook(policy)
+                .record_to(crate::recording::ExecutionRecorder::new(Arc::clone(
+                    &self.conversation,
+                )));
             let server = rig_agent::tool::server::ToolServer::new().run();
             for tool in &self.tools {
                 let bridge = ToolBridge {
@@ -570,34 +585,25 @@ impl Runner {
             }
             builder = builder.tool_server_handle(server);
             let agent = builder.build();
-            let mut stream = agent
+            let (run, mut events) = agent
                 .prompt(&prompt)
                 .max_turns(usize::MAX)
                 .tool_concurrency(self.max_parallel)
-                .stream();
-            let mut success = false;
-            loop {
-                let event = tokio::select! {
+                .run_channel();
+            tokio::pin!(run);
+            let mut events_open = true;
+            let result = loop {
+                tokio::select! {
                     biased;
                     _ = wait_for_cancel(&self.cancel) => { self.give_up("the turn was cancelled".into(), &tx); return; },
                     _ = tx.closed() => return,
-                    event = stream.next() => event,
-                };
-                match event {
-                    Some(Ok(rig_agent::agent::MultiTurnStreamItem::FinalResponse(_))) => {
-                        success = true;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
-                        self.conversation.refresh();
-                        self.give_up(error.to_string(), &tx);
-                        return;
-                    }
-                    None => break,
+                    result = &mut run => break result,
+                    event = events.next(), if events_open => { events_open = event.is_some(); },
                 }
-            }
-            if !success {
-                self.give_up("the task ended without completing".into(), &tx);
+            };
+            if let Err(error) = result {
+                self.conversation.refresh();
+                self.give_up(error.to_string(), &tx);
                 return;
             }
             {

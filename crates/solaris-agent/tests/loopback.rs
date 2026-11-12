@@ -364,6 +364,43 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
         saved,
         "SDK memory saves successful tasks only"
     );
+    let records = store.records(journal.id()).unwrap();
+    let execution: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            solaris_agent::SessionRecord::Execution { task, detail } => Some((task, detail)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        execution
+            .iter()
+            .any(|(_, detail)| detail["event"] == "begin")
+    );
+    assert!(
+        execution
+            .iter()
+            .any(|(_, detail)| detail["event"] == "complete")
+    );
+    assert!(
+        execution
+            .iter()
+            .any(|(_, detail)| detail["event"] == "error")
+    );
+    assert_eq!(
+        execution
+            .iter()
+            .map(|(task, _)| task.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2
+    );
+    assert!(
+        !serde_json::to_string(&execution)
+            .unwrap()
+            .contains("sk-loopback")
+    );
+
     tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
 }
 

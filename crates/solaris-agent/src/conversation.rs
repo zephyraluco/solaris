@@ -102,6 +102,12 @@ impl Conversation {
             .clone()
     }
 
+    pub(crate) fn record_execution(&self, task: &str, detail: serde_json::Value) {
+        self.persist(SessionRecord::Execution {
+            task: task.into(),
+            detail,
+        });
+    }
     pub(crate) fn record_model(&self, provider: Option<&str>, model: &str) {
         self.persist(SessionRecord::Model {
             provider: provider.map(str::to_owned),
