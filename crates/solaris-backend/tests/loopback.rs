@@ -671,3 +671,54 @@ async fn rejected_stream_options_are_removed_once_without_changing_prompt() {
     expected.as_object_mut().unwrap().remove("stream_options");
     assert_eq!(expected, bodies[1]);
 }
+
+#[tokio::test]
+async fn native_executor_connection_uses_the_same_retry_policy() {
+    use rig_core::effect::{Answered, EffectId, EffectKind};
+    use rig_core::serve::{Dispatch, Serve};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for reply in [
+            response(
+                "429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"message":"rate limited"}}"#,
+            ),
+            response("200 OK", "text/event-stream", &completion(Wire::OpenAiChat)),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut socket).await);
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let client = backend(addr).model_client().await.unwrap().unwrap();
+    let reply = client
+        .serve(
+            EffectKind::Completion {
+                request: std::sync::Arc::new(rig_core::completion::CompletionRequest::new(
+                    "retry me",
+                )),
+                stream: true,
+            },
+            Dispatch::new(EffectId::from_raw(1), true),
+        )
+        .await;
+    let Answered::Completion(answer) = tokio::time::timeout(PATIENCE, reply.into_outcome())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("completion expected")
+    };
+    assert_eq!(answer.text(), "ok");
+    assert_eq!(answer.usage.input_tokens, Some(10));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].split_once("\r\n\r\n").unwrap().1,
+        requests[1].split_once("\r\n\r\n").unwrap().1
+    );
+}

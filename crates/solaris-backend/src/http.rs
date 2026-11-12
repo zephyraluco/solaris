@@ -55,17 +55,6 @@ pub fn backoff(attempt: usize, headers: Option<&HeaderMap>) -> Duration {
     asked.clamp(scheduled, MAX_RETRY_AFTER)
 }
 
-/// Whether `status` is worth retrying.
-///
-/// Only ever consulted before the first event reaches the UI, where a retry
-/// cannot duplicate text the user has already seen.
-pub fn is_retryable(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::CONFLICT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-}
-
 /// The innermost message of a reqwest error.
 ///
 /// The top-level display repeats the URL and the method; the root cause is the
@@ -158,19 +147,6 @@ mod tests {
             headers.insert(RETRY_AFTER, value.parse().expect("header value"));
         }
         headers
-    }
-
-    #[test]
-    fn retryable_statuses_are_the_transient_ones() {
-        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable(StatusCode::BAD_GATEWAY));
-        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(is_retryable(StatusCode::REQUEST_TIMEOUT));
-
-        // A rejected key or a bad model is not going to fix itself.
-        assert!(!is_retryable(StatusCode::UNAUTHORIZED));
-        assert!(!is_retryable(StatusCode::BAD_REQUEST));
-        assert!(!is_retryable(StatusCode::NOT_FOUND));
     }
 
     #[test]

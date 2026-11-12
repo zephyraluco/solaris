@@ -29,7 +29,7 @@ impl Serve for ModelClient {
 
     async fn serve(&self, kind: EffectKind, dispatch: Dispatch) -> Reply {
         match self.backend.prepare_effect(kind) {
-            Ok(kind) => self.adapter.serve(kind, dispatch).await,
+            Ok(kind) => crate::request::execute(self.clone(), kind, dispatch, None),
             Err(error) => Reply::Outcome(Err(rig_core::error::ErrorReport::new(
                 rig_core::error::ErrorKind::Request,
                 error.to_string(),
@@ -43,7 +43,7 @@ impl Backend {
     ) -> Result<ModelAdapter<rig_core::operation::Completion>, BackendError> {
         Ok(ModelAdapter::new("default", self.completion_model(&[])?))
     }
-    fn prepare_effect(&self, kind: EffectKind) -> Result<EffectKind, BackendError> {
+    pub(crate) fn prepare_effect(&self, kind: EffectKind) -> Result<EffectKind, BackendError> {
         let EffectKind::Completion { request, stream } = kind else {
             return Err(BackendError::new("expected a model request"));
         };

@@ -1,17 +1,11 @@
 //! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
 use crate::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage,
-    Wire,
+    AgentBackend, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage, Wire,
 };
 use crate::{convert, http, transport::SolarisTransport};
 use futures::StreamExt;
-use rig_core::completion::{CompletionRequest, FinishReason};
 use rig_core::driver::{DynModel, Model};
-use rig_core::message::AssistantContent;
 use rig_core::operation::Completion;
-use rig_core::streaming::{Item, StreamEvent, Streamed};
-use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -248,15 +242,6 @@ impl Backend {
         }
     }
 
-    /// A status line for an attempt that is about to be retried.
-    fn retrying(&self, wait: Duration) -> AgentEvent {
-        AgentEvent::Status(format!(
-            "{} is busy — retrying in {:.1}s",
-            self.endpoint.name,
-            wait.as_secs_f32()
-        ))
-    }
-
     /// A transport failure in the user's terms.
     fn unreachable(&self, error: &reqwest::Error) -> BackendError {
         BackendError::new(format!(
@@ -297,72 +282,39 @@ impl AgentBackend for Backend {
         self.endpoint.label
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        if self.capabilities.tool_calling == Support::Unsupported && !request.tools.is_empty() {
-            return Err(BackendError::new(
-                "this model does not support tool calling; choose another model or disable tools",
-            ));
-        }
-        if self.capabilities.image_input == Support::Unsupported
-            && request.history.iter().any(|message| {
-                message.content.iter().any(|part| match part {
-                    crate::Content::Image { .. } => true,
-                    crate::Content::ToolResult { result } => !result.metadata.images.is_empty(),
-                    _ => false,
-                })
-            })
-        {
-            return Err(BackendError::new("this model does not support image input"));
-        }
-        self.check_credentials()?;
-        let mut converted = convert::request(&request, self.max_tokens)?;
-        let mut params = serde_json::Map::new();
-        if self.endpoint.wire == Wire::OpenAiResponses {
-            params.insert("store".into(), Value::Bool(false));
-        }
-        if let Some(key) = self.prompt_cache_key
-            && self.capabilities.prompt_caching != Support::Unsupported
-        {
-            params.insert("prompt_cache_key".into(), Value::String(key.into()));
-        }
-        if !params.is_empty() {
-            converted = converted.additional_params(Value::Object(params));
-        }
-        let model = self.completion_model(&[])?;
-        let stream = model
-            .stream(converted.clone())
-            .map_err(|error| self.provider_error(&error))?;
-        let mut engine = Engine {
-            backend: self.clone(),
-            model,
-            request: converted,
-            stream: Some(stream),
-            pending: VecDeque::new(),
-            retries: 0,
-            visible: false,
-            done: false,
-            input_characters: request_characters(&request),
-            output_characters: 0,
-            parts: HashMap::new(),
-            repairs: Vec::new(),
-        };
-        let mut opening = VecDeque::new();
-        loop {
-            match engine.next().await {
-                Some(AgentEvent::Error(error)) => return Err(BackendError::new(error)),
-                Some(event @ AgentEvent::Status(_)) => opening.push_back(event),
-                Some(event) => {
-                    opening.push_back(event);
-                    break;
+        // Compatibility display API; every request uses the native connection.
+        let client = self
+            .model_client()
+            .await?
+            .ok_or_else(|| BackendError::new("model connection unavailable"))?;
+        let input_characters = request_characters(&request);
+        let request = convert::request(&request, self.max_tokens)?;
+        let kind = self.prepare_effect(rig_core::effect::EffectKind::Completion {
+            request: std::sync::Arc::new(request),
+            stream: true,
+        })?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = crate::request::execute(
+            client.clone(),
+            kind,
+            rig_core::serve::Dispatch::new(rig_core::effect::EffectId::from_raw(0), true),
+            Some(tx),
+        );
+        let mut events = crate::events::adapt(client, reply.into_stream(), rx, input_characters);
+        let mut opening = Vec::new();
+        while let Some(event) = events.next().await {
+            match event {
+                crate::AgentEvent::Error(error) => return Err(BackendError::new(error)),
+                event @ crate::AgentEvent::Status(_) => opening.push(event),
+                event => {
+                    opening.push(event);
+                    return Ok(Box::pin(futures::stream::iter(opening).chain(events)));
                 }
-                None => return Err(BackendError::new("provider returned no completion")),
             }
         }
-        opening.append(&mut engine.pending);
-        engine.pending = opening;
-        Ok(Box::pin(futures::stream::unfold(
-            engine,
-            |mut engine| async move { engine.next().await.map(|event| (event, engine)) },
-        )))
+        Err(BackendError::new(
+            "model stream ended without a complete response",
+        ))
     }
     /// Ask the provider which models it offers.
     ///
@@ -563,248 +515,24 @@ impl Backend {
         };
         Ok(model)
     }
-    fn provider_error(&self, error: &rig_core::error::ProviderError) -> BackendError {
-        let report = error.report();
+    pub(crate) fn describe_error(&self, report: &rig_core::error::ErrorReport) -> BackendError {
         let text = if let Some(status) = report
             .http_status
             .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
         {
             http::describe(
                 status,
-                error.provider_response_body().unwrap_or(&report.message),
+                report.provider_response_body().unwrap_or(&report.message),
                 self.endpoint.name,
                 self.endpoint.env_keys,
             )
         } else {
             format!("could not reach {}: {}", self.endpoint.name, report.message)
         };
-        if error.report().is_context_overflow() {
+        if report.is_context_overflow() {
             BackendError::new(format!("context length exceeded: {text}"))
         } else {
             BackendError::new(text)
         }
-    }
-}
-
-struct Engine {
-    backend: Backend,
-    model: DynModel<Completion>,
-    request: CompletionRequest,
-    stream: Option<Streamed<Completion>>,
-    pending: VecDeque<AgentEvent>,
-    retries: usize,
-    visible: bool,
-    done: bool,
-    input_characters: usize,
-    output_characters: usize,
-    parts: HashMap<rig_core::streaming::Part, String>,
-    repairs: Vec<crate::policy::Repair>,
-}
-impl Engine {
-    async fn next(&mut self) -> Option<AgentEvent> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Some(event);
-            }
-            if self.done {
-                return None;
-            }
-            let stream = self.stream.as_mut()?;
-            match stream.next().await {
-                Some(Ok(Item::Event(event))) => {
-                    // Opening or growing a tool part is provider output too,
-                    // even before Solaris can publish a complete tool call.
-                    self.visible = true;
-                    let event = match event {
-                        StreamEvent::Text { part, text } => {
-                            self.parts.entry(part).or_default().push_str(&text);
-                            self.output_characters += text.chars().count();
-                            Some(AgentEvent::TextDelta(text))
-                        }
-                        StreamEvent::Reasoning { part, text } => {
-                            self.parts.entry(part).or_default().push_str(&text);
-                            Some(AgentEvent::ThinkingDelta(text))
-                        }
-                        StreamEvent::End {
-                            part,
-                            content: AssistantContent::Text(text),
-                        } => {
-                            let previous = self.parts.remove(&part).unwrap_or_default();
-                            match final_suffix(&previous, &text.text) {
-                                Ok(Some(text)) => {
-                                    self.output_characters += text.chars().count();
-                                    Some(AgentEvent::TextDelta(text))
-                                }
-                                Ok(None) => None,
-                                Err(error) => {
-                                    self.done = true;
-                                    Some(AgentEvent::Error(error.to_string()))
-                                }
-                            }
-                        }
-                        StreamEvent::End {
-                            part,
-                            content: AssistantContent::Reasoning(reasoning),
-                        } => {
-                            let previous = self.parts.remove(&part).unwrap_or_default();
-                            match final_suffix(&previous, &reasoning.text) {
-                                Ok(Some(text)) => Some(AgentEvent::ThinkingDelta(text)),
-                                Ok(None) => None,
-                                Err(error) => {
-                                    self.done = true;
-                                    Some(AgentEvent::Error(error.to_string()))
-                                }
-                            }
-                        }
-                        StreamEvent::End {
-                            content: AssistantContent::ToolCall(call),
-                            ..
-                        } => {
-                            let arguments = if let Some(invalid) = &call.function.invalid_arguments
-                            {
-                                Value::String(invalid.clone())
-                            } else {
-                                call.function.arguments_value()
-                            };
-                            Some(AgentEvent::ToolCall(crate::ToolCall::new(
-                                call.id.wire().into_owned(),
-                                call.function.name.as_str(),
-                                arguments,
-                            )))
-                        }
-                        _ => None,
-                    };
-                    if let Some(event) = event {
-                        self.visible = true;
-                        return Some(event);
-                    }
-                }
-                Some(Ok(Item::Unknown(_))) => {}
-                Some(Err(error)) => {
-                    let retryable = error
-                        .report()
-                        .http_status
-                        .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
-                        .map_or_else(|| error.is_retryable(), http::is_retryable);
-                    let partial = stream.partial();
-                    let usage_received = partial.usage.input_tokens.is_some()
-                        || partial.usage.output_tokens.is_some();
-                    if !self.visible
-                        && !usage_received
-                        && error.report().http_status == Some(400)
-                        && self.backend.endpoint.wire == Wire::OpenAiChat
-                        && let Some(repair) = crate::policy::repair_for(
-                            error.provider_response_body().unwrap_or_default(),
-                        )
-                        && !self.repairs.contains(&repair)
-                    {
-                        self.repairs.push(repair);
-                        let reopened =
-                            self.backend
-                                .completion_model(&self.repairs)
-                                .and_then(|model| {
-                                    let stream = model
-                                        .stream(self.request.clone())
-                                        .map_err(|error| self.backend.provider_error(&error))?;
-                                    self.model = model;
-                                    Ok(stream)
-                                });
-                        match reopened {
-                            Ok(stream) => {
-                                self.stream = Some(stream);
-                                continue;
-                            }
-                            Err(error) => {
-                                self.done = true;
-                                return Some(AgentEvent::Error(error.to_string()));
-                            }
-                        }
-                    }
-                    if !self.visible
-                        && !usage_received
-                        && retryable
-                        && self.retries < http::max_retries()
-                    {
-                        let wait = error
-                            .report()
-                            .retry_after(SystemTime::now())
-                            .unwrap_or_default()
-                            .max(http::backoff(self.retries, None))
-                            .min(Duration::from_secs(30));
-                        self.retries += 1;
-                        tokio::time::sleep(wait).await;
-                        match self.model.stream(self.request.clone()) {
-                            Ok(stream) => {
-                                self.stream = Some(stream);
-                                return Some(self.backend.retrying(wait));
-                            }
-                            Err(error) => {
-                                self.done = true;
-                                return Some(AgentEvent::Error(
-                                    self.backend.provider_error(&error).to_string(),
-                                ));
-                            }
-                        }
-                    }
-                    self.done = true;
-                    return Some(AgentEvent::Error(
-                        self.backend.provider_error(&error).to_string(),
-                    ));
-                }
-                None => {
-                    self.done = true;
-                    let response = match self.stream.take()?.finish().await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            return Some(AgentEvent::Error(
-                                self.backend.provider_error(&error).to_string(),
-                            ));
-                        }
-                    };
-                    if let Some(error) = &response.error {
-                        return Some(AgentEvent::Error(error.clone()));
-                    }
-                    if let Some(error) = &response.aborted {
-                        return Some(AgentEvent::Error(error.clone()));
-                    }
-                    let measured = response.usage.input_tokens.is_some()
-                        || response.usage.output_tokens.is_some();
-                    let usage = if measured {
-                        convert::usage(response.usage)
-                    } else {
-                        Usage::estimate(self.input_characters, self.output_characters)
-                    };
-                    let cost_usd = self.backend.price.map_or(0.0, |price| {
-                        price.cost_with_tiers(&usage, &self.backend.price_tiers)
-                    });
-                    let complete = AgentEvent::TurnComplete { usage, cost_usd };
-                    if matches!(response.finish_reason(), Some(FinishReason::Length)) {
-                        self.pending.push_back(complete);
-                        return Some(AgentEvent::OutputTruncated);
-                    }
-                    return Some(complete);
-                }
-            }
-        }
-    }
-}
-
-// End snapshots may contain text without deltas, or repeat already emitted text.
-fn final_suffix(previous: &str, final_text: &str) -> Result<Option<String>, BackendError> {
-    let suffix = final_text
-        .strip_prefix(previous)
-        .ok_or_else(|| BackendError::new("provider changed previously streamed text"))?;
-    Ok((!suffix.is_empty()).then(|| suffix.to_owned()))
-}
-
-#[cfg(test)]
-mod final_text_tests {
-    use super::final_suffix;
-    #[test]
-    fn snapshots_emit_only_missing_text() {
-        assert_eq!(final_suffix("", "hello").unwrap(), Some("hello".into()));
-        assert_eq!(final_suffix("hello", "hello").unwrap(), None);
-        assert_eq!(final_suffix("你", "你好").unwrap(), Some("好".into()));
-        assert!(final_suffix("hello", "other").is_err());
     }
 }
