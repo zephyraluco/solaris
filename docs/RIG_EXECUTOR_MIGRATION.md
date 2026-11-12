@@ -1,50 +1,48 @@
-# 完整执行器迁移：第一阶段验证
+# 完整执行器迁移
 
-基于官方 `rig-agent` / `rig-core` 0.46.0。当前阶段仅增加可运行的兼容性测试，不切换生产执行路径。
+基于官方 `rig-agent`、`rig-core`、`rig-memory` 0.46.0；使用官方依赖，不引入 vendor 或 SDK 分叉。
 
-## 验证结果
+## 职责
 
-测试位于 `crates/solaris-agent/tests/executor_contract.rs`，直接使用官方 `AgentBuilder` / `AgentRunner` 和官方模型模拟器，不使用项目现有的 `Execution` 状态机包装。
+| 层 | 当前实现 |
+| --- | --- |
+| provider | 厂商配置、目录、凭据及官方认证刷新；为每次请求解析模型配置 |
+| backend | 提供原生模型连接，使用官方协议实现；检查能力、输出预算与请求选项 |
+| agent 执行 | `AgentBuilder` / `AgentRunner` / `run_channel()` 完成模型和工具循环 |
+| agent 消息 | 官方 MemoryStore / DirStore 为唯一消息存储；UI 读取投影 |
+| agent 压缩 | 官方 CompactionPolicy、Summarizer、apply_summary、summary_state |
+| agent 策略 | Solaris 钩子实现参数校验、审批、权限、预算、截断保护、事件与计费 |
+| agent 子任务 | 前台和后台均运行完整 SDK；Solaris 管理模型选择、权限、生命周期和结果通知 |
+| 产品持久化 | SQLite 记录转录、工具意图、用量和 Recorder 生命周期，不再另存一套模型历史 |
 
-| 契约 | 实测结果 | 对迁移的影响 |
-| --- | --- | --- |
-| 模型调用、工具执行、再次请求 | 完整执行器自动完成 | 可以接管基础循环 |
-| 拒绝工具执行 | 执行钩子返回拒绝，工具不运行，模型收到反馈 | 可以接入现有审批策略 |
-| 等待异步审批 | 审批回答前无工具副作用，回答后继续执行 | 可以接入现有审批 UI |
-| 请求历史替换 | 本次请求使用摘要；下一次不重复提供补丁时原始历史恢复 | 补丁不是内部会话修改，也不释放内部历史 |
-| 插入 steering | `history` 补丁把消息放在当前 prompt 前面；最终已提交消息不含 steering | 不能直接实现现有“在当前输入之后追加并持久化”的语义 |
-| 带工具调用的截断回复重试 | `ModelTurnAction::Retry` 报错，不发起第二次请求，工具不执行 | 无法仅通过模型重试钩子实现现有“拒绝调用、追加错误结果、继续请求” |
+八个 crate 和单向依赖保持不变，应用继续负责组装。`solaris-tools`、`solaris-tui`、`solaris-mcp`、`solaris-types` 无需修改。公开接口沿用业务名称；SDK 类型与实现封装在内部。
 
-可复现命令：
+## 运行与持久化语义
+
+- 模型响应直接进入 SDK，保留原生消息、reasoning、finish reason 和 usage。业务消息转换只用于显示、旧会话导入及注入式测试后端。
+- 每个 SDK 任务成功后由官方 memory 保存。失败或取消不追加当前任务未提交的消息；之前成功的阶段不受影响。
+- 工具副作用不随消息提交回滚。工具意图、转录和已发生费用独立保留，恢复不会自动重放工具。
+- steering、follow-up、后台结果在任务边界作为正式输入交付；不使用仅影响一次请求的历史补丁。长任务内不即时插入 steering。
+- 自动压缩在任务之间运行；手动压缩使用同一官方摘要实现。摘要调用遵守 SDK 输出上限、取消期限和共享计费；失败不替换原始 memory。
+- 带工具调用的输出截断直接停止任务，整批不执行。不猜测错误文案并自动重试上下文溢出，也不隐式重放工具。
+- 子任务沿用共享预算和计费链。后台执行是 Solaris 的生命周期服务，模型和工具执行仍由 SDK 完成。
+- Recorder 只保留 effect 标识、状态、请求标识和用量等元数据，不复制完整请求、参数、原始响应或认证信息。
+
+持久会话使用 `sessions/memory/<SESSION_ID>`；只有不存在官方 memory 时才导入旧 SQLite 消息。上下文测量以官方 message ID 对应的 aside 保存，不进入模型消息。
+
+## 验证
+
+`executor_contract.rs` 记录官方执行器的真实扩展点约束：审批等待与拒绝、请求补丁不修改持久消息、带工具调用的截断不能用 Retry 钩子重试。
+
+`loopback.rs` 使用本地 HTTP 服务验证完整模型/工具循环、原生响应和 usage、唯一消息存储、失败不追加、Recorder、摘要输出上限、官方摘要状态，以及取消释放连接。其余 agent 集成测试覆盖预算、权限、steering、子任务、恢复和取消。
 
 ```sh
-cargo test -p solaris-agent --test executor_contract --locked
-cargo clippy -p solaris-agent --test executor_contract --all-features --locked -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.97.1 check --workspace --all-targets --all-features --locked
 ```
 
-SDK 测试支持显式声明为 agent 的开发依赖；不依赖其他 crate 的测试特性被偶然启用，也不访问真实厂商 API。
+## 当前边界
 
-## 对原迁移设计的修正
-
-不能把“请求前有钩子”理解成“可以原地修改 SDK 执行状态”：
-
-- `RequestPatch` 的历史仅替换本次请求的历史部分，不替换当前 prompt，不修改 `AgentRun` 已提交历史。
-- `ModelTurnAction::Retry` 只支持不含工具调用的模型回复。
-- `OutcomeAction::Replace` 也不能替换带工具调用的已接受回复，不能借此直接实现工具截断恢复。
-- 完整 runner 的钩子没有暴露可变的 `AgentRun`，不能在钩子中自行写入完整调用/结果配对。
-
-以上是官方接口行为，不是缺少一个 Solaris 钩子实现。当前生产路径仍然存在双份历史问题；新增测试没有修复它，也不能据此宣称已经完成完整执行器迁移。
-
-## 后续可行路线
-
-如继续使用完整 runner，需要把原先仅为压缩安排的阶段切换扩展为统一的任务阶段协议，而不是继续让两份历史分别演进：
-
-1. 在无在途工具的安全边界结束一个 SDK 执行阶段。
-2. 从 SDK 已提交消息生成业务记录，补齐该阶段初始上下文，验证工具配对及已结算用量。
-3. 由 Solaris 会话协调层应用压缩或追加 steering，再启动下一阶段；执行预算、任务身份、审批状态不能重置。
-4. 对截断造成的未完成调用，先验证如何保留完整模型结果、生成拒绝结果并修复配对，再恢复后续阶段。不得重发已执行但未确认的工具副作用。
-5. 验证成功、失败、取消时阶段交接都能恢复消息及用量，且不会显示内部控制性停止为用户错误。
-
-另一条路线是由 SDK 提供安全暂停、原地追加会话输入和上下文替换接口后再迁移。两条路线都需要独立验证，不能在上述测试发现语义不等价后直接删除现有生产控制。
-
-本阶段按“先验证扩展点”的验收条件完成；完整生产迁移尚未完成。
+完整 runner 不提供可原地修改的活跃会话。因此长时间单个 SDK 任务内的即时 steering、压缩和部分失败消息提交没有被模拟成与旧循环相同的行为；它们采用上述任务边界和成功提交语义。若未来需要工具轮次之间安全暂停并交接，需要单独验证 SDK 的暂停与提交协议，不能依靠请求历史补丁实现。

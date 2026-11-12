@@ -123,29 +123,17 @@ impl Agent {
 }
 ```
 
-### 3.0 执行状态机与对话所有权
+### 3.0 执行器与对话所有权
 
-[`execution.rs`](../crates/solaris-agent/src/execution.rs) 私有封装官方 `rig-agent::AgentRun` 无 I/O 状态机。SDK 决定 `CallModel`、`CallTools`、`Done` 转换；[`session.rs`](../crates/solaris-agent/src/session.rs) 只驱动这些步骤的外部效果和会话策略，不保留另一套轮次决策实现。
+[`driver.rs`](../crates/solaris-agent/src/driver.rs) 使用官方 `AgentBuilder`、`AgentRunner` 和 `run_channel()`。SDK 负责模型—工具—模型循环、工具结果配对及成功任务的 memory 保存；Solaris 不再手动驱动 `AgentRun`，也不维护第二份模型历史。
 
-- 模型步骤：吸收后台结果和 steering，使用当前投影检查上下文与预算，必要时压缩，再发起请求；上下文超限最多压缩恢复一次。
-- 工具步骤：执行现有参数校验、审批、并发限制、子代理和截断拒绝，将匹配的结果交回 SDK 后才进入下一次模型请求。
-- 完成步骤：记录回答，处理后台任务、steering 和 follow-up；有新工作时启动下一个 SDK 任务，整体用量和执行预算继续累计。
-- `Conversation` 与 journal 是唯一持久化事实。每次模型请求使用 Solaris 当前投影，使压缩、动态工具和 UI 估算一致。SDK 工作历史不写入另一份会话文件；压缩完成时在安全模型边界丢弃旧的工作历史，预算不重置。
-- 丢弃流、取消或执行期限到达会终止驱动及正在等待的模型、审批、工具和子代理，并修复未配对工具调用。
+[`conversation.rs`](../crates/solaris-agent/src/conversation.rs) 包装官方 `rig-memory` Store：临时会话使用 MemoryStore，持久会话使用配置目录下 `sessions/memory/<session-id>` 的 DirStore。SQLite journal 保存转录、计费、工具意图及执行元数据；旧版消息仅在没有官方 memory 时导入一次。界面消息是官方消息的投影，不用于重新构造 SDK 工作历史。
 
+每次模型调用通过后端提供的原生连接直接进入 SDK，保留原始响应、reasoning、finish reason 和 usage。钩子负责能力与预算检查、UI 投影、参数校验、权限、审批及用量结算。工具通过官方 ToolServer 注册，仍复用现有工具和子代理业务策略。
 
+SDK 任务成功后保存消息。失败或取消不追加该任务未提交的消息；此前成功阶段仍保留。已经产生的工具副作用不会回滚，其意图、转录和费用记录独立保留。恢复时不会自动重放工具。
 
-**这是这一层最重要的一条不变量**：模型看到的那段对话住在 `Agent` 里（[`conversation.rs`](../crates/solaris-agent/src/conversation.rs)），不是应用每轮递给它、也不是从转录里重建出来的。
-
-理由有三条，都是实际踩过的：
-
-1. **摘要必须活过它所在的那一轮。** 早先的实现在一轮内部压缩，轮次一结束结果就被丢掉，于是下一轮又把整段没压缩的对话发出去、再付一次摘要费。
-2. **插话落在哪里是事实，不是可以重建的东西。** 消息要待在被模型读到的位置；从「一轮的提示词 + 一串工具步骤」反推插入点需要额外记录，而直接留着根本不需要。
-3. **模型自己的话也是对话的一部分。** 转录是给用户看的（轮次、工具步骤、耗时、思考），对话是给模型看的（消息与内容块），两者形状不同：转录里没有「助手说了什么」这一等公民，而对话里必须有。
-
-`Conversation` 只做四件事：`snapshot()`（构造一次请求，复制而非持锁跨越 await）、`push`、`replace_with`（压缩用）、`repair()`（一轮被取消或失败时收回没人应答的工具请求——三条 wire 都不接受没有结果的调用）。它**不含 system 消息**：提示词每轮现写（§3.1），所以压缩永远碰不到指令。
-
-`Agent::run_turn(prompt, mode)` 只收新的话：提示词在循环开始前就写进对话，因此一轮即使被取消或失败，用户说过的话也留下来了。`/clear` 是唯一会忘记它的事——而且必须同时忘记转录，否则下一轮会回答一段用户已经看不见的对话。
+系统提示词来自当前资源，不存入待摘要的消息。上下文查询读取内存投影；模型请求使用 SDK 自己的工作历史。
 
 ### 3.1 提示词系统
 
@@ -185,23 +173,19 @@ Mode::Plan   →  read + grep + find + ls
 
 ### 3.3 一轮的流程
 
-1. **prompt 先写进对话**，在任何请求之前：一轮被取消或失败时，用户说过的话仍然留下。
-2. 排空 `steering`（§3.5）并追加为 user 消息。「先写 prompt」这一步在这里才有意义：插话必须排在它要纠正的那句话**之后**。
-3. 预算超了就压缩（§3.6），用上一次 provider 报的 usage 判断。
-4. 构造本轮 `TurnRequest`（`history` = system 提示词 + 对话快照，`prompt` 留空——它已经在对话里了），调内层后端；转发 `ThinkingDelta`/`TextDelta`/`Status`/`ToolCall`/`OutputTruncated`，拦下 `TurnComplete` 以累计用量与费用。
-5. **流结束时必须已经收到 `TurnComplete`**：只收到一半事件就断流的回合算失败（终态错误），不会把半截回答当成完整回答报成功。
-6. 本轮没有工具调用 → 记录模型这句话（空话不记，部分 wire 拒绝空文本块）→ 再排空一次 `steering`（模型回答期间到达的插话就是「别结束，改成这个」）→ 再排空一次 `follow_up`（§3.5）；有一个非空就继续，都空才发自己的 `TurnComplete`（累计后的数字）并结束。
-7. 有调用 → 跑这一批调用（见 §3.4），把 `assistant(tool_use…)` 与 `user(tool_result…)` 追加进对话，回到第 2 步。
+1. Solaris 检查取消、存储状态和共享预算，在任务开始前按需压缩官方 memory。
+2. 创建官方 runner，注入模型连接、工具服务、策略钩子、memory 和 Recorder。
+3. SDK 接收新 prompt，自动执行模型与工具循环。Solaris 排空 `run_channel()` 的事件，并同时监听取消和消费端关闭。
+4. 成功后 SDK 保存本任务消息，Solaris 保存请求测量注解、发布上下文投影并累计用量。
+5. 处理已完成的后台任务、steering 和 follow-up；存在新输入时启动下一 SDK 任务，共享预算与计费继续累计。
 
-**窗口已满的恢复**：第 4 步的请求可能被明确拒绝（`AgentEvent::Error` / `BackendError`），也可能被接受却悄悄截断输入。前者按一批跨平台的措辞识别（[`overflow.rs`](../crates/solaris-agent/src/overflow.rs)，见 §3.6），后者由 provider 自己报的 usage 看出来。两条路都走同一处理：**强制压缩一次，然后把同一轮重新问一遍**——只重试一次，且压缩关掉时就直接把错误交给用户。这把「上下文过长」从一个用户无能为力的错误变成了一个能自己收场的回合。
-
-**没有轮数上限**：模型一直问到它不再请求、出错、或调用方取消为止。因此「取消」是一轮花销的唯一上界，这也是为什么循环在每一轮开始前、以及每轮调用跑完之后都要检查一次。这里**不是**恢复了 pi 的 `while (true)` 就完事：先前的 24 轮上限会在一次正常的长时间 agentic 工作（反复读—改—跑）中途把回合砍掉，那代价高于它防住的跑飞风险；取消则是用户看得见、随时可用的那条线。
+任务内不设置固定模型轮数上限；取消、请求预算、费用预算、执行期限和子代理限制仍有效。SDK 或厂商错误直接返回，不靠错误文本猜测上下文溢出并隐式重放请求。
 
 ### 3.4 一轮内的并行与取消
 
 **调用默认并行**：上限是 `max_parallel`（`DEFAULT_MAX_PARALLEL = 4`），结果按模型请求的顺序回填给模型；只要该批里任一工具声明了 `execution_mode() == Sequential`（`write`、`edit` 与 shell 都是），整批退回逐个执行——写入类工具的按文件锁保证的是不互相踩，串行保证的是「同一批里能读到刚写下的东西」。
 
-**被输出上限截断的调用不执行**：协议层把 `stop_reason` 为 `length` / `max_tokens` / `incomplete` 变成 `AgentEvent::OutputTruncated`，循环据此拒绝这一批全部调用，并告诉模型「撞到输出上限、参数可能残缺，请重新完整给出」；残缺参数被解析成 `null` 时那句含糊的「参数不是 JSON 对象」不再是唯一线索。
+**被输出上限截断的调用不执行**：协议层把 `stop_reason` 为 `length` / `max_tokens` / `incomplete` 变成 `AgentEvent::OutputTruncated`，执行钩子据此停止任务，这一批全部调用均不执行；用户可以调整输出预算后重试；残缺参数被解析成 `null` 时那句含糊的「参数不是 JSON 对象」不再是唯一线索。
 
 **取消按轮次隔离**：`Cancel` 在每次 `run_turn` 开始时 `reset()`，上一轮的取消不会波及下一轮；应用层持有 `Agent::cancel_handle()`，`Ctrl+C` 因此能杀掉正在跑的命令，而不只是不再读事件。循环在独立任务里跑，返回的流被丢弃（用户取消）就等于取消这一轮——任务发现发送端已关闭便不再继续。
 
@@ -212,7 +196,7 @@ Mode::Plan   →  read + grep + find + ls
 | | steering | follow-up |
 | --- | --- | --- |
 | 意思 | 「不对，是另一个文件」 | 「这轮弄完再跑测试」 |
-| 何时被读 | 每轮开始前，以及模型看似答完时 | 这一轮真的要结束时 |
+| 何时被读 | 当前 SDK 任务成功结束后，或等待后台结果时 | steering 和后台工作处理完后 |
 | 落在哪里 | 并进正在跑的这一轮 | 成为**下一轮**（转录里另起一个 Turn） |
 
 ```rust
@@ -226,7 +210,7 @@ impl Queue {
 同一个类型，两个实例（`Agent::steering_handle()` / `follow_up_handle()`）——区分它们的是**agent 何时去读**，多一个类型只会把这四个方法再抄一遍。
 
 - **共享队列而不是 channel**：句柄的生命周期比任何一轮都长（应用整个会话持有一份），而排空它的一方只活一轮，并且必须能**不阻塞地看一眼**。
-- **steering 的第二次排空是关键**：模型答完最后一段话时再读一次，否则「别结束了，改成 X」会被丢在刚结束的那一轮里。
+- **steering 在任务边界交付**：SDK 保存当前任务后再读队列，否则「别结束了，改成 X」会被丢在刚结束的那一轮里。
 - **follow-up 让循环继续跑**：它不是「等这一轮结束应用再发一次请求」，而是同一个循环里接着下一轮，所以对话是接着长的。循环为此报 `AgentEvent::FollowUp { prompt }`，应用据此把上一轮标记完成、并为这个提示词新开一个 Turn——从这一刻起流出来的东西都属于它。
 - **记录由循环回报**：`AgentEvent::Steered { text }` 在消息**真正被读到**时发出，应用据此写进当前轮的 `Turn.steering`（附 `after_steps`，即当时已完成的调用数）。如果按「用户按下回车时」记录，那么刚好在模型收尾时到达的插话——读到它的可能是**下一轮**——就会在转录里挂错轮次。
 - **显示位置**：[`state.rs`](../crates/solaris/src/state.rs) 用 `after_steps` 把消息画在它当时的位置（`↳ steered …`），因为「纠正落在哪里」才是这件事的重点。
@@ -235,33 +219,11 @@ impl Queue {
 
 ### 3.6 上下文压缩
 
-长会话必然撞窗口，而撞了之后没有降级路径就是把错误留给用户（`context_window` 从前只喂给页脚的占比条）。现在由 agent 自己管：
+Solaris 保留 `Compaction` 的启用、预留回复空间和近期上下文配置；实现委托给官方 `rig-memory` 的 `CompactionPolicy`、`Summarizer`、`apply_summary` 和 `summary_state`。合法切点、工具调用/结果配对及增量摘要状态由 SDK 管理，不再维护自定义历史序列化和两次摘要算法。
 
-```rust
-pub struct Compaction { pub enabled: bool, pub reserve_tokens: u32, pub keep_recent_tokens: u32 }
-// 默认：enabled = true、reserve_tokens = 16384、keep_recent_tokens = 20000
-```
+自动压缩发生在 SDK 任务之间，手动 `/compact` 使用同一路径。摘要调用通过当前原生模型连接，遵守 SDK 摘要输出上限、模型输出上限、共享计费和取消期限。Solaris 提供面向编程任务的结构化摘要提示词。摘要为空、被截断、包含工具调用或请求失败时，不替换原始 memory。
 
-**两个数都是绝对量，不是窗口的比例**，这是刻意的：
-
-- `reserve_tokens` 是留给回复的空间。回复不会因为窗口变大而变长，所以按比例留是错的单位——1M 窗口留十分之一下来，就是 100k 永远用不到的空间；小窗口留十分之一，可能还不够一次回答。
-- `keep_recent_tokens` 是永不摘要的那段最近的对话。用 token 而不是条数同理：8 条可能是一段话，也可能是一整个文件。
-
-触发条件是 `context_tokens > context_window - reserve_tokens`，而 `context_tokens` **优先取 provider 上一轮自己报的 usage**（输入+输出四桶之和），估算是退路。用真数是因为估算会偏，而且偏多少不可知。
-
-其余的规则：
-
-- **系统提示词不参与**：它不在对话里（§3.0），所以摘要永远碰不到指令。
-- **裁切点只落在安全边界**：从尾部往回按 token 预算累加，然后向前跳过 `is_tool_results()` 的消息——一条没有前置 `tool_use` 的工具结果，三条 wire 都会拒收（[`compaction.rs`](../crates/solaris-agent/src/compaction.rs) 的 `cut_point`）。
-- **已有摘要就「更新」而不是「重写」**：第一次用 `COMPACT_PROMPT`（固定的 Goal / Constraints / Progress / Key Decisions / Next Steps / Critical Context 六段），之后用 `UPDATE_COMPACT_PROMPT`，明确要求「保留摘要里已有的一切，只加新的」。**否则每次压缩都是「对上上次摘要的摘要」，开头的信息一代代衰减。**
-- **摘要是固定结构的，不是散文**：读它的模型要据此**行动**——Goal 与 Next Steps 是它接手的部分，Critical Context 是它无法从文件里重新读出的部分，Done/In Progress/Blocked 的三分法防的是它重做已完成的工作。自由散文总会丢掉其中一段，丢哪段不可预测。
-- **摘要调用是最朴素的一轮**：单独发提示词 + 对话文本，声明零工具，它的输出被就地读走而不转发（调用方要的是一轮的回答，不是沿途的笔记）。它**观察本轮取消**：一段长对话的摘要不值得在用户已经放弃之后还等完。
-- **摘要失败就原样发送**：宁可让模型读得多，也不能因为摘要崩了就把对话丢掉；此时不发 `Compacted` 事件，所以界面上也不会声称压过。
-- **窗口未知（0）什么都不做**：没人报过窗口大小时，按一个不存在的预算丢对话是纯损失。
-
-压缩发生时报 `AgentEvent::Compacted { dropped }`：应用弹一条通知并在转录里留一行（`⌁ N earlier messages summarized to make room`）。突然「记性变差」必须能追溯到原因，否则它看起来就像模型退化了。
-
-`/compact` 走同一条路但不带强制与重试：没有要保护的回合，所以对话里没有值得摘要的东西时直接回答「没有可摘要的内容」，而不是白打一次模型调用。应用侧它在事件循环之外跑（和模型发现同一套 channel 手法），完成后报出压掉了几条、还剩几条。
+只有摘要成功并应用后才保存新的官方 conversation、使旧测量失效并发布 `Compacted`。系统提示词始终在摘要范围之外。长时间单个 SDK 任务内部尚不执行压缩；上下文溢出会结束任务，不自动重发已经可能产生副作用的操作。
 
 ### 3.7 审批
 
@@ -706,13 +668,12 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 - **工具调用已经打通，但工具集是固定的八个**。`Agent` 会跑「模型 → 工具 → 模型」直到模型不再请求，用量与费用按轮累计；应用也可注册 MCP 工具及其资源/提示词操作，沿用同一执行策略。
 - **确认对话框只在 `--confirm-tools` 下出现**。默认是 `AlwaysApprove`（终端 agent 已经在替你动手，为一次 `read` 弹框只是噪音）；打开后，改动型调用会弹一个确认框，被拒绝的调用作为错误结果回到模型。
 - **一次调用不可中断到一半**。`Ctrl+C` 取消一轮会让循环停止请求模型、并杀掉正在跑的命令，但已经在执行的 `edit` 不会回滚。
-- **插话在两轮之间生效**。steering 的消息由循环在「构造下一轮之前」读入，所以正在跑的那条命令不会被它打断；要立刻停下只有 `Ctrl+C`。
+- **插话在 SDK 任务之间生效**。steering 的消息由循环在当前 SDK 任务成功保存后读入，所以正在跑的那条命令不会被它打断；要立刻停下只有 `Ctrl+C`。
 - **follow-up 只能靠 `/queue`**。流式期间回车是 steering（默认、也最常用），想在当前这一轮之后另起一轮得打 `/queue <prompt>`——`alt+enter` 已被换行占用，而命令表顺带让 `/help` 与补全能发现它。
 - **资源更新需要 `/reload`**。新增/删除技能、名称与描述修改、项目规则及追加说明修改通过 `/reload` 更新；显式调用每次读取当前正文。运行中的 stream（含后续队列）和压缩结束后才应用重载，已展开的排队消息保留入队时内容。
-- **对话不落盘**。`Conversation` 只在内存里，`/quit` 之后就没了；转录同样不落盘。
+- **失败任务的消息不保存**。官方 memory 仅提交成功的 SDK 任务；产品转录、工具意图和已发生费用独立持久化。
 - **压缩的触发靠真数，裁切靠估算**。是否超预算看 provider 上一轮报的 usage；**从哪里裁**只能按字符估算每个消息（`字符数 / 4`），与 provider 的分词器有出入——所以预留的 16384 token 同时是回复的空间和这个误差的余量。
 - **摘要是有损的**。被替换掉的那些消息只剩模型写的那段摘要，原文不再发给 provider；摘要本身是一次模型调用，因此压缩只在必要时发生（或用户 `/compact` 时）。转录里会留一行说明压掉了几条。
-- **overflow 的识别是猜文本**。`overflow.rs` 用 26 条固定短语匹配，每条对应一个平台的措辞，另有 3 条排除（限流不是超限）与「用 usage 看出静默超限」这条不猜的路。漏掉某家措辞的代价是少一次重试，误判的代价是白丢一段对话——所以宁可漏。
 - **`grep` 与 `find` 需要外部程序**。它们 shell out 到 ripgrep 与 fd；缺失时工具会明确报错并给出安装提示，而不是退化成另一个实现。
 - **工具输出是截断的**。读类保留前 2000 行或 50KB，命令类保留末尾并把完整输出写进临时文件；被截断的那部分只有通过报告出来的路径才读得到。
 - **价格是内置快照**。`provider` 表里的单价是打表值，账单可能不同；未知模型按 0 计。
@@ -745,8 +706,8 @@ not invoke resource loaders or prompt builders. Reload workers run serially and
 publish resources only when the session is idle; session navigation cannot overtake
 a pending loader.
 
-`MessageContext` annotates journaled messages with single-request measurements or
-projection boundaries; protocol encoders exclude these annotations. `projection`
+Official memory asides attach single-request measurements and projection boundaries
+to native message IDs; these annotations are excluded from model requests. `projection`
 uses the most recent compatible measurement plus trailing message estimates, with
 a full in-memory estimate when the request configuration changes. Replacement
 invalidates retained annotations. The same estimator drives pre-request compaction
@@ -758,11 +719,9 @@ publish a full estimate before context events and budget checks. Measurements mu
 match both the base prompt and the actual request header. No tool-change journal is
 required; restored sessions estimate against the currently available tool loadout.
 
-Compaction cuts only before user turns or assistant messages, retaining tool calls
-with all their results. When the retained tail begins inside a task, the preceding
-history and the current task prefix are summarized separately. Both summaries must
-succeed before replacing history, preserving the original task and constraints
-without publishing a partial compaction after failure.
+Compaction uses the official memory policy, summarizer and persisted summary state.
+It preserves legal tool boundaries and applies a summary only after successful generation.
+Automatic compaction runs between SDK tasks; there is no hidden overflow replay.
 
 `AccountingBackend` journals each request's usage before forwarding its completion.
 Child requests write to the parent ledger before forwarding their completion, so

@@ -17,7 +17,7 @@
 
 ---
 
-solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and drives the official Rig Agent state machine over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
+solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and uses the complete official Rig Agent executor and memory over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
 
 The interface is complete, and a connected provider really is called. Connect a provider — or just export an API key — and every turn streams from the real model over SSE, with retries before the first token and per-turn token and cost accounting.
 
@@ -373,10 +373,14 @@ subagent sessions), or `solaris --resume <ID>` to restore one explicitly.
 The journal records the resolved provider and model on attachment and backend
 changes so subsequent resume restores that choice unless explicitly overridden.
 
-The journal retains prompts, tool calls/results, model context, compaction checkpoints and
-child activity. Interrupted tool calls are never automatically executed again: verify their
-side effects before retrying. The journal contains conversation and tool data; treat it as
-private. Credentials and authentication headers are not intentionally recorded.
+Official SDK memory stores model messages and compaction state under
+`sessions/memory/<SESSION_ID>`. The SQLite journal retains the transcript, tool
+intents, usage, child activity and executor metadata. Legacy message journals are
+imported once when no SDK memory exists. Only successful SDK tasks commit messages;
+failed or cancelled tasks retain earlier committed context. Tool side effects and
+billed usage can still occur before failure. Verify side effects before retrying;
+interrupted tools are never automatically replayed. Treat both stores as private.
+Credentials and authentication headers are not intentionally recorded.
 
 ## Review and undo file changes
 

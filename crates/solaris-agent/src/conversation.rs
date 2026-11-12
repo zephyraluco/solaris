@@ -12,9 +12,9 @@
 //! agent writes one per turn, so it can never be summarized away), and nothing
 //! here knows about turns at all.
 //!
-//! Locking is per operation, never held across an `await`: the loop appends after
-//! each step it takes, so a turn abandoned halfway leaves the conversation with
-//! exactly the parts that really happened.
+//! Official memory owns messages and saves successful SDK tasks. Failed or
+//! cancelled tasks leave the previous committed conversation unchanged. Product
+//! records (including tool intents and billing) are persisted independently.
 
 use crate::{SessionJournal, SessionRecord, StoreError};
 use std::sync::{Arc, Mutex, RwLock};
