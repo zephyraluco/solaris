@@ -1157,7 +1157,7 @@ mod tests {
                 },
             ]
         };
-        let inner = Scripted::new(vec![completion(), completion(), completion()]);
+        let inner = Scripted::new(vec![completion(), completion()]);
         let agent = Agent::new(
             choice(inner.clone()),
             Arc::new(ToolRegistry::builtin()),
@@ -1174,7 +1174,7 @@ mod tests {
             .expect("follow-up");
         drain(agent.run_turn("/skill:pdf initial", Mode::Plan)).await;
         let requests = inner.requests();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         let user_text: Vec<_> = requests
             .last()
             .expect("request")

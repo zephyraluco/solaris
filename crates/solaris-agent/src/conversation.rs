@@ -141,6 +141,28 @@ impl Conversation {
     ) -> Result<rig_core::conversation::Conversation, rig_memory::SessionError> {
         rig_memory::load(&self.storage(), "conversation")
     }
+    /// Commit a SDK-owned safe-boundary snapshot, retaining the saved prefix,
+    /// native message IDs and asides. The store's append check rejects races.
+    pub(crate) fn commit_phase(
+        &self,
+        base: &mut rig_core::conversation::Conversation,
+        history: Vec<rig_core::message::Message>,
+    ) -> Result<(), String> {
+        let prefix = base.messages();
+        if history.len() < prefix.len()
+            || !prefix
+                .iter()
+                .map(|message| message.as_ref())
+                .eq(history[..prefix.len()].iter())
+        {
+            return Err("SDK phase history does not extend its saved conversation".into());
+        }
+        rig_core::conversation::pairing::validate(&history).map_err(|error| error.to_string())?;
+        let suffix = history.into_iter().skip(prefix.len()).collect::<Vec<_>>();
+        base.extend(suffix);
+        rig_memory::save(&self.storage(), "conversation", base).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn failed(&self, error: impl std::fmt::Display) {
         *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
     }
@@ -434,6 +456,24 @@ mod tests {
 
     fn call(id: &str) -> ToolCall {
         ToolCall::new(id, "read", json!({ "path": "a.txt" }))
+    }
+
+    #[test]
+    fn a_phase_checkpoint_refuses_a_concurrent_writer() {
+        let conversation = Conversation::new();
+        conversation.push(Message::user("original"));
+        let mut base = conversation.native().unwrap();
+        let mut checkpoint = base
+            .messages()
+            .iter()
+            .map(|message| message.as_ref().clone())
+            .collect::<Vec<_>>();
+        checkpoint.push(rig_core::message::Message::assistant("completed phase"));
+        conversation.push(Message::user("concurrent input"));
+        assert!(conversation.commit_phase(&mut base, checkpoint).is_err());
+        let messages = conversation.snapshot();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].text(), "concurrent input");
     }
 
     #[test]

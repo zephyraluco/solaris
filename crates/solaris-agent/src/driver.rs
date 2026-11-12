@@ -14,8 +14,17 @@ use rig_core::{
 };
 use std::sync::Mutex;
 
+const PHASE_BOUNDARY: &str = "solaris internal phase boundary";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    Steering,
+    Background,
+    Compaction,
+}
+
 #[derive(Default)]
 struct Phase {
+    boundary: Option<Boundary>,
     totals: crate::UsageTotals,
     client: Option<solaris_backend::ModelClient>,
     text: String,
@@ -86,14 +95,6 @@ impl AgentHook for Policy {
             phase.thinking.clear();
             phase.client = None;
         }
-        // Resolve exactly once, before projecting the request. The same client
-        // supplies capabilities, the actual model call and its price snapshot.
-        let client = match Arc::clone(&self.runner.inner).model_client().await {
-            Ok(client) => client,
-            Err(error) => return CompletionCallAction::stop(error.to_string()),
-        };
-        let capabilities = client.capabilities();
-        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
         let header = self.runner.request_header();
         let mut messages: Vec<_> = event
             .history
@@ -117,10 +118,45 @@ impl AgentHook for Policy {
             .runner
             .conversation
             .publish_projection(&messages, &header);
-        context.window = capabilities
+        context.window = self
+            .runner
+            .inner
+            .capabilities()
             .context_window
             .unwrap_or(self.runner.context_window);
-        let _ = self.tx.send(AgentEvent::ContextUsageUpdated { context });
+        let boundary = if self.runner.steering.has_pending() {
+            Some(Boundary::Steering)
+        } else if self.runner.background.has_completed() {
+            Some(Boundary::Background)
+        } else if event.turn > 1 && self.runner.over_budget_tokens(context.tokens.unwrap_or(0)) {
+            Some(Boundary::Compaction)
+        } else {
+            None
+        };
+        if let Some(boundary) = boundary {
+            let _ = self.tx.send(AgentEvent::ContextUsageUpdated { context });
+            self.phase
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .boundary = Some(boundary);
+            return CompletionCallAction::stop(PHASE_BOUNDARY);
+        }
+        // Resolve exactly once, before projecting the request. The same client
+        // supplies capabilities, the actual model call and its price snapshot.
+        let client = match Arc::clone(&self.runner.inner).model_client().await {
+            Ok(client) => client,
+            Err(error) => return CompletionCallAction::stop(error.to_string()),
+        };
+        let capabilities = client.capabilities();
+        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
+        let _ = self.tx.send(AgentEvent::ContextUsageUpdated {
+            context: solaris_backend::ContextUsage {
+                window: capabilities
+                    .context_window
+                    .unwrap_or(self.runner.context_window),
+                ..context
+            },
+        });
         CompletionCallAction::patch(
             RequestPatch::new().active_tools(
                 self.runner
@@ -213,6 +249,21 @@ impl AgentHook for Policy {
             return ModelTurnAction::stop(
                 "model output limit reached; incomplete tool calls were not executed",
             );
+        }
+        if !event
+            .content
+            .iter()
+            .any(|part| matches!(part, AssistantContent::ToolCall(_)))
+            && !self.runner.cancel.is_cancelled()
+            && !self.tx.is_closed()
+        {
+            let inputs = self.runner.steering.drain();
+            if !inputs.is_empty() {
+                for text in &inputs {
+                    let _ = self.tx.send(AgentEvent::Steered { text: text.clone() });
+                }
+                return ModelTurnAction::retry_with_feedback(inputs.join("\n\n"));
+            }
         }
         ModelTurnAction::continue_run()
     }
@@ -429,6 +480,7 @@ impl Runner {
     ) {
         let mut total = Usage::default();
         let mut cost_usd = 0.0;
+        let mut force_compaction = false;
         loop {
             if self.cancel.is_cancelled() {
                 self.give_up("the turn was cancelled".into(), &tx);
@@ -438,7 +490,15 @@ impl Runner {
                 let _ = tx.send(AgentEvent::Error(error));
                 return;
             }
-            self.compact(false, &tx, &mut total, &mut cost_usd).await;
+            self.compact(force_compaction, &tx, &mut total, &mut cost_usd)
+                .await;
+            let mut base = match self.conversation.native() {
+                Ok(base) => base,
+                Err(error) => {
+                    self.give_up(error.to_string(), &tx);
+                    return;
+                }
+            };
             let phase = Arc::new(Mutex::new(Phase::default()));
             let policy = Policy {
                 runner: Arc::clone(self),
@@ -496,11 +556,30 @@ impl Runner {
                     event = events.next(), if events_open => { events_open = event.is_some(); },
                 }
             };
-            if let Err(error) = result {
-                self.conversation.refresh();
-                self.give_up(error.to_string(), &tx);
-                return;
-            }
+            let boundary = phase.lock().unwrap_or_else(|p| p.into_inner()).boundary;
+            let handed_off = match result {
+                Ok(_) => false,
+                Err(rig_agent::completion::PromptError::Cancelled {
+                    chat_history,
+                    reason,
+                }) if boundary.is_some() && reason == PHASE_BOUNDARY => {
+                    if self.cancel.is_cancelled() || tx.is_closed() {
+                        return;
+                    }
+                    if let Err(error) = self.conversation.commit_phase(&mut base, chat_history) {
+                        self.conversation.failed(&error);
+                        self.give_up(error, &tx);
+                        return;
+                    }
+                    true
+                }
+                Err(error) => {
+                    self.conversation.refresh();
+                    self.give_up(error.to_string(), &tx);
+                    return;
+                }
+            };
+            force_compaction = handed_off && boundary == Some(Boundary::Compaction);
             {
                 let phase = phase.lock().unwrap_or_else(|p| p.into_inner());
                 total = total.merge(phase.totals.usage);
@@ -511,7 +590,11 @@ impl Runner {
             self.conversation.refresh();
             self.emit_context(&tx);
             let mut background = self.absorb_background(&mut total, &mut cost_usd);
-            if !background && !self.steering.has_pending() && !self.background.is_empty() {
+            if !handed_off
+                && !background
+                && !self.steering.has_pending()
+                && !self.background.is_empty()
+            {
                 if !self
                     .wait_for_background(&tx, &mut total, &mut cost_usd)
                     .await
@@ -526,7 +609,7 @@ impl Runner {
             for text in &inputs {
                 let _ = tx.send(AgentEvent::Steered { text: text.clone() });
             }
-            if inputs.is_empty() && !background {
+            if inputs.is_empty() && !background && !handed_off {
                 inputs = self.follow_up.drain();
                 for prompt in &inputs {
                     let _ = tx.send(AgentEvent::FollowUp {
@@ -538,6 +621,8 @@ impl Runner {
                 prompt = inputs.join("\n\n");
             } else if background {
                 prompt = "Process the completed background task results.".into();
+            } else if handed_off {
+                prompt = "Continue the current task using the available context.".into();
             } else {
                 let _ = tx.send(AgentEvent::TurnComplete {
                     usage: total,

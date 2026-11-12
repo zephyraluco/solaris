@@ -365,16 +365,17 @@ impl Runner {
     }
 
     fn over_budget(&self) -> bool {
+        self.over_budget_tokens(self.conversation.projected_tokens(&self.request_header()))
+    }
+
+    fn over_budget_tokens(&self, tokens: u32) -> bool {
         let capabilities = self.inner.capabilities();
         let context_window = capabilities.context_window.unwrap_or(self.context_window);
         let policy = self.compaction_policy();
         let window = capabilities.max_input.map_or(context_window, |limit| {
             context_window.min(limit.saturating_add(policy.reserve_tokens))
         });
-        policy.should_compact(
-            self.conversation.projected_tokens(&self.request_header()),
-            window,
-        )
+        policy.should_compact(tokens, window)
     }
 
     /// Read one round to its end, forwarding what it produces.
@@ -1745,6 +1746,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_after_a_tool_hands_off_once_without_resetting_the_request_budget() {
+        struct SteeringTool {
+            queue: Queue,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Tool for SteeringTool {
+            fn name(&self) -> &str {
+                "record"
+            }
+            fn description(&self) -> &str {
+                "Record"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.queue.push("use the other file");
+                ToolOutput::ok("read result")
+            }
+        }
+        let queue = Queue::new();
+        let tool = Arc::new(SteeringTool {
+            queue: queue.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("c1", "record"))]),
+            round(vec![AgentEvent::TextDelta("corrected".into())]),
+        ]);
+        let mut options = AgentOptions::default();
+        options.execution.budget.max_requests = 2;
+        let turn = Turn::of(inner.clone(), tool.clone())
+            .options(options)
+            .steering(queue);
+        let conversation = turn.conversation.clone();
+        let events = turn.run("inspect file").await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:?}"
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.requests().len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_)))
+        );
+        let history = conversation.native().unwrap();
+        rig_core::conversation::pairing::validate(history.messages()).unwrap();
+        let text = serde_json::to_string(history.messages()).unwrap();
+        assert_eq!(text.matches("inspect file").count(), 1);
+        assert_eq!(text.matches("use the other file").count(), 1);
+        assert!(text.find("read result").unwrap() < text.find("use the other file").unwrap());
+    }
+
+    #[tokio::test]
     async fn a_message_steered_in_mid_turn_keeps_the_turn_going() {
         let inner = SteersOnFirstRound::new();
         let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
@@ -2246,7 +2312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_compaction_happens_between_sdk_tasks() {
+    async fn automatic_compaction_happens_between_tool_rounds_without_replaying_calls() {
         let inner = Scripted::new(vec![
             vec![
                 AgentEvent::ToolCall(call("call-1", "record")),
@@ -2255,57 +2321,51 @@ mod tests {
                     cost_usd: 0.0,
                 },
             ],
-            vec![
-                AgentEvent::TextDelta("finished first task".into()),
-                AgentEvent::TurnComplete {
-                    usage: Usage::new(190_000, 100),
-                    cost_usd: 0.0,
-                },
-            ],
             round(vec![AgentEvent::TextDelta("history summary".into())]),
-            round(vec![AgentEvent::TextDelta("task prefix".into())]),
-            round(vec![AgentEvent::TextDelta("finished second task".into())]),
+            round(vec![AgentEvent::TextDelta("finished task".into())]),
         ]);
-        let options = AgentOptions {
-            compaction: Compaction {
-                enabled: true,
-                reserve_tokens: 16_384,
-                keep_recent_tokens: 30,
-            },
-            ..Default::default()
-        };
-        let first = Turn::of(inner.clone(), Arc::new(Recording::default()))
-            .options(options.clone())
+        let tool = Arc::new(Recording::default());
+        let events = Turn::of(inner.clone(), tool.clone())
+            .options(AgentOptions {
+                compaction: Compaction {
+                    enabled: true,
+                    reserve_tokens: 16_384,
+                    keep_recent_tokens: 30,
+                },
+                ..Default::default()
+            })
             .context_window(200_000)
-            .history(long_history(12));
-        let conversation = Arc::clone(&first.conversation);
-        let events = first.run("do it").await;
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
+            .history(long_history(12))
+            .run("do it")
+            .await;
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Compacted { .. }))
-        );
-        assert_eq!(inner.requests().len(), 2);
-        let mut second = Turn::of(inner.clone(), Arc::new(Recording::default()))
-            .options(options)
-            .context_window(200_000);
-        second.conversation = conversation;
-        let events = second.run("next task").await;
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Compacted { .. })),
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
             "{events:?}"
         );
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
+        let result = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolResult { .. }))
+            .unwrap();
+        let compacted = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Compacted { .. }))
+            .unwrap();
+        let answer = events.iter().position(|event| matches!(event, AgentEvent::TextDelta(text) if text.contains("finished task"))).unwrap();
+        assert!(result < compacted && compacted < answer);
+        assert_eq!(tool.calls.lock().unwrap().len(), 1);
+        let requests = inner.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].tools.is_empty());
+        assert!(request_text(&requests[2]).contains("history summary"));
+        let history: Vec<_> = requests[2]
+            .history
+            .iter()
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rig_core::conversation::pairing::validate(&history).unwrap();
     }
+
     fn split_task_history() -> Vec<Message> {
         vec![
             Message::user("old history"),

@@ -97,6 +97,14 @@ impl BackgroundTasks {
         self.lock().tasks.is_empty()
     }
 
+    /// Inspect readiness without consuming a completion or emitting it twice.
+    pub fn has_completed(&self) -> bool {
+        self.lock()
+            .tasks
+            .iter()
+            .any(|task| task.handle.is_finished())
+    }
+
     pub fn try_next(&self) -> Option<Completion> {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         match self.poll_next(&mut cx) {
