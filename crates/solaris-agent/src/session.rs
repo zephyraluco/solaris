@@ -635,8 +635,15 @@ async fn compact_memory(
     let mut policy = rig_memory::CompactionPolicy {
         keep_recent: config.keep_recent_tokens as usize,
         keep_asked: config.keep_recent_tokens as usize,
+        clearing: rig_memory::ClearToolOutputs::new(config.keep_recent_tokens as usize),
         ..Default::default()
     };
+    // Work on the loaded copy. Clearing and summarization are committed
+    // together only after a valid summary, so failed requests lose no context.
+    policy.clearing.clear_conversation(
+        &mut native,
+        rig_core::conversation::Author::plugin("solaris"),
+    );
     let mut state = rig_memory::summary_state(&native);
     if state.summary.is_empty() {
         state.summary = existing_summary(&conversation.snapshot()).unwrap_or_default();
@@ -653,9 +660,8 @@ async fn compact_memory(
     } else {
         rig_memory::CompactReason::Threshold
     };
-    let from = rig_memory::summarized_prefix(&native);
     if policy
-        .cut(native.messages(), from, &reason, Some(&spec))
+        .cut_summary(&native, &state, &reason, &spec)
         .is_none()
     {
         return outcome;
@@ -673,14 +679,16 @@ async fn compact_memory(
         .or((fallback_window > 0).then_some(fallback_window));
     spec.max_input_tokens = caps.max_input;
     spec.max_output_tokens = caps.max_output.or(caps.output_budget);
-    let Some(cut) = policy.cut(native.messages(), from, &reason, Some(&spec)) else {
-        return outcome;
+    let plan = match policy.plan_summary(&native, &state, &reason, &spec) {
+        Ok(Some(plan)) => plan,
+        _ => return outcome,
     };
-    let (mut state, request) =
-        match policy.plan(&state, native.messages(), from, cut, &spec, &reason) {
-            Ok(plan) => plan,
-            Err(_) => return outcome,
-        };
+    let keep = plan.keep_from;
+    let cut = keep
+        .and_then(|id| native.index_of(id))
+        .unwrap_or(native.messages().len());
+    let mut state = plan.state;
+    let request = plan.request;
     let summary = {
         let input = request
             .chat_history
@@ -716,7 +724,6 @@ async fn compact_memory(
         }
     };
     state.summary = summary.clone();
-    let keep = native.id(cut);
     if rig_memory::apply_summary(&mut native, keep, &state).is_none() {
         return outcome;
     }
@@ -728,14 +735,6 @@ async fn compact_memory(
     for id in old_measurements {
         native.remove_aside(id);
     }
-    native.add_aside(
-        rig_core::conversation::Aside::new(
-            "solaris.context",
-            rig_core::conversation::Author::plugin("solaris"),
-            serde_json::to_value(solaris_backend::MessageContext::Boundary).unwrap_or_default(),
-        )
-        .after(native.id(0)),
-    );
     if let Err(error) = rig_memory::save(&conversation.storage(), "conversation", &mut native) {
         conversation.failed(error);
         return outcome;
@@ -2368,6 +2367,59 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         rig_core::conversation::pairing::validate(&history).unwrap();
+    }
+
+    #[tokio::test]
+    async fn official_output_clearing_and_summary_are_saved_atomically() {
+        for success in [true, false] {
+            let old = call("old", "record");
+            let recent = call("recent", "record");
+            let original = vec![
+                Message::user("keep task constraints"),
+                Message::tool_use(old.clone()),
+                Message::tool_result(ToolResult::ok(
+                    &old,
+                    format!("OLD_OUTPUT_MARKER{}", "x".repeat(20000)),
+                )),
+                Message::tool_use(recent.clone()),
+                Message::tool_result(ToolResult::ok(&recent, "RECENT_OUTPUT_MARKER")),
+                Message::user("next action"),
+            ];
+            let conversation = Conversation::new();
+            conversation.replace_with(original.clone());
+            let scripted = if success {
+                round(vec![AgentEvent::TextDelta("useful summary".into())])
+            } else {
+                vec![AgentEvent::Error("summary unavailable".into())]
+            };
+            let model = Scripted::new(vec![scripted]);
+            let inner: Arc<dyn AgentBackend> = model.clone();
+            let outcome = compact_memory(
+                &inner,
+                &Cancel::new(),
+                &conversation,
+                Compaction {
+                    enabled: true,
+                    reserve_tokens: 16384,
+                    keep_recent_tokens: 1000,
+                },
+                128000,
+                true,
+            )
+            .await;
+            assert_eq!(outcome.text.is_some(), success);
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1);
+            let input = request_text(&requests[0]);
+            assert!(input.contains(rig_memory::ClearToolOutputs::PLACEHOLDER));
+            assert!(input.contains("RECENT_OUTPUT_MARKER"));
+            assert!(!input.contains("OLD_OUTPUT_MARKER"));
+            if !success {
+                assert_eq!(conversation.snapshot(), original);
+            }
+            let native = conversation.native().unwrap();
+            rig_core::conversation::pairing::validate(native.messages()).unwrap();
+        }
     }
 
     fn split_task_history() -> Vec<Message> {
