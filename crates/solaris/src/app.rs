@@ -59,7 +59,7 @@ use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
 use crate::recent::{self, RecentActivity};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, ToolStep, Turn};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -1368,18 +1368,18 @@ impl App {
             AgentEvent::ContextUsageUpdated { context } => self.session.context = context,
             AgentEvent::ThinkingDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.thinking.push_str(&chunk);
+                    turn.push_thinking(&chunk);
                 }
             }
             AgentEvent::TextDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.reply.push_str(&chunk);
+                    turn.push_text(&chunk);
                 }
             }
             AgentEvent::Status(text) => self.session.status = Some(text),
             AgentEvent::ToolCall(call) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.steps.push(ToolStep::pending(call));
+                    turn.push_tool(call);
                 }
             }
             AgentEvent::ToolResult {
@@ -1519,8 +1519,7 @@ impl App {
             // than when it was typed, so it lands in the turn that read it.
             AgentEvent::Steered { text } => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    let after_steps = turn.steps.iter().filter(|step| step.is_done()).count();
-                    turn.steering.push(SteeringNote { text, after_steps });
+                    turn.push_steering(text);
                 }
             }
             // A queued prompt is now being run as a turn of its own. The turn it
@@ -1530,7 +1529,7 @@ impl App {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
                     if turn.reply.is_empty() {
-                        turn.reply = "_(superseded by the queued prompt)_".to_string();
+                        turn.push_text("_(superseded by the queued prompt)_");
                     }
                 }
                 self.session.turns.push(Turn {
@@ -1544,7 +1543,7 @@ impl App {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
                     if turn.reply.trim().is_empty() {
-                        turn.reply = format!("**Error:** {message}");
+                        turn.push_text(&format!("**Error:** {message}"));
                     }
                 }
                 self.session.status = None;
@@ -4740,6 +4739,42 @@ mod tests {
         let mut app = app();
         app.on_dialog_message(DialogMessage::Command("/mode".into()));
         assert_eq!(app.mode(), Mode::Plan);
+    }
+
+    #[test]
+    fn streamed_events_record_interleaved_display_order() {
+        use crate::state::TurnPart;
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.apply_event(AgentEvent::ThinkingDelta("先想".into()));
+        app.apply_event(AgentEvent::TextDelta("先".into()));
+        app.apply_event(AgentEvent::TextDelta("说明".into()));
+        let call = ToolCall::new("call", "read", serde_json::json!({"path":"file.rs"}));
+        app.apply_event(AgentEvent::ToolCall(call.clone()));
+        app.apply_event(AgentEvent::ToolResult {
+            result: solaris_agent::ToolResult::ok(&call, "data"),
+            duration_ms: 1,
+        });
+        app.apply_event(AgentEvent::Steered {
+            text: "再检查".into(),
+        });
+        app.apply_event(AgentEvent::ThinkingDelta("再想".into()));
+        app.apply_event(AgentEvent::TextDelta("结论".into()));
+        let turn = &app.session.turns[0];
+        assert_eq!(
+            turn.parts,
+            [
+                TurnPart::Thinking(0..6),
+                TurnPart::Text(0..9),
+                TurnPart::Tool(0),
+                TurnPart::Steering(0),
+                TurnPart::Thinking(6..12),
+                TurnPart::Text(9..15)
+            ]
+        );
+        assert_eq!(turn.reply, "先说明结论");
+        assert_eq!(turn.thinking, "先想再想");
+        assert_eq!(turn.steps[0].result.as_ref().unwrap().output, "data");
     }
 
     #[test]

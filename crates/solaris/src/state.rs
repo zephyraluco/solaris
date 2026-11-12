@@ -114,9 +114,20 @@ pub struct SteeringNote {
     pub after_steps: usize,
 }
 
+/// Arrival-ordered references into a turn's text and tool storage.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnPart {
+    Text(std::ops::Range<usize>),
+    Thinking(std::ops::Range<usize>),
+    Tool(usize),
+    Steering(usize),
+}
+
 /// One prompt/response exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
+    /// Display order; text ranges coalesce only across adjacent deltas.
+    pub parts: Vec<TurnPart>,
     /// The user's prompt.
     pub prompt: String,
     /// Messages the user steered in while this turn was running.
@@ -142,6 +153,49 @@ pub struct Turn {
 }
 
 impl Turn {
+    pub fn push_text(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let start = self.reply.len();
+        self.reply.push_str(chunk);
+        let end = self.reply.len();
+        if let Some(TurnPart::Text(range)) = self.parts.last_mut()
+            && range.end == start
+        {
+            range.end = end;
+        } else {
+            self.parts.push(TurnPart::Text(start..end));
+        }
+    }
+
+    pub fn push_thinking(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let start = self.thinking.len();
+        self.thinking.push_str(chunk);
+        let end = self.thinking.len();
+        if let Some(TurnPart::Thinking(range)) = self.parts.last_mut()
+            && range.end == start
+        {
+            range.end = end;
+        } else {
+            self.parts.push(TurnPart::Thinking(start..end));
+        }
+    }
+
+    pub fn push_tool(&mut self, call: ToolCall) {
+        self.parts.push(TurnPart::Tool(self.steps.len()));
+        self.steps.push(ToolStep::pending(call));
+    }
+
+    pub fn push_steering(&mut self, text: String) {
+        let after_steps = self.steps.iter().filter(|step| step.is_done()).count();
+        self.parts.push(TurnPart::Steering(self.steering.len()));
+        self.steering.push(SteeringNote { text, after_steps });
+    }
+
     /// Locate child activity by its runtime ID, even after its launch returned.
     pub fn subagent_mut(&mut self, task_id: &str) -> Option<&mut ToolStep> {
         self.steps.iter_mut().rev().find(|step| {
