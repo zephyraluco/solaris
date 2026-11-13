@@ -62,11 +62,12 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked
 
 ## Provider 重构
 
-provider 内部已拆成配置、选择、认证、官方目录加载、请求准备和模型发现。
-`ProviderConfig` 支持命名端点及模型；`ModelCatalog` 只管理官方 Catalog 的加载与刷新。
+provider 内部已拆成配置、选择、认证、内置目录配置和模型发现。
+`ProviderConfig` 支持命名端点及模型，并直接持有 Rig 内置 Catalog 与用户覆盖形成的不可变目录。
+Solaris 不下载、缓存或后台刷新外部元数据；已删除目录服务包装及相关启动入口。
 已删除自建快照、上游解析器、价格阶梯实现及生成脚本。backend 直接接收官方
 ModelFacts，编码和标准参考费用均使用官方实现。认证仍通过官方 authenticator，
 共享刷新状态由 Solaris 管理。模块依赖方向不变，agent 不依赖 provider。
 
 `models.json` 使用 `providers`、命名 `models` 和官方格式的 `overrides`，不兼容旧数组格式。
-配置迁移示例见 README。模型列表发现与参数目录分离，显式元数据引用在加载缓存后校验。
+配置迁移示例见 README。模型列表发现与参数目录分离，显式元数据引用在应用用户覆盖后校验。

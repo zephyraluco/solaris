@@ -58,14 +58,14 @@ impl Protocol {
 
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
-    pub catalog: crate::catalog::ModelCatalog,
+    catalog: Arc<Catalog>,
     selections: Arc<BTreeMap<String, ModelSelection>>,
     endpoints: Arc<BTreeMap<String, ProviderEndpoint>>,
 }
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            catalog: crate::catalog::ModelCatalog::default(),
+            catalog: Arc::new(Catalog::builtin().clone()),
             selections: Arc::new(BTreeMap::new()),
             endpoints: Arc::new(BTreeMap::new()),
         }
@@ -109,13 +109,6 @@ impl ResolvedModel {
 impl ProviderConfig {
     /// New configuration: named selections and an official catalog override object.
     pub fn from_json(text: &str) -> Result<Self, String> {
-        Self::parse(text, None)
-    }
-    /// Load cached upstream facts before checking explicit model references.
-    pub fn from_json_with_cache(text: &str, directory: &std::path::Path) -> Result<Self, String> {
-        Self::parse(text, Some(directory))
-    }
-    fn parse(text: &str, directory: Option<&std::path::Path>) -> Result<Self, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Config {
@@ -165,19 +158,12 @@ impl ProviderConfig {
         let patch = Catalog::from_overrides(&overrides, base).map_err(|e| e.to_string())?;
         let catalog = base.with_overrides(&patch);
         let result = Self {
-            catalog: crate::catalog::ModelCatalog::new(catalog, overrides),
+            catalog: Arc::new(catalog),
             selections: Arc::new(config.models),
             endpoints: Arc::new(config.providers),
         };
-        if let Some(directory) = directory {
-            result.catalog.load_cache(directory);
-        }
         {
-            let catalog = result
-                .catalog
-                .state
-                .read()
-                .unwrap_or_else(|p| p.into_inner());
+            let catalog = &result.catalog;
             for selection in result.selections.values() {
                 if let Some(reference) = &selection.metadata {
                     catalog.resolve(reference).map_err(|e| e.to_string())?;
@@ -205,7 +191,7 @@ impl ProviderConfig {
         } else {
             provider
         };
-        let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
+        let catalog = &self.catalog;
         let explicit = selection.and_then(|s| s.metadata.as_deref());
         let direct = format!("{vendor}/{request_id}");
         // Missing models are ordinary for local servers. `resolve` builds typo
@@ -250,7 +236,7 @@ impl ProviderConfig {
         spec.provider = ProviderId::declare("solaris").expect("valid declared vendor");
         spec.id = request_id.into();
         let mut capabilities = capabilities(&spec, known);
-        let output_tokens = crate::request::output_budget(
+        let output_tokens = output_budget(
             &capabilities,
             selection.and_then(|s| s.output_tokens).unwrap_or(
                 crate::DEFAULT_MAX_OUTPUT
@@ -283,7 +269,7 @@ impl ProviderConfig {
         } else {
             provider
         };
-        let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
+        let catalog = &self.catalog;
         let mut models: BTreeMap<String, String> = catalog
             .iter()
             .filter(|s| s.provider.vendor() == vendor && !s.deprecated && s.input.text)
@@ -366,6 +352,20 @@ fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
         price_known: Some(spec.pricing.is_some()),
         ..Default::default()
     }
+}
+
+fn output_budget(capabilities: &ModelCapabilities, requested: u32) -> u32 {
+    capabilities
+        .max_output
+        .unwrap_or(crate::DEFAULT_MAX_OUTPUT)
+        .min(requested)
+        .min(
+            capabilities
+                .context_window
+                .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
+                .saturating_sub(1)
+                .max(1),
+        )
 }
 
 #[cfg(test)]

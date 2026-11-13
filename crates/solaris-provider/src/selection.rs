@@ -246,7 +246,6 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
                 facts,
                 capabilities,
             );
-            let account_authorized = chatgpt.is_some();
             let backend = match chatgpt {
                 Some((account, expiry)) => backend.with_chatgpt(account, expiry),
                 None => backend,
@@ -277,13 +276,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             BackendChoice {
                 configuration: Arc::clone(&options.configuration),
                 backend: Arc::new(crate::discovery::ModelDiscovery {
-                    inner: Arc::new(crate::request::SelectedBackend {
-                        configuration: Arc::clone(&options.configuration),
-                        provider: spec.id.into(),
-                        model: model.clone(),
-                        prototype: backend,
-                        account_authorized,
-                    }),
+                    inner: Arc::new(backend),
                     cache_dir: options.model_cache_dir.clone(),
                     endpoint: format!("{}:{base_url}", spec.id),
                     notice: std::sync::Mutex::new(None),
@@ -384,13 +377,7 @@ fn configured_backend(
     BackendChoice {
         configuration: Arc::clone(&options.configuration),
         backend: Arc::new(crate::discovery::ModelDiscovery {
-            inner: Arc::new(crate::request::SelectedBackend {
-                configuration: Arc::clone(&options.configuration),
-                provider: provider.into(),
-                model: model.into(),
-                prototype: backend,
-                account_authorized: false,
-            }),
+            inner: Arc::new(backend),
             cache_dir: options.model_cache_dir.clone(),
             endpoint: format!("{provider}:{base_url}"),
             notice: std::sync::Mutex::new(None),

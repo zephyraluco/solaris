@@ -488,11 +488,9 @@ bounded independently.
 ## Model capabilities and offline model lists
 
 Model capabilities, limits, encoding rules and reference prices come from the
-official Rig catalog. Solaris loads Rig's built-in data, applies a cached
-[models.dev](https://models.dev/api.json) update, then applies explicit user
-overrides. Background refresh runs every 24 hours; failures retain the current
-catalog. Downloads never receive provider credentials. Solaris maintains no model
-snapshot or separate metadata parser.
+official Rig catalog. Solaris uses Rig's built-in data and explicit user overrides.
+The catalog updates when the Rig dependency is upgraded. Solaris does not download,
+cache or refresh external metadata and maintains no separate model snapshot or parser.
 
 Models are resolved by provider and ID using Rig's lookup rules, including its
 dated-snapshot matching. `opencode` maps to `opencode-go`. Unknown gateways may
@@ -553,8 +551,7 @@ Prices are USD per million tokens. Rig computes standard API list-price estimate
 long-context tiers, service tiers and hosted-tool fees are not included. Gateway
 metadata inherited from a manufacturer is marked as a reference price. Unknown
 prices remain unknown, and ChatGPT account sessions do not use API prices.
-`--print-config` shows the resolved official facts. Each request fixes its facts;
-later requests see catalog refreshes while reusing the HTTP connection pool.
+`--print-config` shows the resolved official facts. Each request fixes its facts and reuses the HTTP connection pool.
 
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched

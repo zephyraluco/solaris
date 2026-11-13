@@ -170,12 +170,6 @@ impl Backend {
         self.endpoint.wire
     }
 
-    /// Select the protocol from the same resolution as the request model ID.
-    pub fn with_wire(mut self, wire: Wire) -> Self {
-        self.endpoint.wire = wire;
-        self
-    }
-
     /// Use the ChatGPT/Codex request profile rather than the public API profile.
     pub fn with_chatgpt(mut self, account_id: String, expires_at: u64) -> Self {
         self.chatgpt = Some((account_id, expires_at));

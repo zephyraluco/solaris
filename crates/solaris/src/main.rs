@@ -211,18 +211,14 @@ fn main() -> Result<()> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 backend_options.configuration = Arc::new(
-                    solaris_provider::ProviderConfig::from_json_with_cache(
-                        &text,
-                        &directory.join("model-cache"),
-                    )
-                    .map_err(anyhow::Error::msg)?,
+                    solaris_provider::ProviderConfig::from_json(&text)
+                        .map_err(anyhow::Error::msg)?,
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let cache_dir = directory.join("model-cache");
-        backend_options.configuration.catalog.load_cache(&cache_dir);
         backend_options.model_cache_dir = Some(cache_dir);
     }
     // Custom endpoints are validated after their configuration has been loaded.
@@ -468,13 +464,6 @@ fn main() -> Result<()> {
         Some(journal)
     };
     let runtime = tokio::runtime::Runtime::new()?;
-    if let Some(directory) = &backend_options.model_cache_dir {
-        let _runtime_guard = runtime.enter();
-        backend_options
-            .configuration
-            .catalog
-            .start_refresh(directory.clone());
-    }
     let _guard = runtime.enter();
     let mcp_path = args
         .mcp_config

@@ -23,7 +23,4 @@ pub use providers::{
 pub use credentials::{Active, AuthError, AuthStore, Credential, mask_secret};
 mod config;
 pub use config::{ModelSelection, Protocol, ProviderConfig, ProviderEndpoint, ResolvedModel};
-mod catalog;
 mod discovery;
-mod request;
-pub use catalog::{MODELS_DEV_URL, ModelCatalog};

@@ -681,20 +681,20 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ### Provider model metadata
 
-`solaris-provider` separates `config`, `selection`, `credentials`, `catalog`,
-`request` and `discovery`. The application loads configuration and assembles services;
+`solaris-provider` separates `config`, `selection`, `credentials` and `discovery`. The application loads configuration and assembles services;
 the agent still depends only on the backend.
 
-`ModelCatalog` manages the lifecycle of the official `rig_core::catalog::Catalog`:
-built-in data, raw models.dev cache/refresh, then official user overrides. Solaris
+`ProviderConfig` holds an immutable official `rig_core::catalog::Catalog`:
+Rig built-in data plus official user overrides. Solaris performs no external metadata
+download, cache or refresh. Catalog updates come from dependency upgrades. Solaris
 has no independent snapshot, model schema, metadata parser or pricing algorithm.
 `ProviderConfig` holds named endpoints and model selections. Endpoint, request ID
 and metadata identity are independent; declared model facts bind the metadata to
 the exact wire alias. Unique manufacturer matching is an explicit gateway policy,
 not a name-prefix heuristic. Ambiguous and unknown facts remain unknown.
 
-`SelectedBackend` fixes official `ModelFacts`, output budget and capabilities once
-per request while reusing its HTTP pool. The backend passes those facts directly
+Provider selection fixes official `ModelFacts`, output budget and capabilities
+when constructing the backend, which reuses its HTTP pool. The backend passes those facts directly
 to official dialects and computes usage prices through official `Pricing::cost`.
 Standard API prices exclude service and long-context tiers and hosted tools.
 Subscription connections remove API pricing. Application accounting retains budgets,
