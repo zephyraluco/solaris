@@ -2,9 +2,7 @@
 //!
 //! Providers report usage under different names and disagree about what "input
 //! tokens" includes, so [`Usage`] normalises everything into four additive
-//! buckets. [`Price`] turns those buckets into dollars using the bundled
-//! snapshot of list prices, which is why a turn's cost is an estimate rather
-//! than a bill.
+//! buckets. Official catalog pricing turns those buckets into reference dollars.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +33,19 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub(crate) fn native(&self) -> rig_core::completion::Usage {
+        let mut usage = rig_core::completion::Usage::new();
+        usage.input_tokens = Some(
+            u64::from(self.input_tokens)
+                + u64::from(self.cache_read_tokens)
+                + u64::from(self.cache_write_tokens),
+        );
+        usage.output_tokens = Some(u64::from(self.output_tokens));
+        usage.cached_input_tokens = Some(u64::from(self.cache_read_tokens));
+        usage.cache_creation_input_tokens = Some(u64::from(self.cache_write_tokens));
+        usage
+    }
+
     /// Measured usage, with the two counts every provider reports.
     pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
         Self {
@@ -117,15 +128,6 @@ pub struct Price {
     pub cache_write: f64,
 }
 
-/// Rates that apply when total input (including caches) exceeds a threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PriceTier {
-    pub input_tokens_above: u32,
-    #[serde(flatten)]
-    pub price: Price,
-}
-
 impl Price {
     /// A price from its four rates, each in USD per million tokens.
     pub const fn per_million(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
@@ -140,28 +142,16 @@ impl Price {
     /// A model running on this machine, which costs nothing to call.
     pub const FREE: Price = Price::per_million(0.0, 0.0, 0.0, 0.0);
 
-    /// Choose the highest applicable context tier before calculating cost.
-    pub fn cost_with_tiers(&self, usage: &Usage, tiers: &[PriceTier]) -> f64 {
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
-        tiers
-            .iter()
-            .filter(|tier| input > tier.input_tokens_above)
-            .max_by_key(|tier| tier.input_tokens_above)
-            .map_or(*self, |tier| tier.price)
-            .cost(usage)
+    pub(crate) fn official(&self) -> rig_core::catalog::Pricing {
+        rig_core::catalog::Pricing::new(self.input, self.output)
+            .with_cache_read(self.cache_read)
+            .with_cache_write(self.cache_write)
     }
-
-    /// What `usage` costs at this price.
+    /// Delegate list-price calculation to the same policy used by native models.
     pub fn cost(&self, usage: &Usage) -> f64 {
-        let billed = |tokens: u32, rate: f64| f64::from(tokens) * rate / 1_000_000.0;
-
-        billed(usage.input_tokens, self.input)
-            + billed(usage.output_tokens, self.output)
-            + billed(usage.cache_read_tokens, self.cache_read)
-            + billed(usage.cache_write_tokens, self.cache_write)
+        self.official()
+            .cost(&usage.native())
+            .map_or(0.0, |cost| cost.total)
     }
 }
 

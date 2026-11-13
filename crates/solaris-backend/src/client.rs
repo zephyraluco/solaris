@@ -110,19 +110,10 @@ pub struct Backend {
 
 impl Backend {
     pub(super) fn usage_cost(&self, usage: Usage) -> f64 {
-        let mut native = rig_core::completion::Usage::new();
-        native.input_tokens = Some(
-            u64::from(usage.input_tokens)
-                + u64::from(usage.cache_read_tokens)
-                + u64::from(usage.cache_write_tokens),
-        );
-        native.output_tokens = Some(u64::from(usage.output_tokens));
-        native.cached_input_tokens = Some(u64::from(usage.cache_read_tokens));
-        native.cache_creation_input_tokens = Some(u64::from(usage.cache_write_tokens));
         self.facts
             .spec()
             .and_then(|s| s.pricing.as_ref())
-            .and_then(|p| p.cost(&native))
+            .and_then(|p| p.cost(&usage.native()))
             .map_or(0.0, |c| c.total)
     }
     pub(super) fn check_credentials(&self) -> Result<(), BackendError> {
@@ -140,7 +131,7 @@ impl Backend {
     }
     /// A backend for `plan`.
     pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
-        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec, Pricing};
+        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
         use rig_core::providers::registry::ProviderId;
         let mut spec = ModelSpec::new(
             ProviderId::declare("solaris").expect("valid declared vendor"),
@@ -149,11 +140,7 @@ impl Backend {
         .with_tools(true);
         spec.input.image = true;
         spec.max_output_tokens = Some(plan.max_tokens);
-        spec.pricing = plan.price.map(|p| {
-            Pricing::new(p.input, p.output)
-                .with_cache_read(p.cache_read)
-                .with_cache_write(p.cache_write)
-        });
+        spec.pricing = plan.price.map(|price| price.official());
         Ok(Self {
             client: http::client()?,
             endpoint: plan.endpoint,
