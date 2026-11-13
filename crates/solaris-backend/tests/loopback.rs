@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{AgentBackend, AgentEvent, Message, Price, TurnRequest, Usage, Wire};
+use solaris_backend::{AgentBackend, AgentEvent, Message, TurnRequest, Usage, Wire};
 use solaris_backend::{Backend, Endpoint, TurnPlan};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -103,7 +103,7 @@ fn backend_with(
     wire: Wire,
     model: &str,
     max_tokens: u32,
-    price: Option<Price>,
+    price: Option<rig_core::catalog::Pricing>,
 ) -> Backend {
     Backend::new(TurnPlan {
         endpoint: Endpoint {
@@ -117,8 +117,22 @@ fn backend_with(
         },
         model: model.to_string(),
         max_tokens,
-        price,
         prompt_cache_key: None,
+    })
+    .map(|backend| {
+        let mut spec = rig_core::catalog::ModelSpec::new(
+            rig_core::providers::registry::ProviderId::declare("test").unwrap(),
+            model,
+        )
+        .with_tools(true);
+        spec.pricing = price;
+        spec.input.image = true;
+        backend.with_model_facts(
+            model.into(),
+            max_tokens,
+            rig_core::catalog::ModelFacts::new(spec),
+            Default::default(),
+        )
     })
     .expect("client")
 }
@@ -262,7 +276,11 @@ async fn a_responses_turn_streams_over_a_real_socket() {
         "gpt-5",
         128_000,
         // The rate the catalogue would have handed over.
-        Some(Price::per_million(1.25, 10.00, 0.125, 0.00)),
+        Some(
+            rig_core::catalog::Pricing::new(1.25, 10.00)
+                .with_cache_read(0.125)
+                .with_cache_write(0.00),
+        ),
     )
     .run_turn(turn())
     .await
@@ -757,7 +775,7 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
         },
         model: "test".into(),
         max_tokens: 100,
-        price: None,
+
         prompt_cache_key: None,
     })
     .unwrap();

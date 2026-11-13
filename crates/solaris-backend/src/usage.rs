@@ -115,46 +115,6 @@ pub fn tokens_for_characters(characters: usize) -> u32 {
     (characters as u32).div_ceil(4)
 }
 
-/// List price for one model, in USD per million tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Price {
-    /// Rate for input tokens.
-    pub input: f64,
-    /// Rate for generated tokens.
-    pub output: f64,
-    /// Rate for input served from the prompt cache.
-    pub cache_read: f64,
-    /// Rate for input written to the prompt cache.
-    pub cache_write: f64,
-}
-
-impl Price {
-    /// A price from its four rates, each in USD per million tokens.
-    pub const fn per_million(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
-        Self {
-            input,
-            output,
-            cache_read,
-            cache_write,
-        }
-    }
-
-    /// A model running on this machine, which costs nothing to call.
-    pub const FREE: Price = Price::per_million(0.0, 0.0, 0.0, 0.0);
-
-    pub(crate) fn official(&self) -> rig_core::catalog::Pricing {
-        rig_core::catalog::Pricing::new(self.input, self.output)
-            .with_cache_read(self.cache_read)
-            .with_cache_write(self.cache_write)
-    }
-    /// Delegate list-price calculation to the same policy used by native models.
-    pub fn cost(&self, usage: &Usage) -> f64 {
-        self.official()
-            .cost(&usage.native())
-            .map_or(0.0, |cost| cost.total)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,23 +142,6 @@ mod tests {
         // One estimated half makes the total partly a guess.
         assert!(first.merge(Usage::estimate(4, 4)).estimated);
         assert!(Usage::estimate(4, 4).merge(first).estimated);
-    }
-
-    #[test]
-    fn cost_charges_each_bucket_at_its_own_rate() {
-        // Sonnet-shaped rates: a million plain input tokens, a million output
-        // tokens, and a million cached reads.
-        let price = Price::per_million(3.0, 15.0, 0.3, 3.75);
-        let usage = Usage::new(1_000_000, 1_000_000).with_cache(1_000_000, 1_000_000);
-
-        let expected = 3.0 + 15.0 + 0.3 + 3.75;
-        assert!((price.cost(&usage) - expected).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_free_model_costs_nothing() {
-        let usage = Usage::new(500_000, 500_000);
-        assert_eq!(Price::FREE.cost(&usage), 0.0);
     }
 
     #[test]

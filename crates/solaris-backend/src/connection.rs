@@ -194,7 +194,7 @@ mod tests {
             },
             model: "test".into(),
             max_tokens: 100,
-            price: None,
+
             prompt_cache_key: None,
         })
         .unwrap();

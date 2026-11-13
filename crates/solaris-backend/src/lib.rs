@@ -27,7 +27,7 @@ pub use event::{AgentEvent, BackendError, TurnRequest};
 pub use http::IDLE_TIMEOUT;
 pub use message::{Content, Message, MessageContext, Role};
 pub use tool::{ToolCall, ToolResult, ToolSpec};
-pub use usage::{Price, Usage, tokens_for_characters};
+pub use usage::{Usage, tokens_for_characters};
 pub use wire::Wire;
 
 use std::pin::Pin;

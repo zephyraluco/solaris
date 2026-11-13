@@ -1,7 +1,5 @@
 //! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
-use crate::{
-    AgentBackend, AgentEventStream, BackendError, Price, Support, TurnRequest, Usage, Wire,
-};
+use crate::{AgentBackend, AgentEventStream, BackendError, Support, TurnRequest, Usage, Wire};
 use crate::{convert, http, transport::CompletionRoute};
 use futures::StreamExt;
 use rig_core::driver::{DynModel, Model};
@@ -78,8 +76,8 @@ pub(super) fn session_id() -> &'static str {
 /// One turn, already resolved by the caller.
 ///
 /// Everything platform-specific has been decided before this point: which
-/// endpoint, which model, how large a reply to ask for, what that model costs,
-/// and whether a prompt-cache key should ride along.
+/// endpoint, which model, how large a reply to ask for, and whether a prompt-cache
+/// key should ride along. Official model facts are attached separately.
 #[derive(Debug, Clone)]
 pub struct TurnPlan {
     /// Where the turn goes and how it authenticates.
@@ -88,9 +86,6 @@ pub struct TurnPlan {
     pub model: String,
     /// Largest reply to ask for.
     pub max_tokens: u32,
-    /// List price for the model, when the caller knows one. The backend only
-    /// multiplies; it has no idea what any model costs by itself.
-    pub price: Option<Price>,
     /// Prompt-cache routing key, for the platforms that want one.
     pub prompt_cache_key: Option<&'static str>,
 }
@@ -140,7 +135,6 @@ impl Backend {
         .with_tools(true);
         spec.input.image = true;
         spec.max_output_tokens = Some(plan.max_tokens);
-        spec.pricing = plan.price.map(|price| price.official());
         Ok(Self {
             client: http::client()?,
             endpoint: plan.endpoint,
@@ -179,23 +173,6 @@ impl Backend {
     /// Select the protocol from the same resolution as the request model ID.
     pub fn with_wire(mut self, wire: Wire) -> Self {
         self.endpoint.wire = wire;
-        self
-    }
-
-    /// Attach explicit catalog metadata without inferring features from model names.
-    pub fn with_capabilities(mut self, capabilities: crate::ModelCapabilities) -> Self {
-        self.capabilities = capabilities;
-        self.capabilities.output_budget = Some(self.max_tokens);
-        if let Some(spec) = self.facts.spec() {
-            let mut spec = spec.clone();
-            spec.tools = self.capabilities.tool_calling != Support::Unsupported;
-            spec.input.image = self.capabilities.image_input != Support::Unsupported;
-            spec.context_window = self.capabilities.context_window;
-            spec.max_input_tokens = self.capabilities.max_input;
-            spec.max_output_tokens = self.capabilities.max_output;
-            self.facts = rig_core::catalog::ModelFacts::new(spec)
-                .with_catalog(&rig_core::catalog::Catalog::default());
-        }
         self
     }
 
@@ -392,7 +369,7 @@ mod pricing_tests {
             },
             model: "alias".into(),
             max_tokens: 4096,
-            price: None,
+
             prompt_cache_key: None,
         })
         .unwrap()

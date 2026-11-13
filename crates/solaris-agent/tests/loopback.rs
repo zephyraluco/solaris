@@ -135,7 +135,7 @@ fn backend(addr: SocketAddr) -> Backend {
         },
         model: "test-model".to_string(),
         max_tokens: 4096,
-        price: None,
+
         prompt_cache_key: None,
     })
     .expect("client")
@@ -292,7 +292,7 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
         },
         model: "native-model".into(),
         max_tokens: 1234,
-        price: None,
+
         prompt_cache_key: None,
     })
     .unwrap();
@@ -481,11 +481,23 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
             ],
         })
         .unwrap();
-    let model = backend(addr).with_capabilities(solaris_backend::ModelCapabilities {
-        context_window: Some(8192),
-        max_output: Some(4096),
-        ..Default::default()
-    });
+    let spec = rig_core::catalog::ModelSpec::new(
+        rig_core::providers::registry::ProviderId::declare("test").unwrap(),
+        "test-model",
+    )
+    .with_tools(true)
+    .with_context_window(8192)
+    .with_max_output_tokens(4096);
+    let model = backend(addr).with_model_facts(
+        "test-model".into(),
+        4096,
+        rig_core::catalog::ModelFacts::new(spec),
+        solaris_backend::ModelCapabilities {
+            context_window: Some(8192),
+            max_output: Some(4096),
+            ..Default::default()
+        },
+    );
     let mut options = AgentOptions::in_directory(directory.path());
     options.compaction.keep_recent_tokens = 1;
     let agent = Agent::new(
