@@ -672,7 +672,7 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 - **摘要是有损的**。被替换掉的那些消息只剩模型写的那段摘要，原文不再发给 provider；摘要本身是一次模型调用，因此压缩只在必要时发生（或用户 `/compact` 时）。转录里会留一行说明压掉了几条。
 - **`grep` 与 `find` 需要外部程序**。它们 shell out 到 ripgrep 与 fd；缺失时工具会明确报错并给出安装提示，而不是退化成另一个实现。
 - **工具输出是截断的**。读类保留前 2000 行或 50KB，命令类保留末尾并把完整输出写进临时文件；被截断的那部分只有通过报告出来的路径才读得到。
-- **价格是内置快照**。`provider` 表里的单价是打表值，账单可能不同；未知模型按 0 计。
+- **价格是官方目录参考价**。Rig 计算标准 API 单价估算，账单可能不同；未知价格保持未知。
 - **报不了用量的服务端会被估算**。OpenAI 兼容服务里有一部分不实现 `stream_options.include_usage`，那一轮退回按字符估算，并在 `/stats` 里标注 `≈`。
 - **Windows 上不启用 bracketed paste**，粘贴内容以按键事件到达（`Component::handle_paste` 不会被调用）。
 - **拖选依赖系统剪贴板**。`arboard` 打不开剪贴板时（例如无 X11 / Wayland 的 headless 环境），高亮仍然生效，只是 `Ctrl+C` 会发一条「取不到剪贴板」的警告。
@@ -681,17 +681,29 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 
 ### Provider model metadata
 
-`solaris-provider::ModelCatalog` normalizes models.dev v2 and OpenRouter catalogs
-into provider-scoped snapshots. Startup merges independent validated caches over a
-bundled snapshot and refreshes them in the background. Exact model lookup and user
-overrides produce one `ResolvedModel` containing request aliases, capabilities,
-limits, provider prices, context tiers and field provenance. Explicit capability references across providers never import prices or protocols.
-Providers without catalogs can fall back to a unique exact model ID in the bundled
-manufacturer allowlist, including official estimated prices; user overrides win. `choose_backend` captures an
-immutable resolution for each HTTP request; later requests can observe refreshed
-metadata while reusing the HTTP pool. Agent code consumes backend capabilities and
-input budgets without depending on provider catalog types. Provider credentials and
-wire selection remain in the application/provider boundary.
+`solaris-provider` separates `config`, `selection`, `credentials`, `catalog`,
+`request` and `discovery`. The application loads configuration and assembles services;
+the agent still depends only on the backend.
+
+`ModelCatalog` manages the lifecycle of the official `rig_core::catalog::Catalog`:
+built-in data, raw models.dev cache/refresh, then official user overrides. Solaris
+has no independent snapshot, model schema, metadata parser or pricing algorithm.
+`ProviderConfig` holds named endpoints and model selections. Endpoint, request ID
+and metadata identity are independent; declared model facts bind the metadata to
+the exact wire alias. Unique manufacturer matching is an explicit gateway policy,
+not a name-prefix heuristic. Ambiguous and unknown facts remain unknown.
+
+`SelectedBackend` fixes official `ModelFacts`, output budget and capabilities once
+per request while reusing its HTTP pool. The backend passes those facts directly
+to official dialects and computes usage prices through official `Pricing::cost`.
+Standard API prices exclude service and long-context tiers and hosted tools.
+Subscription connections remove API pricing. Application accounting retains budgets,
+settlement and journals; it does not select model price tiers.
+
+Model discovery is a separate endpoint operation. `ModelDiscovery` caches the remote
+list of account-visible model IDs and marks offline fallback. Credentials use the
+SDK authenticator, with shared refresh state and atomic local persistence. Custom
+endpoints may reference API credentials but cannot receive subscription tokens.
 
 ### Resource preparation, context projection, and billing
 

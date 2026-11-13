@@ -352,25 +352,34 @@ solaris 是从两个项目移植 / 借鉴设计的 Rust 实现，源码在相关
 
 ## 模型目录与参数覆盖
 
-模型能力、上下文及输入输出限制、价格默认来自 models.dev 的 Provider 目录，
-OpenRouter 使用自身目录优先补充。随包快照仅保留 OpenAI、Anthropic、Google、
-DeepSeek、xAI、Mistral、Meta、Moonshot、智谱和 MiniMax；
-网关参数由运行时缓存和刷新提供。启动读取有效缓存或快照，
-后台更新目录，失败继续使用已有数据。模型按 Provider 和 ID 精确匹配，
-不按名称前缀匹配。当 Provider 没有目录时，按模型 ID 精确匹配主流厂商；
-唯一匹配时继承官方参数和估算价格，用户配置优先。存在歧义时保留默认值。
+模型能力、限制、编码规则和参考价格统一来自 Rig 官方 Catalog。加载顺序为
+Rig 内置目录 → models.dev 原始缓存及后台更新 → 用户显式覆盖。Solaris 不再维护
+自己的快照、模型 schema、价格解析器或 OpenRouter 通用覆盖层。后台每 24 小时更新，
+失败保留当前有效目录；公共目录请求不携带模型服务凭证。
 
-全局 `models.json` 保持现有格式，用户配置优先。新增可选字段：
+全局 `models.json` 改为三个对象：
 
-- `request_id`：实际请求名称，默认等于 `id`。
-- `catalog`：例如 `{"provider":"anthropic","id":"claude-sonnet-4-5"}`，为网关别名引用能力和限制；不会继承其他平台的价格或协议。
-- `output_tokens`：请求的输出预算，受模型输出和上下文限制约束，默认 8,192。
-- `capabilities.max_input`：模型的独立输入上限。
-- `price_tiers`：包含 `input_tokens_above` 和四项价格的长上下文阶梯费率。
+- `providers`：命名端点，包含 `protocol`、`base_url` 和可选的 `credential` 引用。
+- `models`：命名模型，包含 `provider`、`request_id`、可选的 `metadata` 和 `output_tokens`。
+- `overrides`：Rig 官方覆盖格式，以厂商、`models` 和模型行组织参数。
 
-价格单位为美元/百万 tokens。缺失价格保持未知，显式零价格表示免费；
-ChatGPT 账号授权不按 API 价格估算。`--print-config` 显示最终参数及来源。
-维护者使用 `bash scripts/update-model-catalog.sh` 更新随包快照。
+完整示例见 [英文配置说明](README.md#model-capabilities-and-offline-model-lists)。
+运行 `solaris --model fast` 可选择示例中的命名模型及其端点。
+`request_id` 原样发送给服务端，`metadata` 如 `anthropic/claude-sonnet-4-5`
+只绑定模型事实，不改变端点或协议。自定义端点支持 `openai-chat`、
+`openai-responses` 和 `anthropic-messages`；凭证引用 `auth.json` 已保存的 API 凭据，
+不允许转发 ChatGPT 账户令牌。
+
+不再兼容旧版 `models` 数组、`capabilities`、`price_tiers` 等配置。
+迁移时将别名改为命名模型，将 `catalog` 改为 `metadata`；模型能力和价格改用
+官方覆盖行中的 `tool_call`、`modalities`、`limit`、`cost` 和 `rig` 等字段。
+模型匹配采用官方规则；未知网关只对允许的主流厂商执行唯一 ID 匹配，歧义保留未知。
+未知上下文由应用采用 128,000 token 预算回退，默认回复预算最多 8,192 token。
+
+Rig 按标准 API 单价计算参考费用，不包含长上下文阶梯、服务等级及托管工具费用。
+网关继承厂商价格时标记为参考价；未知价格保持未知，账户订阅不使用 API 价格。
+每次请求固定一份官方模型事实，后续请求才看到刷新；`--print-config` 显示解析结果。
+远程可用模型列表单独缓存，不与模型参数目录混合。
 
 ## 上下文投影与请求计费
 

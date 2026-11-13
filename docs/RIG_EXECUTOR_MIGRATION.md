@@ -56,6 +56,17 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked
 
 正常模型—工具循环始终由完整 AgentRunner 驱动。on_completion_call 检查 steering、后台完成和上下文预算；没有协调需求就继续，有需求才停止并交接。内部停止有阶段状态与专用原因双重校验，不作为用户取消显示。保存失败不继续执行；取消与交接竞争时仍发送取消终态。
 
-交接前保留官方 conversation 的保存基线，核对 SDK 返回的完整历史确实扩展这个前缀，保留原有消息 ID 与 asides，再依赖 Store 的原子长度检查提交。模型请求预算、子任务计数、执行期限、计费和任务身份不会随 SDK 阶段重置。
+交接前保留官方 conversation 的保存基线，捕获 SDK 请求前的原始历史，核对它扩展保存前缀，并与 SDK 取消时返回的规范化历史等价。取消会合并相邻 user 消息，因此不直接用该规范化结果逐条比对原始前缀。保存时保留原有消息 ID 与 asides，再依赖 Store 的原子长度检查提交。模型请求预算、子任务计数、执行期限、计费和任务身份不会随 SDK 阶段重置。
 
 这不是对同一个活跃 AgentRun 的原地修改，也不是每轮重启：只有需要正式历史变更时才交接。工具正在执行时不被 steering 打断；进程崩溃或直接丢弃 future 也不保证运行结束 hook 执行。当前不做每个工具步骤的耐崩溃消息提交，产品工具意图和费用仍独立记录。
+
+## Provider 重构
+
+provider 内部已拆成配置、选择、认证、官方目录加载、请求准备和模型发现。
+`ProviderConfig` 支持命名端点及模型；`ModelCatalog` 只管理官方 Catalog 的加载与刷新。
+已删除自建快照、上游解析器、价格阶梯实现及生成脚本。backend 直接接收官方
+ModelFacts，编码和标准参考费用均使用官方实现。认证仍通过官方 authenticator，
+共享刷新状态由 Solaris 管理。模块依赖方向不变，agent 不依赖 provider。
+
+`models.json` 使用 `providers`、命名 `models` 和官方格式的 `overrides`，不兼容旧数组格式。
+配置迁移示例见 README。模型列表发现与参数目录分离，显式元数据引用在加载缓存后校验。

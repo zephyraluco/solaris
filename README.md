@@ -294,7 +294,7 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 
 - **Streaming.** Text and thinking arrive as the model produces them; `Ctrl+C` mid-stream cancels the request by dropping the connection.
 - **Retries.** A `429`, a `5xx` or a dropped connection is retried up to three times with backoff, but only *before* the first token — after that a retry would duplicate text, so the failure is reported instead.
-- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
+- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from the official model catalog, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
 - **Prompt caching.** solaris asks for it rather than hoping: an Anthropic `cache_control` breakpoint on the last message, and an OpenAI `prompt_cache_key` when the endpoint is OpenAI's own. That is what makes the cache rows in `/stats` move, and why a long conversation gets cheaper per turn as the unchanged prefix starts coming back as cache reads.
 - **Context.** `/stats` reports `session tokens` (everything the session has spent) and `context used` separately. Only the second says how full the window is: it is the last turn's reported usage plus a size estimate for anything submitted since, because summing a session's turns would grow without bound and say nothing about a per-request window.
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
@@ -487,63 +487,74 @@ bounded independently.
 
 ## Model capabilities and offline model lists
 
-Model capabilities, context/input/output limits and pricing come from provider-scoped
-[models.dev](https://models.dev/experimental/v2.0/api.json) metadata. OpenRouter's own
-model catalog takes precedence for OpenRouter. A compact snapshot ships with Solaris;
-the bundled snapshot includes only OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
-Meta, Moonshot, Zhipu and MiniMax. Gateway metadata is available from
-runtime caches and refreshes. Startup loads validated local caches immediately, then refreshes public catalogs in
-the background (24-hour freshness, hourly retry). Downloads never receive provider
-credentials. Failed refreshes retain cached data or the bundled snapshot.
+Model capabilities, limits, encoding rules and reference prices come from the
+official Rig catalog. Solaris loads Rig's built-in data, applies a cached
+[models.dev](https://models.dev/api.json) update, then applies explicit user
+overrides. Background refresh runs every 24 hours; failures retain the current
+catalog. Downloads never receive provider credentials. Solaris maintains no model
+snapshot or separate metadata parser.
 
-Matching uses exact, case-sensitive provider/model IDs. Solaris's `opencode` provider
-maps to the upstream `opencode-go` catalog. When a provider has no catalog, an exact model ID shared by only one of these
-manufacturers inherits that manufacturer's parameters and estimated prices; user
-overrides still win. Ambiguous or unknown IDs retain unknown features and prices,
-a 128,000-token context window and an 8,192-token output limit. The default
-requested output is capped at 8,192 and the model's limits. Model-name prefixes do not
-imply capabilities, prices or request protocols.
+Models are resolved by provider and ID using Rig's lookup rules, including its
+dated-snapshot matching. `opencode` maps to `opencode-go`. Unknown gateways may
+match a unique model ID among OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
+Meta, Moonshot, Zhipu and MiniMax. Ambiguous and unknown models retain unknown
+capabilities and prices; the application uses a 128,000-token fallback context
+budget and requests at most 8,192 output tokens, capped by known limits.
 
-`models.json` in the user configuration directory provides explicit, provider-scoped
-overrides. For example:
+`models.json` now uses named model selections and official catalog overrides.
+The previous array-based format is no longer accepted. For example:
 
 ```json
 {
-  "models": [{
-    "provider": "local",
-    "id": "my-model",
-    "capabilities": {
-      "tool_calling": "supported",
-      "image_input": "unsupported",
-      "structured_output": "unknown",
-      "context_window": 32768,
-      "max_output": 4096
+  "providers": {
+    "gateway": {
+      "protocol": "openai-chat",
+      "base_url": "https://example.com/v1",
+      "credential": "new-api"
     }
-  }]
+  },
+  "models": {
+    "fast": {
+      "provider": "gateway",
+      "request_id": "private-alias",
+      "metadata": "anthropic/claude-sonnet-4-5",
+      "output_tokens": 4096
+    }
+  },
+  "overrides": {
+    "anthropic": {
+      "models": {
+        "claude-sonnet-4-5": {
+          "limit": { "context": 200000, "output": 64000 }
+        }
+      }
+    }
+  }
 }
 ```
 
-Feature values are `supported`, `unsupported`, or `unknown`; unknown features are
-not inferred from model names. A model that explicitly lacks tool calling receives
-no tools. Strict schema sampling is enabled only for explicit support and compatible
-schemas. `--print-config` reports resolved capabilities. Optional `price` uses
-`input`, `output`, `cache_read`, and `cache_write` USD-per-million-token rates.
-Unknown prices display as unknown; `--max-cost` requires known pricing.
+Run `solaris --model fast` to select the named model and its provider. `request_id`
+is sent unchanged; `metadata` identifies the official model facts and never
+changes the endpoint or protocol. It may be omitted for ordinary model matching.
+Custom providers support `openai-chat`, `openai-responses`, and
+`anthropic-messages`; their names must not replace a built-in provider.
+`credential` references an API credential already stored in `auth.json` (the
+example uses `/connect`'s New API credential); omit it for a keyless endpoint.
+ChatGPT subscription tokens cannot be used by custom endpoints.
 
-An override may additionally set `request_id` (defaults to `id`), `output_tokens` (requested reply budget), and
-`catalog: {"provider": "anthropic", "id": "claude-sonnet-4-5"}` to map a gateway alias
-to catalog capabilities. This reference never imports another provider's price or
-protocol. `capabilities.max_input` limits the input budget separately from the total
-context window. Optional `price_tiers` entries contain `input_tokens_above` and the
-same four price fields; the highest matching threshold is used. Explicit zero prices
-mean free, while absent input/output prices remain unknown. ChatGPT account sessions
-never use API prices. `--print-config` includes resolved parameters and their sources.
-Updates apply at the next model request and reuse the HTTP connection pool.
+The `overrides` object follows Rig's strict catalog override format: vendor keys,
+`models`, and model rows with fields such as `limit`, `cost`, `tool_call`,
+`modalities` and `rig`. Use it for custom model facts as well as changes to known
+models. To migrate an old override, replace `capabilities` and `price` with the
+official row fields; replace `catalog` with the selection's `metadata` reference.
+Unknown fields and invalid references fail configuration loading.
 
-Maintainers can regenerate the bundled snapshot with
-`bash scripts/update-model-catalog.sh`. Both refresh and generation use the same
-Rust source adapters; unused upstream documentation and benchmarks are omitted.
-The snapshot is metadata, not a guarantee that an account can access every model.
+Prices are USD per million tokens. Rig computes standard API list-price estimates;
+long-context tiers, service tiers and hosted-tool fees are not included. Gateway
+metadata inherited from a manufacturer is marked as a reference price. Unknown
+prices remain unknown, and ChatGPT account sessions do not use API prices.
+`--print-config` shows the resolved official facts. Each request fixes its facts;
+later requests see catalog refreshes while reusing the HTTP connection pool.
 
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
@@ -551,7 +562,7 @@ cache entries are rejected. This cache stores model IDs, not credentials.
 
 ## Images
 
-For a model explicitly marked `image_input: "supported"` in `models.json`,
+For a model whose official catalog facts enable image input,
 `read` can return PNG, JPEG, GIF and WebP images as image content. Headless runs
 can use `--image <PATH>` with `--print` (up to eight images, 8 MiB each). Detection
 uses file signatures. Unknown/unsupported model capabilities fail locally.
