@@ -9,12 +9,16 @@ description = "The agent session for solaris: tools declared to a model and run 
 [lints]
 workspace = true
 
+[features]
+test-utils = ["solaris-backend/test-utils"]
+
 [dependencies]
 rig-agent.workspace = true
 rig-memory = { version = "0.46.0", features = ["fs"] }
 rig-core.workspace = true
 solaris-backend = { workspace = true }
 solaris-tools = { workspace = true }
+solaris-types.workspace = true
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -28,6 +32,7 @@ sha2 = "0.10"
 jsonschema = { version = "0.33", default-features = false }
 
 [dev-dependencies]
+solaris-agent = { path = ".", features = ["test-utils"] }
 solaris-backend = { workspace = true, features = ["test-utils"] }
 rig-core = { workspace = true, features = ["test-utils"] }
 tempfile = "3"

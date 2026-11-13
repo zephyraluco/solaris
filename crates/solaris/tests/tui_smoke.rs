@@ -14,10 +14,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
+use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Role, ToolCall, Usage,
+    AgentEvent, AgentEventStream, BackendError, ModelConnector, Role, ToolCall, Usage,
 };
-use solaris_backend::testing::TurnRequest;
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 
@@ -50,11 +50,11 @@ const FOOTER: u16 = HEIGHT - 1;
 struct FakeBackend;
 
 #[async_trait::async_trait]
-impl AgentBackend for FakeBackend {
+impl ModelConnector for FakeBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -96,11 +96,11 @@ struct ToolBackend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for ToolBackend {
+impl ModelConnector for ToolBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -154,11 +154,11 @@ struct DelegatingBackend {
 struct InspectingBackend;
 
 #[async_trait::async_trait]
-impl AgentBackend for InspectingBackend {
+impl ModelConnector for InspectingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -208,11 +208,11 @@ impl InspectingBackend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for DelegatingBackend {
+impl ModelConnector for DelegatingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -488,12 +488,12 @@ impl Harness {
     }
 
     /// A harness driven by `backend` rather than the echoing fake.
-    fn with_backend(backend: Arc<dyn AgentBackend>) -> Self {
+    fn with_backend(backend: Arc<dyn ModelConnector>) -> Self {
         let (clipboard, _) = clipboard_for(None);
         Self::with_backend_and_clipboard(backend, clipboard)
     }
 
-    fn with_backend_and_clipboard(backend: Arc<dyn AgentBackend>, clipboard: Clipboard) -> Self {
+    fn with_backend_and_clipboard(backend: Arc<dyn ModelConnector>, clipboard: Clipboard) -> Self {
         let fallback = Arc::clone(&backend);
         let mut tui = Tui::new();
         let mut options = AppOptions::new(

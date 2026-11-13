@@ -1,12 +1,12 @@
 //! Application-owned translation from provider resolution to agent inputs.
 
-use solaris_agent::AgentBackendConfig;
+use solaris_agent::ConnectionConfig;
 use solaris_provider::{BackendChoice, DEFAULT_CONTEXT_WINDOW, provider_spec};
 
 /// Resolve provider catalogue metadata into the agent's execution contract.
 /// Authentication provenance and endpoint configuration remain in the app.
-pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
-    AgentBackendConfig {
+pub fn agent_backend(choice: BackendChoice) -> ConnectionConfig {
+    ConnectionConfig {
         fallback_context_window: choice
             .backend
             .capabilities()
@@ -27,18 +27,18 @@ pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_agent::{AgentBackend, AgentEventStream, BackendError};
-    use solaris_backend::testing::TurnRequest;
+    use solaris_agent::testing::TurnRequest;
+    use solaris_agent::{AgentEventStream, BackendError, ModelConnector};
     use solaris_provider::CredentialSource;
     use std::sync::Arc;
 
     struct Backend;
     #[async_trait::async_trait]
-    impl AgentBackend for Backend {
+    impl ModelConnector for Backend {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(solaris_agent::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -55,8 +55,9 @@ mod tests {
 
     #[test]
     fn application_resolves_endpoint_instructions_and_context_fallback() {
-        let backend: Arc<dyn AgentBackend> = Arc::new(Backend);
+        let backend: Arc<dyn ModelConnector> = Arc::new(Backend);
         let config = agent_backend(BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
             configuration: Default::default(),
             backend: Arc::clone(&backend),
             provider_id: Some("local".into()),
@@ -78,6 +79,7 @@ mod tests {
     #[test]
     fn unresolved_provider_does_not_add_endpoint_instructions() {
         let config = agent_backend(BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
             configuration: Default::default(),
             backend: Arc::new(Backend),
             provider_id: None,

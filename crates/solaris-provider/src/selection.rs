@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{AgentBackend, Backend, BackendError, Endpoint, TurnPlan};
+use solaris_backend::{Backend, BackendError, Endpoint, ModelConnector, TurnPlan};
 
 use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, provider_spec};
 use crate::{AuthStore, Credential};
@@ -28,7 +28,7 @@ impl UnconnectedBackend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for UnconnectedBackend {
+impl ModelConnector for UnconnectedBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         Err(BackendError::new(self.message.clone()))
     }
@@ -103,7 +103,8 @@ pub enum CredentialSource {
 #[derive(Clone)]
 pub struct BackendChoice {
     /// The backend to use.
-    pub backend: Arc<dyn AgentBackend>,
+    pub backend: Arc<dyn ModelConnector>,
+    pub models: Arc<dyn crate::ModelSource>,
     pub configuration: Arc<crate::ProviderConfig>,
     /// Provider this resolved to, when one was picked at all.
     pub provider_id: Option<String>,
@@ -122,6 +123,7 @@ impl BackendChoice {
     fn unconnected(reason: CredentialSource, message: String, model: &str) -> Self {
         Self {
             backend: Arc::new(UnconnectedBackend::new(message)),
+            models: Arc::new(crate::UnavailableModels),
             configuration: Arc::new(crate::ProviderConfig::default()),
             provider_id: None,
             base_url: None,
@@ -300,7 +302,14 @@ fn connect(
         }
     };
     let base_url = backend.base_url().to_owned();
-    let (backend, source): (Arc<dyn AgentBackend>, _) = if model.is_empty() {
+    let backend = Arc::new(backend);
+    let models = Arc::new(crate::discovery::ModelDiscovery {
+        inner: Arc::clone(&backend),
+        cache_dir: options.model_cache_dir.clone(),
+        endpoint: format!("{provider}:{base_url}"),
+        notice: std::sync::Mutex::new(None),
+    });
+    let (backend, source): (Arc<dyn ModelConnector>, _) = if model.is_empty() {
         (
             Arc::new(NamelessBackend {
                 endpoint: backend,
@@ -309,19 +318,12 @@ fn connect(
             CredentialSource::NoModel,
         )
     } else {
-        (
-            Arc::new(crate::discovery::ModelDiscovery {
-                inner: Arc::new(backend),
-                cache_dir: options.model_cache_dir.clone(),
-                endpoint: format!("{provider}:{base_url}"),
-                notice: std::sync::Mutex::new(None),
-            }),
-            source,
-        )
+        (backend, source)
     };
     BackendChoice {
         configuration: Arc::clone(&options.configuration),
         backend,
+        models,
         provider_id: Some(provider.into()),
         base_url: Some(base_url),
         model: model.into(),
@@ -337,23 +339,19 @@ fn connect(
 /// model list is still fetched.
 struct NamelessBackend {
     /// The client the credential resolved to, used for the model list.
-    endpoint: Backend,
+    endpoint: Arc<Backend>,
     /// What a turn says instead of being sent.
     message: String,
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for NamelessBackend {
+impl ModelConnector for NamelessBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         Err(BackendError::new(self.message.clone()))
     }
 
     fn label(&self) -> &str {
         self.endpoint.label()
-    }
-
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.endpoint.models().await
     }
 }
 
@@ -516,7 +514,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_backend::testing::TurnRequest;
+    use solaris_agent::testing::TurnRequest;
 
     /// Options with a fixed environment, so tests never touch the process's
     /// variables or the network.
@@ -565,7 +563,7 @@ mod tests {
         assert_eq!(choice.provider_id.as_deref(), None);
         assert_eq!(choice.backend.label(), "unconnected");
 
-        let error = match solaris_backend::testing::request(choice.backend, request()).await {
+        let error = match solaris_agent::testing::request(choice.backend, request()).await {
             Ok(_) => panic!("an unconnected backend must not answer"),
             Err(error) => error,
         };
@@ -685,7 +683,7 @@ mod tests {
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
-        let error = match solaris_backend::testing::request(choice.backend, request()).await {
+        let error = match solaris_agent::testing::request(choice.backend, request()).await {
             Ok(_) => panic!("a model-less provider must not be asked"),
             Err(error) => error,
         };
@@ -713,7 +711,7 @@ mod tests {
         let choice = choose_backend(&auth, "", options());
 
         let error = choice
-            .backend
+            .models
             .models()
             .await
             .expect_err("nothing is listening");

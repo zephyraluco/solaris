@@ -5,15 +5,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{AgentEvent, AgentEventStream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solaris_backend::{AgentBackend, AgentEvent, AgentEventStream, BackendError};
+use solaris_backend::{BackendError, ModelConnector};
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
-use crate::{Agent, AgentBackendConfig, AgentOptions, Mode, ResourceSnapshot, default_tool_names};
+use crate::{Agent, AgentOptions, ConnectionConfig, Mode, ResourceSnapshot, default_tool_names};
 
 /// Runtime tool for delegating a self-contained task to an isolated child agent.
 pub const SUBAGENT_TOOL: &str = "subagent";
@@ -93,7 +94,7 @@ pub(crate) struct Task {
 
 /// Snapshot captured at the parent's turn boundary, not a reference to its history.
 pub(crate) struct SubagentRunner {
-    pub choice: AgentBackendConfig,
+    pub choice: ConnectionConfig,
     pub parent: Option<Arc<crate::SessionJournal>>,
     pub billing: Arc<crate::conversation::Conversation>,
     pub registry: Arc<ToolRegistry>,
@@ -430,14 +431,14 @@ async fn collect(
 /// Counts every provider request (including compaction), even when the child
 /// eventually fails. Never reports a child's usage as the parent's context size.
 struct BoundedBackend {
-    inner: Arc<dyn AgentBackend>,
+    inner: Arc<dyn ModelConnector>,
     requests: AtomicUsize,
     totals: Arc<Mutex<Totals>>,
     usage_tx: Option<UnboundedSender<AgentEvent>>,
 }
 
 #[async_trait]
-impl AgentBackend for BoundedBackend {
+impl ModelConnector for BoundedBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         let client = Arc::clone(&self.inner).model_client().await?;
         if self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {

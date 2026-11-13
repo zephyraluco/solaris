@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use solaris_backend::{AgentEventStream, BackendError};
+use crate::AgentEventStream;
 use solaris_tools::{Cancel, ToolRegistry, ToolSelection};
 
 use crate::approver::{AlwaysApprove, Approver};
@@ -16,7 +16,7 @@ use crate::queue::Queue;
 use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
 use crate::skills::Skills;
 use crate::subagent::{SubagentRunner, SubagentTool};
-use crate::{AgentBackendConfig, InputError, PromptContext, ResourceSnapshot, expand_input};
+use crate::{ConnectionConfig, InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
@@ -148,7 +148,7 @@ struct CachedPrompt {
 pub struct Agent {
     prompts: RwLock<Vec<CachedPrompt>>,
     /// Application-resolved backend and execution metadata.
-    choice: AgentBackendConfig,
+    choice: ConnectionConfig,
     active: Arc<std::sync::atomic::AtomicBool>,
     /// Every tool this platform has, built once so `edit` and `write` keep
     /// serialising against the same per-file locks for the whole session.
@@ -168,7 +168,7 @@ pub struct Agent {
 impl Agent {
     /// A session over `choice`, offering the registry's tools.
     pub fn new(
-        choice: AgentBackendConfig,
+        choice: ConnectionConfig,
         registry: Arc<ToolRegistry>,
         mut options: AgentOptions,
     ) -> Self {
@@ -283,7 +283,7 @@ impl Agent {
 
     /// Replace transport credentials at an idle boundary without losing the
     /// conversation, queued input, resources, tools or cancellation handle.
-    pub fn with_refreshed_backend(&self, choice: AgentBackendConfig) -> Self {
+    pub fn with_refreshed_backend(&self, choice: ConnectionConfig) -> Self {
         // Persistence failures are retained by the conversation and block the
         // next request, including callers whose refresh API cannot return errors.
         self.conversation
@@ -359,7 +359,7 @@ impl Agent {
         let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))?;
         let cancel = self.cancel.begin_turn();
         let budget = crate::ExecutionBudget::new(self.options.execution.budget.clone());
-        let inner: Arc<dyn solaris_backend::AgentBackend> =
+        let inner: Arc<dyn solaris_backend::ModelConnector> =
             Arc::new(crate::budget::BudgetedBackend {
                 inner: Arc::new(crate::billing::AccountingBackend {
                     inner: Arc::clone(&self.choice.backend),
@@ -394,9 +394,6 @@ impl Agent {
 
     pub fn capabilities(&self) -> solaris_backend::ModelCapabilities {
         self.choice.backend.capabilities()
-    }
-    pub fn model_catalog_notice(&self) -> Option<String> {
-        self.choice.backend.model_catalog_notice()
     }
 
     fn rebuild_prompts(&self) {
@@ -472,11 +469,6 @@ impl Agent {
 
     pub fn usage_totals(&self) -> Option<crate::UsageTotals> {
         self.conversation.usage_totals()
-    }
-
-    /// The models the endpoint offers, for the picker to choose from.
-    pub async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.choice.backend.models().await
     }
 
     /// The context window of the model this session will ask.
@@ -685,13 +677,12 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::testing::TurnRequest;
+    use crate::{AgentEvent, AgentEventStream};
     use async_trait::async_trait;
     use futures::StreamExt;
     use serde_json::{Value, json};
-    use solaris_backend::testing::TurnRequest;
-    use solaris_backend::{
-        AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, Usage,
-    };
+    use solaris_backend::{BackendError, ModelConnector, ToolCall, Usage};
     use solaris_tools::{SHELL_TOOL, Tool, ToolContext, ToolOutput};
 
     #[tokio::test]
@@ -887,11 +878,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentBackend for Scripted {
+    impl ModelConnector for Scripted {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(crate::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -921,11 +912,11 @@ mod tests {
     struct Listed;
 
     #[async_trait]
-    impl AgentBackend for Listed {
+    impl ModelConnector for Listed {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(crate::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -936,10 +927,6 @@ mod tests {
 
         fn label(&self) -> &str {
             "listed"
-        }
-
-        async fn models(&self) -> Result<Vec<String>, BackendError> {
-            Ok(vec!["first".to_string()])
         }
     }
     impl Listed {
@@ -979,8 +966,8 @@ mod tests {
     }
 
     /// A backend as the choice carries it, with a provider behind it.
-    fn choice(backend: Arc<dyn AgentBackend>) -> AgentBackendConfig {
-        AgentBackendConfig {
+    fn choice(backend: Arc<dyn ModelConnector>) -> ConnectionConfig {
+        ConnectionConfig {
             backend,
             provider_id: Some("anthropic".into()),
             model: "claude-sonnet-4-5".to_string(),
@@ -990,7 +977,7 @@ mod tests {
     }
 
     /// A session over `backend`, offering every built-in tool.
-    fn agent(backend: Arc<dyn AgentBackend>) -> Agent {
+    fn agent(backend: Arc<dyn ModelConnector>) -> Agent {
         Agent::new(
             choice(backend),
             Arc::new(ToolRegistry::builtin()),
@@ -1403,11 +1390,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_backends_label_and_models_pass_through() {
+    async fn the_connection_label_passes_through() {
         let agent = agent(Arc::new(Listed));
 
         assert_eq!(agent.label(), "listed");
-        assert_eq!(agent.models().await.expect("a list"), ["first"]);
     }
 
     #[test]

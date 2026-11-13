@@ -133,20 +133,20 @@ pub async fn serve_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_agent::testing::TurnRequest;
     use solaris_agent::{
-        Agent, AgentBackend, AgentBackendConfig, AgentOptions, BackendError, ToolRegistry,
+        Agent, AgentOptions, BackendError, ConnectionConfig, ModelConnector, ToolRegistry,
     };
-    use solaris_backend::testing::TurnRequest;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
     struct Waiting;
     #[async_trait::async_trait]
-    impl AgentBackend for Waiting {
+    impl ModelConnector for Waiting {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(solaris_agent::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -163,7 +163,7 @@ mod tests {
 
     fn session() -> SessionRuntime {
         SessionRuntime::new(Agent::new(
-            AgentBackendConfig {
+            ConnectionConfig {
                 backend: Arc::new(Waiting),
                 provider_id: None,
                 model: "test".into(),

@@ -15,12 +15,12 @@ type Response = Pin<Box<dyn Future<Output = Result<AgentEventStream, BackendErro
 struct Fixture {
     reply: Box<dyn Fn(TurnRequest) -> Response + Send + Sync>,
 }
-pub fn client<F, Fut>(capabilities: crate::ModelCapabilities, reply: F) -> ModelClient
+pub fn client<F, Fut>(capabilities: solaris_backend::ModelCapabilities, reply: F) -> ModelClient
 where
     F: Fn(TurnRequest) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<AgentEventStream, BackendError>> + Send + 'static,
 {
-    ModelClient::fixture(
+    ModelClient::from_handler(
         Fixture {
             reply: Box::new(move |request| Box::pin(reply(request))),
         },

@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use crate::AgentEvent;
 use futures::future::poll_fn;
 use serde_json::json;
-use solaris_backend::AgentEvent;
 use solaris_tools::{ToolContext, ToolOutput};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;

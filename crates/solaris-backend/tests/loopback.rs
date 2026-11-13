@@ -7,14 +7,15 @@
 //! content length, chunked reads, teardown) is exercised too. Nothing here
 //! reaches the network.
 
-use solaris_backend::testing::NativeRequest;
+use solaris_agent::testing::NativeRequest;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::testing::TurnRequest;
-use solaris_backend::{AgentBackend, AgentEvent, Message, Usage, Wire};
+use solaris_agent::AgentEvent;
+use solaris_agent::testing::TurnRequest;
 use solaris_backend::{Backend, Endpoint, TurnPlan};
+use solaris_backend::{Message, ModelConnector, Usage, Wire};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -812,7 +813,7 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
             label: "custom".into(),
             env_keys: &[],
         },
-        model: solaris_backend::testing::parameters("test", 100),
+        model: solaris_agent::testing::parameters("test", 100),
 
         prompt_cache_key: None,
     })

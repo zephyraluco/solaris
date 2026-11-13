@@ -30,7 +30,7 @@ impl ModelClient {
         })
     }
     #[cfg(feature = "test-utils")]
-    pub(crate) fn fixture(
+    pub fn from_handler(
         handler: impl Serve<Family = family::Completion> + 'static,
         capabilities: crate::ModelCapabilities,
     ) -> Self {
@@ -186,7 +186,16 @@ impl Backend {
 mod tests {
     use super::*;
     fn backend() -> Backend {
-        backend_with_model(crate::testing::parameters("test", 100))
+        backend_with_model(crate::ModelParameters::new(
+            rig_core::catalog::ModelSpec::new(
+                rig_core::providers::registry::ProviderId::declare("fixture").unwrap(),
+                "test",
+            )
+            .with_tools(true)
+            .with_max_output_tokens(100),
+            Some(100),
+            true,
+        ))
     }
     fn backend_with_model(model: crate::ModelParameters) -> Backend {
         Backend::new(crate::TurnPlan {

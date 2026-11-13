@@ -7,12 +7,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
-    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions, Approval,
-    BackendError, FnApprover, Mode, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
+    Agent, AgentEvent, AgentEventStream, AgentOptions, Approval, BackendError, ConnectionConfig,
+    FnApprover, Mode, ModelConnector, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
     ToolOutput, ToolRegistry, ToolSelection, Usage,
 };
-use solaris_backend::testing::TurnRequest;
 use tokio::sync::{Barrier, Notify};
 
 fn complete(text: &str) -> Vec<AgentEvent> {
@@ -79,11 +79,11 @@ fn is_child(request: &TurnRequest) -> bool {
 }
 
 #[async_trait]
-impl AgentBackend for Model {
+impl ModelConnector for Model {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -198,7 +198,7 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
         }),
     ]);
     Agent::new(
-        AgentBackendConfig {
+        ConnectionConfig {
             backend: model,
             provider_id: None,
             model: "test-model".into(),
@@ -638,7 +638,7 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     options.child_backend = Some(Arc::new(move |name| {
         assert_eq!(name, "child-model");
         called.fetch_add(1, Ordering::SeqCst);
-        Ok(AgentBackendConfig {
+        Ok(ConnectionConfig {
             backend: child_model.clone(),
             provider_id: None,
             model: name.into(),
@@ -728,8 +728,8 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
     let options = AgentOptions {
         child_backend: Some(Arc::new(move |name| {
             assert_eq!(name, "child-model");
-            Ok(AgentBackendConfig {
-                backend: Arc::clone(&child_backend) as Arc<dyn AgentBackend>,
+            Ok(ConnectionConfig {
+                backend: Arc::clone(&child_backend) as Arc<dyn ModelConnector>,
                 provider_id: None,
                 model: name.into(),
                 fallback_context_window: 128_000,

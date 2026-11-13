@@ -4,10 +4,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::AgentEvent;
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use solaris_backend::{AgentEvent, Message};
+use solaris_backend::Message;
 
 /// Storage failures stop execution rather than silently discarding history.
 #[derive(Debug, thiserror::Error)]

@@ -39,9 +39,9 @@ impl TurnRequest {
 
 /// Execute a fixture request through the sole Rig connection interface.
 pub async fn request(
-    backend: Arc<dyn crate::AgentBackend>,
+    backend: Arc<dyn crate::ModelConnector>,
     request: TurnRequest,
-) -> Result<crate::AgentEventStream, crate::BackendError> {
+) -> Result<crate::AgentEventStream, solaris_backend::BackendError> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let client = backend
         .model_client()
@@ -67,7 +67,7 @@ pub async fn request(
     for tool in request.tools {
         native = native.tool(rig_core::completion::ToolDefinition::new(
             rig_core::message::ToolName::new(tool.name)
-                .map_err(|e| crate::BackendError::new(e.to_string()))?,
+                .map_err(|e| solaris_backend::BackendError::new(e.to_string()))?,
             tool.description,
             tool.parameters,
         ));
@@ -86,7 +86,9 @@ pub async fn request(
     let mut opening = Vec::new();
     while let Some(event) = events.next().await {
         match event {
-            crate::AgentEvent::Error(error) => return Err(crate::BackendError::new(error)),
+            crate::AgentEvent::Error(error) => {
+                return Err(solaris_backend::BackendError::new(error));
+            }
             event @ crate::AgentEvent::Status(_) => opening.push(event),
             event => {
                 opening.push(event);
@@ -94,24 +96,24 @@ pub async fn request(
             }
         }
     }
-    Err(crate::BackendError::new(
+    Err(solaris_backend::BackendError::new(
         "model stream ended without a complete response",
     ))
 }
 
 #[async_trait::async_trait]
-pub trait NativeRequest: crate::AgentBackend + Clone + Sized + 'static {
+pub trait NativeRequest: crate::ModelConnector + Clone + Sized + 'static {
     async fn complete(
         &self,
         input: TurnRequest,
-    ) -> Result<crate::AgentEventStream, crate::BackendError> {
+    ) -> Result<crate::AgentEventStream, solaris_backend::BackendError> {
         request(Arc::new(self.clone()), input).await
     }
 }
-impl NativeRequest for crate::Backend {}
+impl NativeRequest for solaris_backend::Backend {}
 
 /// Explicit native facts for unpriced HTTP test models.
-pub fn parameters(id: &str, output_tokens: u32) -> crate::ModelParameters {
+pub fn parameters(id: &str, output_tokens: u32) -> solaris_backend::ModelParameters {
     let mut spec = rig_core::catalog::ModelSpec::new(
         rig_core::providers::registry::ProviderId::declare("fixture").unwrap(),
         id,
@@ -119,5 +121,5 @@ pub fn parameters(id: &str, output_tokens: u32) -> crate::ModelParameters {
     .with_tools(true)
     .with_max_output_tokens(output_tokens);
     spec.input.image = true;
-    crate::ModelParameters::new(spec, Some(output_tokens), true)
+    solaris_backend::ModelParameters::new(spec, Some(output_tokens), true)
 }

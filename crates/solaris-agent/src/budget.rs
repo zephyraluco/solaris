@@ -1,7 +1,7 @@
 //! A shared per-turn request, time and observed-cost budget for parent and children.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{AgentBackend, BackendError};
+use solaris_backend::{BackendError, ModelConnector};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,11 +78,11 @@ impl ExecutionBudget {
 }
 
 pub(crate) struct BudgetedBackend {
-    pub inner: Arc<dyn AgentBackend>,
+    pub inner: Arc<dyn ModelConnector>,
     pub budget: Arc<ExecutionBudget>,
 }
 #[async_trait]
-impl AgentBackend for BudgetedBackend {
+impl ModelConnector for BudgetedBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         self.budget.check().map_err(BackendError::new)?;
         let client = Arc::clone(&self.inner).model_client().await?;
@@ -115,9 +115,6 @@ impl AgentBackend for BudgetedBackend {
     fn label(&self) -> &str {
         self.inner.label()
     }
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.inner.models().await
-    }
 }
 
 #[cfg(test)]
@@ -126,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn cost_budget_stops_when_rig_does_not_report_a_charge() {
         use solaris_backend::{Backend, Endpoint, TurnPlan, Wire};
-        let mut spec = solaris_backend::testing::parameters("test", 100)
+        let mut spec = crate::testing::parameters("test", 100)
             .facts()
             .spec()
             .unwrap()

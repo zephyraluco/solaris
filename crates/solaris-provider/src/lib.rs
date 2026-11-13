@@ -24,3 +24,5 @@ pub use credentials::{Active, AuthError, AuthStore, Credential, mask_secret};
 mod config;
 pub use config::{ModelSelection, Protocol, ProviderConfig, ProviderEndpoint, ResolvedModel};
 mod discovery;
+
+pub use discovery::{ModelSource, UnavailableModels};

@@ -13,7 +13,7 @@
 //! there rather than having to be reconstructed from the transcript.
 
 #[cfg(test)]
-use solaris_backend::testing::TurnRequest;
+use crate::testing::TurnRequest;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -21,10 +21,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use crate::{AgentEvent, AgentEventStream};
 use futures::{Stream, StreamExt};
-use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, Message, ToolCall, ToolResult, ToolSpec, Usage,
-};
+use solaris_backend::{Message, ModelConnector, ToolCall, ToolResult, ToolSpec, Usage};
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -47,7 +46,7 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 /// started it.
 pub(crate) struct TurnInput {
     /// The backend the credentials resolved to.
-    pub inner: Arc<dyn AgentBackend>,
+    pub inner: Arc<dyn ModelConnector>,
     /// The tools this turn may declare and run.
     pub tools: Vec<Arc<dyn Tool>>,
     pub options: AgentOptions,
@@ -100,7 +99,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         .shared_budget
         .clone()
         .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
-    let inner: Arc<dyn AgentBackend> = Arc::new(crate::budget::BudgetedBackend {
+    let inner: Arc<dyn ModelConnector> = Arc::new(crate::budget::BudgetedBackend {
         inner: Arc::new(crate::billing::AccountingBackend {
             inner,
             conversation: Arc::clone(&conversation),
@@ -176,7 +175,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 /// The state one turn's loop runs with, owned outright so it can outlive the
 /// call that started it.
 struct Runner {
-    inner: Arc<dyn AgentBackend>,
+    inner: Arc<dyn ModelConnector>,
     budget: Arc<crate::ExecutionBudget>,
     tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
@@ -606,7 +605,7 @@ struct SummaryOutcome {
     dropped: usize,
 }
 async fn compact_memory(
-    inner: &Arc<dyn AgentBackend>,
+    inner: &Arc<dyn ModelConnector>,
     cancel: &Cancel,
     conversation: &Conversation,
     config: Compaction,
@@ -741,7 +740,7 @@ async fn compact_memory(
 }
 
 pub(crate) async fn compact_now(
-    inner: &Arc<dyn AgentBackend>,
+    inner: &Arc<dyn ModelConnector>,
     conversation: &Conversation,
     config: Compaction,
     cancel: &Cancel,
@@ -787,7 +786,7 @@ impl Stream for EventStream {
 }
 #[cfg(test)]
 mod tests {
-    fn request_text(request: &solaris_backend::testing::TurnRequest) -> String {
+    fn request_text(request: &crate::testing::TurnRequest) -> String {
         request
             .history
             .iter()
@@ -933,11 +932,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentBackend for Scripted {
+    impl ModelConnector for Scripted {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(crate::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -991,7 +990,7 @@ mod tests {
     /// a mode is [`crate::Agent`]'s job — the loop declares exactly what it is
     /// given and can run exactly that.
     struct Turn {
-        inner: Arc<dyn AgentBackend>,
+        inner: Arc<dyn ModelConnector>,
         tools: Vec<Arc<dyn Tool>>,
         options: AgentOptions,
         cancel: Cancel,
@@ -1009,7 +1008,7 @@ mod tests {
         /// The context window is left at zero, which puts nothing over budget:
         /// a test that is not about compaction therefore never pays for a
         /// second model call.
-        fn of(inner: Arc<dyn AgentBackend>, tool: Arc<dyn Tool>) -> Self {
+        fn of(inner: Arc<dyn ModelConnector>, tool: Arc<dyn Tool>) -> Self {
             Self {
                 inner,
                 tools: vec![tool],
@@ -1342,11 +1341,11 @@ mod tests {
         struct Endless;
 
         #[async_trait]
-        impl AgentBackend for Endless {
+        impl ModelConnector for Endless {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(solaris_backend::testing::client(
+                Ok(crate::testing::client(
                     self.capabilities(),
                     move |request| {
                         let fixture = std::sync::Arc::clone(&self);
@@ -1515,11 +1514,11 @@ mod tests {
         struct Endless;
 
         #[async_trait]
-        impl AgentBackend for Endless {
+        impl ModelConnector for Endless {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(solaris_backend::testing::client(
+                Ok(crate::testing::client(
                     self.capabilities(),
                     move |request| {
                         let fixture = std::sync::Arc::clone(&self);
@@ -1741,11 +1740,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentBackend for SteersOnFirstRound {
+    impl ModelConnector for SteersOnFirstRound {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(crate::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -2416,7 +2415,7 @@ mod tests {
                 vec![AgentEvent::Error("summary unavailable".into())]
             };
             let model = Scripted::new(vec![scripted]);
-            let inner: Arc<dyn AgentBackend> = model.clone();
+            let inner: Arc<dyn ModelConnector> = model.clone();
             let outcome = compact_memory(
                 &inner,
                 &Cancel::new(),
@@ -2465,7 +2464,7 @@ mod tests {
             )]),
             round(vec![AgentEvent::TextDelta("preserve parser flags".into())]),
         ]);
-        let inner: Arc<dyn AgentBackend> = scripted.clone();
+        let inner: Arc<dyn ModelConnector> = scripted.clone();
         let conversation = Conversation::new();
         conversation.replace_with(split_task_history());
         let policy = Compaction {
@@ -2499,7 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_official_summary_does_not_change_saved_context() {
-        let inner: Arc<dyn AgentBackend> =
+        let inner: Arc<dyn ModelConnector> =
             Scripted::new(vec![vec![AgentEvent::Error("summary failed".into())]]);
         let conversation = Conversation::new();
         conversation.replace_with(split_task_history());

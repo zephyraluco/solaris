@@ -22,8 +22,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
-    Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
+    Agent, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest, Approver, Cancel,
+    ChannelApprover, Mode, ModelConnector, PromptContext, ResourcePaths, Skills, ToolCall,
     ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
@@ -152,7 +152,7 @@ impl AppOptions {
     /// discovery is left off for the same reason: whatever backend it was handed
     /// is the only thing this app should talk to.
     pub fn new(
-        backend: Arc<dyn AgentBackend>,
+        backend: Arc<dyn ModelConnector>,
         config: Config,
         quit: QuitFlag,
         overlay_queue: OverlayQueue,
@@ -160,6 +160,7 @@ impl AppOptions {
     ) -> Self {
         Self {
             backend_factory: Arc::new(move |_, model| BackendChoice {
+                models: Arc::new(solaris_provider::UnavailableModels),
                 configuration: Default::default(),
                 backend: Arc::clone(&backend),
                 provider_id: None,
@@ -268,6 +269,7 @@ fn with_tools(
 pub struct App {
     /// The session every turn goes through, and the backend behind it.
     pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
+    model_source: Arc<dyn solaris_provider::ModelSource>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
     pub(crate) config: Config,
@@ -433,6 +435,7 @@ impl App {
 
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
         let provider_config = Arc::clone(&choice.configuration);
+        let model_source = Arc::clone(&choice.models);
         let (agent, tool_cancel) = with_tools(
             choice,
             Arc::clone(&registry),
@@ -462,6 +465,7 @@ impl App {
 
         let mut app = Self {
             agent,
+            model_source,
             backend_factory,
             config,
             theme,
@@ -677,6 +681,7 @@ impl App {
         }
         let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
         self.provider_config = Arc::clone(&choice.configuration);
+        self.model_source = Arc::clone(&choice.models);
         let (agent, cancel) = with_tools(
             choice,
             Arc::clone(&self.registry),
@@ -764,6 +769,7 @@ impl App {
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
         self.provider_config = Arc::clone(&choice.configuration);
+        self.model_source = Arc::clone(&choice.models);
         let source = choice.source;
         let (agent, cancel) = with_tools(
             choice,
@@ -1824,17 +1830,18 @@ impl App {
             }
         }
 
-        let agent = Arc::clone(&self.agent);
+        let models = Arc::clone(&self.model_source);
         let (tx, rx) = unbounded_channel();
         self.models_rx = Some(rx);
 
         tokio::spawn(async move {
-            let answer = agent.models().await.map_err(|error| error.to_string());
+            let answer = models.models().await.map_err(|error| error.to_string());
             let _ = tx.send(answer);
         });
     }
 
     fn refresh_transport(&mut self, choice: BackendChoice) {
+        self.model_source = Arc::clone(&choice.models);
         let factory = Arc::clone(&self.backend_factory);
         let auth = self.auth.clone();
         self.agent = Arc::new(
@@ -1848,7 +1855,7 @@ impl App {
 
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
-        let catalog_notice = self.agent.model_catalog_notice();
+        let catalog_notice = self.model_source.notice();
         match answer {
             Ok(models) if !models.is_empty() => {
                 // The provider's own list is the one that knows which models
@@ -3310,8 +3317,8 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
+    use solaris_agent::testing::TurnRequest;
     use solaris_agent::{BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
-    use solaris_backend::testing::TurnRequest;
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -3391,11 +3398,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AgentBackend for FakeBackend {
+    impl ModelConnector for FakeBackend {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(solaris_agent::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -3407,7 +3414,9 @@ mod tests {
         fn label(&self) -> &str {
             "fake"
         }
-
+    }
+    #[async_trait::async_trait]
+    impl solaris_provider::ModelSource for FakeBackend {
         async fn models(&self) -> Result<Vec<String>, BackendError> {
             self.models.clone().map_err(BackendError::new)
         }
@@ -3433,14 +3442,14 @@ mod tests {
 
     /// The fake, type-erased the way `AppOptions` wants it. It lists no models,
     /// which is what a backend with nothing to say looks like.
-    fn fake_backend() -> Arc<dyn AgentBackend> {
+    fn fake_backend() -> Arc<FakeBackend> {
         Arc::new(FakeBackend {
             models: Err("this backend cannot list models".to_string()),
         })
     }
 
     /// The same, reporting `models` when asked.
-    fn fake_backend_reporting(models: &[&str]) -> Arc<dyn AgentBackend> {
+    fn fake_backend_reporting(models: &[&str]) -> Arc<FakeBackend> {
         Arc::new(FakeBackend {
             models: Ok(models.iter().map(|id| (*id).to_string()).collect()),
         })
@@ -3453,6 +3462,7 @@ mod tests {
     fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
         Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             crate::agent_backend(BackendChoice {
+                models: Arc::new(solaris_provider::UnavailableModels),
                 configuration: Default::default(),
                 backend: fake_backend(),
                 provider_id: Some(provider.into()),
@@ -3480,11 +3490,18 @@ mod tests {
     }
 
     /// An app pinned to `backend` that is allowed to ask it for its models.
-    fn app_with_backend(backend: Arc<dyn AgentBackend>) -> App {
+    fn app_with_backend(backend: Arc<FakeBackend>) -> App {
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let models: Arc<dyn solaris_provider::ModelSource> = backend.clone();
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        let factory = options.backend_factory.clone();
+        options.backend_factory = Arc::new(move |auth, model| {
+            let mut choice = factory(auth, model);
+            choice.models = Arc::clone(&models);
+            choice
+        });
         options.discover_models = true;
         App::new(options)
     }
@@ -3501,8 +3518,9 @@ mod tests {
         let mut options = AppOptions::new(pinned, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            models: resolved.clone(),
             configuration: Default::default(),
-            backend: Arc::clone(&resolved),
+            backend: resolved.clone(),
             provider_id: Some(provider.into()),
             base_url: None,
             model: model.to_string(),
@@ -3521,6 +3539,7 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
             configuration: Default::default(),
             backend: fake_backend(),
             provider_id: Some(provider.into()),
@@ -4935,7 +4954,7 @@ mod tests {
         settle_discovery(&mut app).await;
         let text = rendered_text(&mut app, 100, 22);
         assert!(text.contains("Could not list OpenAI models"));
-        assert!(text.contains("this backend cannot list models"));
+        assert!(text.contains("model discovery is unavailable"));
         assert!(app.model_choices().is_empty());
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
         app.handle_key(key(KeyCode::Char('r')));

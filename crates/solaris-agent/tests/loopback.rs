@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use solaris_agent::{
-    Agent, AgentBackendConfig, AgentEvent, AgentOptions, Mode, Tool, ToolRegistry, ToolSelection,
+    Agent, AgentEvent, AgentOptions, ConnectionConfig, Mode, Tool, ToolRegistry, ToolSelection,
 };
 use solaris_backend::Wire;
 use solaris_backend::{Backend, Endpoint, TurnPlan};
@@ -143,10 +143,7 @@ fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_ag
 }
 
 fn backend(addr: SocketAddr) -> Backend {
-    backend_with_model(
-        addr,
-        solaris_backend::testing::parameters("test-model", 4096),
-    )
+    backend_with_model(addr, solaris_agent::testing::parameters("test-model", 4096))
 }
 
 fn backend_with_model(addr: SocketAddr, model: solaris_backend::ModelParameters) -> Backend {
@@ -179,7 +176,7 @@ fn registry() -> Arc<ToolRegistry> {
 /// A gateway answers no catalogue, so the tool is named outright rather than
 /// left to a mode's default set.
 fn agent(addr: SocketAddr, dir: &Path) -> Agent {
-    let choice = AgentBackendConfig {
+    let choice = ConnectionConfig {
         backend: Arc::new(backend(addr)),
         provider_id: None,
         model: "test-model".to_string(),
@@ -301,7 +298,7 @@ async fn a_turn_with_no_tool_call_is_a_single_request() {
 
 #[tokio::test]
 async fn native_connection_preserves_full_response_in_the_complete_executor() {
-    use solaris_backend::AgentBackend;
+    use solaris_backend::ModelConnector;
     let (addr, seen) = serve(vec![sse(&[
         r#"{"id":"native-response","choices":[{"index":0,"delta":{"content":"native result"},"finish_reason":null}]}"#,
         r#"{"id":"native-response","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3}}"#,
@@ -316,7 +313,7 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
             label: "local".into(),
             env_keys: &[],
         },
-        model: solaris_backend::testing::parameters("native-model", 1234),
+        model: solaris_agent::testing::parameters("native-model", 1234),
 
         prompt_cache_key: None,
     })
@@ -460,7 +457,7 @@ async fn manual_native_compaction_obeys_the_deadline_and_releases_the_connection
     options.execution.budget.max_seconds = 1;
     options.compaction.keep_recent_tokens = 1;
     let agent = Agent::new(
-        AgentBackendConfig {
+        ConnectionConfig {
             backend: Arc::new(backend(addr)),
             model: "test-model".into(),
             provider_id: None,
@@ -516,7 +513,7 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
     let mut options = AgentOptions::in_directory(directory.path());
     options.compaction.keep_recent_tokens = 1;
     let agent = Agent::new(
-        AgentBackendConfig {
+        ConnectionConfig {
             backend: Arc::new(model),
             model: "test-model".into(),
             provider_id: None,

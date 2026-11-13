@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{AgentBackend, BackendError, Usage};
+use solaris_backend::{BackendError, ModelConnector, Usage};
 
 use crate::{SessionRecord, conversation::Conversation};
 
@@ -62,12 +62,12 @@ pub enum UsageKind {
 }
 
 pub(crate) struct AccountingBackend {
-    pub inner: Arc<dyn AgentBackend>,
+    pub inner: Arc<dyn ModelConnector>,
     pub conversation: Arc<Conversation>,
     pub kind: UsageKind,
 }
 #[async_trait]
-impl AgentBackend for AccountingBackend {
+impl ModelConnector for AccountingBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         let client = Arc::clone(&self.inner).model_client().await?;
         let conversation = Arc::clone(&self.conversation);
@@ -105,7 +105,7 @@ mod tests {
         .unwrap();
         let records = [
             SessionRecord::Event {
-                event: solaris_backend::AgentEvent::TurnComplete {
+                event: crate::AgentEvent::TurnComplete {
                     usage: Usage::new(999, 999),
                     cost_usd: 99.0,
                 },

@@ -2,8 +2,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use solaris_backend::{AgentBackend, BackendError};
-use solaris_types::ModelCapabilities;
+use solaris_backend::{Backend, BackendError};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +18,7 @@ fn digest(text: &[u8]) -> String {
 }
 
 pub(crate) struct ModelDiscovery {
-    pub inner: Arc<dyn AgentBackend>,
+    pub inner: Arc<Backend>,
     pub cache_dir: Option<PathBuf>,
     pub endpoint: String,
     pub notice: Mutex<Option<String>>,
@@ -66,19 +65,26 @@ impl ModelDiscovery {
         Some(data.ids)
     }
 }
+/// Endpoint discovery is separate from model execution.
 #[async_trait]
-impl AgentBackend for ModelDiscovery {
-    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        Arc::clone(&self.inner).model_client().await
+pub trait ModelSource: Send + Sync {
+    async fn models(&self) -> Result<Vec<String>, BackendError>;
+    fn notice(&self) -> Option<String> {
+        None
     }
+}
 
-    fn label(&self) -> &str {
-        self.inner.label()
+pub struct UnavailableModels;
+#[async_trait]
+impl ModelSource for UnavailableModels {
+    async fn models(&self) -> Result<Vec<String>, BackendError> {
+        Err(BackendError::new("model discovery is unavailable"))
     }
-    fn capabilities(&self) -> ModelCapabilities {
-        self.inner.capabilities()
-    }
-    fn model_catalog_notice(&self) -> Option<String> {
+}
+
+#[async_trait]
+impl ModelSource for ModelDiscovery {
+    fn notice(&self) -> Option<String> {
         self.notice
             .lock()
             .unwrap_or_else(|p| p.into_inner())

@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use solaris_backend::{AgentBackend, BackendError, ModelCapabilities};
+use solaris_backend::{BackendError, ModelCapabilities, ModelConnector};
 use tokio::sync::Mutex;
 
 use crate::{AuthStore, BackendChoice, BackendOptions, Credential, choose_backend, oauth};
@@ -50,7 +50,7 @@ struct Credentials {
 struct State {
     auth: AuthStore,
     dirty: bool,
-    backends: HashMap<String, Arc<dyn AgentBackend>>,
+    backends: HashMap<String, BackendChoice>,
 }
 
 impl Credentials {
@@ -76,6 +76,11 @@ impl Credentials {
                 Some(Credential::ChatGpt { .. })
             )
         {
+            choice.models = Arc::new(RefreshingModels {
+                model: choice.model.clone(),
+                credentials: Arc::clone(self),
+                initial: Arc::clone(&choice.models),
+            });
             choice.backend = Arc::new(RefreshingBackend {
                 model: choice.model.clone(),
                 initial: choice.backend,
@@ -85,7 +90,7 @@ impl Credentials {
         choice
     }
 
-    async fn backend(&self, model: &str) -> Result<Arc<dyn AgentBackend>, BackendError> {
+    async fn backend(&self, model: &str) -> Result<BackendChoice, BackendError> {
         // Serialize refresh only; release this guard before model/network work.
         let mut state = self.current.lock().await;
         if let Some(credential) = state
@@ -121,38 +126,53 @@ impl Credentials {
         }
         if !state.backends.contains_key(model) {
             let choice = (self.factory)(&state.auth, model);
-            state.backends.insert(model.to_owned(), choice.backend);
+            state.backends.insert(model.to_owned(), choice);
         }
-        Ok(Arc::clone(&state.backends[model]))
+        Ok(state.backends[model].clone())
     }
 }
 
 struct RefreshingBackend {
     model: String,
-    initial: Arc<dyn AgentBackend>,
+    initial: Arc<dyn ModelConnector>,
     credentials: Arc<Credentials>,
 }
 
 #[async_trait]
-impl AgentBackend for RefreshingBackend {
+impl ModelConnector for RefreshingBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
         self.credentials
             .backend(&self.model)
             .await?
+            .backend
             .model_client()
             .await
     }
 
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.credentials.backend(&self.model).await?.models().await
-    }
     fn label(&self) -> &str {
         self.initial.label()
     }
     fn capabilities(&self) -> ModelCapabilities {
         self.initial.capabilities()
     }
-    fn model_catalog_notice(&self) -> Option<String> {
+}
+
+struct RefreshingModels {
+    model: String,
+    initial: Arc<dyn crate::ModelSource>,
+    credentials: Arc<Credentials>,
+}
+#[async_trait]
+impl crate::ModelSource for RefreshingModels {
+    async fn models(&self) -> Result<Vec<String>, BackendError> {
+        self.credentials
+            .backend(&self.model)
+            .await?
+            .models
+            .models()
+            .await
+    }
+    fn notice(&self) -> Option<String> {
         self.credentials
             .current
             .try_lock()
@@ -161,9 +181,9 @@ impl AgentBackend for RefreshingBackend {
                 state
                     .backends
                     .get(&self.model)
-                    .and_then(|backend| backend.model_catalog_notice())
+                    .and_then(|choice| choice.models.notice())
             })
-            .or_else(|| self.initial.model_catalog_notice())
+            .or_else(|| self.initial.notice())
     }
 }
 
@@ -171,8 +191,8 @@ impl AgentBackend for RefreshingBackend {
 mod tests {
     use super::*;
     use crate::CredentialSource;
-    use solaris_backend::AgentEventStream;
-    use solaris_backend::testing::TurnRequest;
+    use solaris_agent::AgentEventStream;
+    use solaris_agent::testing::TurnRequest;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -190,11 +210,11 @@ mod tests {
         calls: Arc<StdMutex<Vec<String>>>,
     }
     #[async_trait]
-    impl AgentBackend for Recording {
+    impl ModelConnector for Recording {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::testing::client(
+            Ok(solaris_agent::testing::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -207,7 +227,7 @@ mod tests {
         async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.calls.lock().expect("calls").push(self.token.clone());
             Ok(Box::pin(futures::stream::iter([
-                solaris_backend::AgentEvent::TurnComplete {
+                solaris_agent::AgentEvent::TurnComplete {
                     usage: Default::default(),
                     cost_usd: 0.0,
                 },
@@ -228,6 +248,7 @@ mod tests {
                 panic!("OAuth credential")
             };
             BackendChoice {
+                models: Arc::new(crate::UnavailableModels),
                 configuration: Default::default(),
                 backend: Arc::new(Recording {
                     token: access_token.clone(),
@@ -298,8 +319,8 @@ mod tests {
         let parent = shared.choice("parent");
         let child = shared.choice("child");
         let (one, two) = tokio::join!(
-            solaris_backend::testing::request(parent.backend, request()),
-            solaris_backend::testing::request(child.backend, request())
+            solaris_agent::testing::request(parent.backend, request()),
+            solaris_agent::testing::request(child.backend, request())
         );
         drop(one.expect("parent request"));
         drop(two.expect("child request"));
@@ -338,7 +359,7 @@ mod tests {
         let (shared, calls) = setup(directory.path().join("auth.json"), refresh);
         let backend = shared.choice("model").backend;
         drop(
-            solaris_backend::testing::request(Arc::clone(&backend), request())
+            solaris_agent::testing::request(Arc::clone(&backend), request())
                 .await
                 .expect("first prompt"),
         );
@@ -350,7 +371,7 @@ mod tests {
         state.auth.store("openai", expired);
         drop(state);
         drop(
-            solaris_backend::testing::request(Arc::clone(&backend), request())
+            solaris_agent::testing::request(Arc::clone(&backend), request())
                 .await
                 .expect("second prompt"),
         );
@@ -369,7 +390,7 @@ mod tests {
         shared.initial.save(&path).expect("original credentials");
         let before = std::fs::read(&path).expect("before");
         let result =
-            solaris_backend::testing::request(shared.choice("model").backend, request()).await;
+            solaris_agent::testing::request(shared.choice("model").backend, request()).await;
         assert!(matches!(result, Err(error) if error.to_string().contains("refresh rejected")));
         assert!(calls.lock().expect("calls").is_empty());
         assert_eq!(std::fs::read(path).expect("after"), before);
@@ -391,14 +412,14 @@ mod tests {
         );
         let backend = shared.choice("model").backend;
         assert!(
-            solaris_backend::testing::request(Arc::clone(&backend), request())
+            solaris_agent::testing::request(Arc::clone(&backend), request())
                 .await
                 .is_err()
         );
         assert!(calls.lock().expect("calls").is_empty());
         std::fs::remove_dir(&path).expect("restore storage");
         drop(
-            solaris_backend::testing::request(Arc::clone(&backend), request())
+            solaris_agent::testing::request(Arc::clone(&backend), request())
                 .await
                 .expect("retry saved token"),
         );
@@ -419,7 +440,7 @@ mod tests {
         owned.current.get_mut().auth = owned.initial.clone();
         owned.path = None;
         drop(
-            solaris_backend::testing::request(shared.choice("model").backend, request())
+            solaris_agent::testing::request(shared.choice("model").backend, request())
                 .await
                 .expect("valid request"),
         );

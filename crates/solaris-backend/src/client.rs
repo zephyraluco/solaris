@@ -1,5 +1,5 @@
 //! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
-use crate::{AgentBackend, BackendError, Wire};
+use crate::{BackendError, ModelConnector, Wire};
 use crate::{http, transport::CompletionRoute};
 use rig_core::driver::{DynModel, Model};
 use rig_core::operation::Completion;
@@ -101,6 +101,13 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Ask the provider which models it offers.
+    ///
+    /// One attempt, no retries: this feeds a picker, so a slow or unreachable
+    /// provider reports an error rather than leaving the picker loading forever.
+    pub async fn models(&self) -> Result<Vec<String>, BackendError> {
+        self.discover_models().await
+    }
     pub(super) fn check_credentials(&self) -> Result<(), BackendError> {
         if let Some((_, expires)) = &self.chatgpt
             && *expires
@@ -146,7 +153,7 @@ impl Backend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for Backend {
+impl ModelConnector for Backend {
     async fn model_client(self: std::sync::Arc<Self>) -> Result<crate::ModelClient, BackendError> {
         crate::ModelClient::native((*self).clone())
     }
@@ -155,13 +162,6 @@ impl AgentBackend for Backend {
     }
     fn label(&self) -> &str {
         &self.endpoint.label
-    }
-    /// Ask the provider which models it offers.
-    ///
-    /// One attempt, no retries: this feeds a picker, so a slow or unreachable
-    /// provider reports an error rather than leaving the picker loading forever.
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        self.discover_models().await
     }
 }
 

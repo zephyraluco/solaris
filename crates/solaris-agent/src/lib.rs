@@ -40,7 +40,7 @@ pub use agent::{Agent, AgentOptions};
 pub use approver::{
     AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, DenyAll, FnApprover,
 };
-pub use backend::AgentBackendConfig;
+pub use backend::ConnectionConfig;
 pub use compaction::Compaction;
 pub use input::{InputError, expand_input};
 pub use mode::{Mode, default_tool_names};
@@ -52,8 +52,8 @@ pub use subagent::{SUBAGENT_TOOL, agent_tool_registry};
 
 // The conversation: what a turn is written in and what it streams back.
 pub use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Content, ContextUsage, Message,
-    ModelClient, Role, ToolCall, ToolResult, ToolSpec, Usage, tokens_for_characters,
+    BackendError, Content, ContextUsage, Message, ModelClient, ModelConnector, Role, ToolCall,
+    ToolResult, ToolSpec, Usage, tokens_for_characters,
 };
 // The tools, as the application sees them: what to hold, and what to hand in.
 pub use solaris_tools::{
@@ -85,7 +85,13 @@ pub struct ExecutionSettings {
 pub use runtime::{RuntimeCommand, SessionRuntime};
 
 pub type ChildBackendFactory =
-    std::sync::Arc<dyn Fn(&str) -> Result<AgentBackendConfig, String> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&str) -> Result<ConnectionConfig, String> + Send + Sync>;
 pub use subagent::TaskControls;
 
 mod tool_search;
+
+mod event;
+pub use event::AgentEvent;
+pub type AgentEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = AgentEvent> + Send>>;
+#[cfg(feature = "test-utils")]
+pub mod testing;

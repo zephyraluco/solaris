@@ -7,11 +7,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
-    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions,
-    BackendError, Mode, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, Usage,
+    Agent, AgentEvent, AgentEventStream, AgentOptions, BackendError, ConnectionConfig, Mode,
+    ModelConnector, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, Usage,
 };
-use solaris_backend::testing::TurnRequest;
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Default)]
@@ -96,11 +96,11 @@ fn notifications(request: &TurnRequest) -> Vec<String> {
 }
 
 #[async_trait]
-impl AgentBackend for Model {
+impl ModelConnector for Model {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-        Ok(solaris_backend::testing::client(
+        Ok(solaris_agent::testing::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -217,7 +217,7 @@ impl Tool for Read {
 
 fn agent(model: &Arc<Model>, options: AgentOptions, read: &Arc<Read>) -> Agent {
     Agent::new(
-        AgentBackendConfig {
+        ConnectionConfig {
             backend: model.clone(),
             provider_id: None,
             model: "test-model".into(),
