@@ -101,12 +101,12 @@ pub async fn serve_rpc(
                 }
                 let result = match serde_json::from_value::<RuntimeCommand>(command) {
                     Err(error) => Err(error.to_string()),
-                    Ok(command) if matches!(command, RuntimeCommand::Prompt { .. }) && active.is_some() => Err("a prompt is already running".into()),
+                    Ok(command) if matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact) && active.is_some() => Err("a prompt is already running".into()),
                     Ok(command) => {
-                        let prompt = matches!(command, RuntimeCommand::Prompt { .. });
+                        let streaming = matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact);
                         match session.execute(command).await {
                             Ok(stream) => {
-                                if prompt { active = Some(stream); request_id = Some(request.id.clone()); }
+                                if streaming { active = Some(stream); request_id = Some(request.id.clone()); }
                                 Ok(())
                             }
                             Err(error) => Err(error),

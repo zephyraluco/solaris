@@ -164,11 +164,9 @@ async fn structured_output_metadata_does_not_override_rigs_native_tool_schema_po
     );
     let schema = serde_json::json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false});
     let mut input = turn();
-    input.tools.push(solaris_backend::ToolSpec::new(
-        "read",
-        "Read",
-        schema.clone(),
-    ));
+    input
+        .tools
+        .push(solaris_types::ToolSpec::new("read", "Read", schema.clone()));
     let events: Vec<_> = model.complete(input).await.unwrap().collect().await;
     assert!(matches!(
         events.last(),
@@ -576,7 +574,8 @@ fn completion(wire: Wire) -> String {
 
 #[tokio::test]
 async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_metadata() {
-    use solaris_backend::{Content, InlineImage, ToolCall, ToolResult};
+    use solaris_backend::{Content, InlineImage};
+    use solaris_types::{ToolCall, ToolResult};
     for wire in [
         Wire::OpenAiChat,
         Wire::OpenAiResponses,
@@ -612,7 +611,7 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                 serve(response("200 OK", "text/event-stream", &completion(wire))).await;
             let mut input = TurnRequest::new(history, "");
             if tool_image {
-                input.tools.push(solaris_backend::ToolSpec::new(
+                input.tools.push(solaris_types::ToolSpec::new(
                     "read",
                     "Read an image",
                     serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),

@@ -1,16 +1,6 @@
-//! The loop that runs the model's tool calls and asks it again.
-//!
-//! A model cannot run anything: it can only ask. This drives a real backend
-//! through as many model calls as the model needs — declaring the tools it was
-//! handed, running what comes back, feeding the results in, and repeating until
-//! the model stops asking. Only [`crate::Agent`] calls it: working out which
-//! tools a turn may use is the agent's business, so by the time the loop starts
-//! the set is settled.
-//!
-//! It appends to the [conversation](crate::conversation) rather than being handed
-//! one, and that is what makes the two things that span turns work: a summary
-//! still stands on the next turn, and a message the user steered in is simply
-//! there rather than having to be reconstructed from the transcript.
+//! Rig execution phases, prepared requests, tool policy and summary coordination.
+//! The SDK owns model/tool rounds; this module supplies product policy and safe
+//! request-boundary handoffs without authoring a second model history.
 
 #[cfg(test)]
 use crate::testing::TurnRequest;
@@ -23,18 +13,19 @@ use std::time::Instant;
 
 use crate::{AgentEvent, AgentEventStream};
 use futures::{Stream, StreamExt};
-use solaris_backend::{Message, ModelConnector, ToolCall, ToolResult, ToolSpec, Usage};
+use solaris_backend::{Message, ModelConnector, Usage};
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
+use solaris_types::{ToolCall, ToolResult, ToolSpec};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::agent::AgentOptions;
-use crate::approver::{Approval, Approver};
-use crate::background::{BackgroundTasks, Completion};
-use crate::compaction::Compaction;
-use crate::conversation::Conversation;
-use crate::prompt::{COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, existing_summary};
-use crate::queue::Queue;
-use crate::subagent::{SUBAGENT_TOOL, SubagentRunner};
+use crate::context::compaction::Compaction;
+use crate::context::prompt::{COMPACT_PROMPT, UPDATE_COMPACT_PROMPT, existing_summary};
+use crate::policy::approver::{Approval, Approver};
+use crate::runtime::agent::AgentOptions;
+use crate::runtime::queue::Queue;
+use crate::storage::memory::Conversation;
+use crate::tasks::background::{BackgroundTasks, Completion};
+use crate::tasks::{SUBAGENT_TOOL, SubagentRunner};
 
 /// Tool calls from one round that run at the same time.
 ///
@@ -51,7 +42,7 @@ pub(crate) struct TurnInput {
     /// The tools this turn may declare and run.
     pub tools: Vec<Arc<dyn Tool>>,
     pub options: AgentOptions,
-    pub services: crate::billing::SessionServices,
+    pub services: crate::runtime::services::SessionServices,
     /// Stops the turn in flight.
     pub cancel: Cancel,
     /// Messages that correct the turn, read before each round.
@@ -60,7 +51,7 @@ pub(crate) struct TurnInput {
     pub follow_up: Queue,
     /// The conversation this turn extends.
     pub conversation: Arc<Conversation>,
-    /// The system prompt for this turn, written by [`crate::prompt`].
+    /// The system prompt for this turn, written by [`crate::context::prompt`].
     pub system: String,
     /// The new user prompt.
     pub prompt: String,
@@ -100,12 +91,13 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     } = input;
 
     let budget = services.budget.clone().expect("turn budget");
-    let inner: Arc<dyn ModelConnector> = Arc::new(crate::billing::ExecutionConnector {
-        inner,
-        conversation: Arc::clone(&conversation),
-        services,
-        kind: crate::UsageKind::Model,
-    });
+    let inner: Arc<dyn ModelConnector> =
+        Arc::new(crate::execution::connection::ExecutionConnector {
+            inner,
+            conversation: Arc::clone(&conversation),
+            services,
+            kind: crate::UsageKind::Model,
+        });
     let specs: Vec<ToolSpec> = tools
         .iter()
         .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
@@ -328,9 +320,12 @@ impl Runner {
             .collect()
     }
 
-    fn request_header(&self) -> crate::projection::Header {
-        let mut header =
-            crate::projection::Header::new(&self.model_key, &self.system, &self.request_tools());
+    fn request_header(&self) -> crate::context::projection::Header {
+        let mut header = crate::context::projection::Header::new(
+            &self.model_key,
+            &self.system,
+            &self.request_tools(),
+        );
         if !self.base_id.is_empty() {
             header.base_id.clone_from(&self.base_id);
         }
@@ -400,7 +395,10 @@ impl Runner {
 
         // External schema retrieval is disabled in the dependency features.
         // Validate before approvals or side effects, including extension tools.
-        let schema = tool.parameters();
+        let Some(spec) = self.specs.iter().find(|spec| spec.name == call.name) else {
+            return ToolResult::error(call, "tool has no prepared specification").into();
+        };
+        let schema = spec.parameters.clone();
         let validator = match jsonschema::validator_for(&schema) {
             Ok(validator) => validator,
             Err(error) => {
@@ -800,7 +798,7 @@ mod tests {
             .join("\n")
     }
     use super::*;
-    use crate::prompt::summary_message;
+    use crate::context::prompt::summary_message;
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
@@ -809,8 +807,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
-    use crate::approver::{Approval, DenyAll};
-    use crate::mode::Mode;
+    use crate::policy::approver::{Approval, DenyAll};
+    use crate::runtime::mode::Mode;
     use solaris_backend::{BackendError, Usage};
     use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput};
 
@@ -1069,7 +1067,7 @@ mod tests {
                 lease: None,
                 inner: self.inner,
                 tools: self.tools,
-                services: crate::billing::SessionServices::default().for_turn(
+                services: crate::runtime::services::SessionServices::default().for_turn(
                     crate::ExecutionBudget::new(self.options.execution.budget.clone()),
                 ),
                 options: self.options,
@@ -1077,10 +1075,10 @@ mod tests {
                 steering: self.steering,
                 follow_up: self.follow_up,
                 conversation: Arc::clone(&self.conversation),
-                system: crate::prompt::system_prompt(
+                system: crate::context::prompt::system_prompt(
                     Mode::Build,
                     &[],
-                    &crate::skills::Skills::empty(),
+                    &crate::context::skills::Skills::empty(),
                     None,
                 ),
                 prompt: prompt.to_string(),
@@ -1564,16 +1562,16 @@ mod tests {
             inner: Arc::new(Endless),
             tools: vec![tool.clone()],
             options: AgentOptions::default(),
-            services: crate::billing::SessionServices::default()
+            services: crate::runtime::services::SessionServices::default()
                 .for_turn(crate::ExecutionBudget::new(Default::default())),
             cancel: Cancel::new(),
             steering: Queue::new(),
             follow_up: Queue::new(),
             conversation: Arc::new(Conversation::new()),
-            system: crate::prompt::system_prompt(
+            system: crate::context::prompt::system_prompt(
                 Mode::Build,
                 &[],
-                &crate::skills::Skills::empty(),
+                &crate::context::skills::Skills::empty(),
                 None,
             ),
             prompt: "do it".to_string(),
@@ -2529,3 +2527,6 @@ mod tests {
         assert_eq!(conversation.snapshot(), before);
     }
 }
+
+pub(crate) mod connection;
+pub(crate) mod tool_search;

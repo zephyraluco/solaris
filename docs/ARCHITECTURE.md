@@ -15,6 +15,7 @@ graph TD
     app --> tui[solaris-tui · 终端组件]
     agent --> backend[solaris-backend · 模型连接]
     agent --> tools
+    agent --> types
     provider --> backend
     provider --> types[solaris-types · 共享数据]
     backend --> types
@@ -26,12 +27,12 @@ graph TD
 | --- | --- | --- |
 | `solaris` | CLI/TUI、配置加载、认证交互、服务组装、应用状态与转录展示 | `main.rs`、`assembly.rs`、`app.rs`、`automation.rs` |
 | `solaris-provider` | 连接预设、用户端点、官方模型事实解析、凭据存储与刷新、远程模型列表 | `config.rs`、`selection.rs`、`credentials/`、`discovery.rs` |
-| `solaris-backend` | Rig 原生模型连接、协议选择、HTTP 策略、有限重试、业务消息与事件类型 | `lib.rs`、`connection.rs`、`client.rs`、`request.rs` |
-| `solaris-agent` | 会话入口、SDK 执行器集成、审批、预算、队列、压缩、子代理、持久化 | `agent.rs`、`driver.rs`、`session.rs`、`conversation.rs` |
+| `solaris-backend` | Rig 原生模型连接、协议选择、HTTP 策略、有限重试、请求用量与消息边界转换 | `lib.rs`、`connection.rs`、`client.rs`、`request.rs` |
+| `solaris-agent` | 会话入口、SDK 执行器集成、审批、预算、队列、压缩、子代理、持久化 | `runtime/`、`execution/`、`policy/`、`context/`、`tasks/`、`storage/` |
 | `solaris-tools` | 工具注册与选择、Bash 执行环境、文件操作、搜索、输出截断与变更记录 | `lib.rs`、`environment.rs`、`runner.rs`、`tools/` |
 | `solaris-mcp` | MCP 连接、发现、资源与提示词操作、工具适配 | `lib.rs` |
 | `solaris-tui` | 组件、布局、输入、浮层、主题、终端生命周期 | `lib.rs` |
-| `solaris-types` | 能力状态、工具状态、附件、截断与变更等共享数据 | `lib.rs` |
+| `solaris-types` | 工具声明/调用/结果、能力状态、附件、截断与变更等共享数据 | `lib.rs` |
 
 应用负责组装：选择 provider、准备 agent 后端配置、建立 MCP 连接并显式注册工具。agent 不依赖 provider 或应用；MCP 不修改工具注册表。TUI 框架不承担模型执行和会话策略。
 
@@ -48,9 +49,9 @@ graph TD
 | 工具权限、参数校验、审批、执行预算、steering / follow-up | Solaris agent，通过 SDK 接口与 hook 接入 |
 | 业务转录、工具意图、计费账本、子代理管理、UI 投影 | Solaris |
 
-Solaris 只保留一个生产模型入口：`AgentBackend::model_client()` 返回 `ModelClient`。它携带固定能力、原生 Serve handler 及结算/状态观察器。`Backend` 是生产模型连接实现；认证、预算和账本通过包装连接准备或观察结算工作，不提供另一套模型执行循环。
+Solaris 只保留一个生产模型入口：`ModelConnector::model_client()` 返回 `ModelClient`。它携带固定能力、原生 Serve handler 及单一结算回调与状态通知。`Backend` 是生产模型连接实现；认证由 provider 的连接工厂协调，预算和账本通过 agent 的统一执行连接准备与结算流程工作，不提供另一套模型执行循环。
 
-业务 `Message`、`ToolCall`、`ToolResult` 和 `AgentEvent` 用于工具边界、journal 与展示。它们与 Rig 类型之间的转换不是第二个模型后端。`test-utils` 仅由开发依赖启用，提供 Rig handler 和 HTTP 测试夹具。
+`AgentEvent` 属于 agent，工具调用数据契约属于 `solaris-types`，并由 tools 暴露。业务 `Message` 用于必要的边界转换与展示，`ToolCall`、`ToolResult` 和 `AgentEvent` 用于工具边界、journal 与展示。它们与 Rig 类型之间的转换不是第二个模型后端。`test-utils` 仅由开发依赖启用，提供 Rig handler 和 HTTP 测试夹具。
 
 ## 3. Provider 与模型连接
 
@@ -62,7 +63,7 @@ Solaris 只保留一个生产模型入口：`AgentBackend::model_client()` 返�
 
 `selection.rs` 在选择连接时解析模型，生成不可变 `ModelParameters` 和 `TurnPlan`。请求模型名、能力、上下文限制及输出预算由同一份事实派生。内置 provider 与自定义端点共用连接组装函数；认证方式和端点路由在组装前确定。
 
-远程模型发现与官方元数据目录是两项独立操作：前者查询账号可见的模型 ID，允许缓存与离线回退；后者提供模型能力和标准价格事实。
+远程模型发现与官方元数据目录是两项独立操作：前者由 provider 的 `ModelSource` 查询账号可见的模型 ID，允许缓存与离线回退；后者提供模型能力和标准价格事实。执行连接不再提供模型列表查询或列表诊断。
 
 ### 认证和请求
 
@@ -79,7 +80,7 @@ sequenceDiagram
     participant SDK as Rig Agent
     participant Model as 模型连接
     participant Tool as 工具适配器
-    App->>Host: run_turn(prompt, mode)
+    App->>Host: submit / execute(RuntimeCommand)
     Host->>Host: 准备提示词、工具与预算
     Host->>SDK: prompt / run_channel
     loop SDK 模型与工具循环
@@ -95,7 +96,7 @@ sequenceDiagram
     Host-->>App: 业务事件流
 ```
 
-`driver.rs` 通过 `AgentBuilder`、hook、ToolServer 和 `run_channel()` 集成完整 SDK 执行器。SDK 负责模型—工具—模型循环；host 外层协调任务阶段、steering、后台完成通知与压缩，不逐轮重建或手动驱动模型请求。
+`execution/driver.rs` 通过 `AgentBuilder`、hook、ToolServer 和 `run_channel()` 集成完整 SDK 执行器。SDK 负责模型—工具—模型循环；host 外层协调任务阶段、steering、后台完成通知与压缩，不逐轮重建或手动驱动模型请求。
 
 需要改变当前请求历史时，host 在下一次模型请求前建立安全交接：保存已配对的 SDK 原生历史、核对取消返回的规范历史，再交接后续阶段。检查保存游标可拒绝并发写入。普通失败和取消不保存当前未提交阶段；此前成功或安全交接的消息继续保留。
 
@@ -106,13 +107,30 @@ sequenceDiagram
 - **取消**：取消模型执行及可取消的工具进程，不回滚已经发生的文件或外部副作用。
 - **预算**：父任务、摘要和子代理共享请求次数、期限与费用约束。
 
-单个会话通过 turn lease 限制一个活动轮次。UI 事件通过持久化边界输出；journal 写入失败会停止流并报告错误。
+`SessionRuntime` 的单一处理任务串行接收发送、取消、插话、排队、清空、压缩、资源替换和连接切换等命令。`submit()` 同步入队并返回接受回执，`execute()` 等待接受结果；调用方消费带元数据的事件流，或通过 `subscribe()` 订阅，通过 `snapshot()` 查询状态。运行时不再 Deref 为 Agent。
+
+事件包含会话 ID、任务 ID 和会话级递增序号，序号在持久会话恢复后继续增长。快照包含模型、模式、活动任务、费用与上下文。应用侧 TUI、CLI 和 RPC 共用命令入口，模型发现直接使用 provider 服务。
+
+会话租约由实际执行任务持有，丢弃输出流只触发取消，不提前释放租约。终态交付会等待执行器退场，避免旧任务晚写 memory 与新任务冲突。journal 写入失败会停止流并报告错误。
+
+agent 内部职责按目录组织：
+
+| 目录 | 职责 |
+| --- | --- |
+| `runtime/` | 会话构造、命令处理、事件、队列和状态投影 |
+| `execution/` | Rig hook/handler、固定请求快照、工具桥接和执行连接 |
+| `policy/` | 权限、审批、请求/时间/费用预算 |
+| `context/` | 提示词资源、技能、请求估算和压缩策略 |
+| `tasks/` | 前后台子代理、并发、取消和结果交付 |
+| `storage/` | native memory、journal、计费账本、执行记录和提交检查点 |
+
+`AgentOptions` 仅包含用户会话配置；资源通过 `with_resources(ResourceSnapshot)` 独立注入。审批策略从原始配置为每个会话构造一次，子代理不会继承已包装的策略实例。共享预算、父账本、子模型工厂、任务控制与费用报告保存在内部会话服务中，不再混入用户配置。
 
 ## 5. 消息、持久化与恢复
 
 模型历史唯一来源是官方 memory：临时会话使用 MemoryStore，持久会话使用 `sessions/memory/<SESSION_ID>` 下的 DirStore。不存在另一份独立 SDK 会话历史，也不从 UI 转录重建模型历史。
 
-SQLite journal 保存产品事件、工具意图、模型选择、请求用量、子任务和执行元数据。它不是模型消息存储；旧 SQL 上下文和旧消息日志不再导入。历史费用只从逐请求账本恢复，不从累计 `TurnComplete` 事件回推。
+SQLite journal 保存产品事件、工具意图、模型选择、请求用量、子任务和执行元数据。它不是模型消息存储；旧 SQL 上下文和旧消息日志不再导入。历史费用只从逐请求账本恢复，不从累计 `TurnComplete` 事件回推。清空使用独立 `Cleared` 业务记录，不携带另一份消息列表。
 
 恢复直接打开 native memory，并由 Rig `normalize()` 修复工具配对。Solaris 只为 SDK 补齐的缺失工具结果添加中断提示，要求核查副作用后再尝试。修复保留消息身份，重复恢复不会重复补结果，也不会重新执行工具。
 
@@ -120,13 +138,17 @@ SQLite journal 保存产品事件、工具意图、模型选择、请求用量�
 
 模型 history、转录和费用的提交边界不同：失败阶段可能没有进入 memory，但已经发生的工具意图、展示事件与费用仍会保留。恢复不等于重放副作用。两个存储均应视为敏感数据。
 
+持久 memory 使用检查点包装器：先向 SQLite 记录待提交的日志范围与摘要，再由原生 Store 执行带游标校验的写入，最后确认提交。恢复时根据已存在的日志字节确认或中止未完成检查点，不补写消息、不执行工具。原子事务不跨越两种存储。
+
+当前会话 schema 为 4，只接受新数据库或同版本数据库。旧 schema 和旧记录格式明确报错，不提供自动迁移或静默导入。
+
 ## 6. 上下文、压缩与计费
 
 ### 上下文投影
 
-`projection.rs` 使用官方 `Prepared`、`RequestStart`、`Anchor` 与 `next_request_tokens` 计算当前请求占用。它引用 SDK 活动历史的共享原生消息，只计算投影，不另写一份模型历史。
+`context/projection.rs` 使用官方 `Prepared`、`RequestStart`、`Anchor` 与 `next_request_tokens` 计算当前请求占用。它引用 SDK 活动历史的共享原生消息，只计算投影，不另写一份模型历史。
 
-可复用的请求锚点使用实测用量加其后新增内容的估算；模型、提示词、工具集合或历史变化会使旧锚点失效。工具变化重算当前工作视图，UI 和预算读取同一计算结果。恢复后的会话重新估算，不用累计账单代替单次请求上下文。
+可复用的请求锚点使用实测用量加其后新增内容的估算；模型、提示词、工具集合或历史变化会使旧锚点失效。工具变化重算当前工作视图，UI 和预算读取同一计算结果。每次调用固定 `RequestSnapshot`，模型连接、请求头及工具声明一致；SDK 注册、请求工具集和参数校验使用准备好的工具规格，结算使用该请求保留的计量头。恢复后的会话重新估算，不用累计账单代替单次请求上下文。
 
 规则和技能加载时准备模型可见路径。资源与工具估算输入在内存中缓存，查询上下文不读文件、不启动 Bash、不重建提示词。应用重载资源在后台串行准备，空闲边界发布。
 
@@ -138,11 +160,11 @@ SQLite journal 保存产品事件、工具意图、模型选择、请求用量�
 
 普通输入、输出、缓存读、缓存写经统一转换保留为业务用量。缺少上游用量时允许标记为估算；费用仍只读取原生响应的 `usage.cost`，不按估算 token 回退计价。
 
-结算观察器保留完整 SDK `Cost`，包括缺失状态和完整性标记。`UsageTotals.cost_usd` 是已知费用小计，`cost_complete` 表示全部请求费用是否完整；部分或未知费用不会被当成完整的零费用。启用费用预算时，无法获得完整费用会停止执行。
+结算协调器保留完整 SDK `Cost`，包括缺失状态和完整性标记。每个准备好的模型请求具有独立标识，连接只结算一次，数据库对会话内请求标识建立唯一约束，恢复也按请求去重。固定顺序为：父/本会话账本持久化、累计值更新、预算判断、统计发布，不依赖观察器注册顺序。`UsageTotals.cost_usd` 是已知费用小计，`cost_complete` 表示全部请求费用是否完整；部分或未知费用不会被当成完整的零费用。启用费用预算时，无法获得完整费用会停止执行。
 
 账本逐请求记录，摘要及子代理的已发生消耗在失败或取消后仍可恢复。子请求先写入父账本，后交付完成通知；父任务吸收子任务结果只更新轮次累计，避免重复记账。子代理占用不计入父模型上下文。
 
-当前应用事件和 UI 仍展示标量费用小计，尚未展示核心费用完整性状态。Rig 标准 API 参考价也不等于实际账单，订阅连接不套用 API 价格。
+当前统计 UI 区分完整费用、部分小计及未知费用；轮次事件仍携带便于展示的标量小计，完整状态以核心账本为准。Rig 标准 API 参考价也不等于实际账单，订阅连接不套用 API 价格。
 
 ## 7. 子代理与后台任务
 
@@ -177,7 +199,7 @@ Windows 启动校验 `cygwin.rs::REQUIRED_FILES`，覆盖 Bash、Cygwin DLL、pr
 
 应用层负责命令、对话状态、转录、终端输入与认证交互；`solaris-tui` 提供可复用组件框架。Markdown 使用官方 `tui-markdown` 依赖，并在展示层适配所需样式。流式思考、文本和工具事件由 agent hook 产生，应用维护展示投影，展示数据不作为 SDK 工作历史。
 
-应用层目前仍集中承担较多组装、状态和展示职责，本批核心清理没有拆分应用层。
+应用保留组装、导航和展示状态；活动会话的执行状态、命令接受与业务策略由运行时管理。
 
 ## 10. 验证与扩展
 
@@ -191,7 +213,7 @@ cargo check --workspace --lib --bins --locked
 
 测试覆盖原生 SDK 请求、流事件、取消、审批、工具参数、费用状态、压缩、恢复与分叉、子代理、认证刷新及 TUI。HTTP 与回调测试使用本地夹具，不依赖真实模型账号。
 
-扩展优先沿现有边界进行：新工具实现工具接口，由应用注册；新 MCP 能力提供适配器；新厂商优先使用 Rig 官方连接与方言；模型事实使用官方目录/覆盖；执行策略通过 SDK hook 或连接观察器接入。避免恢复独立协议客户端、第二份 history、独立计价器或逐轮模型驱动循环。
+扩展优先沿现有边界进行：新工具实现工具接口，由应用注册；新 MCP 能力提供适配器；新厂商优先使用 Rig 官方连接与方言；模型事实使用官方目录/覆盖；执行策略通过 SDK hook 或统一执行连接接入。避免恢复独立协议客户端、第二份 history、独立计价器或逐轮模型驱动循环。
 
 ## 附录：随包 Cygwin 工具来源
 

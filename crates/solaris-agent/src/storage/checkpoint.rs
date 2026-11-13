@@ -39,7 +39,7 @@ impl CheckpointStore {
         bytes: &[u8],
         replace: bool,
     ) -> Result<(), LogWriteError> {
-        let id = crate::billing::new_request_id();
+        let id = crate::identity::new_id();
         self.journal
             .begin_checkpoint(&PendingCheckpoint {
                 id: id.clone(),

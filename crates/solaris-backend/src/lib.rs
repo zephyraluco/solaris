@@ -1,6 +1,6 @@
-//! Model execution and business contracts.
+//! Native model connections and request policy.
 //!
-//! Public messages, tools, events and usage are independent of the SDK. The
+//! Connection errors and request usage are independent of session events. The
 //! single production [`Backend`] delegates protocol encoding and stream decoding
 //! to the official model SDK; authentication and model resolution belong to the
 //! provider layer, while conversation and execution policy belong to the agent.
@@ -12,21 +12,20 @@ mod connection;
 mod discovery;
 pub use connection::ModelClient;
 mod convert;
-mod event;
+mod error;
 mod http;
 mod message;
 mod policy;
 mod request;
-mod tool;
 mod transport;
 mod usage;
 mod wire;
 
 pub use client::{Backend, Endpoint, TurnPlan};
-pub use event::BackendError;
+pub use error::BackendError;
 pub use http::IDLE_TIMEOUT;
 pub use message::{Content, Message, Role};
-pub use tool::{ToolCall, ToolResult, ToolSpec};
+use solaris_types::{ToolCall, ToolResult};
 pub use usage::{Usage, tokens_for_characters};
 pub use wire::Wire;
 

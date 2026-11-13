@@ -30,8 +30,8 @@ use solaris_backend::Role;
 /// The messages a turn is built from and appends to.
 pub(crate) struct Conversation {
     storage: RwLock<Arc<dyn rig_memory::Store + Send + Sync>>,
-    headers: Mutex<Vec<crate::projection::Header>>,
-    projections: Mutex<std::collections::BTreeMap<String, crate::projection::Projection>>,
+    headers: Mutex<Vec<crate::context::projection::Header>>,
+    projections: Mutex<std::collections::BTreeMap<String, crate::context::projection::Projection>>,
     projecting: AtomicBool,
     published: Mutex<std::collections::BTreeMap<String, solaris_backend::ContextUsage>>,
     journal: RwLock<Option<Arc<SessionJournal>>>,
@@ -91,7 +91,7 @@ impl Conversation {
             })
             .collect();
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
-        let storage = crate::checkpoint::CheckpointStore::open(Arc::clone(&journal))?;
+        let storage = crate::storage::checkpoint::CheckpointStore::open(Arc::clone(&journal))?;
         *self.storage.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(storage);
         *self
             .journal
@@ -240,7 +240,7 @@ impl Conversation {
     pub(crate) fn publish_projection(
         &self,
         messages: &[Arc<rig_core::message::Message>],
-        header: &crate::projection::Header,
+        header: &crate::context::projection::Header,
         sent: bool,
     ) -> solaris_backend::ContextUsage {
         let mut projections = self.projections.lock().unwrap_or_else(|p| p.into_inner());
@@ -255,7 +255,7 @@ impl Conversation {
     }
     pub(crate) fn observe_usage(
         &self,
-        header: &crate::projection::Header,
+        header: &crate::context::projection::Header,
         usage: solaris_backend::Usage,
     ) {
         if let Some(projection) = self
@@ -387,7 +387,7 @@ impl Conversation {
         self.billing.try_lock().ok().map(|totals| *totals)
     }
 
-    pub(crate) fn set_headers(&self, headers: Vec<crate::projection::Header>) {
+    pub(crate) fn set_headers(&self, headers: Vec<crate::context::projection::Header>) {
         self.projections
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -396,7 +396,7 @@ impl Conversation {
         self.publish();
     }
 
-    pub(crate) fn update_request_header(&self, header: crate::projection::Header) {
+    pub(crate) fn update_request_header(&self, header: crate::context::projection::Header) {
         {
             let mut headers = self.headers.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(current) = headers
@@ -457,7 +457,7 @@ impl Conversation {
             })
     }
 
-    pub(crate) fn projected_tokens(&self, header: &crate::projection::Header) -> u32 {
+    pub(crate) fn projected_tokens(&self, header: &crate::context::projection::Header) -> u32 {
         self.update_request_header(header.clone());
         self.context_usage(&header.base_id, 0).tokens.unwrap_or(0)
     }
@@ -467,10 +467,11 @@ impl Conversation {
 mod tests {
     use super::*;
     use serde_json::json;
-    use solaris_backend::{ToolCall, ToolResult};
+
+    use solaris_types::{ToolCall, ToolResult};
 
     fn tokens(conversation: &Conversation) -> u32 {
-        let header = crate::projection::Header::new("", "", &[]);
+        let header = crate::context::projection::Header::new("", "", &[]);
         conversation.projected_tokens(&header)
     }
 
@@ -684,7 +685,7 @@ mod tests {
     #[test]
     fn tool_changes_reestimate_the_same_projection_for_ui_and_budget() {
         let conversation = Conversation::new();
-        let initial = crate::projection::Header::new("model", "system", &[]);
+        let initial = crate::context::projection::Header::new("model", "system", &[]);
         conversation.set_headers(vec![initial.clone()]);
         conversation.publish_projection(&[], &initial, true);
         conversation.observe_usage(&initial, solaris_backend::Usage::new(9000, 100));
@@ -693,13 +694,13 @@ mod tests {
             let tools = if schema == "null" {
                 vec![]
             } else {
-                vec![solaris_backend::ToolSpec {
+                vec![solaris_types::ToolSpec {
                     name: "lookup".into(),
                     description: "Find an item".into(),
                     parameters: serde_json::from_str(schema).expect("schema"),
                 }]
             };
-            let mut header = crate::projection::Header::new("model", "system", &tools);
+            let mut header = crate::context::projection::Header::new("model", "system", &tools);
             header.base_id.clone_from(&initial.base_id);
             conversation.update_request_header(header.clone());
             let display = conversation.context_usage(&initial.base_id, 10000);
@@ -722,19 +723,19 @@ mod tests {
     #[test]
     fn changing_tools_during_a_run_uses_sdk_working_messages_not_saved_memory() {
         let conversation = Conversation::new();
-        let initial = crate::projection::Header::new("model", "system", &[]);
+        let initial = crate::context::projection::Header::new("model", "system", &[]);
         conversation.set_headers(vec![initial.clone()]);
         let guard = conversation.projecting();
         let working = vec![Arc::new(rig_core::message::Message::user(
             "x".repeat(20_000),
         ))];
         conversation.publish_projection(&working, &initial, true);
-        let tools = [solaris_backend::ToolSpec::new(
+        let tools = [solaris_types::ToolSpec::new(
             "read",
             "Read",
             json!({"type":"object"}),
         )];
-        let mut changed = crate::projection::Header::new("model", "system", &tools);
+        let mut changed = crate::context::projection::Header::new("model", "system", &tools);
         changed.base_id.clone_from(&initial.base_id);
         conversation.update_request_header(changed.clone());
         let live = conversation.context_usage(&initial.base_id, 10000);
@@ -759,7 +760,7 @@ mod tests {
     #[test]
     fn ui_reads_published_projection_without_waiting_for_message_lock() {
         let conversation = Arc::new(Conversation::new());
-        let header = crate::projection::Header::new("model", "system", &[]);
+        let header = crate::context::projection::Header::new("model", "system", &[]);
         let base = header.base_id.clone();
         conversation.set_headers(vec![header.clone()]);
         conversation.publish_projection(&[], &header, true);

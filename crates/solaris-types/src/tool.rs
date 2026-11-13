@@ -72,7 +72,7 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Display metadata excluded from provider request bodies.
     #[serde(default)]
-    pub metadata: Box<solaris_types::ToolMetadata>,
+    pub metadata: Box<crate::ToolMetadata>,
 }
 
 impl ToolResult {
@@ -94,8 +94,8 @@ impl ToolResult {
             name: call.name.clone(),
             output: output.into(),
             is_error: true,
-            metadata: Box::new(solaris_types::ToolMetadata {
-                status: solaris_types::ToolStatus::Failed,
+            metadata: Box::new(crate::ToolMetadata {
+                status: crate::ToolStatus::Failed,
                 ..Default::default()
             }),
         }

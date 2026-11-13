@@ -92,3 +92,6 @@ pub struct ContextUsage {
     pub window: u32,
     pub estimated: bool,
 }
+
+mod tool;
+pub use tool::{ToolCall, ToolResult, ToolSpec};

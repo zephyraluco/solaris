@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use solaris_backend::Usage;
-use solaris_backend::{ToolCall, ToolResult};
+
+use solaris_types::{ToolCall, ToolResult};
 
 /// A single incremental event produced while answering a turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

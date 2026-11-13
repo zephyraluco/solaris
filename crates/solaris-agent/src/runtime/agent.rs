@@ -7,15 +7,15 @@ use std::sync::{Arc, RwLock};
 use crate::AgentEventStream;
 use solaris_tools::{Cancel, ToolRegistry, ToolSelection};
 
-use crate::approver::{AlwaysApprove, Approver};
-use crate::compaction::Compaction;
-use crate::conversation::Conversation;
-use crate::mode::{Mode, default_tool_names};
-use crate::prompt;
-use crate::queue::Queue;
-use crate::session::{self, DEFAULT_MAX_PARALLEL, TurnInput};
-use crate::skills::Skills;
-use crate::subagent::{SubagentRunner, SubagentTool};
+use crate::context::compaction::Compaction;
+use crate::context::prompt;
+use crate::context::skills::Skills;
+use crate::execution::{self, DEFAULT_MAX_PARALLEL, TurnInput};
+use crate::policy::approver::{AlwaysApprove, Approver};
+use crate::runtime::mode::{Mode, default_tool_names};
+use crate::runtime::queue::Queue;
+use crate::storage::memory::Conversation;
+use crate::tasks::{SubagentRunner, SubagentTool};
 use crate::{ConnectionConfig, InputError, PromptContext, ResourceSnapshot, expand_input};
 
 /// What a session is told once, and keeps for every turn of it.
@@ -35,19 +35,11 @@ pub struct AgentOptions {
     /// `1` runs every round one call at a time; a round holding a tool that
     /// declared itself sequential does that whatever this says.
     ///
-    /// There is no cap on how many rounds a turn may take: the loop runs until
-    /// the model stops asking, fails, or the turn is cancelled.
+    /// The SDK runs until completion, cancellation, failure or an execution
+    /// budget stops further requests.
     pub max_parallel: usize,
     /// When the conversation is summarized to stay inside the context window.
     pub compaction: Compaction,
-    /// The skills this session may draw on.
-    ///
-    /// Held here rather than in the application because the system prompt is
-    /// written here: what the model is told exists and what it can be pointed at
-    /// by name have to be the same list.
-    pub skills: Skills,
-    /// Global and project instructions used by every turn.
-    pub prompt_context: PromptContext,
     /// Whether this agent may delegate. Children always disable delegation.
     pub subagents: bool,
     /// Permission profile and aggregate request/time/cost limits.
@@ -63,8 +55,6 @@ impl Default for AgentOptions {
             temp_dir: std::env::temp_dir(),
             max_parallel: DEFAULT_MAX_PARALLEL,
             compaction: Compaction::default(),
-            skills: Skills::empty(),
-            prompt_context: PromptContext::default(),
             subagents: true,
             execution: crate::ExecutionSettings::default(),
         }
@@ -100,18 +90,6 @@ impl AgentOptions {
         self
     }
 
-    /// The same options with `skills` as what this session may draw on.
-    pub fn with_skills(mut self, skills: Skills) -> Self {
-        self.skills = skills;
-        self
-    }
-
-    /// Append instruction sources to the built-in system prompt.
-    pub fn with_prompt_context(mut self, context: PromptContext) -> Self {
-        self.prompt_context = context;
-        self
-    }
-
     /// Enable or disable the runtime's subagent tool.
     pub fn with_subagents(mut self, enabled: bool) -> Self {
         self.subagents = enabled;
@@ -133,7 +111,7 @@ impl AgentOptions {
 #[derive(Clone)]
 struct CachedPrompt {
     text: String,
-    header: crate::projection::Header,
+    header: crate::context::projection::Header,
 }
 
 pub struct Agent {
@@ -145,7 +123,8 @@ pub struct Agent {
     /// serialising against the same per-file locks for the whole session.
     registry: Arc<ToolRegistry>,
     options: AgentOptions,
-    services: crate::billing::SessionServices,
+    approver: Arc<dyn Approver>,
+    services: crate::runtime::services::SessionServices,
     /// Stops the turn in flight, tools included.
     cancel: Cancel,
     /// The conversation every turn extends.
@@ -164,15 +143,22 @@ impl Agent {
         registry: Arc<ToolRegistry>,
         options: AgentOptions,
     ) -> Self {
-        Self::with_services(choice, registry, options, Default::default())
+        Self::with_services(
+            choice,
+            registry,
+            options,
+            Default::default(),
+            Default::default(),
+        )
     }
     pub(crate) fn with_services(
         choice: ConnectionConfig,
         registry: Arc<ToolRegistry>,
-        mut options: AgentOptions,
-        services: crate::billing::SessionServices,
+        options: AgentOptions,
+        services: crate::runtime::services::SessionServices,
+        mut resources: ResourceSnapshot,
     ) -> Self {
-        options.approver = Arc::new(crate::PolicyApprover {
+        let approver: Arc<dyn Approver> = Arc::new(crate::PolicyApprover {
             profile: options.execution.profile,
             read_only_tools: registry
                 .names()
@@ -198,18 +184,13 @@ impl Agent {
             > 8
         {
             let mut registry = registry.as_ref().clone();
-            registry.add(Arc::new(crate::tool_search::ToolSearch));
+            registry.add(Arc::new(crate::execution::tool_search::ToolSearch));
             Arc::new(registry)
         } else {
             registry
         };
-        let mut prompt = options.prompt_context.clone();
-        prompt.prepare_paths(&options.cwd);
-        let resources = Arc::new(RwLock::new(ResourceSnapshot {
-            skills: options.skills.clone(),
-            prompt,
-            warnings: Vec::new(),
-        }));
+        resources.prompt.prepare_paths(&options.cwd);
+        let resources = Arc::new(RwLock::new(resources));
         let steering = Queue::for_resources(Arc::clone(&resources));
         let follow_up = Queue::for_resources(Arc::clone(&resources));
         let agent = Self {
@@ -218,6 +199,7 @@ impl Agent {
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
             options,
+            approver,
             services,
             cancel: Cancel::new(),
             conversation: Arc::new(Conversation::new()),
@@ -227,6 +209,12 @@ impl Agent {
         };
         agent.rebuild_prompts();
         agent
+    }
+
+    /// Initial resources are separate from user configuration and runtime services.
+    pub fn with_resources(self, resources: ResourceSnapshot) -> Self {
+        self.replace_resources(resources);
+        self
     }
 
     /// Attach a persistent session at an idle boundary and restore its context.
@@ -284,7 +272,7 @@ impl Agent {
 
     /// Replace transport credentials at an idle boundary without losing the
     /// conversation, queued input, resources, tools or cancellation handle.
-    pub fn with_refreshed_backend(&self, choice: ConnectionConfig) -> Self {
+    pub(crate) fn with_refreshed_backend(&self, choice: ConnectionConfig) -> Self {
         // Persistence failures are retained by the conversation and block the
         // next request, including callers whose refresh API cannot return errors.
         self.conversation
@@ -295,6 +283,7 @@ impl Agent {
             active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
+            approver: Arc::clone(&self.approver),
             services: self.services.clone(),
             cancel: self.cancel.clone(),
             conversation: Arc::clone(&self.conversation),
@@ -363,12 +352,12 @@ impl Agent {
     ///
     /// Returns how many messages the summary replaced, or `None` when there was
     /// nothing worth summarizing or the model would not produce one.
-    pub async fn compact(&self) -> Option<usize> {
+    pub(crate) async fn compact(&self) -> Option<usize> {
         let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))?;
         let cancel = self.cancel.begin_turn();
         let budget = crate::ExecutionBudget::new(self.options.execution.budget.clone());
         let inner: Arc<dyn solaris_backend::ModelConnector> =
-            Arc::new(crate::billing::ExecutionConnector {
+            Arc::new(crate::execution::connection::ExecutionConnector {
                 inner: Arc::clone(&self.choice.backend),
                 conversation: Arc::clone(&self.conversation),
                 services: self.services.for_turn(Arc::clone(&budget)),
@@ -377,7 +366,7 @@ impl Agent {
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(budget.deadline()) => { cancel.cancel(); None },
-            result = session::compact_now(&inner, &self.conversation, self.options.compaction, &cancel) => result,
+            result = execution::compact_now(&inner, &self.conversation, self.options.compaction, &cancel) => result,
         }
     }
 
@@ -418,14 +407,11 @@ impl Agent {
             let specs: Vec<_> = tools
                 .iter()
                 .map(|tool| {
-                    solaris_backend::ToolSpec::new(
-                        tool.name(),
-                        tool.description(),
-                        tool.parameters(),
-                    )
+                    solaris_types::ToolSpec::new(tool.name(), tool.description(), tool.parameters())
                 })
                 .collect();
-            let mut header = crate::projection::Header::new(&self.model_key(mode), &text, &specs);
+            let mut header =
+                crate::context::projection::Header::new(&self.model_key(mode), &text, &specs);
             if specs.iter().any(|spec| spec.name == "tool_search")
                 && specs
                     .iter()
@@ -437,8 +423,11 @@ impl Agent {
                     .into_iter()
                     .filter(|spec| !spec.name.starts_with("mcp_"))
                     .collect();
-                let initial =
-                    crate::projection::Header::new(&self.model_key(mode), &text, &declared);
+                let initial = crate::context::projection::Header::new(
+                    &self.model_key(mode),
+                    &text,
+                    &declared,
+                );
                 header.tools = initial.tools;
                 header.request_id = initial.request_id;
             }
@@ -591,7 +580,7 @@ impl Agent {
     ///
     /// The prompt is recorded in the conversation before anything is asked, so a
     /// turn that is abandoned still leaves what the user said.
-    pub fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
+    pub(crate) fn run_turn(&self, prompt: impl Into<String>, mode: Mode) -> AgentEventStream {
         let Some(lease) = crate::runtime::TurnLease::acquire(Arc::clone(&self.active)) else {
             return Box::pin(futures::stream::once(async {
                 crate::AgentEvent::Error("session already has an active turn".into())
@@ -609,7 +598,8 @@ impl Agent {
                 }));
             }
         };
-        let turn_options = self.options.clone();
+        let mut turn_options = self.options.clone();
+        turn_options.approver = Arc::clone(&self.approver);
         let services =
             self.services
                 .for_turn(self.services.budget.clone().unwrap_or_else(|| {
@@ -625,7 +615,7 @@ impl Agent {
                     parent: self.journal(),
                     billing: Arc::clone(&self.conversation),
                     registry: Arc::clone(&self.registry),
-                    options: turn_options.clone(),
+                    options: self.options.clone(),
                     services: services.clone(),
                     resources: resources.clone(),
                     mode,
@@ -649,7 +639,7 @@ impl Agent {
                 crate::AgentEvent::Error(error.to_string())
             }));
         }
-        let stream = session::start(TurnInput {
+        let stream = execution::start(TurnInput {
             lease: Some(lease),
             inner: Arc::clone(&self.choice.backend),
             tools,
@@ -692,8 +682,9 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use serde_json::{Value, json};
-    use solaris_backend::{BackendError, ModelConnector, ToolCall, Usage};
+    use solaris_backend::{BackendError, ModelConnector, Usage};
     use solaris_tools::{SHELL_TOOL, Tool, ToolContext, ToolOutput};
+    use solaris_types::ToolCall;
 
     #[tokio::test]
     async fn saved_context_is_restored_and_transcript_events_survive_restart() {
@@ -1227,8 +1218,12 @@ mod tests {
         let agent = Agent::new(
             choice(inner.clone()),
             Arc::new(ToolRegistry::builtin()),
-            AgentOptions::in_directory(&dir).with_skills(skills),
-        );
+            AgentOptions::in_directory(&dir),
+        )
+        .with_resources(ResourceSnapshot {
+            skills,
+            ..Default::default()
+        });
         std::fs::write(&path, "---\ndescription: PDF work\ndisable-model-invocation: true\n---\nNew body: read references/formats.md").expect("update");
         agent
             .steering_handle()

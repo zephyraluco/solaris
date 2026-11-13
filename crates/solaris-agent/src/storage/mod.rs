@@ -67,7 +67,7 @@ pub enum SessionRecord {
     },
     Cleared,
     ToolIntent {
-        call: solaris_backend::ToolCall,
+        call: solaris_types::ToolCall,
     },
     Interrupted,
 }
@@ -323,7 +323,7 @@ impl SessionJournal {
     }
     pub(crate) fn begin_checkpoint(
         &self,
-        checkpoint: &crate::checkpoint::PendingCheckpoint,
+        checkpoint: &crate::storage::checkpoint::PendingCheckpoint,
     ) -> Result<(), StoreError> {
         self.store.lock()?.execute("INSERT INTO memory_checkpoints(id,session_id,log,offset,length,digest,state) VALUES (?1,?2,?3,?4,?5,?6,'pending')",
             params![checkpoint.id, self.id, checkpoint.log, checkpoint.offset, checkpoint.length, checkpoint.digest])?;
@@ -338,12 +338,12 @@ impl SessionJournal {
     }
     pub(crate) fn pending_checkpoints(
         &self,
-    ) -> Result<Vec<crate::checkpoint::PendingCheckpoint>, StoreError> {
+    ) -> Result<Vec<crate::storage::checkpoint::PendingCheckpoint>, StoreError> {
         let connection = self.store.lock()?;
         let mut query = connection.prepare("SELECT id,log,offset,length,digest FROM memory_checkpoints WHERE session_id=?1 AND state='pending' ORDER BY rowid")?;
         Ok(query
             .query_map([&self.id], |row| {
-                Ok(crate::checkpoint::PendingCheckpoint {
+                Ok(crate::storage::checkpoint::PendingCheckpoint {
                     id: row.get(0)?,
                     log: row.get(1)?,
                     offset: row.get(2)?,
@@ -383,7 +383,7 @@ impl SessionJournal {
         // asides while giving the child its own store and save cursor.
         let original = rig_memory::load(&self.memory_store()?, "conversation")
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
-        let destination = crate::checkpoint::CheckpointStore::open(Arc::clone(&child))?;
+        let destination = crate::storage::checkpoint::CheckpointStore::open(Arc::clone(&child))?;
         let mut forked = rig_memory::load(&destination, "conversation")
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
         let entries = (0..original.messages().len())
@@ -449,7 +449,7 @@ mod tests {
             )
             .unwrap();
         assert!(journal.context().unwrap().is_empty());
-        let conversation = crate::conversation::Conversation::new();
+        let conversation = crate::storage::memory::Conversation::new();
         conversation.attach(Arc::clone(&journal)).unwrap();
         assert!(conversation.snapshot().is_empty());
     }
@@ -547,7 +547,7 @@ mod tests {
         seed_memory(&session, vec![Message::user("hello")]);
         session
             .append(&SessionRecord::ToolIntent {
-                call: solaris_backend::ToolCall::new(
+                call: solaris_types::ToolCall::new(
                     "call",
                     "bash",
                     serde_json::json!({"command":"echo test"}),
@@ -602,3 +602,8 @@ mod tests {
         assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"auxiliary_usage","usage":{"input_tokens":10,"output_tokens":2},"cost_usd":0.01}"#).is_err(), "legacy charge aliases are not imported");
     }
 }
+
+pub(crate) mod billing;
+pub(crate) mod checkpoint;
+pub(crate) mod memory;
+pub(crate) mod recording;

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool::{ToolCall, ToolResult};
+use solaris_types::{ToolCall, ToolResult};
 
 /// Who produced a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

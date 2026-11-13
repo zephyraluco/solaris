@@ -27,7 +27,7 @@ enum Boundary {
 #[derive(Clone)]
 struct RequestSnapshot {
     client: solaris_backend::ModelClient,
-    header: crate::projection::Header,
+    header: crate::context::projection::Header,
 }
 #[derive(Default)]
 struct Phase {
@@ -506,9 +506,9 @@ impl Runner {
                 .memory(self.conversation.storage())
                 .conversation("conversation")
                 .add_hook(policy)
-                .record_to(crate::recording::ExecutionRecorder::new(Arc::clone(
-                    &self.conversation,
-                )));
+                .record_to(crate::storage::recording::ExecutionRecorder::new(
+                    Arc::clone(&self.conversation),
+                ));
             let server = rig_agent::tool::server::ToolServer::new().run();
             for tool in &self.tools {
                 let bridge = ToolBridge {

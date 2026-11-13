@@ -1,11 +1,9 @@
 //! Per-request accounting, independent from context projection and turn completion.
-use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{BackendError, ModelConnector, Usage};
+use solaris_backend::Usage;
 
-use crate::{SessionRecord, conversation::Conversation};
+use crate::SessionRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotals {
@@ -65,103 +63,14 @@ pub enum UsageKind {
     Manual,
 }
 
-/// Session services are runtime state, never user configuration.
-#[derive(Clone, Default)]
-pub(crate) struct SessionServices {
-    pub budget: Option<Arc<crate::ExecutionBudget>>,
-    pub child_backend: Option<crate::ChildBackendFactory>,
-    pub tasks: crate::TaskControls,
-    pub parent_ledger: Option<Arc<Conversation>>,
-    pub child_requests: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    pub report: Option<ChildReport>,
-}
-#[derive(Clone)]
-pub(crate) struct ChildReport {
-    pub totals: Arc<std::sync::Mutex<UsageTotals>>,
-    pub tx: Option<tokio::sync::mpsc::UnboundedSender<crate::AgentEvent>>,
-}
-impl SessionServices {
-    pub fn for_turn(&self, budget: Arc<crate::ExecutionBudget>) -> Self {
-        Self {
-            budget: Some(budget),
-            ..self.clone()
-        }
-    }
-}
-
-/// One explicit settlement pipeline: persist, account, enforce, then publish.
-pub(crate) struct ExecutionConnector {
-    pub inner: Arc<dyn ModelConnector>,
-    pub conversation: Arc<Conversation>,
-    pub services: SessionServices,
-    pub kind: UsageKind,
-}
-#[async_trait]
-impl ModelConnector for ExecutionConnector {
-    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        let budget = self.services.budget.clone().expect("execution budget");
-        budget.request()?;
-        if let Some(requests) = &self.services.child_requests
-            && requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20
-        {
-            return Err(BackendError::new(
-                "subagent exceeded its 20 model-request budget",
-            ));
-        }
-        let client = Arc::clone(&self.inner).model_client().await?;
-        budget.validate_pricing(client.capabilities().price_known)?;
-        let request_id = new_request_id();
-        Ok(client.with_settlement(move |usage, cost| {
-            // Parent ledger is authoritative even when a child later fails.
-            if let Some(parent) = &self.services.parent_ledger {
-                parent.record_billing(&request_id, usage, cost, UsageKind::Child)?;
-            }
-            self.conversation
-                .record_billing(&request_id, usage, cost, self.kind)?;
-            // Record known consumption before denying further requests.
-            if let Some(report) = &self.services.report {
-                report
-                    .totals
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .add(usage, cost);
-            }
-            let decision = budget.settle(cost);
-            if let Some(report) = &self.services.report
-                && let Some(tx) = &report.tx
-            {
-                let _ = tx.send(crate::AgentEvent::SubagentUsage {
-                    usage,
-                    cost_usd: cost.map_or(0.0, |value| value.total),
-                });
-            }
-            decision
-        }))
-    }
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
-    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
-        self.inner.capabilities()
-    }
-}
-
-pub(crate) fn new_request_id() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    format!(
-        "{:x}-{:x}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::connection::ExecutionConnector;
+    use crate::runtime::services::SessionServices;
+    use crate::storage::memory::Conversation;
+    use solaris_backend::ModelConnector;
+    use std::sync::Arc;
     fn charge(value: f64) -> solaris_backend::Cost {
         solaris_backend::Cost::from_parts(value, 0.0, 0.0, 0.0)
     }

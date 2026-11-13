@@ -1,6 +1,6 @@
 //! When a conversation is summarized, and how much of it is kept.
 //!
-//! The policy is here and the driving of it is in [`crate::session`], because the
+//! The policy is here and the driving of it is in [`crate::execution`], because the
 //! decisions are pure — a token count against a window, an index into a list —
 //! and being able to test them without a backend is worth the split.
 //!
@@ -129,7 +129,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use solaris_backend::Role;
-    use solaris_backend::{ToolCall, ToolResult};
+
+    use solaris_types::{ToolCall, ToolResult};
 
     fn call(id: &str) -> ToolCall {
         ToolCall::new(id, "read", json!({}))

@@ -27,9 +27,9 @@ use std::sync::Arc;
 use solaris_backend::Message;
 use solaris_tools::Tool;
 
-use crate::mode::Mode;
-use crate::resources::PromptContext;
-use crate::skills::Skills;
+use crate::context::resources::PromptContext;
+use crate::context::skills::Skills;
+use crate::runtime::mode::Mode;
 use std::path::Path;
 
 /// The tool a model opens a file with, which is the one a skill is read by.
@@ -245,7 +245,7 @@ pub(crate) fn build_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::Skill;
+    use crate::context::skills::Skill;
     use solaris_tools::ToolRegistry;
 
     /// The registry's tools as a turn would declare them.

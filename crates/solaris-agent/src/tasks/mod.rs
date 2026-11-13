@@ -94,10 +94,10 @@ pub(crate) struct Task {
 pub(crate) struct SubagentRunner {
     pub choice: ConnectionConfig,
     pub parent: Option<Arc<crate::SessionJournal>>,
-    pub billing: Arc<crate::conversation::Conversation>,
+    pub billing: Arc<crate::storage::memory::Conversation>,
     pub registry: Arc<ToolRegistry>,
     pub options: AgentOptions,
-    pub services: crate::billing::SessionServices,
+    pub services: crate::runtime::services::SessionServices,
     pub resources: ResourceSnapshot,
     pub mode: Mode,
     pub slots: Semaphore,
@@ -186,7 +186,7 @@ impl SubagentRunner {
         // The deadline includes waiting for a shared foreground/background slot.
         let output = tokio::select! {
             biased;
-            _ = crate::session::wait_for_cancel(&ctx.cancel) => ToolOutput::error("subagent was cancelled"),
+            _ = crate::execution::wait_for_cancel(&ctx.cancel) => ToolOutput::error("subagent was cancelled"),
             _ = tx.closed() => ToolOutput::error("subagent was cancelled"),
             _ = tokio::time::sleep(TIMEOUT) => ToolOutput::error("subagent timed out after 5 minutes"),
             output = self.execute(task, ctx, tx, call_id, Arc::clone(&totals)) => output,
@@ -269,7 +269,7 @@ impl SubagentRunner {
         let mut services = self.services.clone();
         services.parent_ledger = Some(Arc::clone(&self.billing));
         services.child_requests = Some(Arc::new(AtomicUsize::new(0)));
-        services.report = Some(crate::billing::ChildReport {
+        services.report = Some(crate::runtime::services::ChildReport {
             totals: Arc::clone(&totals),
             tx: task.background.then(|| tx.clone()),
         });
@@ -282,10 +282,10 @@ impl SubagentRunner {
             only: registry.names(),
             ..Default::default()
         };
-        options.skills = self.resources.skills.clone();
-        options.prompt_context = self.resources.prompt.clone();
+
         let child_model = choice.model.clone();
-        let child = Agent::with_services(choice, registry, options, services);
+        let child =
+            Agent::with_services(choice, registry, options, services, self.resources.clone());
         let journal = if let Some(parent) = &self.parent {
             let result = if let Some(id) = &task.resume_id {
                 match parent.store().list(&ctx.cwd) {
@@ -588,3 +588,5 @@ mod control_tests {
         assert!(two.is_cancelled());
     }
 }
+
+pub(crate) mod background;

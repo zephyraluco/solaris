@@ -1,5 +1,6 @@
 //! Background delegation through the public API, synchronized without sleeps.
 
+use solaris_agent::testing::AgentFixture;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -233,7 +234,7 @@ async fn run_with_release(model: &Arc<Model>, agent: &Agent) -> Vec<AgentEvent> 
     tokio::time::timeout(Duration::from_secs(3), async {
         let (events, ()) = tokio::join!(
             agent
-                .run_turn("Delegate and continue working.", Mode::Build)
+                .run_fixture("Delegate and continue working.", Mode::Build)
                 .collect(),
             async {
                 model.wait_started(1).await;
@@ -338,7 +339,9 @@ async fn foreground_default_and_explicit_false_wait_before_parent_work_continues
         let agent = agent(&model, AgentOptions::default(), &read);
         let events = tokio::time::timeout(Duration::from_secs(3), async {
             let (events, ()) = tokio::join!(
-                agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
+                agent
+                    .run_fixture("Delegate", Mode::Build)
+                    .collect::<Vec<_>>(),
                 async {
                     model.wait_started(1).await;
                     assert_eq!(model.parent_rounds.load(Ordering::SeqCst), 1);
@@ -368,7 +371,9 @@ async fn an_idle_parent_waits_for_a_notification_without_polling_the_model() {
     let agent = agent(&model, AgentOptions::default(), &read);
     let events = tokio::time::timeout(Duration::from_secs(3), async {
         let (events, ()) = tokio::join!(
-            agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
+            agent
+                .run_fixture("Delegate", Mode::Build)
+                .collect::<Vec<_>>(),
             async {
                 model.wait_started(1).await;
                 model.idle.notified().await;
@@ -393,7 +398,7 @@ async fn completion_notifies_immediately_even_while_the_parent_request_is_pendin
     model.hold_parent_request = true;
     let model = Arc::new(model);
     let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
+    let mut stream = agent.run_fixture("Delegate", Mode::Build);
     tokio::time::timeout(Duration::from_secs(1), async {
         model.wait_started(1).await;
         model.progressed.notified().await;
@@ -432,7 +437,7 @@ async fn completion_notifies_immediately_even_while_the_parent_request_is_pendin
 async fn steering_reaches_a_parent_waiting_for_background_reports() {
     let model = Arc::new(Model::new(1));
     let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
+    let mut stream = agent.run_fixture("Delegate", Mode::Build);
     tokio::time::timeout(Duration::from_secs(1), async {
         model.wait_started(1).await;
         model.idle.notified().await;
@@ -470,7 +475,7 @@ async fn background_children_share_the_parallel_cap_across_batches() {
     let events = tokio::time::timeout(Duration::from_secs(3), async {
         let (events, ()) = tokio::join!(
             agent
-                .run_turn("Delegate five tasks", Mode::Build)
+                .run_fixture("Delegate five tasks", Mode::Build)
                 .collect::<Vec<_>>(),
             async {
                 model.wait_started(2).await;
@@ -514,7 +519,9 @@ async fn foreground_and_background_children_share_the_same_execution_slots() {
     );
     let events = tokio::time::timeout(Duration::from_secs(3), async {
         let (events, ()) = tokio::join!(
-            agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
+            agent
+                .run_fixture("Delegate", Mode::Build)
+                .collect::<Vec<_>>(),
             async {
                 model.wait_started(1).await;
                 assert_eq!(model.active.count.load(Ordering::SeqCst), 1);
@@ -567,7 +574,7 @@ async fn invalid_background_arguments_and_plan_writes_are_rejected_before_launch
         model.inputs = vec![input];
         let model = Arc::new(model);
         let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-        let mut stream = agent.run_turn("Delegate", Mode::Plan);
+        let mut stream = agent.run_fixture("Delegate", Mode::Plan);
         let result = tokio::time::timeout(Duration::from_secs(1), async {
             while let Some(event) = stream.next().await {
                 if let AgentEvent::ToolResult { result, .. } = event {
@@ -606,7 +613,7 @@ async fn cancelling_or_dropping_the_parent_stops_running_and_queued_background_c
             },
             &Arc::new(Read::default()),
         );
-        let stream = agent.run_turn("Delegate", Mode::Build);
+        let stream = agent.run_fixture("Delegate", Mode::Build);
         tokio::time::timeout(Duration::from_secs(1), model.wait_started(1))
             .await
             .unwrap();
@@ -632,7 +639,7 @@ async fn cancelling_or_dropping_the_parent_stops_running_and_queued_background_c
         model.release.add_permits(3);
         let next: Vec<_> = tokio::time::timeout(
             Duration::from_secs(1),
-            agent.run_turn("A new turn", Mode::Build).collect(),
+            agent.run_fixture("A new turn", Mode::Build).collect(),
         )
         .await
         .unwrap();
@@ -661,7 +668,7 @@ async fn completed_child_request_usage_survives_parent_cancellation() {
     model.child_tool_before_wait = true;
     let model = Arc::new(model);
     let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let stream = agent.run_turn("Delegate", Mode::Build);
+    let stream = agent.run_fixture("Delegate", Mode::Build);
     tokio::time::timeout(Duration::from_secs(1), model.wait_started(1))
         .await
         .unwrap();
@@ -706,7 +713,7 @@ async fn parent_failure_aborts_its_background_children() {
     let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
     let events: Vec<_> = tokio::time::timeout(
         Duration::from_secs(1),
-        agent.run_turn("Delegate", Mode::Build).collect(),
+        agent.run_fixture("Delegate", Mode::Build).collect(),
     )
     .await
     .unwrap();
@@ -720,7 +727,7 @@ async fn parent_failure_aborts_its_background_children() {
 async fn background_timeout_is_a_notification_and_the_parent_can_finish() {
     let model = Arc::new(Model::new(1));
     let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
+    let mut stream = agent.run_fixture("Delegate", Mode::Build);
     model.wait_started(1).await;
     model.idle.notified().await;
     tokio::time::advance(Duration::from_secs(301)).await;
@@ -750,7 +757,7 @@ async fn child_requests_are_billed_before_parent_failure_or_cancellation_and_sur
         let journal = store.create(directory.path(), "test-model", None).unwrap();
         original.attach_journal(journal.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            let mut stream = original.run_turn("Delegate", Mode::Build);
+            let mut stream = original.run_fixture("Delegate", Mode::Build);
             while let Some(event) = stream.next().await {
                 if matches!(event, AgentEvent::SubagentUsage { .. }) {
                     // The child's first request completed; its next request is still blocked.

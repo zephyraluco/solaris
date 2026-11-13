@@ -2,7 +2,8 @@
 use rig_core::{completion::ToolDefinition, conversation::Conversation, message::Message};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use solaris_backend::{ContextUsage, ToolSpec, Usage};
+use solaris_backend::{ContextUsage, Usage};
+use solaris_types::ToolSpec;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]

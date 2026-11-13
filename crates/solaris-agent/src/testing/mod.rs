@@ -123,3 +123,21 @@ pub fn parameters(id: &str, output_tokens: u32) -> solaris_backend::ModelParamet
     spec.input.image = true;
     solaris_backend::ModelParameters::new(spec, Some(output_tokens), true)
 }
+
+/// Direct executor access exists only in test fixtures, not the production API.
+pub trait AgentFixture {
+    fn run_fixture(&self, prompt: impl Into<String>, mode: crate::Mode) -> crate::AgentEventStream;
+    fn compact_fixture(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>>;
+}
+impl AgentFixture for crate::Agent {
+    fn run_fixture(&self, prompt: impl Into<String>, mode: crate::Mode) -> crate::AgentEventStream {
+        self.run_turn(prompt, mode)
+    }
+    fn compact_fixture(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>> {
+        Box::pin(self.compact())
+    }
+}

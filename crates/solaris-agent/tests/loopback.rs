@@ -7,6 +7,7 @@
 //! parsed tool call, the executed tool and the follow-up request are all
 //! exercised together. Nothing here reaches the network.
 
+use solaris_agent::testing::AgentFixture;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -198,7 +199,7 @@ fn agent(addr: SocketAddr, dir: &Path) -> Agent {
 
 /// Read a turn's stream to its end.
 async fn drain(agent: &Agent, prompt: &str) -> Vec<AgentEvent> {
-    let mut stream = agent.run_turn(prompt, Mode::Build);
+    let mut stream = agent.run_fixture(prompt, Mode::Build);
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -469,7 +470,7 @@ async fn manual_native_compaction_obeys_the_deadline_and_releases_the_connection
     );
     agent.attach_journal(Arc::clone(&journal)).unwrap();
     assert_eq!(
-        tokio::time::timeout(PATIENCE, agent.compact())
+        tokio::time::timeout(PATIENCE, agent.compact_fixture())
             .await
             .unwrap(),
         None
@@ -524,7 +525,7 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
         options,
     );
     agent.attach_journal(Arc::clone(&journal)).unwrap();
-    assert_eq!(agent.compact().await, Some(2));
+    assert_eq!(agent.compact_fixture().await, Some(2));
     let memory =
         rig_memory::DirStore::open(directory.path().join("memory").join(journal.id())).unwrap();
     let conversation = rig_memory::load(&memory, "conversation").unwrap();

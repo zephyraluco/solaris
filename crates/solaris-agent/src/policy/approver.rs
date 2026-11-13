@@ -8,7 +8,7 @@
 //! answers immediately.
 
 use async_trait::async_trait;
-use solaris_backend::ToolCall;
+use solaris_types::ToolCall;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 /// The answer to "may this call run?".

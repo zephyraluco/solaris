@@ -1,8 +1,5 @@
 //! Persist official executor lifecycle observations without copying message history.
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use rig_core::{
     effect::{Answered, EffectId, EffectKind, HandlerDescriptor, HandlerKey},
@@ -14,7 +11,7 @@ use rig_core::{
 };
 use serde_json::json;
 
-use crate::conversation::Conversation;
+use crate::storage::memory::Conversation;
 
 pub(crate) struct ExecutionRecorder {
     conversation: Arc<Conversation>,
@@ -22,17 +19,9 @@ pub(crate) struct ExecutionRecorder {
 }
 impl ExecutionRecorder {
     pub fn new(conversation: Arc<Conversation>) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |time| time.as_nanos());
         Self {
             conversation,
-            task: format!(
-                "{}-{time}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ),
+            task: crate::identity::new_id(),
         }
     }
     fn record(&self, detail: serde_json::Value) {

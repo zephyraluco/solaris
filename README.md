@@ -621,3 +621,5 @@ Request accounting preserves the full SDK cost and its completeness flag. Unknow
 partial costs remain incomplete in the ledger and core totals; a cost budget stops
 execution if a complete charge is unavailable. The current UI displays the known
 subtotal. No token-price fallback is used.
+
+Session execution now uses a single command-owning runtime with session-scoped event sequences and snapshots. Model discovery is a separate provider service. Persistent sessions use schema 4; older session databases are rejected without migration. Native memory writes have journal checkpoints, and request settlement is idempotent. See [the architecture](docs/ARCHITECTURE.md) for module boundaries.

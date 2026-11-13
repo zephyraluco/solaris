@@ -13,7 +13,7 @@ use solaris_tools::{ToolContext, ToolOutput};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::subagent::{SubagentResult, SubagentRunner, Task};
+use crate::tasks::{SubagentResult, SubagentRunner, Task};
 
 #[derive(Default)]
 pub(crate) struct BackgroundTasks {

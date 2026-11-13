@@ -2,7 +2,7 @@
 use crate::{Approval, Approver};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solaris_backend::ToolCall;
+use solaris_types::ToolCall;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -503,3 +503,6 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod approver;
+pub(crate) mod budget;

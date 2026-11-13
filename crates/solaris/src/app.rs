@@ -249,8 +249,6 @@ fn with_tools(
 ) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
     let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
-        .with_skills(skills.clone())
-        .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
@@ -259,6 +257,11 @@ fn with_tools(
         Arc::new(move |model| Ok(crate::agent_backend(factory(&auth, model))));
     let agent = Arc::new(solaris_agent::SessionRuntime::new(
         Agent::new(crate::agent_backend(choice), registry, options)
+            .with_resources(solaris_agent::ResourceSnapshot {
+                skills: skills.clone(),
+                prompt: prompt_context.clone(),
+                warnings: Vec::new(),
+            })
             .with_child_backend(child_factory),
     ));
     let cancel = agent.cancel_handle();
@@ -630,6 +633,10 @@ impl App {
             || self.compact_rx.is_some()
             || self.resource_rx.is_some()
             || self.oauth.is_some()
+            || self
+                .runtime_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
         {
             self.notifications
                 .warning("finish or cancel the active operation before changing sessions");
@@ -3161,6 +3168,10 @@ impl Component for App {
         }
         if self.reload_pending
             && self.events_rx.is_none()
+            && self
+                .runtime_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
             && self.compact_rx.is_none()
             && self.resource_rx.is_none()
         {

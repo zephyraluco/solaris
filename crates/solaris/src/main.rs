@@ -507,9 +507,12 @@ fn main() -> Result<()> {
 
     if args.print.is_some() || args.rpc {
         let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
-            .with_selection(tools)
-            .with_skills(skills)
-            .with_prompt_context(resources.prompt);
+            .with_selection(tools);
+        let session_resources = solaris_agent::ResourceSnapshot {
+            skills,
+            prompt: resources.prompt,
+            warnings: resources.warnings,
+        };
         options.execution = execution;
         let factory = Arc::new(solaris_provider::refreshing_backend_factory(
             auth,
@@ -531,6 +534,7 @@ fn main() -> Result<()> {
         }
         let session = solaris_agent::SessionRuntime::new(
             solaris_agent::Agent::new(solaris::agent_backend(choice), Arc::new(registry), options)
+                .with_resources(session_resources)
                 .with_child_backend(child_factory),
         );
         if let Some(journal) = journal {

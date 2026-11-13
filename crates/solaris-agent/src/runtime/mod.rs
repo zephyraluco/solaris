@@ -66,7 +66,7 @@ pub struct RuntimeEvent {
     pub event: AgentEvent,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RuntimeSnapshot {
     pub session_id: String,
     pub sequence: u64,
@@ -95,7 +95,7 @@ impl CommandReceipt {
 struct Request {
     command: RuntimeCommand,
     output: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    accepted: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    accepted: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 struct Core {
     view: std::sync::RwLock<Arc<crate::Agent>>,
@@ -122,7 +122,7 @@ impl SessionRuntime {
     pub fn new(agent: crate::Agent) -> Self {
         let session_id = agent
             .journal()
-            .map_or_else(crate::billing::new_request_id, |j| j.id().into());
+            .map_or_else(crate::identity::new_id, |j| j.id().into());
         let sequence = agent
             .journal()
             .map(|journal| journal.event_sequence())
@@ -186,7 +186,7 @@ impl SessionRuntime {
         self.send(Request {
             command,
             output,
-            accepted: Some(accepted),
+            accepted,
         })?;
         Ok(CommandReceipt {
             ready,
@@ -363,6 +363,7 @@ async fn serve(
             .filter(|run| !run.abandoned)
             .map(|run| run.output.clone());
         tokio::select! {
+            biased;
             request = commands.recv() => {
                 let Some(Request { command, output, accepted }) = request else { break };
                 let Some(core) = weak.upgrade() else { break };
@@ -411,7 +412,7 @@ async fn serve(
                     }
                     _ => result = Err("session already has an active operation".into()),
                 }
-                if let Some(accepted) = accepted { let _ = accepted.send(result.clone()); }
+                let _ = accepted.send(result.clone());
                 if let Err(error) = result { let event = publish(&core, None, crate::Mode::Build, AgentEvent::Error(error)); let _ = output.send(event); }
                 refresh(&core, active.as_ref().map(|a| a.id), active.as_ref().map_or(crate::Mode::Build, |a| a.mode));
             }
@@ -697,3 +698,11 @@ mod tests {
         assert_eq!(events[0].session_id, id);
     }
 }
+
+pub(crate) mod agent;
+pub(crate) mod connection;
+pub(crate) mod event;
+pub(crate) mod input;
+pub(crate) mod mode;
+pub(crate) mod queue;
+pub(crate) mod services;

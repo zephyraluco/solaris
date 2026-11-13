@@ -1,5 +1,6 @@
 //! Delegation through the public Agent API, with scripted model replies.
 
+use solaris_agent::testing::AgentFixture;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -213,7 +214,7 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
 async fn run(agent: &Agent, mode: Mode) -> Vec<AgentEvent> {
     tokio::time::timeout(
         Duration::from_secs(3),
-        agent.run_turn("ROOT_PRIVATE_CONTEXT", mode).collect(),
+        agent.run_fixture("ROOT_PRIVATE_CONTEXT", mode).collect(),
     )
     .await
     .expect("turn must finish")
@@ -235,14 +236,17 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
     model.child_tool = Some("read");
     let model = Arc::new(model);
     let runs = Arc::new(AtomicUsize::new(0));
-    let options = AgentOptions::default().with_prompt_context(PromptContext {
-        project_rules: vec![PromptFile {
-            path: "AGENTS.md".into(),
-            content: "PROJECT_RULE".into(),
-        }],
+    let resources = solaris_agent::ResourceSnapshot {
+        prompt: PromptContext {
+            project_rules: vec![PromptFile {
+                path: "AGENTS.md".into(),
+                content: "PROJECT_RULE".into(),
+            }],
+            ..Default::default()
+        },
         ..Default::default()
-    });
-    let agent = agent(Arc::clone(&model), options, &runs);
+    };
+    let agent = agent(Arc::clone(&model), AgentOptions::default(), &runs).with_resources(resources);
     let events = run(&agent, Mode::Build).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(result(&events).output, "child final report");
@@ -553,7 +557,7 @@ async fn cancellation_and_dropped_parent_stream_stop_pending_child_network_reque
             AgentOptions::default(),
             &Arc::new(AtomicUsize::new(0)),
         );
-        let mut stream = agent.run_turn("ROOT_PRIVATE_CONTEXT", Mode::Build);
+        let mut stream = agent.run_fixture("ROOT_PRIVATE_CONTEXT", Mode::Build);
         tokio::time::timeout(Duration::from_secs(1), model.started.notified())
             .await
             .unwrap();
