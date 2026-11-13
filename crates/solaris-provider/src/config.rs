@@ -3,11 +3,7 @@ use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
 use rig_core::providers::registry::ProviderId;
 use serde::{Deserialize, Serialize};
 use solaris_types::{ModelCapabilities, Support};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{Arc, RwLock},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 const MANUFACTURERS: &[&str] = &[
     "openai",
@@ -34,18 +30,44 @@ pub struct ModelSelection {
     pub output_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ModelCatalog {
-    pub(super) state: Arc<RwLock<Catalog>>,
-    pub(super) overrides: Arc<String>,
-    selections: Arc<BTreeMap<String, ModelSelection>>,
+/// A named endpoint; credentials remain in AuthStore, never in model metadata.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEndpoint {
+    pub protocol: Protocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub credential: Option<String>,
 }
-impl Default for ModelCatalog {
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    OpenaiChat,
+    OpenaiResponses,
+    AnthropicMessages,
+}
+impl Protocol {
+    pub(crate) fn wire(self) -> solaris_backend::Wire {
+        match self {
+            Self::OpenaiChat => solaris_backend::Wire::OpenAiChat,
+            Self::OpenaiResponses => solaris_backend::Wire::OpenAiResponses,
+            Self::AnthropicMessages => solaris_backend::Wire::AnthropicMessages,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub catalog: crate::catalog::ModelCatalog,
+    selections: Arc<BTreeMap<String, ModelSelection>>,
+    endpoints: Arc<BTreeMap<String, ProviderEndpoint>>,
+}
+impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            state: Arc::new(RwLock::new(Catalog::builtin().clone())),
-            overrides: Arc::new("{}".into()),
+            catalog: crate::catalog::ModelCatalog::default(),
             selections: Arc::new(BTreeMap::new()),
+            endpoints: Arc::new(BTreeMap::new()),
         }
     }
 }
@@ -63,7 +85,7 @@ pub struct ResolvedModel {
     pub facts: ModelFacts,
 }
 
-impl ModelCatalog {
+impl ProviderConfig {
     /// New configuration: named selections and an official catalog override object.
     pub fn from_json(text: &str) -> Result<Self, String> {
         #[derive(Deserialize)]
@@ -71,6 +93,8 @@ impl ModelCatalog {
         struct Config {
             #[serde(default)]
             models: BTreeMap<String, ModelSelection>,
+            #[serde(default)]
+            providers: BTreeMap<String, ProviderEndpoint>,
             #[serde(default = "empty_object")]
             overrides: serde_json::Value,
         }
@@ -90,6 +114,22 @@ impl ModelCatalog {
                 return Err("model selections need a name, provider, request_id and a positive output budget".into());
             }
         }
+        for (id, endpoint) in &config.providers {
+            if id.is_empty() || crate::provider_spec(id).is_some() {
+                return Err("custom endpoints need a unique non-built-in provider name".into());
+            }
+            let url =
+                reqwest::Url::parse(&endpoint.base_url).map_err(|_| "invalid provider base_url")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err("provider base_url must be an HTTP(S) URL without credentials, query or fragment".into());
+            }
+        }
         let overrides = serde_json::to_string(&config.overrides).map_err(|e| e.to_string())?;
         let base = Catalog::builtin();
         let patch = Catalog::from_overrides(&overrides, base).map_err(|e| e.to_string())?;
@@ -100,10 +140,17 @@ impl ModelCatalog {
             }
         }
         Ok(Self {
-            state: Arc::new(RwLock::new(catalog)),
-            overrides: Arc::new(overrides),
+            catalog: crate::catalog::ModelCatalog::new(catalog, overrides),
             selections: Arc::new(config.models),
+            endpoints: Arc::new(config.providers),
         })
+    }
+
+    pub fn selection(&self, name: &str) -> Option<&ModelSelection> {
+        self.selections.get(name)
+    }
+    pub fn endpoint(&self, name: &str) -> Option<&ProviderEndpoint> {
+        self.endpoints.get(name)
     }
 
     pub fn resolve(&self, provider: &str, model: &str) -> ResolvedModel {
@@ -117,7 +164,7 @@ impl ModelCatalog {
         } else {
             provider
         };
-        let catalog = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
         let explicit = selection.and_then(|s| s.metadata.as_deref());
         let direct = format!("{vendor}/{request_id}");
         let mut found = catalog.resolve(explicit.unwrap_or(&direct)).ok();
@@ -155,7 +202,7 @@ impl ModelCatalog {
         spec.provider = ProviderId::declare("solaris").expect("valid declared vendor");
         spec.id = request_id.into();
         let mut capabilities = capabilities(&spec, known);
-        let output_tokens = super::super::discovery::output_budget(
+        let output_tokens = crate::request::output_budget(
             &capabilities,
             selection.and_then(|s| s.output_tokens).unwrap_or(
                 crate::DEFAULT_MAX_OUTPUT
@@ -189,7 +236,7 @@ impl ModelCatalog {
         } else {
             provider
         };
-        let catalog = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
         let mut ids: Vec<_> = catalog
             .iter()
             .filter(|s| s.provider.vendor() == vendor && !s.deprecated)
@@ -204,12 +251,6 @@ impl ModelCatalog {
         ids.sort();
         ids.dedup();
         ids
-    }
-    pub fn load_cache(&self, directory: &Path) {
-        super::cache::load(self, directory);
-    }
-    pub fn start_refresh(&self, directory: std::path::PathBuf) {
-        super::cache::start(self.clone(), directory);
     }
 }
 fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
@@ -232,7 +273,11 @@ fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
         } else {
             Support::Supported
         },
-        temperature: Support::Unknown,
+        temperature: match spec.sampling {
+            Some(rig_core::catalog::Sampling::Any) => Support::Supported,
+            Some(rig_core::catalog::Sampling::Never) => Support::Unsupported,
+            _ => Support::Unknown,
+        },
         context_window: spec.context_window,
         max_input: spec.max_input_tokens,
         max_output: spec.max_output_tokens,
@@ -246,7 +291,7 @@ mod tests {
     use super::*;
     #[test]
     fn gateway_identity_preserves_request_id_and_uses_official_facts() {
-        let catalog = ModelCatalog::default();
+        let catalog = ProviderConfig::default();
         let official = catalog.resolve("anthropic", "claude-sonnet-4-5");
         let gateway = catalog.resolve("new-api", "claude-sonnet-4-5");
         assert_eq!(gateway.request_id, "claude-sonnet-4-5");
@@ -257,7 +302,7 @@ mod tests {
     }
     #[test]
     fn explicit_alias_keeps_routing_separate_from_metadata() {
-        let catalog = ModelCatalog::from_json(r#"{"models":{"fast":{"provider":"new-api","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}}"#).expect("configuration");
+        let catalog = ProviderConfig::from_json(r#"{"models":{"fast":{"provider":"new-api","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}}"#).expect("configuration");
         let model = catalog.resolve("new-api", "fast");
         assert_eq!(model.request_id, "private-alias");
         assert_eq!(model.output_tokens, 4096);
@@ -267,17 +312,17 @@ mod tests {
     }
     #[test]
     fn unknown_and_wrong_vendor_do_not_invent_metadata() {
-        let catalog = ModelCatalog::default();
+        let catalog = ProviderConfig::default();
         let unknown = catalog.resolve("local", "unlisted-model");
         assert_eq!(unknown.capabilities.tool_calling, Support::Unknown);
         assert_eq!(unknown.capabilities.context_window, None);
         assert_eq!(unknown.capabilities.price_known, Some(false));
         assert!(catalog.resolve("anthropic", "gpt-5").metadata.is_none());
-        assert!(ModelCatalog::from_json(r#"{"models":{"x":{"provider":"new-api","request_id":"x","metadata":"anthropic/not-listed"}}}"#).is_err());
+        assert!(ProviderConfig::from_json(r#"{"models":{"x":{"provider":"new-api","request_id":"x","metadata":"anthropic/not-listed"}}}"#).is_err());
     }
     #[test]
     fn official_override_parser_updates_facts_and_limits() {
-        let catalog = ModelCatalog::from_json(r#"{"overrides":{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":32000,"output":2000}}}}}}"#).expect("override");
+        let catalog = ProviderConfig::from_json(r#"{"overrides":{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":32000,"output":2000}}}}}}"#).expect("override");
         let model = catalog.resolve("anthropic", "claude-sonnet-4-5");
         assert_eq!(model.capabilities.context_window, Some(32000));
         assert_eq!(model.output_tokens, 2000);

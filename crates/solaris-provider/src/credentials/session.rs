@@ -72,7 +72,7 @@ impl Credentials {
 
     fn choice(self: &Arc<Self>, model: &str) -> BackendChoice {
         let mut choice = (self.factory)(&self.initial, model);
-        if self.initial.active_provider() == Some("openai")
+        if choice.provider_id.as_deref() == Some("openai")
             && matches!(
                 self.initial.credential("openai"),
                 Some(Credential::ChatGpt { .. })
@@ -226,7 +226,7 @@ mod tests {
                     token: access_token.clone(),
                     calls: Arc::clone(&recorded),
                 }),
-                provider_id: Some("openai"),
+                provider_id: Some("openai".into()),
                 base_url: None,
                 model: model.into(),
                 source: CredentialSource::Stored,
@@ -331,11 +331,13 @@ mod tests {
         let (shared, calls) = setup(directory.path().join("auth.json"), refresh);
         let backend = shared.choice("model").backend;
         drop(backend.run_turn(request()).await.expect("first prompt"));
-        if let Some(Credential::ChatGpt { expires_at, .. }) =
-            shared.current.lock().await.auth.entries.get_mut("openai")
-        {
+        let mut state = shared.current.lock().await;
+        let mut expired = state.auth.credential("openai").expect("credential").clone();
+        if let Credential::ChatGpt { expires_at, .. } = &mut expired {
             *expires_at = 0;
         }
+        state.auth.store("openai", expired);
+        drop(state);
         drop(backend.run_turn(request()).await.expect("second prompt"));
         assert_eq!(*calls.lock().expect("calls"), vec!["fresh-1", "fresh-2"]);
         assert_eq!(count.load(Ordering::SeqCst), 2);

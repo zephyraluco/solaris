@@ -1,5 +1,4 @@
 //! Endpoint model discovery and offline model-list cache.
-use crate::{ModelCatalog, ResolvedModel};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,69 +18,13 @@ fn digest(text: &[u8]) -> String {
     format!("{:x}", Sha256::digest(text))
 }
 
-/// A fresh immutable parameter set is taken at the start of each model request.
-pub(crate) struct LiveModel {
-    pub catalog: Arc<ModelCatalog>,
-    pub provider: &'static str,
-    pub model: String,
-    pub prototype: solaris_backend::Backend,
-    pub account_authorized: bool,
-}
-impl LiveModel {
-    fn resolved(&self) -> ResolvedModel {
-        let mut resolved = self.catalog.resolve(self.provider, &self.model);
-        if self.account_authorized {
-            if let Some(spec) = resolved.facts.spec() {
-                let mut spec = spec.clone();
-                spec.pricing = None;
-                resolved.facts = rig_core::catalog::ModelFacts::new(spec)
-                    .with_catalog(&rig_core::catalog::Catalog::default());
-            }
-            resolved.capabilities.price_known = Some(false);
-        }
-        resolved
-    }
-    fn backend(&self) -> solaris_backend::Backend {
-        let resolved = self.resolved();
-        let wire = if self.account_authorized {
-            solaris_backend::Wire::OpenAiResponses
-        } else {
-            crate::provider_spec(self.provider)
-                .map(|provider| provider.wire_for(&resolved.request_id))
-                .unwrap_or_else(|| self.prototype.wire())
-        };
-        self.prototype.clone().with_wire(wire).with_model_facts(
-            resolved.request_id,
-            resolved.output_tokens,
-            resolved.facts,
-            resolved.capabilities,
-        )
-    }
-}
-
-pub(crate) fn output_budget(capabilities: &ModelCapabilities, requested: u32) -> u32 {
-    capabilities
-        .max_output
-        .unwrap_or(crate::DEFAULT_MAX_OUTPUT)
-        .min(requested)
-        .min(
-            capabilities
-                .context_window
-                .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
-                .saturating_sub(1)
-                .max(1),
-        )
-}
-
-pub(crate) struct CatalogBackend {
+pub(crate) struct ModelDiscovery {
     pub inner: Arc<dyn AgentBackend>,
-    pub live: Option<LiveModel>,
-    pub capabilities: ModelCapabilities,
     pub cache_dir: Option<PathBuf>,
     pub endpoint: String,
     pub notice: Mutex<Option<String>>,
 }
-impl CatalogBackend {
+impl ModelDiscovery {
     fn cache_path(&self) -> Option<PathBuf> {
         self.cache_dir
             .as_ref()
@@ -124,22 +67,16 @@ impl CatalogBackend {
     }
 }
 #[async_trait]
-impl AgentBackend for CatalogBackend {
+impl AgentBackend for ModelDiscovery {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        match &self.live {
-            Some(live) => Arc::new(live.backend()).model_client().await,
-            None => Arc::clone(&self.inner).model_client().await,
-        }
+        Arc::clone(&self.inner).model_client().await
     }
 
     fn label(&self) -> &str {
         self.inner.label()
     }
     fn capabilities(&self) -> ModelCapabilities {
-        self.live.as_ref().map_or_else(
-            || self.capabilities.clone(),
-            |live| live.resolved().capabilities,
-        )
+        self.inner.capabilities()
     }
     fn model_catalog_notice(&self) -> Option<String> {
         self.notice
@@ -148,10 +85,7 @@ impl AgentBackend for CatalogBackend {
             .clone()
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        match &self.live {
-            Some(live) => live.backend().run_turn(request).await,
-            None => self.inner.run_turn(request).await,
-        }
+        self.inner.run_turn(request).await
     }
     async fn models(&self) -> Result<Vec<String>, BackendError> {
         match self.inner.models().await {

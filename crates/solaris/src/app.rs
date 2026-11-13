@@ -3451,7 +3451,7 @@ mod tests {
         Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             crate::agent_backend(BackendChoice {
                 backend: fake_backend(),
-                provider_id: Some(provider),
+                provider_id: Some(provider.into()),
                 base_url: None,
                 model: String::new(),
                 source: CredentialSource::None,
@@ -3498,7 +3498,7 @@ mod tests {
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
             backend: Arc::clone(&resolved),
-            provider_id: Some(provider),
+            provider_id: Some(provider.into()),
             base_url: None,
             model: model.to_string(),
             source: CredentialSource::None,
@@ -3517,7 +3517,7 @@ mod tests {
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
             backend: fake_backend(),
-            provider_id: Some(provider),
+            provider_id: Some(provider.into()),
             base_url: None,
             model: model.to_string(),
             source: CredentialSource::None,

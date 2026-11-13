@@ -80,7 +80,7 @@ pub fn empty_environment() -> Environment {
 pub struct BackendOptions {
     /// Where provider keys are looked up.
     pub environment: Environment,
-    pub catalog: Arc<crate::ModelCatalog>,
+    pub configuration: Arc<crate::ProviderConfig>,
     pub model_cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -88,7 +88,7 @@ impl Default for BackendOptions {
     fn default() -> Self {
         Self {
             environment: process_environment(),
-            catalog: Arc::new(crate::ModelCatalog::default()),
+            configuration: Arc::new(crate::ProviderConfig::default()),
             model_cache_dir: None,
         }
     }
@@ -117,7 +117,7 @@ pub struct BackendChoice {
     /// The backend to use.
     pub backend: Arc<dyn AgentBackend>,
     /// Provider this resolved to, when one was picked at all.
-    pub provider_id: Option<&'static str>,
+    pub provider_id: Option<String>,
     /// Endpoint requests go to, when a real client was built.
     pub base_url: Option<String>,
     /// Model that will actually be asked for, which is not always the one that
@@ -150,6 +150,21 @@ type EnvLookup<'a> = &'a Environment;
 /// provider it is talking to. With no usable credential it returns a backend
 /// that refuses turns with an explanation instead of reaching the network.
 pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) -> BackendChoice {
+    let selected = options
+        .configuration
+        .selection(model)
+        .map(|s| s.provider.as_str())
+        .or_else(|| auth.active_provider());
+    if let Some(provider) = selected {
+        if options.configuration.endpoint(provider).is_some() {
+            return configured_backend(auth, provider, model, &options);
+        }
+        if auth.active_provider() != Some(provider) && provider_spec(provider).is_some() {
+            let mut selected_auth = auth.clone();
+            selected_auth.activate(provider);
+            return choose_backend(&selected_auth, model, options);
+        }
+    }
     let lookup = &options.environment;
 
     let Some(spec) = active_provider(auth, lookup) else {
@@ -188,7 +203,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     } else {
         real_model(spec, model)
     };
-    let resolved = options.catalog.resolve(spec.id, &model);
+    let resolved = options.configuration.resolve(spec.id, &model);
     let wire = if chatgpt.is_some() {
         solaris_backend::Wire::OpenAiResponses
     } else {
@@ -200,8 +215,8 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         session_header: spec.session_header,
         base_url,
         secret,
-        name: spec.name,
-        label: spec.id,
+        name: spec.name.into(),
+        label: spec.id.into(),
         env_keys: spec.env_keys,
     };
     let prompt_cache_key = is_openai_host(&endpoint.base_url).then_some(PROMPT_CACHE_KEY);
@@ -258,7 +273,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
                             spec.name
                         ),
                     }),
-                    provider_id: Some(spec.id),
+                    provider_id: Some(spec.id.into()),
                     base_url: Some(base_url),
                     model,
                     source: CredentialSource::NoModel,
@@ -266,21 +281,19 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             }
 
             BackendChoice {
-                backend: Arc::new(crate::discovery::CatalogBackend {
-                    live: Some(crate::discovery::LiveModel {
-                        catalog: Arc::clone(&options.catalog),
-                        provider: spec.id,
+                backend: Arc::new(crate::discovery::ModelDiscovery {
+                    inner: Arc::new(crate::request::SelectedBackend {
+                        configuration: Arc::clone(&options.configuration),
+                        provider: spec.id.into(),
                         model: model.clone(),
                         prototype: backend.clone(),
                         account_authorized,
                     }),
-                    inner: Arc::new(backend),
-                    capabilities,
                     cache_dir: options.model_cache_dir.clone(),
                     endpoint: format!("{}:{base_url}", spec.id),
                     notice: std::sync::Mutex::new(None),
                 }),
-                provider_id: Some(spec.id),
+                provider_id: Some(spec.id.into()),
                 base_url: Some(base_url),
                 model,
                 source,
@@ -294,6 +307,87 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             format!("could not set up HTTP for {}: {error}", spec.name),
             &model,
         ),
+    }
+}
+
+fn configured_backend(
+    auth: &AuthStore,
+    provider: &str,
+    model: &str,
+    options: &BackendOptions,
+) -> BackendChoice {
+    let endpoint = options
+        .configuration
+        .endpoint(provider)
+        .expect("selected endpoint");
+    let credential = endpoint.credential.as_deref();
+    let secret = credential
+        .and_then(|id| auth.credential(id))
+        .and_then(secret_of);
+    // Subscription OAuth tokens must never be forwarded to a custom host.
+    if credential.is_some_and(|id| matches!(auth.credential(id), Some(Credential::ChatGpt { .. })))
+        || (credential.is_some() && secret.is_none())
+    {
+        return BackendChoice::unconnected(
+            CredentialSource::Missing,
+            format!("{provider} needs its configured API credential — run /connect"),
+            model,
+        );
+    }
+    let resolved = options.configuration.resolve(provider, model);
+    let base_url = endpoint.base_url.trim_end_matches('/').to_owned();
+    let plan = TurnPlan {
+        endpoint: Endpoint {
+            wire: endpoint.protocol.wire(),
+            session_header: None,
+            base_url: base_url.clone(),
+            secret,
+            name: provider.into(),
+            label: provider.into(),
+            env_keys: &[],
+        },
+        model: resolved.request_id.clone(),
+        max_tokens: resolved.output_tokens,
+        price: None,
+        prompt_cache_key: None,
+    };
+    let backend = match Backend::new(plan) {
+        Ok(backend) => backend.with_model_facts(
+            resolved.request_id,
+            resolved.output_tokens,
+            resolved.facts,
+            resolved.capabilities.clone(),
+        ),
+        Err(error) => {
+            return BackendChoice::unconnected(
+                CredentialSource::Missing,
+                format!("could not create provider connection: {error}"),
+                model,
+            );
+        }
+    };
+    let source = if credential.is_some() {
+        CredentialSource::Stored
+    } else {
+        CredentialSource::None
+    };
+    BackendChoice {
+        backend: Arc::new(crate::discovery::ModelDiscovery {
+            inner: Arc::new(crate::request::SelectedBackend {
+                configuration: Arc::clone(&options.configuration),
+                provider: provider.into(),
+                model: model.into(),
+                prototype: backend,
+                account_authorized: false,
+            }),
+            cache_dir: options.model_cache_dir.clone(),
+            endpoint: format!("{provider}:{base_url}"),
+            notice: std::sync::Mutex::new(None),
+        }),
+        provider_id: Some(provider.into()),
+        base_url: Some(base_url),
+        model: model.into(),
+        source,
     }
 }
 
@@ -542,7 +636,7 @@ mod tests {
         let choice = choose_backend(&AuthStore::new(), "", options());
 
         assert_eq!(choice.source, CredentialSource::Missing);
-        assert_eq!(choice.provider_id, None);
+        assert_eq!(choice.provider_id.as_deref(), None);
         assert_eq!(choice.backend.label(), "unconnected");
 
         let error = match choice.backend.run_turn(request()).await {
@@ -563,7 +657,7 @@ mod tests {
         let choice = choose_backend(&auth, "claude-sonnet-4-5", options());
 
         assert_eq!(choice.source, CredentialSource::Stored);
-        assert_eq!(choice.provider_id, Some("anthropic"));
+        assert_eq!(choice.provider_id.as_deref(), Some("anthropic"));
         assert_eq!(choice.backend.label(), "anthropic");
         assert_eq!(
             choice.base_url.as_deref(),
@@ -661,7 +755,7 @@ mod tests {
         assert_eq!(choice.source, CredentialSource::NoModel);
         // The endpoint is resolved all the same: it is the provider that will
         // be asked what it offers, since nothing else can name a model here.
-        assert_eq!(choice.provider_id, Some("new-api"));
+        assert_eq!(choice.provider_id.as_deref(), Some("new-api"));
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
@@ -785,7 +879,7 @@ mod tests {
         );
 
         assert_eq!(choice.source, CredentialSource::Env("GOOGLE_API_KEY"));
-        assert_eq!(choice.provider_id, Some("google"));
+        assert_eq!(choice.provider_id.as_deref(), Some("google"));
         assert_eq!(
             choice.base_url.as_deref(),
             Some("https://generativelanguage.googleapis.com/v1beta/openai")
@@ -858,7 +952,7 @@ mod tests {
         );
         let choice = choose_backend(&auth, "gpt-4o", options());
 
-        assert_eq!(choice.provider_id, Some("new-api"));
+        assert_eq!(choice.provider_id.as_deref(), Some("new-api"));
         assert_eq!(
             choice.base_url.as_deref(),
             Some("http://one-api.server22.jz/v1")
@@ -919,7 +1013,7 @@ mod tests {
         for model in ["grok-4.7", "claude-haiku-5-5", "qwen3.8-max"] {
             let choice = choose_backend(&auth, model, options());
             assert_eq!(choice.source, CredentialSource::Stored, "{model}");
-            assert_eq!(choice.provider_id, Some("opencode"), "{model}");
+            assert_eq!(choice.provider_id.as_deref(), Some("opencode"), "{model}");
             assert_eq!(
                 choice.base_url.as_deref(),
                 Some("https://opencode.ai/zen/go/v1"),
@@ -999,7 +1093,7 @@ mod tests {
         let choice = choose_backend(&auth, "", options());
         assert!(choice.model.is_empty());
         assert_eq!(choice.source, CredentialSource::NoModel);
-        assert_eq!(choice.provider_id, Some("openai"));
+        assert_eq!(choice.provider_id.as_deref(), Some("openai"));
     }
 
     #[test]
@@ -1018,5 +1112,71 @@ mod tests {
             choose_backend(&auth, "gpt-5", options()).source,
             CredentialSource::Missing
         );
+    }
+}
+
+#[cfg(test)]
+mod configured_tests {
+    use super::*;
+    fn options() -> BackendOptions {
+        BackendOptions {
+            configuration: Arc::new(crate::ProviderConfig::from_json(r#"{
+              "providers":{"gateway":{"protocol":"openai-chat","base_url":"http://localhost:9999/v1","credential":"gateway-key"}},
+              "models":{"fast":{"provider":"gateway","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}
+            }"#).expect("config")),
+            environment: empty_environment(), ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn named_model_selects_custom_endpoint_and_fixes_request_facts_without_io() {
+        let mut auth = AuthStore::new();
+        auth.store(
+            "gateway-key",
+            Credential::ApiKey {
+                key: "test-key".into(),
+            },
+        );
+        let choice = choose_backend(&auth, "fast", options());
+        assert_eq!(choice.provider_id.as_deref(), Some("gateway"));
+        assert_eq!(choice.base_url.as_deref(), Some("http://localhost:9999/v1"));
+        assert_eq!(choice.model, "fast");
+        assert_eq!(choice.backend.label(), "gateway");
+        let client = choice
+            .backend
+            .model_client()
+            .await
+            .expect("local preparation");
+        assert_eq!(client.capabilities().output_budget, Some(4096));
+        assert_eq!(
+            client.capabilities().tool_calling,
+            solaris_types::Support::Supported
+        );
+    }
+    #[test]
+    fn custom_host_refuses_subscription_tokens_and_missing_credentials() {
+        let mut auth = AuthStore::new();
+        assert_eq!(
+            choose_backend(&auth, "fast", options()).source,
+            CredentialSource::Missing
+        );
+        auth.store(
+            "gateway-key",
+            Credential::ChatGpt {
+                access_token: "token".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                expires_at: u64::MAX,
+                account_id: "account".into(),
+            },
+        );
+        assert_eq!(
+            choose_backend(&auth, "fast", options()).source,
+            CredentialSource::Missing
+        );
+    }
+    #[test]
+    fn endpoint_configuration_rejects_credentials_in_url_and_unknown_fields() {
+        assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://secret@example.com/v1"}}}"#).is_err());
+        assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://example.com/v1","api_key":"secret"}}}"#).is_err());
     }
 }

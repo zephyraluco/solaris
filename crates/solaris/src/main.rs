@@ -191,14 +191,6 @@ fn main() -> Result<()> {
         eprintln!("solaris: {} — {}", warning.path.display(), warning.message);
     }
 
-    // `--provider` moves this run without rewriting the saved choice.
-    if let Some(id) = &args.provider {
-        if provider_spec(id).is_none() {
-            anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
-        }
-        auth.activate(id.clone());
-    }
-
     // What the last session left, unless this run overrides it: a flag always
     // wins, so `--plan` in a script keeps meaning plan. The model follows the
     // provider it was chosen for, and is kept in `auth.json` beside it.
@@ -213,30 +205,39 @@ fn main() -> Result<()> {
         config.mode = mode;
     }
 
-    // Without `--model`, a session starts on the model this provider was last
-    // used with: the catalogue's first entry is a fallback, not a decision, and
-    // reconnecting should not quietly move the user onto it.
-    if args.model.is_none()
-        && let Some(model) = auth.active_model()
-    {
-        config.model = model.to_string();
-    }
-
     let mut backend_options = BackendOptions::default();
     if let Some(directory) = config_dir() {
         let path = directory.join("models.json");
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                backend_options.catalog = Arc::new(
-                    solaris_provider::ModelCatalog::from_json(&text).map_err(anyhow::Error::msg)?,
+                backend_options.configuration = Arc::new(
+                    solaris_provider::ProviderConfig::from_json(&text)
+                        .map_err(anyhow::Error::msg)?,
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let cache_dir = directory.join("model-cache");
-        backend_options.catalog.load_cache(&cache_dir);
+        backend_options.configuration.catalog.load_cache(&cache_dir);
         backend_options.model_cache_dir = Some(cache_dir);
+    }
+    // Custom endpoints are validated after their configuration has been loaded.
+    if let Some(id) = &args.provider {
+        if provider_spec(id).is_none() && backend_options.configuration.endpoint(id).is_none() {
+            anyhow::bail!("unknown provider `{id}` — built-ins: {}", provider_ids());
+        }
+        auth.activate(id.clone());
+        if args.model.is_none()
+            && let Some(model) = auth.active_model()
+        {
+            config.model = model.to_owned();
+        }
+    }
+    if args.model.is_none()
+        && let Some(model) = auth.active_model()
+    {
+        config.model = model.to_owned();
     }
     // Resolved here for reporting, and again by the app whenever the
     // credentials or the model change.
@@ -277,12 +278,12 @@ fn main() -> Result<()> {
             }
         );
         let mut resolved = backend_options
-            .catalog
-            .resolve(choice.provider_id.unwrap_or(""), &choice.model);
+            .configuration
+            .resolve(choice.provider_id.as_deref().unwrap_or(""), &choice.model);
         if matches!(
             auth.credential("openai"),
             Some(solaris_provider::Credential::ChatGpt { .. })
-        ) && choice.provider_id == Some("openai")
+        ) && choice.provider_id.as_deref() == Some("openai")
         {
             resolved.capabilities.price_known = Some(false);
             resolved.reference_price = false;
@@ -472,7 +473,10 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     if let Some(directory) = &backend_options.model_cache_dir {
         let _runtime_guard = runtime.enter();
-        backend_options.catalog.start_refresh(directory.clone());
+        backend_options
+            .configuration
+            .catalog
+            .start_refresh(directory.clone());
     }
     let _guard = runtime.enter();
     let mcp_path = args

@@ -14,10 +14,11 @@ pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
             .unwrap_or(DEFAULT_CONTEXT_WINDOW),
         instructions: choice
             .provider_id
+            .as_deref()
             .and_then(provider_spec)
             .and_then(|spec| spec.prompt)
             .map(str::to_owned),
-        provider_id: choice.provider_id.map(str::to_owned),
+        provider_id: choice.provider_id,
         backend: choice.backend,
         model: choice.model,
     }
@@ -49,7 +50,7 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = Arc::new(Backend);
         let config = agent_backend(BackendChoice {
             backend: Arc::clone(&backend),
-            provider_id: Some("local"),
+            provider_id: Some("local".into()),
             base_url: Some("http://localhost:8080/v1".into()),
             model: "claude-sonnet-4-5".into(),
             source: CredentialSource::None,

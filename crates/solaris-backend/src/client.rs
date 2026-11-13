@@ -23,9 +23,9 @@ pub struct Endpoint {
     /// The key or token to send, or `None` for a runtime that wants none.
     pub secret: Option<String>,
     /// Display name, used in error messages.
-    pub name: &'static str,
+    pub name: String,
     /// Short label shown in the status bar — the platform id.
-    pub label: &'static str,
+    pub label: String,
     /// Environment variables that could carry a key, for the error message.
     pub env_keys: &'static [&'static str],
 }
@@ -179,24 +179,6 @@ impl Backend {
         self
     }
 
-    /// Reuse the HTTP pool while fixing one request's resolved model parameters.
-    pub fn with_model_parameters(
-        mut self,
-        model: String,
-        max_tokens: u32,
-        capabilities: crate::ModelCapabilities,
-        price: Option<Price>,
-        tiers: Vec<crate::PriceTier>,
-    ) -> Self {
-        self.model = model;
-        self.max_tokens = max_tokens;
-        self.capabilities = capabilities;
-        self.capabilities.output_budget = Some(self.max_tokens);
-        self.price = price;
-        self.price_tiers = tiers;
-        self
-    }
-
     /// The protocol selected for this immutable request configuration.
     pub fn wire(&self) -> Wire {
         self.endpoint.wire
@@ -205,12 +187,6 @@ impl Backend {
     /// Select the protocol from the same resolution as the request model ID.
     pub fn with_wire(mut self, wire: Wire) -> Self {
         self.endpoint.wire = wire;
-        self
-    }
-
-    /// Apply provider-specific context pricing tiers.
-    pub fn with_price_tiers(mut self, tiers: Vec<crate::PriceTier>) -> Self {
-        self.price_tiers = tiers;
         self
     }
 
@@ -247,7 +223,7 @@ impl AgentBackend for Backend {
         self.capabilities.clone()
     }
     fn label(&self) -> &str {
-        self.endpoint.label
+        &self.endpoint.label
     }
     async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         // Compatibility display API; every request uses the native connection.
@@ -368,7 +344,7 @@ impl Backend {
         let dialect = if self.chatgpt.is_some() {
             &rig_core::providers::chatgpt::DIALECT
         } else {
-            wire::by_name(self.endpoint.label).unwrap_or(&wire::OPENAI)
+            wire::by_name(&self.endpoint.label).unwrap_or(&wire::OPENAI)
         };
         let mut config =
             OpenAIConfig::with_key(dialect, self.endpoint.secret.clone().unwrap_or_default())
@@ -395,7 +371,7 @@ impl Backend {
             http::describe(
                 status,
                 report.provider_response_body().unwrap_or(&report.message),
-                self.endpoint.name,
+                &self.endpoint.name,
                 self.endpoint.env_keys,
             )
         } else {
