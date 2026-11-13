@@ -81,8 +81,27 @@ pub struct ResolvedModel {
     pub output_tokens: u32,
     pub capabilities: ModelCapabilities,
     pub reference_price: bool,
-    #[serde(skip)]
+    #[serde(serialize_with = "serialize_facts")]
     pub facts: ModelFacts,
+}
+
+fn serialize_facts<S: serde::Serializer>(
+    facts: &ModelFacts,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    facts.spec().serialize(serializer)
+}
+impl ResolvedModel {
+    pub(crate) fn without_pricing(mut self) -> Self {
+        if let Some(spec) = self.facts.spec() {
+            let mut spec = spec.clone();
+            spec.pricing = None;
+            self.facts = ModelFacts::new(spec).with_catalog(&Catalog::default());
+        }
+        self.capabilities.price_known = Some(false);
+        self.reference_price = false;
+        self
+    }
 }
 
 impl ProviderConfig {

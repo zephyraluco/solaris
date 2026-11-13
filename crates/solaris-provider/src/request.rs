@@ -12,17 +12,12 @@ pub(crate) struct SelectedBackend {
 }
 impl SelectedBackend {
     fn resolved(&self) -> ResolvedModel {
-        let mut resolved = self.configuration.resolve(&self.provider, &self.model);
+        let resolved = self.configuration.resolve(&self.provider, &self.model);
         if self.account_authorized {
-            if let Some(spec) = resolved.facts.spec() {
-                let mut spec = spec.clone();
-                spec.pricing = None;
-                resolved.facts = rig_core::catalog::ModelFacts::new(spec)
-                    .with_catalog(&rig_core::catalog::Catalog::default());
-            }
-            resolved.capabilities.price_known = Some(false);
+            resolved.without_pricing()
+        } else {
+            resolved
         }
-        resolved
     }
     pub(crate) fn backend(&self) -> solaris_backend::Backend {
         let resolved = self.resolved();

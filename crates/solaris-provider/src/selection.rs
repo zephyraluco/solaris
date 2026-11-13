@@ -204,6 +204,11 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         real_model(spec, model)
     };
     let resolved = options.configuration.resolve(spec.id, &model);
+    let resolved = if chatgpt.is_some() {
+        resolved.without_pricing()
+    } else {
+        resolved
+    };
     let wire = if chatgpt.is_some() {
         solaris_backend::Wire::OpenAiResponses
     } else {
@@ -238,15 +243,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     match Backend::new(plan) {
         Ok(backend) => {
-            let mut facts = resolved.facts;
-            if chatgpt.is_some()
-                && let Some(spec) = facts.spec()
-            {
-                let mut spec = spec.clone();
-                spec.pricing = None;
-                facts = rig_core::catalog::ModelFacts::new(spec)
-                    .with_catalog(&rig_core::catalog::Catalog::default());
-            }
+            let facts = resolved.facts;
             let backend = backend.with_model_facts(
                 resolved.request_id,
                 resolved.output_tokens,

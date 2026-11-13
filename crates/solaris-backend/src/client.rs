@@ -102,9 +102,7 @@ pub struct Backend {
     pub(super) endpoint: Endpoint,
     pub(super) model: String,
     pub(super) max_tokens: u32,
-    pub(super) price: Option<Price>,
-    pub(super) facts: Option<rig_core::catalog::ModelFacts>,
-    pub(super) price_tiers: Vec<crate::PriceTier>,
+    pub(super) facts: rig_core::catalog::ModelFacts,
     pub(super) prompt_cache_key: Option<&'static str>,
     pub(super) chatgpt: Option<(String, u64)>,
     pub(super) capabilities: crate::ModelCapabilities,
@@ -112,25 +110,20 @@ pub struct Backend {
 
 impl Backend {
     pub(super) fn usage_cost(&self, usage: Usage) -> f64 {
-        if let Some(facts) = &self.facts {
-            let mut native = rig_core::completion::Usage::new();
-            native.input_tokens = Some(
-                u64::from(usage.input_tokens)
-                    + u64::from(usage.cache_read_tokens)
-                    + u64::from(usage.cache_write_tokens),
-            );
-            native.output_tokens = Some(u64::from(usage.output_tokens));
-            native.cached_input_tokens = Some(u64::from(usage.cache_read_tokens));
-            native.cache_creation_input_tokens = Some(u64::from(usage.cache_write_tokens));
-            return facts
-                .spec()
-                .and_then(|s| s.pricing.as_ref())
-                .and_then(|p| p.cost(&native))
-                .map_or(0.0, |c| c.total);
-        }
-        self.price.map_or(0.0, |price| {
-            price.cost_with_tiers(&usage, &self.price_tiers)
-        })
+        let mut native = rig_core::completion::Usage::new();
+        native.input_tokens = Some(
+            u64::from(usage.input_tokens)
+                + u64::from(usage.cache_read_tokens)
+                + u64::from(usage.cache_write_tokens),
+        );
+        native.output_tokens = Some(u64::from(usage.output_tokens));
+        native.cached_input_tokens = Some(u64::from(usage.cache_read_tokens));
+        native.cache_creation_input_tokens = Some(u64::from(usage.cache_write_tokens));
+        self.facts
+            .spec()
+            .and_then(|s| s.pricing.as_ref())
+            .and_then(|p| p.cost(&native))
+            .map_or(0.0, |c| c.total)
     }
     pub(super) fn check_credentials(&self) -> Result<(), BackendError> {
         if let Some((_, expires)) = &self.chatgpt
@@ -147,14 +140,26 @@ impl Backend {
     }
     /// A backend for `plan`.
     pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
+        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec, Pricing};
+        use rig_core::providers::registry::ProviderId;
+        let mut spec = ModelSpec::new(
+            ProviderId::declare("solaris").expect("valid declared vendor"),
+            &plan.model,
+        )
+        .with_tools(true);
+        spec.input.image = true;
+        spec.max_output_tokens = Some(plan.max_tokens);
+        spec.pricing = plan.price.map(|p| {
+            Pricing::new(p.input, p.output)
+                .with_cache_read(p.cache_read)
+                .with_cache_write(p.cache_write)
+        });
         Ok(Self {
             client: http::client()?,
             endpoint: plan.endpoint,
             model: plan.model,
             max_tokens: plan.max_tokens,
-            price: plan.price,
-            facts: None,
-            price_tiers: Vec::new(),
+            facts: ModelFacts::new(spec).with_catalog(&Catalog::default()),
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
             capabilities: crate::ModelCapabilities {
@@ -175,7 +180,7 @@ impl Backend {
         self.model = model;
         self.max_tokens = max_tokens;
         self.capabilities = capabilities;
-        self.facts = Some(facts);
+        self.facts = facts;
         self
     }
 
@@ -194,6 +199,16 @@ impl Backend {
     pub fn with_capabilities(mut self, capabilities: crate::ModelCapabilities) -> Self {
         self.capabilities = capabilities;
         self.capabilities.output_budget = Some(self.max_tokens);
+        if let Some(spec) = self.facts.spec() {
+            let mut spec = spec.clone();
+            spec.tools = self.capabilities.tool_calling != Support::Unsupported;
+            spec.input.image = self.capabilities.image_input != Support::Unsupported;
+            spec.context_window = self.capabilities.context_window;
+            spec.max_input_tokens = self.capabilities.max_input;
+            spec.max_output_tokens = self.capabilities.max_output;
+            self.facts = rig_core::catalog::ModelFacts::new(spec)
+                .with_catalog(&rig_core::catalog::Catalog::default());
+        }
         self
     }
 
@@ -282,23 +297,8 @@ impl Backend {
         &self,
         repairs: &[crate::policy::Repair],
     ) -> Result<DynModel<Completion>, BackendError> {
-        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
-        use rig_core::providers::registry::ProviderId;
         let transport = CompletionRoute::new(self.request_http(repairs), self.endpoint.url());
-        // Bind Solaris metadata under a declared identity so every Rig dialect
-        // consults the supplied facts, including aliased gateway model names.
-        let id =
-            ProviderId::declare("solaris").map_err(|error| BackendError::new(error.to_string()))?;
-        let mut spec = ModelSpec::new(id, &self.model)
-            .with_tools(self.capabilities.tool_calling != Support::Unsupported);
-        spec.input.image = self.capabilities.image_input != Support::Unsupported;
-        spec.context_window = self.capabilities.context_window;
-        spec.max_input_tokens = self.capabilities.max_input;
-        spec.max_output_tokens = self.capabilities.max_output;
-        let facts = self
-            .facts
-            .clone()
-            .unwrap_or_else(|| ModelFacts::new(spec).with_catalog(&Catalog::default()));
+        let facts = self.facts.clone();
         let model = match self.endpoint.wire {
             Wire::AnthropicMessages => {
                 let config = self.anthropic_config();
@@ -382,5 +382,54 @@ impl Backend {
         } else {
             BackendError::new(text)
         }
+    }
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+    use rig_core::catalog::{Catalog, ModelFacts, ModelSpec, Pricing};
+    use rig_core::providers::registry::ProviderId;
+    fn backend(price: Option<Pricing>) -> Backend {
+        let mut spec = ModelSpec::new(ProviderId::declare("solaris").unwrap(), "alias");
+        spec.pricing = price;
+        Backend::new(TurnPlan {
+            endpoint: Endpoint {
+                wire: Wire::OpenAiChat,
+                session_header: None,
+                base_url: "http://localhost/v1".into(),
+                secret: None,
+                name: "test".into(),
+                label: "test".into(),
+                env_keys: &[],
+            },
+            model: "alias".into(),
+            max_tokens: 4096,
+            price: None,
+            prompt_cache_key: None,
+        })
+        .unwrap()
+        .with_model_facts(
+            "alias".into(),
+            4096,
+            ModelFacts::new(spec).with_catalog(&Catalog::default()),
+            Default::default(),
+        )
+    }
+    #[test]
+    fn official_pricing_counts_additive_cache_buckets_once() {
+        let backend = backend(Some(
+            Pricing::new(1.0, 2.0)
+                .with_cache_read(0.1)
+                .with_cache_write(1.25),
+        ));
+        let usage = Usage::new(1000, 2000).with_cache(3000, 4000);
+        assert!((backend.usage_cost(usage) - 0.0103).abs() < 1e-12);
+    }
+    #[test]
+    fn absent_prices_are_not_inherited_from_builtin_model_names() {
+        let backend = backend(None);
+        assert_eq!(backend.usage_cost(Usage::new(1000, 2000)), 0.0);
+        assert!(backend.facts.spec().unwrap().pricing.is_none());
     }
 }

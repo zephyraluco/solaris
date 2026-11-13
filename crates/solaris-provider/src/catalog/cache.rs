@@ -69,3 +69,75 @@ async fn refresh(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn data(context: u32) -> String {
+        serde_json::json!({"anthropic":{"models":{"solaris-cache-fixture":{
+          "name":"Cache fixture","tool_call":true,"reasoning":false,
+          "modalities":{"input":["text"],"output":["text"]},
+          "limit":{"context":context,"output":4096},
+          "cost":{"input":1,"output":2}
+        }}}})
+        .to_string()
+    }
+    #[test]
+    fn refresh_updates_shared_catalog_but_not_already_resolved_facts() {
+        let config = crate::ProviderConfig::default();
+        let shared = config.clone();
+        install(&config.catalog, &data(32000)).expect("first catalog");
+        let before = config.resolve("anthropic", "solaris-cache-fixture");
+        install(&config.catalog, &data(64000)).expect("second catalog");
+        assert_eq!(
+            before.facts.spec().expect("facts").context_window,
+            Some(32000)
+        );
+        assert_eq!(
+            shared
+                .resolve("anthropic", "solaris-cache-fixture")
+                .capabilities
+                .context_window,
+            Some(64000)
+        );
+        assert!(install(&config.catalog, "broken JSON").is_err());
+        assert!(install(&config.catalog, "{}").is_err());
+        assert_eq!(
+            shared
+                .resolve("anthropic", "solaris-cache-fixture")
+                .capabilities
+                .context_window,
+            Some(64000)
+        );
+    }
+    #[test]
+    fn startup_ignores_corrupt_cache_and_applies_official_overrides_last() {
+        let config = crate::ProviderConfig::from_json(r#"{"overrides":{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":12345}}}}}}"#).expect("config");
+        let dir = tempfile::tempdir().expect("directory");
+        std::fs::write(dir.path().join(FILE), "broken").expect("write");
+        load(&config.catalog, dir.path());
+        assert_eq!(
+            config
+                .resolve("anthropic", "claude-sonnet-4-5")
+                .capabilities
+                .context_window,
+            Some(12345)
+        );
+        std::fs::write(dir.path().join(FILE), data(32000)).expect("write");
+        load(&config.catalog, dir.path());
+        assert_eq!(
+            config
+                .resolve("anthropic", "solaris-cache-fixture")
+                .capabilities
+                .context_window,
+            Some(32000)
+        );
+        assert_eq!(
+            config
+                .resolve("anthropic", "claude-sonnet-4-5")
+                .capabilities
+                .context_window,
+            Some(12345)
+        );
+    }
+}

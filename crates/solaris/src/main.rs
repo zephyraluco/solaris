@@ -228,11 +228,6 @@ fn main() -> Result<()> {
             anyhow::bail!("unknown provider `{id}` — built-ins: {}", provider_ids());
         }
         auth.activate(id.clone());
-        if args.model.is_none()
-            && let Some(model) = auth.active_model()
-        {
-            config.model = model.to_owned();
-        }
     }
     if args.model.is_none()
         && let Some(model) = auth.active_model()
