@@ -2,7 +2,7 @@
 use crate::{Backend, BackendError, Usage};
 use rig_core::effect::{EffectKind, family};
 use rig_core::serve::{Dispatch, Reply, Serve, adapters::ModelAdapter};
-type UsageObserver =
+type Settlement =
     std::sync::Arc<dyn Fn(Usage, Option<crate::Cost>) -> Result<(), BackendError> + Send + Sync>;
 pub(crate) type StatusObservers =
     std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn Fn(String) + Send + Sync>>>>;
@@ -10,7 +10,8 @@ pub(crate) type StatusObservers =
 pub struct ModelClient {
     adapter: rig_core::serve::ErasedHandler,
     capabilities: crate::ModelCapabilities,
-    observers: Vec<UsageObserver>,
+    settlement: Option<Settlement>,
+    settled: std::sync::Arc<std::sync::Mutex<Option<Result<f64, String>>>>,
     status: StatusObservers,
 }
 impl ModelClient {
@@ -25,7 +26,8 @@ impl ModelClient {
                 adapter,
                 status: status.clone(),
             }),
-            observers: Vec::new(),
+            settlement: None,
+            settled: Default::default(),
             status,
         })
     }
@@ -37,7 +39,8 @@ impl ModelClient {
         Self {
             adapter: rig_core::serve::ErasedHandler::new(handler),
             capabilities,
-            observers: Vec::new(),
+            settlement: None,
+            settled: Default::default(),
             status: StatusObservers::default(),
         }
     }
@@ -51,27 +54,26 @@ impl ModelClient {
             .push(std::sync::Arc::new(observer));
         self
     }
-    pub fn with_usage_observer(
+    pub fn with_settlement(
         mut self,
-        observer: impl Fn(Usage, Option<crate::Cost>) -> Result<(), BackendError>
-        + Send
-        + Sync
-        + 'static,
+        settle: impl Fn(Usage, Option<crate::Cost>) -> Result<(), BackendError> + Send + Sync + 'static,
     ) -> Self {
-        self.observers.insert(0, std::sync::Arc::new(observer));
+        self.settlement = Some(std::sync::Arc::new(settle));
         self
     }
-    /// Record usage and accumulate only charges supplied by the SDK.
-    pub fn settle(
-        &self,
-        usage: Usage,
-        reported_cost: Option<crate::Cost>,
-    ) -> Result<f64, BackendError> {
-        let cost = reported_cost.map_or(0.0, |cost| cost.total);
-        for observer in &self.observers {
-            observer(usage, reported_cost)?;
-        }
-        Ok(cost)
+    /// Settle this prepared request exactly once, including a failed settlement.
+    pub fn settle(&self, usage: Usage, cost: Option<crate::Cost>) -> Result<f64, BackendError> {
+        let mut settled = self
+            .settled
+            .lock()
+            .map_err(|_| BackendError::new("settlement lock poisoned"))?;
+        let result = settled.get_or_insert_with(|| {
+            if let Some(handler) = &self.settlement {
+                handler(usage, cost).map_err(|e| e.to_string())?;
+            }
+            Ok(cost.map_or(0.0, |value| value.total))
+        });
+        result.clone().map_err(BackendError::new)
     }
 }
 impl Serve for ModelClient {
@@ -227,7 +229,7 @@ mod tests {
         let recorded = seen.clone();
         let client = ModelClient::native(backend)
             .unwrap()
-            .with_usage_observer(move |_, cost| {
+            .with_settlement(move |_, cost| {
                 recorded.lock().unwrap().push(cost.map(|cost| cost.total));
                 Ok(())
             });
@@ -240,10 +242,10 @@ mod tests {
         );
         assert_eq!(
             client.settle(usage, None).unwrap(),
-            0.0,
-            "unknown cost adds no invented charge"
+            0.25,
+            "repeated completion returns the original settlement"
         );
-        assert_eq!(*seen.lock().unwrap(), vec![Some(0.25), None]);
+        assert_eq!(*seen.lock().unwrap(), vec![Some(0.25)]);
     }
 
     #[tokio::test]

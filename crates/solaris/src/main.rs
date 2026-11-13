@@ -517,9 +517,8 @@ fn main() -> Result<()> {
             backend_options,
         ));
         let choice = factory(&config.model);
-        options.child_backend = Some(Arc::new(move |model| {
-            Ok(solaris::agent_backend(factory(model)))
-        }));
+        let child_factory: solaris_agent::ChildBackendFactory =
+            Arc::new(move |model| Ok(solaris::agent_backend(factory(model))));
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {
@@ -530,11 +529,10 @@ fn main() -> Result<()> {
             }
             options.approver = Arc::new(solaris_agent::DenyAll);
         }
-        let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
-            solaris::agent_backend(choice),
-            Arc::new(registry),
-            options,
-        ));
+        let session = solaris_agent::SessionRuntime::new(
+            solaris_agent::Agent::new(solaris::agent_backend(choice), Arc::new(registry), options)
+                .with_child_backend(child_factory),
+        );
         if let Some(journal) = journal {
             session.attach_journal(journal)?;
         }

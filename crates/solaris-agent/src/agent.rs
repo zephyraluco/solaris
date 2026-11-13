@@ -52,12 +52,6 @@ pub struct AgentOptions {
     pub subagents: bool,
     /// Permission profile and aggregate request/time/cost limits.
     pub execution: crate::ExecutionSettings,
-    /// Existing turn scope when constructing a child; leave None for a root.
-    pub shared_budget: Option<Arc<crate::ExecutionBudget>>,
-    /// Optional factory for explicit child model overrides under the current provider.
-    pub child_backend: Option<crate::ChildBackendFactory>,
-    /// Handles for cancelling individual active/queued children.
-    pub tasks: crate::TaskControls,
 }
 
 impl Default for AgentOptions {
@@ -73,9 +67,6 @@ impl Default for AgentOptions {
             prompt_context: PromptContext::default(),
             subagents: true,
             execution: crate::ExecutionSettings::default(),
-            shared_budget: None,
-            child_backend: None,
-            tasks: crate::TaskControls::default(),
         }
     }
 }
@@ -154,6 +145,7 @@ pub struct Agent {
     /// serialising against the same per-file locks for the whole session.
     registry: Arc<ToolRegistry>,
     options: AgentOptions,
+    services: crate::billing::SessionServices,
     /// Stops the turn in flight, tools included.
     cancel: Cancel,
     /// The conversation every turn extends.
@@ -170,7 +162,15 @@ impl Agent {
     pub fn new(
         choice: ConnectionConfig,
         registry: Arc<ToolRegistry>,
+        options: AgentOptions,
+    ) -> Self {
+        Self::with_services(choice, registry, options, Default::default())
+    }
+    pub(crate) fn with_services(
+        choice: ConnectionConfig,
+        registry: Arc<ToolRegistry>,
         mut options: AgentOptions,
+        services: crate::billing::SessionServices,
     ) -> Self {
         options.approver = Arc::new(crate::PolicyApprover {
             profile: options.execution.profile,
@@ -218,6 +218,7 @@ impl Agent {
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
             options,
+            services,
             cancel: Cancel::new(),
             conversation: Arc::new(Conversation::new()),
             steering,
@@ -266,10 +267,10 @@ impl Agent {
     }
 
     pub fn active_tasks(&self) -> Vec<String> {
-        self.options.tasks.active()
+        self.services.tasks.active()
     }
     pub fn cancel_task(&self, id: &str) -> bool {
-        self.options.tasks.cancel(id)
+        self.services.tasks.cancel(id)
     }
 
     /// A handle that stops a turn in flight: a running command is killed and no
@@ -294,6 +295,7 @@ impl Agent {
             active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
+            services: self.services.clone(),
             cancel: self.cancel.clone(),
             conversation: Arc::clone(&self.conversation),
             steering: self.steering.clone(),
@@ -306,7 +308,7 @@ impl Agent {
 
     /// Replace the factory used by subsequent child model overrides.
     pub fn with_child_backend(mut self, factory: crate::ChildBackendFactory) -> Self {
-        self.options.child_backend = Some(factory);
+        self.services.child_backend = Some(factory);
         self
     }
 
@@ -360,13 +362,11 @@ impl Agent {
         let cancel = self.cancel.begin_turn();
         let budget = crate::ExecutionBudget::new(self.options.execution.budget.clone());
         let inner: Arc<dyn solaris_backend::ModelConnector> =
-            Arc::new(crate::budget::BudgetedBackend {
-                inner: Arc::new(crate::billing::AccountingBackend {
-                    inner: Arc::clone(&self.choice.backend),
-                    conversation: Arc::clone(&self.conversation),
-                    kind: crate::UsageKind::Manual,
-                }),
-                budget: Arc::clone(&budget),
+            Arc::new(crate::billing::ExecutionConnector {
+                inner: Arc::clone(&self.choice.backend),
+                conversation: Arc::clone(&self.conversation),
+                services: self.services.for_turn(Arc::clone(&budget)),
+                kind: crate::UsageKind::Manual,
             });
         tokio::select! {
             biased;
@@ -603,11 +603,12 @@ impl Agent {
                 }));
             }
         };
-        let mut turn_options = self.options.clone();
-        turn_options.shared_budget =
-            Some(self.options.shared_budget.clone().unwrap_or_else(|| {
-                crate::ExecutionBudget::new(self.options.execution.budget.clone())
-            }));
+        let turn_options = self.options.clone();
+        let services =
+            self.services
+                .for_turn(self.services.budget.clone().unwrap_or_else(|| {
+                    crate::ExecutionBudget::new(self.options.execution.budget.clone())
+                }));
         let tools = self.turn_tools(mode);
         let subagent = tools
             .iter()
@@ -619,6 +620,7 @@ impl Agent {
                     billing: Arc::clone(&self.conversation),
                     registry: Arc::clone(&self.registry),
                     options: turn_options.clone(),
+                    services: services.clone(),
                     resources: resources.clone(),
                     mode,
                     slots: tokio::sync::Semaphore::new(self.options.max_parallel.max(1)),
@@ -645,6 +647,7 @@ impl Agent {
             inner: Arc::clone(&self.choice.backend),
             tools,
             options: turn_options,
+            services,
             cancel: self.cancel.clone(),
             steering: self.steering.clone(),
             follow_up: self.follow_up.clone(),
@@ -1079,14 +1082,14 @@ mod tests {
                 Ok(next)
             }));
         assert_eq!(
-            refreshed.options.child_backend.as_ref().expect("factory")("child-model")
+            refreshed.services.child_backend.as_ref().expect("factory")("child-model")
                 .expect("fresh credential")
                 .model,
             "child-model"
         );
         assert!(
             original
-                .options
+                .services
                 .child_backend
                 .as_ref()
                 .expect("old factory")("child-model")

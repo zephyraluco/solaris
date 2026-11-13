@@ -629,7 +629,10 @@ async fn cancelling_or_dropping_the_parent_stops_running_and_queued_background_c
         )
         .await
         .unwrap();
-        assert!(matches!(next.last(), Some(AgentEvent::TurnComplete { .. })));
+        assert!(
+            matches!(next.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{next:?}"
+        );
         assert!(
             completions(&next).is_empty(),
             "old tasks must not leak into a new turn"

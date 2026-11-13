@@ -634,8 +634,8 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     let child_model = Arc::clone(&model);
     let factory_called = Arc::new(AtomicUsize::new(0));
     let called = Arc::clone(&factory_called);
-    let mut options = AgentOptions::in_directory(directory.path());
-    options.child_backend = Some(Arc::new(move |name| {
+    let options = AgentOptions::in_directory(directory.path());
+    let child_factory: solaris_agent::ChildBackendFactory = Arc::new(move |name| {
         assert_eq!(name, "child-model");
         called.fetch_add(1, Ordering::SeqCst);
         Ok(ConnectionConfig {
@@ -645,8 +645,9 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
             fallback_context_window: 128_000,
             instructions: Some("Child model instructions resolved by the caller".into()),
         })
-    }));
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    });
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     parent.attach_journal(journal).expect("attach");
     let events = run(&parent, Mode::Build).await;
     assert_eq!(factory_called.load(Ordering::SeqCst), 1);
@@ -708,13 +709,11 @@ async fn blank_child_selectors_inherit_the_parent_without_a_factory_or_saved_ses
 async fn blank_child_model_does_not_invoke_the_override_factory() {
     let mut model = Model::new("explore");
     model.model_override = Some(String::new());
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(|_| {
-            panic!("blank override must inherit parent backend")
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(|_| panic!("blank override must inherit parent backend"));
+    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -725,20 +724,19 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
     model.model_override = Some(" \tchild-model\r\n ".into());
     let model = Arc::new(model);
     let child_backend = Arc::clone(&model);
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(move |name| {
-            assert_eq!(name, "child-model");
-            Ok(ConnectionConfig {
-                backend: Arc::clone(&child_backend) as Arc<dyn ModelConnector>,
-                provider_id: None,
-                model: name.into(),
-                fallback_context_window: 128_000,
-                instructions: None,
-            })
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(model, options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory = Arc::new(move |name| {
+        assert_eq!(name, "child-model");
+        Ok(ConnectionConfig {
+            backend: Arc::clone(&child_backend) as Arc<dyn ModelConnector>,
+            provider_id: None,
+            model: name.into(),
+            fallback_context_window: 128_000,
+            instructions: None,
+        })
+    });
+    let parent =
+        agent(model, options, &Arc::new(AtomicUsize::new(0))).with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -752,13 +750,11 @@ async fn invalid_child_model_is_rejected_before_resolving_or_running_a_child() {
         let mut model = Model::new("explore");
         model.model_override = Some(invalid);
         let model = Arc::new(model);
-        let options = AgentOptions {
-            child_backend: Some(Arc::new(|_| {
-                panic!("invalid model must not reach the factory")
-            })),
-            ..AgentOptions::default()
-        };
-        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+        let options = AgentOptions::default();
+        let child_factory: solaris_agent::ChildBackendFactory =
+            Arc::new(|_| panic!("invalid model must not reach the factory"));
+        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory);
         let events = run(&parent, Mode::Build).await;
         let output = result(&events);
         assert!(output.is_error);
@@ -772,13 +768,11 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
     let mut model = Model::new("explore");
     model.model_override = Some("missing-model".into());
     let model = Arc::new(model);
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(|_| {
-            Err("requested child model is unavailable".into())
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(|_| Err("requested child model is unavailable".into()));
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(result(&events).is_error);
     assert!(

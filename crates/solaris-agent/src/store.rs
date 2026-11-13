@@ -50,6 +50,7 @@ pub enum SessionRecord {
         detail: serde_json::Value,
     },
     Usage {
+        request_id: String,
         usage: solaris_backend::Usage,
         cost: Option<solaris_backend::Cost>,
         kind: crate::UsageKind,

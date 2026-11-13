@@ -759,10 +759,16 @@ pub fn stats_lines(
         row("cache write", usage.cache_write_tokens.to_string()),
         row(
             "cost",
-            if price_known == Some(false) {
+            if let Some(totals) = session.billing {
+                if totals.cost_complete {
+                    format!("${:.4}", totals.cost_usd)
+                } else {
+                    format!("${:.4} (partial; total unknown)", totals.cost_usd)
+                }
+            } else if price_known == Some(false) {
                 "unknown (pricing unavailable)".to_string()
             } else {
-                format!("${:.4}", session.total_cost())
+                "unknown (no settled request)".to_string()
             },
         ),
         row("context window", context_window.to_string()),

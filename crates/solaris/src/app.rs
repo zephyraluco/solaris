@@ -253,14 +253,12 @@ fn with_tools(
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
     let auth = auth.clone();
-    options.child_backend = Some(Arc::new(move |model| {
-        Ok(crate::agent_backend(factory(&auth, model)))
-    }));
-    let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
-        crate::agent_backend(choice),
-        registry,
-        options,
-    )));
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(move |model| Ok(crate::agent_backend(factory(&auth, model))));
+    let agent = Arc::new(solaris_agent::SessionRuntime::new(
+        Agent::new(crate::agent_backend(choice), registry, options)
+            .with_child_backend(child_factory),
+    ));
     let cancel = agent.cancel_handle();
     (agent, cancel)
 }

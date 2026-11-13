@@ -50,6 +50,7 @@ pub(crate) struct TurnInput {
     /// The tools this turn may declare and run.
     pub tools: Vec<Arc<dyn Tool>>,
     pub options: AgentOptions,
+    pub services: crate::billing::SessionServices,
     /// Stops the turn in flight.
     pub cancel: Cancel,
     /// Messages that correct the turn, read before each round.
@@ -83,6 +84,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         inner,
         tools,
         options,
+        services,
         cancel: _,
         steering,
         follow_up,
@@ -95,17 +97,12 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
         subagent,
     } = input;
 
-    let budget = options
-        .shared_budget
-        .clone()
-        .unwrap_or_else(|| crate::ExecutionBudget::new(options.execution.budget.clone()));
-    let inner: Arc<dyn ModelConnector> = Arc::new(crate::budget::BudgetedBackend {
-        inner: Arc::new(crate::billing::AccountingBackend {
-            inner,
-            conversation: Arc::clone(&conversation),
-            kind: crate::UsageKind::Model,
-        }),
-        budget: Arc::clone(&budget),
+    let budget = services.budget.clone().expect("turn budget");
+    let inner: Arc<dyn ModelConnector> = Arc::new(crate::billing::ExecutionConnector {
+        inner,
+        conversation: Arc::clone(&conversation),
+        services,
+        kind: crate::UsageKind::Model,
     });
     let specs: Vec<ToolSpec> = tools
         .iter()
@@ -1064,6 +1061,9 @@ mod tests {
             let mut stream = start(TurnInput {
                 inner: self.inner,
                 tools: self.tools,
+                services: crate::billing::SessionServices::default().for_turn(
+                    crate::ExecutionBudget::new(self.options.execution.budget.clone()),
+                ),
                 options: self.options,
                 cancel: self.cancel,
                 steering: self.steering,
@@ -1552,6 +1552,8 @@ mod tests {
             inner: Arc::new(Endless),
             tools: vec![tool.clone()],
             options: AgentOptions::default(),
+            services: crate::billing::SessionServices::default()
+                .for_turn(crate::ExecutionBudget::new(Default::default())),
             cancel: Cancel::new(),
             steering: Queue::new(),
             follow_up: Queue::new(),

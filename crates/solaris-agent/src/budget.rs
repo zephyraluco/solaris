@@ -1,7 +1,6 @@
 //! A shared per-turn request, time and observed-cost budget for parent and children.
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{BackendError, ModelConnector};
+use solaris_backend::BackendError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,7 +51,7 @@ impl ExecutionBudget {
         }
         Ok(())
     }
-    fn request(&self) -> Result<(), BackendError> {
+    pub(crate) fn request(&self) -> Result<(), BackendError> {
         self.check().map_err(BackendError::new)?;
         let mut state = self
             .state
@@ -77,43 +76,25 @@ impl ExecutionBudget {
     }
 }
 
-pub(crate) struct BudgetedBackend {
-    pub inner: Arc<dyn ModelConnector>,
-    pub budget: Arc<ExecutionBudget>,
-}
-#[async_trait]
-impl ModelConnector for BudgetedBackend {
-    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        self.budget.check().map_err(BackendError::new)?;
-        let client = Arc::clone(&self.inner).model_client().await?;
-        if self.budget.limits.max_cost_usd.is_some()
-            && client.capabilities().price_known == Some(false)
-        {
+impl ExecutionBudget {
+    pub(crate) fn validate_pricing(&self, known: Option<bool>) -> Result<(), BackendError> {
+        if self.limits.max_cost_usd.is_some() && known == Some(false) {
             return Err(BackendError::new(
                 "cost budget requires known model pricing; configure models.json or omit --max-cost",
             ));
         }
-        self.budget.request()?;
-        let budget = Arc::clone(&self.budget);
-        Ok(client.with_usage_observer(move |_, cost| {
-            if let Some(cost) = cost {
-                budget.charge(cost.total);
-            }
-            if budget.limits.max_cost_usd.is_some() && !cost.is_some_and(|cost| cost.is_complete()) {
-                return Err(BackendError::new(
-                    "Rig did not report complete request cost; execution stopped because a cost budget is enabled",
-                ));
-            }
-            Ok(())
-        }))
+        Ok(())
     }
-
-    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
+    pub(crate) fn settle(&self, cost: Option<solaris_backend::Cost>) -> Result<(), BackendError> {
+        if let Some(cost) = cost {
+            self.charge(cost.total);
+        }
+        if self.limits.max_cost_usd.is_some() && !cost.is_some_and(|value| value.is_complete()) {
+            return Err(BackendError::new(
+                "Rig did not report complete request cost; execution stopped because a cost budget is enabled",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -122,42 +103,15 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn cost_budget_stops_when_rig_does_not_report_a_charge() {
-        use solaris_backend::{Backend, Endpoint, TurnPlan, Wire};
-        let mut spec = crate::testing::parameters("test", 100)
-            .facts()
-            .spec()
-            .unwrap()
-            .clone();
-        spec.pricing = Some(rig_core::catalog::Pricing::new(1.0, 1.0));
-        let inner = Backend::new(TurnPlan {
-            endpoint: Endpoint {
-                wire: Wire::OpenAiChat,
-                session_header: None,
-                base_url: "http://127.0.0.1:1/v1".into(),
-                secret: None,
-                name: "test".into(),
-                label: "test".into(),
-                env_keys: &[],
-            },
-            model: solaris_backend::ModelParameters::new(spec, Some(100), true),
-            prompt_cache_key: None,
-        })
-        .unwrap();
-        let source = Arc::new(BudgetedBackend {
-            inner: Arc::new(inner),
-            budget: ExecutionBudget::new(BudgetLimits {
-                max_cost_usd: Some(1.0),
-                ..Default::default()
-            }),
+        let budget = ExecutionBudget::new(BudgetLimits {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
         });
         let partial: solaris_backend::Cost =
             serde_json::from_value(serde_json::json!({"input":0.1,"total":0.1,"incomplete":true}))
                 .unwrap();
         for cost in [None, Some(partial)] {
-            let client = source.clone().model_client().await.unwrap();
-            let error = client
-                .settle(solaris_backend::Usage::new(100, 1), cost)
-                .unwrap_err();
+            let error = budget.settle(cost).unwrap_err();
             assert!(
                 error
                     .to_string()

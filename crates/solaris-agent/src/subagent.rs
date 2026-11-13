@@ -1,7 +1,7 @@
 //! Bounded delegation with isolated conversations and inherited policy.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solaris_backend::{BackendError, ModelConnector};
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
@@ -18,7 +17,6 @@ use crate::{Agent, AgentOptions, ConnectionConfig, Mode, ResourceSnapshot, defau
 
 /// Runtime tool for delegating a self-contained task to an isolated child agent.
 pub const SUBAGENT_TOOL: &str = "subagent";
-const MAX_CALLS: usize = 20;
 const TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RESULT_BYTES: usize = 16 * 1024;
 
@@ -99,6 +97,7 @@ pub(crate) struct SubagentRunner {
     pub billing: Arc<crate::conversation::Conversation>,
     pub registry: Arc<ToolRegistry>,
     pub options: AgentOptions,
+    pub services: crate::billing::SessionServices,
     pub resources: ResourceSnapshot,
     pub mode: Mode,
     pub slots: Semaphore,
@@ -168,7 +167,7 @@ impl SubagentRunner {
         let mut local_ctx = ctx.clone();
         local_ctx.cancel = ctx.cancel.child();
         let _task_guard = self
-            .options
+            .services
             .tasks
             .register(call_id, local_ctx.cancel.clone());
         let ctx = &local_ctx;
@@ -253,8 +252,8 @@ impl SubagentRunner {
             .filter(|tool| mode != Mode::Plan || tool.is_read_only())
             .collect();
         let registry = Arc::new(ToolRegistry::with_tools(tools));
-        let mut choice = if let Some(model) = &task.model {
-            let Some(factory) = &self.options.child_backend else {
+        let choice = if let Some(model) = &task.model {
+            let Some(factory) = &self.services.child_backend else {
                 return ToolOutput::error(
                     "child model overrides are not configured for this runtime",
                 );
@@ -267,17 +266,13 @@ impl SubagentRunner {
             self.choice.clone()
         };
         // Each child retains its own request ceiling while sharing the parent's budget.
-        let backend = Arc::new(BoundedBackend {
-            inner: Arc::new(crate::billing::AccountingBackend {
-                inner: Arc::clone(&choice.backend),
-                conversation: Arc::clone(&self.billing),
-                kind: crate::UsageKind::Child,
-            }),
-            requests: AtomicUsize::new(0),
+        let mut services = self.services.clone();
+        services.parent_ledger = Some(Arc::clone(&self.billing));
+        services.child_requests = Some(Arc::new(AtomicUsize::new(0)));
+        services.report = Some(crate::billing::ChildReport {
             totals: Arc::clone(&totals),
-            usage_tx: task.background.then(|| tx.clone()),
+            tx: task.background.then(|| tx.clone()),
         });
-        choice.backend = backend;
         let mut options = self.options.clone().with_subagents(false);
         options.cwd = ctx.cwd.clone();
         options.temp_dir = ctx.temp_dir.clone();
@@ -290,7 +285,7 @@ impl SubagentRunner {
         options.skills = self.resources.skills.clone();
         options.prompt_context = self.resources.prompt.clone();
         let child_model = choice.model.clone();
-        let child = Agent::new(choice, registry, options);
+        let child = Agent::with_services(choice, registry, options, services);
         let journal = if let Some(parent) = &self.parent {
             let result = if let Some(id) = &task.resume_id {
                 match parent.store().list(&ctx.cwd) {
@@ -426,50 +421,6 @@ async fn collect(
         text.push_str("\n[subagent result truncated to 16 KiB]");
     }
     ToolOutput::ok(text)
-}
-
-/// Counts every provider request (including compaction), even when the child
-/// eventually fails. Never reports a child's usage as the parent's context size.
-struct BoundedBackend {
-    inner: Arc<dyn ModelConnector>,
-    requests: AtomicUsize,
-    totals: Arc<Mutex<Totals>>,
-    usage_tx: Option<UnboundedSender<AgentEvent>>,
-}
-
-#[async_trait]
-impl ModelConnector for BoundedBackend {
-    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        let client = Arc::clone(&self.inner).model_client().await?;
-        if self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
-            return Err(BackendError::new(
-                "subagent exceeded its 20 model-request budget",
-            ));
-        }
-        let totals = Arc::clone(&self.totals);
-        let tx = self.usage_tx.clone();
-        Ok(client.with_usage_observer(move |usage, cost| {
-            {
-                let mut totals = totals.lock().unwrap_or_else(|p| p.into_inner());
-                totals.add(usage, cost);
-            }
-            if let Some(tx) = &tx {
-                let _ = tx.send(AgentEvent::SubagentUsage {
-                    usage,
-                    cost_usd: cost.map_or(0.0, |cost| cost.total),
-                });
-            }
-            Ok(())
-        }))
-    }
-
-    fn capabilities(&self) -> solaris_backend::ModelCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
 }
 
 #[cfg(test)]

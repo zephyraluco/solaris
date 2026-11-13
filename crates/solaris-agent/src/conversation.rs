@@ -37,6 +37,7 @@ pub(crate) struct Conversation {
     journal: RwLock<Option<Arc<SessionJournal>>>,
     failure: Mutex<Option<String>>,
     billing: Mutex<crate::UsageTotals>,
+    billed: Mutex<std::collections::HashSet<String>>,
 }
 
 pub(crate) struct ProjectionGuard<'a>(&'a Conversation);
@@ -58,6 +59,7 @@ impl Default for Conversation {
             journal: RwLock::new(None),
             failure: Mutex::new(None),
             billing: Mutex::new(Default::default()),
+            billed: Default::default(),
         }
     }
 }
@@ -76,7 +78,18 @@ impl Conversation {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        let billing = crate::UsageTotals::restore(&journal.store().records(journal.id())?);
+        let records = journal.store().records(journal.id())?;
+        let billing = crate::UsageTotals::restore(&records);
+        *self.billed.lock().unwrap_or_else(|p| p.into_inner()) = records
+            .iter()
+            .filter_map(|record| {
+                if let SessionRecord::Usage { request_id, .. } = record {
+                    Some(request_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
         let storage = journal.memory_store()?;
         *self.storage.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(storage);
@@ -345,15 +358,31 @@ impl Conversation {
 
     pub(crate) fn record_billing(
         &self,
+        request_id: &str,
         usage: solaris_backend::Usage,
         cost: Option<solaris_backend::Cost>,
         kind: crate::UsageKind,
-    ) -> bool {
+    ) -> Result<(), solaris_backend::BackendError> {
+        let mut billed = self.billed.lock().unwrap_or_else(|p| p.into_inner());
+        if billed.contains(request_id) {
+            return Ok(());
+        }
+        if !self.persist(SessionRecord::Usage {
+            request_id: request_id.into(),
+            usage,
+            cost,
+            kind,
+        }) {
+            return Err(solaris_backend::BackendError::new(
+                "cannot persist request usage; session stopped",
+            ));
+        }
         self.billing
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .add(usage, cost);
-        self.persist(SessionRecord::Usage { usage, cost, kind })
+        billed.insert(request_id.into());
+        Ok(())
     }
 
     pub(crate) fn usage_totals(&self) -> Option<crate::UsageTotals> {
