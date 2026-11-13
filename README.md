@@ -17,7 +17,7 @@
 
 ---
 
-solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and uses the complete official Rig Agent executor and memory over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
+solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and uses the complete official Rig Agent executor and memory over the Rig model connection and an application-assembled tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
 
 The interface is complete, and a connected provider really is called. Connect a provider — or just export an API key — and every turn streams from the real model over SSE, with retries before the first token and per-turn token and cost accounting.
 
@@ -547,7 +547,7 @@ models. To migrate an old override, replace `capabilities` and `price` with the
 official row fields; replace `catalog` with the selection's `metadata` reference.
 Unknown fields and invalid references fail configuration loading.
 
-Prices are USD per million tokens. Rig computes standard API list-price estimates;
+Prices are USD per million tokens. Rig attaches standard API list-price estimates to native response usage; Solaris reads only `usage.cost` and does not calculate a fallback charge.
 long-context tiers, service tiers and hosted-tool fees are not included. Gateway
 metadata inherited from a manufacturer is marked as a reference price. Unknown
 prices remain unknown, and ChatGPT account sessions do not use API prices.
@@ -607,7 +607,7 @@ prompt/tool estimation inputs. UI polling only reads nonblocking snapshots: it n
 builds prompts, reads files or starts a shell. Restoring messages uses the same
 projection as ordinary requests, without a separate recovery-validation task.
 
-Each completed model request records usage and estimated cost immediately, including
+Each completed model request records usage and the cost supplied by Rig immediately, including
 automatic and manual summary calls. Known charges survive later request failures or
 cancellation. Child usage is accounted separately from parent context occupancy. Old
 cumulative records are supported without double counting new per-request records.

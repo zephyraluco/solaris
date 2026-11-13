@@ -20,15 +20,15 @@
 ## Provider / backend 收敛
 
 - 每次请求准备明确的原生连接，固定模型 ID、协议、认证、能力、输出预算和价格。UI 请求投影、模型调用、摘要规划和费用结算使用连接的固定事实。
-- 删除旧 Engine。原生执行和业务事件兼容入口共用官方模型与统一请求策略；重试依据 SDK 原生错误，收到输出或未知载荷后不重放。
+- 删除旧 Engine。模型仅通过 `model_client()` 进入 Rig，删除 backend 事件执行入口；重试依据 SDK 原生错误，收到输出或未知载荷后不重放。
 - 标准模型发现使用官方 ModelListing 与游标驱动；仅补充严格列表 envelope 检查、稀疏网关标签和 SDK 未覆盖的 Codex 订阅 schema。
 - 浏览器登录及刷新使用官方 Authenticator，删除 Solaris 自建 PKCE、回调 HTTP 服务和授权码交换。UI 异步接收 URL，凭据继续按原格式保存。
-- 移除 `model_client() -> Option<_>` 和 provider trait 上的 `observe_usage`。事件源必须显式注入；预算、账本、子任务用量作为连接观察器保留。
+- 移除 `model_client() -> Option<_>` 和 provider trait 上的 `observe_usage`。生产构建不支持事件后端注入；测试夹具只在开发构建启用。预算、账本、子任务用量作为连接观察器保留。
 - 官方 HTTP middleware 负责产品会话头及请求选项；只为非标准网关路径保留精确 completion URL 适配。没有 vendor、SDK 分叉或新 crate。
 
 ## 运行与持久化语义
 
-- 模型响应直接进入 SDK，保留原生消息、reasoning、finish reason 和 usage。业务消息转换只用于显示、旧会话导入及注入式测试后端。
+- 模型响应直接进入 SDK，保留原生消息、reasoning、finish reason 和 usage。业务消息转换只用于显示、旧会话导入及Rig handler 测试夹具。
 - SDK 任务成功后由官方 memory 保存。工具结果配对完成后的请求前边界可以主动交接：停止旧 runner，校验其原生完整历史前缀及工具配对，使用原始会话的并发写入检查提交，再启动新阶段。普通失败或取消不追加当前未提交阶段的消息；此前成功阶段和已交接阶段保留。
 - 工具副作用不随消息提交回滚。工具意图、转录和已发生费用独立保留，恢复不会自动重放工具。
 - steering 和已完成后台结果在下一次模型请求前交付。无工具回复后的 steering 使用官方 retry_with_feedback，保留回答与正式 user feedback；工具往返后的 steering 和后台结果通过安全阶段交接追加，不用临时 history patch 模拟持久消息。follow-up 等当前工作完成后启动。
@@ -71,3 +71,11 @@ ModelFacts，编码和标准参考费用均使用官方实现。认证仍通过�
 
 `models.json` 使用 `providers`、命名 `models` 和官方格式的 `overrides`，不兼容旧数组格式。
 配置迁移示例见 README。模型列表发现与参数目录分离，显式元数据引用在应用用户覆盖后校验。
+
+## 唯一 Rig 执行接口
+
+已删除 backend 的 run_turn、from_events、事件后端适配和后端类型分支。
+正常请求、摘要、子代理及重试都使用同一个原生 ModelClient。旧的测试请求形状和
+显示适配仅位于开发依赖启用的 test-utils 中，不属于生产 API。
+费用只读取 Rig 的 usage.cost；不再按 token 重新估算。缺失费用保留为缺失，
+账本仅累加已知金额；启用费用预算时缺失费用会停止执行，避免被当作免费请求。
