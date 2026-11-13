@@ -148,7 +148,7 @@ impl ModelConnector for ExecutionConnector {
     }
 }
 
-fn new_request_id() -> String {
+pub(crate) fn new_request_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
         "{:x}-{:x}-{:x}",

@@ -82,7 +82,10 @@ pub struct ExecutionSettings {
     pub budget: BudgetLimits,
 }
 
-pub use runtime::{RuntimeCommand, SessionRuntime};
+pub use runtime::{
+    CommandReceipt, RuntimeCommand, RuntimeEvent, RuntimeEventStream, RuntimeSnapshot,
+    SessionRuntime,
+};
 
 pub type ChildBackendFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<ConnectionConfig, String> + Send + Sync>;

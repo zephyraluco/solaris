@@ -73,6 +73,12 @@ impl Queue {
         Ok(true)
     }
 
+    pub(crate) fn push_prepared(&self, text: String) {
+        if !text.trim().is_empty() {
+            self.lock().push(text);
+        }
+    }
+
     /// Take everything waiting, oldest first.
     ///
     /// Draining rather than reading is deliberate: a message is put into the

@@ -45,6 +45,7 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 /// Everything one turn needs, gathered so the loop can outlive the call that
 /// started it.
 pub(crate) struct TurnInput {
+    pub lease: Option<crate::runtime::TurnLease>,
     /// The backend the credentials resolved to.
     pub inner: Arc<dyn ModelConnector>,
     /// The tools this turn may declare and run.
@@ -81,6 +82,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     let turn_cancel = input.cancel.begin_turn();
 
     let TurnInput {
+        lease,
         inner,
         tools,
         options,
@@ -146,6 +148,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 
     let (tx, rx) = unbounded_channel();
     let cancel = runner.cancel.clone();
+    let (completed, done) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let sender = tx.clone();
         let drive = runner.drive(prompt, tx);
@@ -160,11 +163,14 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
                 }
             }
         }
+        drop(lease);
+        let _ = completed.send(());
     });
 
     Box::pin(EventStream {
         rx,
         cancel,
+        done,
         finished: false,
     })
 }
@@ -756,6 +762,7 @@ pub(crate) async fn compact_now(
 struct EventStream {
     rx: UnboundedReceiver<AgentEvent>,
     cancel: Cancel,
+    done: tokio::sync::oneshot::Receiver<()>,
     finished: bool,
 }
 
@@ -770,7 +777,7 @@ impl Stream for EventStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<AgentEvent>> {
         if self.finished {
-            return Poll::Ready(None);
+            return std::future::Future::poll(Pin::new(&mut self.done), cx).map(|_| None);
         }
         let event = self.rx.poll_recv(cx);
         if let Poll::Ready(Some(event)) = &event {
@@ -1059,6 +1066,7 @@ mod tests {
         /// Run the turn and collect everything it produced.
         async fn run(self, prompt: &str) -> Vec<AgentEvent> {
             let mut stream = start(TurnInput {
+                lease: None,
                 inner: self.inner,
                 tools: self.tools,
                 services: crate::billing::SessionServices::default().for_turn(
@@ -1132,8 +1140,11 @@ mod tests {
             duration_ms: 1,
         })
         .unwrap();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        completed.send(()).unwrap();
         let stream = EventStream {
             rx,
+            done,
             cancel: Cancel::new(),
             finished: false,
         };
@@ -1549,6 +1560,7 @@ mod tests {
 
         let tool = Arc::new(Recording::default());
         let mut stream = start(TurnInput {
+            lease: None,
             inner: Arc::new(Endless),
             tools: vec![tool.clone()],
             options: AgentOptions::default(),

@@ -9,6 +9,8 @@
 //! screen. While the transcript is empty the first rows are the welcome box,
 //! which scrolls away with the first turn.
 
+use futures::StreamExt;
+
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -268,6 +270,9 @@ pub struct App {
     /// The session every turn goes through, and the backend behind it.
     pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
     model_source: Arc<dyn solaris_provider::ModelSource>,
+    runtime_errors: UnboundedReceiver<String>,
+    runtime_pending: Arc<std::sync::atomic::AtomicUsize>,
+    runtime_error_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
     pub(crate) config: Config,
@@ -461,9 +466,13 @@ impl App {
         editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
 
+        let (runtime_error_tx, runtime_errors) = unbounded_channel();
         let mut app = Self {
             agent,
             model_source,
+            runtime_errors,
+            runtime_pending: Default::default(),
+            runtime_error_tx,
             backend_factory,
             config,
             theme,
@@ -748,7 +757,7 @@ impl App {
     }
 
     /// The label of the backend answering turns right now.
-    pub fn backend_label(&self) -> &str {
+    pub fn backend_label(&self) -> String {
         self.agent.label()
     }
 
@@ -756,7 +765,7 @@ impl App {
     ///
     /// The model picker lists this provider's models, so it needs the id rather
     /// than the backend's display label.
-    fn provider_id(&self) -> Option<&str> {
+    fn provider_id(&self) -> Option<String> {
         self.agent.provider_id()
     }
 
@@ -1032,7 +1041,7 @@ impl App {
         self.config.model = name.to_string();
         // A model belongs to the provider that offers it, so it is remembered
         // beside that provider rather than in the settings file.
-        if let Some(provider) = self.provider_id().map(str::to_owned) {
+        if let Some(provider) = self.provider_id() {
             self.auth.activate(&provider);
         }
         self.auth.remember_model(name);
@@ -1094,10 +1103,31 @@ impl App {
     /// folded it in — that is when the turn's record gets the note, so a
     /// message that arrives just too late to be read by this turn is recorded
     /// against the turn that does read it rather than the one it was typed into.
+    fn runtime_command(&self, command: solaris_agent::RuntimeCommand) {
+        if self.agent.configure(command.clone()).is_ok() {
+            return;
+        }
+        let submitted = self.agent.submit(command);
+        let errors = self.runtime_error_tx.clone();
+        let pending = Arc::clone(&self.runtime_pending);
+        pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        tokio::spawn(async move {
+            let result = match submitted {
+                Ok(receipt) => receipt.accepted().await.map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                let _ = errors.send(error);
+            }
+            pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        });
+    }
+
     fn steer(&mut self, text: String) {
-        match self.agent.steering_handle().try_push(text.clone()) {
-            Ok(true) => {}
-            Ok(false) => return,
+        match self.agent.expand_input(&text) {
+            Ok(prepared) if !prepared.trim().is_empty() => self
+                .runtime_command(solaris_agent::RuntimeCommand::PreparedSteer { text: prepared }),
+            Ok(_) => return,
             Err(error) => {
                 self.notifications.error(error.to_string());
                 return;
@@ -1175,7 +1205,15 @@ impl App {
                 self.agent.active_tasks().join(", ")
             )),
             "stop" => {
-                if self.agent.cancel_task(command.args.trim()) {
+                if self
+                    .agent
+                    .active_tasks()
+                    .iter()
+                    .any(|id| id == command.args.trim())
+                {
+                    self.runtime_command(solaris_agent::RuntimeCommand::CancelTask {
+                        id: command.args.trim().into(),
+                    });
                     self.notifications.info("stopping child task");
                 } else {
                     self.notifications
@@ -1226,12 +1264,17 @@ impl App {
             self.start_turn(prompt.clone(), prompt);
             return;
         }
-        match self.agent.follow_up_handle().try_push(text) {
-            Ok(true) => self.notifications.info(format!(
-                "after this turn: {}",
-                crate::transcript::summarize(text)
-            )),
-            Ok(false) => {}
+        match self.agent.expand_input(text) {
+            Ok(prepared) if !prepared.trim().is_empty() => {
+                self.runtime_command(solaris_agent::RuntimeCommand::PreparedQueue {
+                    text: prepared,
+                });
+                self.notifications.info(format!(
+                    "after this turn: {}",
+                    crate::transcript::summarize(text)
+                ));
+            }
+            Ok(_) => {}
             Err(error) => self.notifications.error(error.to_string()),
         }
     }
@@ -1268,7 +1311,9 @@ impl App {
                     .collect::<Vec<_>>();
                 self.skills = snapshot.skills.clone();
                 self.editor.set_hints(commands::hints(&self.skills));
-                self.agent.replace_resources(snapshot);
+                self.runtime_command(solaris_agent::RuntimeCommand::ReplaceResources {
+                    resources: snapshot,
+                });
                 if diagnostics.is_empty() {
                     self.notifications.info(format!(
                         "reloaded {} skills and prompt instructions",
@@ -1302,8 +1347,22 @@ impl App {
         self.notifications.clear();
         self.notifications.info("compacting…".to_string());
 
+        let errors = self.runtime_error_tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(agent.compact().await);
+            let mut dropped = None;
+            match agent.execute(solaris_agent::RuntimeCommand::Compact).await {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        if let AgentEvent::Compacted { dropped: count } = event.event {
+                            dropped = Some(count);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = errors.send(error);
+                }
+            }
+            let _ = tx.send(dropped);
         });
     }
 
@@ -1361,12 +1420,21 @@ impl App {
 
         let agent = Arc::clone(&self.agent);
         let mode = self.config.mode;
+        let submitted = agent.submit(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream =
-                agent.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
+            let mut stream = match match submitted {
+                Ok(receipt) => receipt.accepted().await,
+                Err(error) => Err(error),
+            } {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = tx.send(AgentEvent::Error(error));
+                    return;
+                }
+            };
             while let Some(event) = stream.next().await {
-                if tx.send(event).is_err() {
+                if tx.send(event.event).is_err() {
                     break;
                 }
             }
@@ -1598,7 +1666,7 @@ impl App {
                 // clearing what is on screen must also forget what the model
                 // would be sent, or the next turn answers a conversation the
                 // user can no longer see.
-                self.agent.clear();
+                self.runtime_command(solaris_agent::RuntimeCommand::Clear);
                 self.notifications.info("transcript cleared");
             }
             DialogMessage::Confirm {
@@ -1678,7 +1746,7 @@ impl App {
     fn open_stats(&mut self) {
         self.session.billing = self.agent.usage_totals().or(self.session.billing);
         self.session.context = self.agent.context_usage(self.config.mode);
-        let backend = self.agent.label().to_string();
+        let backend = self.agent.label();
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -1842,13 +1910,12 @@ impl App {
         self.model_source = Arc::clone(&choice.models);
         let factory = Arc::clone(&self.backend_factory);
         let auth = self.auth.clone();
-        self.agent = Arc::new(
-            self.agent
-                .with_refreshed_backend(crate::agent_backend(choice))
-                .with_child_backend(Arc::new(move |model| {
-                    Ok(crate::agent_backend(factory(&auth, model)))
-                })),
-        );
+        self.runtime_command(solaris_agent::RuntimeCommand::ReplaceConnection {
+            connection: crate::agent_backend(choice),
+            children: Some(Arc::new(move |model| {
+                Ok(crate::agent_backend(factory(&auth, model)))
+            })),
+        });
     }
 
     /// Adopt the model list the provider reported.
@@ -1991,7 +2058,7 @@ impl App {
     fn model_choices(&self) -> Vec<SelectItem> {
         let catalogue = self
             .provider_id()
-            .map(|id| self.provider_config.models(id))
+            .map(|id| self.provider_config.models(&id))
             .unwrap_or_default();
         if self.discovered.is_empty() {
             if self.uses_chatgpt() {
@@ -2698,7 +2765,7 @@ impl App {
 
         // The model slot disappears while no model is named, so the footer
         // never shows an empty gap between two separators.
-        let mut facts = vec![self.agent.label().to_string()];
+        let mut facts = vec![self.agent.label()];
         if !self.config.model.is_empty() {
             facts.push(self.config.model.clone());
         }
@@ -3034,6 +3101,9 @@ impl Component for App {
     }
 
     fn tick(&mut self) -> bool {
+        while let Ok(error) = self.runtime_errors.try_recv() {
+            self.notifications.error(error);
+        }
         let mut dirty = self.poll_oauth();
         let context_window = u64::from(
             self.agent
@@ -5652,9 +5722,12 @@ mod tests {
         // No concurrent turn, and the message is waiting for the loop that is
         // running to read it rather than being run as a turn of its own.
         assert_eq!(app.session.turns.len(), 1, "a concurrent turn was started");
+        settle_turn(&mut app).await;
         assert!(
-            app.agent.steering_handle().has_pending(),
-            "the message never reached the running turn"
+            app.session.turns[0]
+                .steering
+                .iter()
+                .any(|note| note.text == "second")
         );
         assert!(
             app.notifications
@@ -5778,7 +5851,13 @@ mod tests {
     async fn settle_resources(app: &mut App) {
         for _ in 0..1000 {
             app.tick();
-            if app.resource_rx.is_none() && !app.reload_pending {
+            if app.resource_rx.is_none()
+                && !app.reload_pending
+                && app
+                    .runtime_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6045,9 +6124,11 @@ mod tests {
 
         // No second turn yet, and no steering either: this is the queue for after.
         assert_eq!(app.session.turns.len(), 1);
-        assert!(app.agent.follow_up_handle().has_pending());
+        settle_turn(&mut app).await;
+        assert_eq!(app.session.turns.len(), 2);
+        assert_eq!(app.session.turns[1].prompt, "run the tests");
         assert!(
-            app.agent.steering_handle().is_empty(),
+            !app.agent.steering_pending(),
             "a queued prompt is not a correction"
         );
         assert!(
@@ -6065,7 +6146,7 @@ mod tests {
 
         assert_eq!(app.session.turns.len(), 1, "it started straight away");
         assert_eq!(app.session.turns[0].prompt, "do it now");
-        assert!(app.agent.follow_up_handle().is_empty());
+        assert!(!app.agent.follow_up_pending());
     }
 
     #[tokio::test]

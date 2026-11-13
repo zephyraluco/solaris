@@ -349,6 +349,9 @@ impl Agent {
     /// application has that the agent cannot state more honestly: what the
     /// conversation costs is the provider's to say, and it says it per turn in
     /// the usage.
+    pub fn is_idle(&self) -> bool {
+        !self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
     pub fn conversation_len(&self) -> usize {
         self.conversation.len()
     }
@@ -644,6 +647,7 @@ impl Agent {
             }));
         }
         let stream = session::start(TurnInput {
+            lease: Some(lease),
             inner: Arc::clone(&self.choice.backend),
             tools,
             options: turn_options,
@@ -659,7 +663,7 @@ impl Agent {
             base_id: cached.header.base_id,
             subagent,
         });
-        crate::runtime::leased_stream(crate::runtime::journal_stream(stream, journal), lease)
+        crate::runtime::journal_stream(stream, journal)
     }
 }
 

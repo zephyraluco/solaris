@@ -622,6 +622,13 @@ async fn cancelling_or_dropping_the_parent_stops_running_and_queued_background_c
             );
         }
         wait_stopped(&model).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !agent.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         model.release.add_permits(3);
         let next: Vec<_> = tokio::time::timeout(
             Duration::from_secs(1),
