@@ -1135,6 +1135,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_steering_preserves_adjacent_saved_user_messages_across_handoff() {
+        let inner = Scripted::new(vec![vec![
+            AgentEvent::TextDelta("done".into()),
+            AgentEvent::TurnComplete {
+                usage: Usage::new(1, 1),
+                cost_usd: 0.0,
+            },
+        ]]);
+        let agent = agent(inner.clone());
+        agent
+            .conversation
+            .push(crate::Message::user("earlier notification one"));
+        agent
+            .conversation
+            .push(crate::Message::user("earlier notification two"));
+        let before = agent.conversation.native().expect("saved history");
+        agent
+            .steering_handle()
+            .try_push("new direction")
+            .expect("steering");
+        let events = drain(agent.run_turn("current task", Mode::Plan)).await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:#?}"
+        );
+        assert_eq!(
+            inner.requests().len(),
+            1,
+            "handoff must not spend a request"
+        );
+        let after = agent.conversation.native().expect("saved history");
+        for index in 0..2 {
+            assert_eq!(before.id(index), after.id(index));
+            assert_eq!(before.messages()[index], after.messages()[index]);
+        }
+        let messages = agent.conversation.snapshot();
+        for text in [
+            "earlier notification one",
+            "earlier notification two",
+            "current task",
+            "new direction",
+        ] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.text() == text)
+                    .count(),
+                1,
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn skill_input_expands_in_turns_and_both_queues_with_current_body() {
         let dir = std::env::temp_dir().join(format!("solaris-agent-input-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("pdf")).expect("directory");

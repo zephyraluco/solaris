@@ -486,7 +486,8 @@ async fn background_children_share_the_parallel_cap_across_batches() {
             "subagent-3",
             "subagent-4",
             "subagent-5"
-        ]
+        ],
+        "{events:#?}"
     );
 }
 

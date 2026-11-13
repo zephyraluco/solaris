@@ -26,6 +26,7 @@ enum Boundary {
 #[derive(Default)]
 struct Phase {
     boundary: Option<Boundary>,
+    checkpoint: Option<Vec<native::Message>>,
     reject_truncated: bool,
     totals: crate::UsageTotals,
     client: Option<solaris_backend::ModelClient>,
@@ -125,10 +126,14 @@ impl AgentHook for Policy {
         };
         if let Some(boundary) = boundary {
             let _ = self.tx.send(AgentEvent::ContextUsageUpdated { context });
-            self.phase
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .boundary = Some(boundary);
+            let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
+            phase.boundary = Some(boundary);
+            phase.checkpoint = Some(
+                messages
+                    .iter()
+                    .map(|message| message.as_ref().clone())
+                    .collect(),
+            );
             return CompletionCallAction::stop(PHASE_BOUNDARY);
         }
         // Resolve exactly once, before projecting the request. The same client
@@ -555,7 +560,29 @@ impl Runner {
                     if tx.is_closed() {
                         return;
                     }
-                    if let Err(error) = self.conversation.commit_phase(&mut base, chat_history) {
+                    // Cancellation canonicalizes adjacent user messages. Preserve
+                    // the SDK's raw request-boundary view so original message IDs
+                    // and the saved prefix remain intact, and verify both views
+                    // describe exactly the same canonical history.
+                    let checkpoint = phase
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .checkpoint
+                        .take();
+                    let Some(checkpoint) = checkpoint else {
+                        self.give_up("SDK phase boundary has no checkpoint".into(), &tx);
+                        return;
+                    };
+                    if rig_core::conversation::pairing::repair(checkpoint.clone()).messages
+                        != chat_history
+                    {
+                        self.give_up(
+                            "SDK phase checkpoint does not match its cancellation history".into(),
+                            &tx,
+                        );
+                        return;
+                    }
+                    if let Err(error) = self.conversation.commit_phase(&mut base, checkpoint) {
                         self.conversation.failed(&error);
                         self.give_up(error, &tx);
                         return;
