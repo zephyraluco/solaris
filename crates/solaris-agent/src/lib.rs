@@ -98,3 +98,6 @@ pub use event::AgentEvent;
 pub type AgentEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = AgentEvent> + Send>>;
 #[cfg(feature = "test-utils")]
 pub mod testing;
+
+#[path = "storage/checkpoint.rs"]
+mod checkpoint;

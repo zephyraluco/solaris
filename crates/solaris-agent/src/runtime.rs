@@ -72,6 +72,7 @@ pub struct RuntimeSnapshot {
     pub sequence: u64,
     pub task_id: Option<u64>,
     pub model: String,
+    pub mode: crate::Mode,
     pub context: crate::ContextUsage,
     pub billing: Option<crate::UsageTotals>,
 }
@@ -122,11 +123,21 @@ impl SessionRuntime {
         let session_id = agent
             .journal()
             .map_or_else(crate::billing::new_request_id, |j| j.id().into());
+        let sequence = agent
+            .journal()
+            .map(|journal| journal.event_sequence())
+            .transpose()
+            .unwrap_or_else(|error| {
+                agent.fail(error);
+                None
+            })
+            .unwrap_or(0);
         let snapshot = RuntimeSnapshot {
             session_id,
-            sequence: 0,
+            sequence,
             task_id: None,
             model: agent.model().into(),
+            mode: crate::Mode::Build,
             context: agent.context_usage(crate::Mode::Build),
             billing: agent.usage_totals(),
         };
@@ -281,11 +292,20 @@ fn refresh(core: &Core, task_id: Option<u64>, mode: crate::Mode) {
     let view = core.view.read().unwrap_or_else(|p| p.into_inner());
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
     if let Some(journal) = view.journal() {
+        if snapshot.session_id != journal.id() {
+            snapshot.sequence = journal.event_sequence().unwrap_or_else(|error| {
+                view.fail(error);
+                snapshot.sequence
+            });
+        }
         snapshot.session_id = journal.id().into();
     }
     snapshot.task_id = task_id;
     snapshot.model = view.model().into();
-    snapshot.context = view.context_usage(mode);
+    if task_id.is_some() {
+        snapshot.mode = mode;
+    }
+    snapshot.context = view.context_usage(snapshot.mode);
     snapshot.billing = view.usage_totals();
 }
 fn publish(
@@ -294,9 +314,26 @@ fn publish(
     mode: crate::Mode,
     event: AgentEvent,
 ) -> RuntimeEvent {
-    refresh(core, task_id, mode);
+    refresh(core, if event.is_terminal() { None } else { task_id }, mode);
+    let mut event = event;
+    let sequence = core
+        .view
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .journal()
+        .map(|journal| journal.next_sequence());
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
-    snapshot.sequence += 1;
+    snapshot.sequence = match sequence {
+        Some(Ok(sequence)) => sequence,
+        Some(Err(error)) => {
+            let agent = core.view.read().unwrap_or_else(|p| p.into_inner());
+            agent.fail(&error);
+            agent.cancel_handle().cancel();
+            event = AgentEvent::Error(format!("cannot persist event sequence: {error}"));
+            snapshot.sequence + 1
+        }
+        None => snapshot.sequence + 1,
+    };
     let event = RuntimeEvent {
         session_id: snapshot.session_id.clone(),
         sequence: snapshot.sequence,
@@ -621,5 +658,42 @@ mod tests {
             next.last().unwrap().event,
             AgentEvent::TurnComplete { .. }
         ));
+    }
+    #[tokio::test]
+    async fn event_sequence_continues_after_reopening_a_persistent_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let journal = store.create(directory.path(), "fixture", None).unwrap();
+        let id = journal.id().to_owned();
+        let first = runtime();
+        first.attach_journal(journal).unwrap();
+        let events = collect(
+            first
+                .execute(RuntimeCommand::Prompt {
+                    text: "first".into(),
+                    mode: crate::Mode::Plan,
+                })
+                .await
+                .unwrap(),
+        )
+        .await;
+        let sequence = events.last().unwrap().sequence;
+        assert_eq!(first.snapshot().mode, crate::Mode::Plan);
+        drop(first);
+        let second = runtime();
+        second.attach_journal(store.resume(&id).unwrap()).unwrap();
+        assert_eq!(second.snapshot().sequence, sequence);
+        let events = collect(
+            second
+                .execute(RuntimeCommand::Prompt {
+                    text: "second".into(),
+                    mode: crate::Mode::Build,
+                })
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(events[0].sequence, sequence + 1);
+        assert_eq!(events[0].session_id, id);
     }
 }

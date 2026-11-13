@@ -23,13 +23,19 @@ enum Boundary {
     Compaction,
 }
 
+/// The exact model connection and tool/header view fixed for one SDK request.
+#[derive(Clone)]
+struct RequestSnapshot {
+    client: solaris_backend::ModelClient,
+    header: crate::projection::Header,
+}
 #[derive(Default)]
 struct Phase {
     boundary: Option<Boundary>,
     checkpoint: Option<Vec<native::Message>>,
     reject_truncated: bool,
     totals: crate::UsageTotals,
-    client: Option<solaris_backend::ModelClient>,
+    request: Option<RequestSnapshot>,
     text: String,
     thinking: String,
     input_characters: usize,
@@ -84,7 +90,7 @@ impl AgentHook for Policy {
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
             phase.text.clear();
             phase.thinking.clear();
-            phase.client = None;
+            phase.request = None;
             phase.reject_truncated = false;
         }
         let header = self.runner.request_header();
@@ -132,7 +138,10 @@ impl AgentHook for Policy {
             let _ = notices.send(AgentEvent::Status(text));
         });
         let capabilities = client.capabilities();
-        self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
+        self.phase.lock().unwrap_or_else(|p| p.into_inner()).request = Some(RequestSnapshot {
+            client,
+            header: header.clone(),
+        });
         let context = self
             .runner
             .conversation
@@ -147,16 +156,16 @@ impl AgentHook for Policy {
         });
         CompletionCallAction::patch(
             RequestPatch::new().active_tools(
-                self.runner
-                    .request_tools()
-                    .into_iter()
-                    .map(|tool| tool.name),
+                header
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str().to_owned()),
             ),
         )
     }
     async fn on_text_delta(&self, _: &HookContext, event: TextDelta<'_>) -> ObservationAction {
         let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-        if phase.client.is_none() {
+        if phase.request.is_none() {
             return ObservationAction::continue_run();
         }
         phase.text.push_str(event.delta);
@@ -237,7 +246,7 @@ impl AgentHook for Policy {
     async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
         if let Some(response) = event.completion() {
             let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(client) = &phase.client else {
+            let Some(request) = &phase.request else {
                 return OutcomeAction::replace(Err(failure("model connection was not prepared")));
             };
             let measured = if response.usage.input_tokens.is_some()
@@ -255,13 +264,13 @@ impl AgentHook for Policy {
                     .sum();
                 Usage::estimate(phase.input_characters, output)
             };
-            match client.settle(measured, response.usage.cost) {
+            match request.client.settle(measured, response.usage.cost) {
                 Ok(_) => {}
                 Err(error) => return OutcomeAction::replace(Err(failure(error))),
             };
             self.runner
                 .conversation
-                .observe_usage(&self.runner.request_header(), measured);
+                .observe_usage(&request.header, measured);
             phase.totals.add(measured, response.usage.cost);
         }
         OutcomeAction::proceed()
@@ -353,8 +362,9 @@ impl Serve for Policy {
             .phase
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .client
-            .clone();
+            .request
+            .as_ref()
+            .map(|request| request.client.clone());
         match client {
             Some(client) => client.serve(kind, dispatch).await,
             None => Reply::Outcome(Err(failure("model connection was not prepared"))),
@@ -362,16 +372,16 @@ impl Serve for Policy {
     }
 }
 struct ToolBridge {
-    tool: Arc<dyn Tool>,
+    spec: ToolSpec,
     policy: Policy,
 }
 impl Serve for ToolBridge {
     type Family = family::Tool;
     fn descriptor(&self) -> HandlerDescriptor {
         HandlerDescriptor::tool(
-            self.tool.name(),
-            self.tool.description(),
-            self.tool.parameters(),
+            &self.spec.name,
+            &self.spec.description,
+            self.spec.parameters.clone(),
         )
     }
     async fn serve(&self, _: EffectKind, dispatch: Dispatch) -> Reply {
@@ -502,7 +512,12 @@ impl Runner {
             let server = rig_agent::tool::server::ToolServer::new().run();
             for tool in &self.tools {
                 let bridge = ToolBridge {
-                    tool: Arc::clone(tool),
+                    spec: self
+                        .specs
+                        .iter()
+                        .find(|spec| spec.name == tool.name())
+                        .expect("registered tool specification")
+                        .clone(),
                     policy: Policy {
                         runner: Arc::clone(self),
                         tx: tx.clone(),

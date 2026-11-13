@@ -48,9 +48,7 @@ impl UsageTotals {
                     cost,
                     ..
                 } if seen.insert(request_id) => totals.add(*usage, *cost),
-                SessionRecord::Context { messages } if messages.is_empty() => {
-                    totals = Self::default()
-                }
+                SessionRecord::Cleared => totals = Self::default(),
                 _ => {}
             }
         }

@@ -552,11 +552,9 @@ impl App {
                 solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
                     "session interrupted; verify unfinished tool outcomes before retrying".into(),
                 )),
-                solaris_agent::SessionRecord::Context { messages } => {
+                solaris_agent::SessionRecord::Cleared => {
                     self.session.context = Default::default();
-                    if messages.is_empty() {
-                        self.session.turns.clear();
-                    }
+                    self.session.turns.clear();
                 }
                 _ => {}
             }

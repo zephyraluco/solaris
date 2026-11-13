@@ -373,7 +373,7 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
     assert!(
         !records
             .iter()
-            .any(|record| matches!(record, solaris_agent::SessionRecord::Context { .. }))
+            .any(|record| matches!(record, solaris_agent::SessionRecord::Cleared))
     );
     assert!(
         directory

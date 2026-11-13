@@ -349,6 +349,9 @@ impl Agent {
     /// application has that the agent cannot state more honestly: what the
     /// conversation costs is the provider's to say, and it says it per turn in
     /// the usage.
+    pub(crate) fn fail(&self, error: impl std::fmt::Display) {
+        self.conversation.failed(error);
+    }
     pub fn is_idle(&self) -> bool {
         !self.active.load(std::sync::atomic::Ordering::Acquire)
     }

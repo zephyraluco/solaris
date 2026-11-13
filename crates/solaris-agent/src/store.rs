@@ -65,9 +65,7 @@ pub enum SessionRecord {
     Event {
         event: AgentEvent,
     },
-    Context {
-        messages: Vec<Message>,
-    },
+    Cleared,
     ToolIntent {
         call: solaris_backend::ToolCall,
     },
@@ -99,40 +97,29 @@ impl SessionStore {
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 3 {
+        if version != 0 && version != 4 {
             return Err(StoreError::Invalid(format!(
                 "unsupported session schema version {version}"
             )));
         }
         transaction.execute_batch("CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY, cwd TEXT NOT NULL, parent_id TEXT REFERENCES sessions(id),
-                model TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'idle',
-                updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                model TEXT NOT NULL, provider TEXT, is_subagent INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'idle',
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()), event_sequence INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS records (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS records_session ON records(session_id, seq);
 ")?;
-        if version < 2 {
-            transaction.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
-        }
-        if version < 3 {
-            transaction.execute(
-                "ALTER TABLE sessions ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-            // In schema 2, forks recorded a Model entry while ordinary children
-            // did not. Parent event links also identify children whose metadata
-            // was subsequently updated. Unannounced children have no Model entry.
-            transaction.execute_batch(
-                "UPDATE sessions SET is_subagent=1
-                WHERE parent_id IS NOT NULL AND (
-                    EXISTS (SELECT 1 FROM records r WHERE r.session_id=sessions.parent_id
-                        AND json_extract(r.data,'$.event.SubagentSession.session_id')=sessions.id)
-                    OR NOT EXISTS (SELECT 1 FROM records r WHERE r.session_id=sessions.id
-                        AND json_extract(r.data,'$.type')='model'));",
-            )?;
-        }
-        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS request_settlements
+            ON records(session_id, json_extract(data,'$.request_id'))
+            WHERE json_extract(data,'$.type')='usage';
+            CREATE TABLE IF NOT EXISTS memory_checkpoints (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                log TEXT NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL,
+                digest TEXT NOT NULL, state TEXT NOT NULL);",
+        )?;
+        transaction.pragma_update(None, "user_version", 4)?;
         transaction.commit()?;
         #[cfg(unix)]
         {
@@ -145,7 +132,7 @@ impl SessionStore {
         }))
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
         self.connection
             .lock()
             .map_err(|_| StoreError::Invalid("session database lock poisoned".into()))
@@ -260,10 +247,6 @@ impl SessionStore {
         let mut records = Vec::new();
         for text in data {
             let value: serde_json::Value = serde_json::from_str(&text)?;
-            // Obsolete hashes from the previous implementation are not a projection input.
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("context_checkpoint") {
-                continue;
-            }
             records.push(serde_json::from_value(value)?);
         }
         Ok(records)
@@ -328,6 +311,49 @@ impl SessionJournal {
         Ok(())
     }
 
+    pub(crate) fn event_sequence(&self) -> Result<u64, StoreError> {
+        Ok(self.store.lock()?.query_row(
+            "SELECT event_sequence FROM sessions WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?)
+    }
+    pub(crate) fn next_sequence(&self) -> Result<u64, StoreError> {
+        Ok(self.store.lock()?.query_row("UPDATE sessions SET event_sequence=event_sequence+1 WHERE id=?1 RETURNING event_sequence", [&self.id], |row| row.get(0))?)
+    }
+    pub(crate) fn begin_checkpoint(
+        &self,
+        checkpoint: &crate::checkpoint::PendingCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.store.lock()?.execute("INSERT INTO memory_checkpoints(id,session_id,log,offset,length,digest,state) VALUES (?1,?2,?3,?4,?5,?6,'pending')",
+            params![checkpoint.id, self.id, checkpoint.log, checkpoint.offset, checkpoint.length, checkpoint.digest])?;
+        Ok(())
+    }
+    pub(crate) fn finish_checkpoint(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        self.store.lock()?.execute(
+            "UPDATE memory_checkpoints SET state=?3 WHERE id=?1 AND session_id=?2",
+            params![id, self.id, state],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn pending_checkpoints(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::PendingCheckpoint>, StoreError> {
+        let connection = self.store.lock()?;
+        let mut query = connection.prepare("SELECT id,log,offset,length,digest FROM memory_checkpoints WHERE session_id=?1 AND state='pending' ORDER BY rowid")?;
+        Ok(query
+            .query_map([&self.id], |row| {
+                Ok(crate::checkpoint::PendingCheckpoint {
+                    id: row.get(0)?,
+                    log: row.get(1)?,
+                    offset: row.get(2)?,
+                    length: row.get(3)?,
+                    digest: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     pub(crate) fn memory_store(&self) -> Result<rig_memory::DirStore, StoreError> {
         rig_memory::DirStore::open(self.store.directory.join("memory").join(&self.id))
             .map_err(|error| StoreError::Invalid(error.to_string()))
@@ -357,7 +383,7 @@ impl SessionJournal {
         // asides while giving the child its own store and save cursor.
         let original = rig_memory::load(&self.memory_store()?, "conversation")
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
-        let destination = child.memory_store()?;
+        let destination = crate::checkpoint::CheckpointStore::open(Arc::clone(&child))?;
         let mut forked = rig_memory::load(&destination, "conversation")
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
         let entries = (0..original.messages().len())
@@ -485,82 +511,19 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn version_one_is_migrated_without_losing_existing_context() {
-        let directory = tempfile::tempdir().expect("directory");
-        let path = directory.path().join("sessions.sqlite");
-        let store = SessionStore::open(&path).expect("store");
-        let journal = store
-            .create(Path::new("/project"), "model", None)
-            .expect("session");
-        let id = journal.id().to_string();
-        seed_memory(&journal, vec![Message::user("preserve")]);
-        drop(journal);
-        drop(store);
-        let connection = Connection::open(&path).expect("old schema");
-        connection
-            .execute_batch("ALTER TABLE sessions DROP COLUMN provider; ALTER TABLE sessions DROP COLUMN is_subagent; PRAGMA user_version=1;")
-            .expect("simulate version one");
-        drop(connection);
-        let migrated = SessionStore::open(&path).expect("migrate");
-        assert_eq!(
-            migrated
-                .resume(&id)
-                .expect("resume")
-                .context()
-                .expect("context"),
-            vec![Message::user("preserve")]
-        );
-    }
-
-    #[test]
-    fn version_two_migration_distinguishes_children_from_user_forks() {
-        let directory = tempfile::tempdir().expect("directory");
-        let path = directory.path().join("sessions.sqlite");
-        let cwd = directory.path();
-        let store = SessionStore::open(&path).expect("store");
-        let root = store.create(cwd, "root", None).expect("root");
-        let child = store
-            .create_subagent(cwd, "child", root.id())
-            .expect("child");
-        // Cover an announced child that already has backend metadata.
-        child
-            .append(&SessionRecord::Model {
-                provider: Some("local".into()),
-                model: "child".into(),
-            })
-            .expect("model");
-        root.append(&SessionRecord::Event {
-            event: AgentEvent::SubagentSession {
-                task_id: "task".into(),
-                session_id: child.id().into(),
-            },
-        })
-        .expect("child link");
-        let orphan = store
-            .create_subagent(cwd, "orphan", root.id())
-            .expect("unannounced child");
-        let fork = root.fork(cwd, "fork").expect("user fork");
-        let ids = [root.id(), child.id(), orphan.id(), fork.id()].map(str::to_owned);
-        drop(root);
-        drop(child);
-        drop(orphan);
-        drop(fork);
-        drop(store);
-        Connection::open(&path)
-            .expect("connection")
-            .execute_batch("ALTER TABLE sessions DROP COLUMN is_subagent; PRAGMA user_version=2;")
-            .expect("version two fixture");
-        let store = SessionStore::open(&path).expect("migrate");
-        let sessions = store.list(cwd).expect("sessions");
-        for (id, is_subagent) in ids.iter().zip([false, true, true, false]) {
-            assert_eq!(
-                sessions
-                    .iter()
-                    .find(|session| &session.id == id)
-                    .expect("saved session")
-                    .is_subagent,
-                is_subagent
-            );
+    fn unsupported_schema_versions_are_rejected_without_migration() {
+        for version in [1, 2, 3, 5] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("sessions.sqlite");
+            Connection::open(&path)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let error = match SessionStore::open(&path) {
+                Ok(_) => panic!("old schema accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("unsupported session schema"));
         }
     }
 
@@ -613,7 +576,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
     #[test]
-    fn obsolete_context_checkpoints_do_not_prevent_reading_old_sessions() {
+    fn obsolete_record_formats_are_rejected_instead_of_silently_imported() {
         let directory = tempfile::tempdir().expect("directory");
         let store = SessionStore::open(&directory.path().join("sessions.sqlite")).expect("store");
         let journal = store
@@ -635,7 +598,7 @@ mod tests {
                 text: "hello".into(),
             })
             .expect("prompt");
-        assert_eq!(store.records(journal.id()).expect("read").len(), 1);
+        assert!(store.records(journal.id()).is_err());
         assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"auxiliary_usage","usage":{"input_tokens":10,"output_tokens":2},"cost_usd":0.01}"#).is_err(), "legacy charge aliases are not imported");
     }
 }

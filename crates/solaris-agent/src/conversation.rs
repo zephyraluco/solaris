@@ -91,7 +91,7 @@ impl Conversation {
             })
             .collect();
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
-        let storage = journal.memory_store()?;
+        let storage = crate::checkpoint::CheckpointStore::open(Arc::clone(&journal))?;
         *self.storage.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(storage);
         *self
             .journal
@@ -277,9 +277,7 @@ impl Conversation {
     /// prompt, so nothing of the old conversation reaches the model again.
     pub(crate) fn clear(&self) {
         self.replace_with(Vec::new());
-        self.persist(SessionRecord::Context {
-            messages: Vec::new(),
-        });
+        self.persist(SessionRecord::Cleared);
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
     }
 
