@@ -103,6 +103,7 @@ pub struct Backend {
     pub(super) model: String,
     pub(super) max_tokens: u32,
     pub(super) price: Option<Price>,
+    pub(super) facts: Option<rig_core::catalog::ModelFacts>,
     pub(super) price_tiers: Vec<crate::PriceTier>,
     pub(super) prompt_cache_key: Option<&'static str>,
     pub(super) chatgpt: Option<(String, u64)>,
@@ -111,6 +112,22 @@ pub struct Backend {
 
 impl Backend {
     pub(super) fn usage_cost(&self, usage: Usage) -> f64 {
+        if let Some(facts) = &self.facts {
+            let mut native = rig_core::completion::Usage::new();
+            native.input_tokens = Some(
+                u64::from(usage.input_tokens)
+                    + u64::from(usage.cache_read_tokens)
+                    + u64::from(usage.cache_write_tokens),
+            );
+            native.output_tokens = Some(u64::from(usage.output_tokens));
+            native.cached_input_tokens = Some(u64::from(usage.cache_read_tokens));
+            native.cache_creation_input_tokens = Some(u64::from(usage.cache_write_tokens));
+            return facts
+                .spec()
+                .and_then(|s| s.pricing.as_ref())
+                .and_then(|p| p.cost(&native))
+                .map_or(0.0, |c| c.total);
+        }
         self.price.map_or(0.0, |price| {
             price.cost_with_tiers(&usage, &self.price_tiers)
         })
@@ -136,6 +153,7 @@ impl Backend {
             model: plan.model,
             max_tokens: plan.max_tokens,
             price: plan.price,
+            facts: None,
             price_tiers: Vec::new(),
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
@@ -144,6 +162,21 @@ impl Backend {
                 ..Default::default()
             },
         })
+    }
+
+    /// Bind the official catalog facts to an immutable request configuration.
+    pub fn with_model_facts(
+        mut self,
+        model: String,
+        max_tokens: u32,
+        facts: rig_core::catalog::ModelFacts,
+        capabilities: crate::ModelCapabilities,
+    ) -> Self {
+        self.model = model;
+        self.max_tokens = max_tokens;
+        self.capabilities = capabilities;
+        self.facts = Some(facts);
+        self
     }
 
     /// Reuse the HTTP pool while fixing one request's resolved model parameters.
@@ -286,7 +319,10 @@ impl Backend {
         spec.context_window = self.capabilities.context_window;
         spec.max_input_tokens = self.capabilities.max_input;
         spec.max_output_tokens = self.capabilities.max_output;
-        let facts = ModelFacts::new(spec).with_catalog(&Catalog::default());
+        let facts = self
+            .facts
+            .clone()
+            .unwrap_or_else(|| ModelFacts::new(spec).with_catalog(&Catalog::default()));
         let model = match self.endpoint.wire {
             Wire::AnthropicMessages => {
                 let config = self.anthropic_config();

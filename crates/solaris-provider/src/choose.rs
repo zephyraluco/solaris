@@ -215,11 +215,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     }
     let plan = TurnPlan {
         max_tokens: resolved.output_tokens,
-        price: if chatgpt.is_some() {
-            None
-        } else {
-            resolved.price
-        },
+        price: None,
         prompt_cache_key,
         model: resolved.request_id.clone(),
         endpoint,
@@ -227,13 +223,21 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
 
     match Backend::new(plan) {
         Ok(backend) => {
-            let backend = backend
-                .with_capabilities(capabilities.clone())
-                .with_price_tiers(if chatgpt.is_some() {
-                    Vec::new()
-                } else {
-                    resolved.price_tiers
-                });
+            let mut facts = resolved.facts;
+            if chatgpt.is_some()
+                && let Some(spec) = facts.spec()
+            {
+                let mut spec = spec.clone();
+                spec.pricing = None;
+                facts = rig_core::catalog::ModelFacts::new(spec)
+                    .with_catalog(&rig_core::catalog::Catalog::default());
+            }
+            let backend = backend.with_model_facts(
+                resolved.request_id,
+                resolved.output_tokens,
+                facts,
+                capabilities.clone(),
+            );
             let account_authorized = chatgpt.is_some();
             let backend = match chatgpt {
                 Some((account, expiry)) => backend.with_chatgpt(account, expiry),
@@ -262,8 +266,8 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             }
 
             BackendChoice {
-                backend: Arc::new(crate::catalog::CatalogBackend {
-                    live: Some(crate::catalog::LiveModel {
+                backend: Arc::new(crate::discovery::CatalogBackend {
+                    live: Some(crate::discovery::LiveModel {
                         catalog: Arc::clone(&options.catalog),
                         provider: spec.id,
                         model: model.clone(),

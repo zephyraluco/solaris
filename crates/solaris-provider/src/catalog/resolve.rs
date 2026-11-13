@@ -1,350 +1,289 @@
-//! One resolution supplies requests, budgets, capability checks and diagnostics.
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
-
+//! Model facts come exclusively from the official catalog.
+use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
+use rig_core::providers::registry::ProviderId;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{Price, PriceTier};
 use solaris_types::{ModelCapabilities, Support};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
-use super::schema::{CatalogModel, CatalogSnapshot, ParameterSources, valid_price};
+const MANUFACTURERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "deepseek",
+    "xai",
+    "mistral",
+    "meta",
+    "moonshotai",
+    "zhipuai",
+    "minimax",
+];
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Routing is independent of the catalog identity; aliases never change the endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ModelCatalog {
+pub struct ModelSelection {
+    pub provider: String,
+    pub request_id: String,
     #[serde(default)]
-    pub models: Vec<ModelOverride>,
-    #[serde(skip)]
-    pub(super) state: SharedCatalog,
+    pub metadata: Option<String>,
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SharedCatalog(pub Arc<RwLock<BTreeMap<String, CatalogSnapshot>>>);
-impl Default for SharedCatalog {
+pub struct ModelCatalog {
+    pub(super) state: Arc<RwLock<Catalog>>,
+    pub(super) overrides: Arc<String>,
+    selections: Arc<BTreeMap<String, ModelSelection>>,
+}
+impl Default for ModelCatalog {
     fn default() -> Self {
-        static BUNDLED: OnceLock<CatalogSnapshot> = OnceLock::new();
-        let snapshot = BUNDLED.get_or_init(|| {
-            serde_json::from_str(include_str!("snapshot.json")).unwrap_or_default()
-        });
-        Self(Arc::new(RwLock::new(BTreeMap::from([(
-            "snapshot:bundled".into(),
-            snapshot.clone(),
-        )]))))
+        Self {
+            state: Arc::new(RwLock::new(Catalog::builtin().clone())),
+            overrides: Arc::new("{}".into()),
+            selections: Arc::new(BTreeMap::new()),
+        }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogReference {
-    pub provider: String,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelOverride {
-    pub provider: String,
-    pub id: String,
-    #[serde(default)]
-    pub request_id: Option<String>,
-    /// Requested reply budget, separately capped by model limits.
-    #[serde(default)]
-    pub output_tokens: Option<u32>,
-    #[serde(default)]
-    pub catalog: Option<CatalogReference>,
-    #[serde(default)]
-    pub capabilities: ModelCapabilities,
-    #[serde(default)]
-    pub price: Option<Price>,
-    #[serde(default)]
-    pub price_tiers: Vec<PriceTier>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedModel {
     pub provider_id: String,
-    pub id: String,
     pub request_id: String,
-    pub catalog: Option<CatalogReference>,
+    pub metadata: Option<String>,
     pub name: String,
     pub output_tokens: u32,
     pub capabilities: ModelCapabilities,
-    pub price: Option<Price>,
-    pub price_tiers: Vec<PriceTier>,
-    pub sources: ParameterSources,
-}
-
-fn apply_capabilities(
-    target: &mut ModelCapabilities,
-    patch: &ModelCapabilities,
-    source: &str,
-    sources: &mut ParameterSources,
-) {
-    macro_rules! support {
-        ($($field:ident),*) => { $(if patch.$field != Support::Unknown {
-            target.$field = patch.$field;
-            sources.insert(stringify!($field).into(), source.into());
-        })* };
-    }
-    macro_rules! limit {
-        ($($field:ident),*) => { $(if patch.$field.is_some() {
-            target.$field = patch.$field;
-            sources.insert(stringify!($field).into(), source.into());
-        })* };
-    }
-    support!(
-        tool_calling,
-        structured_output,
-        image_input,
-        reasoning,
-        streaming_usage,
-        prompt_caching,
-        temperature
-    );
-    limit!(context_window, max_input, max_output);
+    pub reference_price: bool,
+    #[serde(skip)]
+    pub facts: ModelFacts,
 }
 
 impl ModelCatalog {
+    /// New configuration: named selections and an official catalog override object.
     pub fn from_json(text: &str) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Config {
+            #[serde(default)]
+            models: BTreeMap<String, ModelSelection>,
+            #[serde(default = "empty_object")]
+            overrides: serde_json::Value,
+        }
+        fn empty_object() -> serde_json::Value {
+            serde_json::json!({})
+        }
         if text.len() > 1024 * 1024 {
-            return Err("model overrides exceed 1 MiB".into());
+            return Err("model configuration exceeds 1 MiB".into());
         }
-        let catalog: Self = serde_json::from_str(text).map_err(|error| error.to_string())?;
-        let mut ids = BTreeSet::new();
-        for entry in &catalog.models {
-            if entry.provider.is_empty()
-                || entry.id.is_empty()
-                || entry.id.len() > 512
-                || !ids.insert((&entry.provider, &entry.id))
+        let config: Config = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        for (name, model) in &config.models {
+            if name.is_empty()
+                || model.provider.is_empty()
+                || model.request_id.is_empty()
+                || model.output_tokens == Some(0)
             {
-                return Err("empty or duplicate provider/model ID".into());
-            }
-            if entry
-                .request_id
-                .as_ref()
-                .is_some_and(|id| id.is_empty() || id.len() > 512)
-                || entry.catalog.as_ref().is_some_and(|reference| {
-                    reference.provider.is_empty() || reference.id.is_empty()
-                })
-            {
-                return Err("empty model reference or request ID".into());
-            }
-            if entry.output_tokens == Some(0)
-                || entry.capabilities.context_window == Some(0)
-                || entry.capabilities.max_output == Some(0)
-                || entry.capabilities.max_input == Some(0)
-            {
-                return Err("model token limits must be positive".into());
-            }
-            if entry.price.is_some_and(|price| !valid_price(price))
-                || entry
-                    .price_tiers
-                    .iter()
-                    .any(|tier| !valid_price(tier.price))
-            {
-                return Err("model prices must be finite and nonnegative".into());
-            }
-            if !entry.price_tiers.is_empty() && entry.price.is_none() {
-                return Err("price tiers require an explicit base price".into());
+                return Err("model selections need a name, provider, request_id and a positive output budget".into());
             }
         }
-        Ok(catalog)
+        let overrides = serde_json::to_string(&config.overrides).map_err(|e| e.to_string())?;
+        let base = Catalog::builtin();
+        let patch = Catalog::from_overrides(&overrides, base).map_err(|e| e.to_string())?;
+        let catalog = base.with_overrides(&patch);
+        for selection in config.models.values() {
+            if let Some(reference) = &selection.metadata {
+                catalog.resolve(reference).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(Self {
+            state: Arc::new(RwLock::new(catalog)),
+            overrides: Arc::new(overrides),
+            selections: Arc::new(config.models),
+        })
     }
 
     pub fn resolve(&self, provider: &str, model: &str) -> ResolvedModel {
-        let patch = self
-            .models
-            .iter()
-            .find(|entry| entry.provider == provider && entry.id == model);
-        let mut reference = patch
-            .and_then(|entry| entry.catalog.clone())
-            .unwrap_or_else(|| CatalogReference {
-                provider: provider.to_owned(),
-                id: patch
-                    .and_then(|entry| entry.request_id.clone())
-                    .unwrap_or_else(|| model.into()),
-            });
-        let mut sources = ParameterSources::from([
-            ("context_window".into(), "default".into()),
-            ("max_output".into(), "default".into()),
-            ("price".into(), "unknown".into()),
-        ]);
-        let mut capabilities = ModelCapabilities {
-            context_window: Some(crate::DEFAULT_CONTEXT_WINDOW),
-            max_output: Some(crate::DEFAULT_MAX_OUTPUT),
-            ..ModelCapabilities::default()
-        };
-        // Both lookups share one read lock: a refresh cannot mix two generations.
-        let layers = self
-            .state
-            .0
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let mut found = Self::lookup(&layers, &reference.provider, &reference.id);
-        let provider_key = if provider == "opencode" {
+        let selection = self
+            .selections
+            .get(model)
+            .filter(|s| s.provider == provider);
+        let request_id = selection.map_or(model, |s| s.request_id.as_str());
+        let vendor = if provider == "opencode" {
             "opencode-go"
         } else {
             provider
         };
-        let has_provider = layers
-            .values()
-            .any(|snapshot| snapshot.providers.contains_key(provider_key));
-        let mut official_fallback = false;
-        if found.is_none() && !has_provider && patch.is_none_or(|entry| entry.catalog.is_none()) {
-            let candidates: Vec<_> = super::SNAPSHOT_PROVIDERS
+        let catalog = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let explicit = selection.and_then(|s| s.metadata.as_deref());
+        let direct = format!("{vendor}/{request_id}");
+        let mut found = catalog.resolve(explicit.unwrap_or(&direct)).ok();
+        if found.is_none()
+            && explicit.is_none()
+            && !catalog.iter().any(|s| s.provider.vendor() == vendor)
+        {
+            let mut matches = MANUFACTURERS
                 .iter()
-                .filter_map(|official| {
-                    Self::lookup(&layers, official, &reference.id).map(|entry| (*official, entry))
-                })
-                .collect();
-            // Never choose arbitrarily between two manufacturers sharing an ID.
-            if let [(official, entry)] = candidates.as_slice() {
-                reference.provider = (*official).into();
-                found = Some(entry.clone());
-                official_fallback = true;
+                .filter_map(|vendor| catalog.resolve(&format!("{vendor}/{request_id}")).ok());
+            let first = matches.next();
+            if matches.next().is_none() {
+                found = first;
             }
         }
-        let mut price = None;
-        let mut tiers = Vec::new();
-        let mut name = model.to_owned();
-        if let Some((entry, source)) = &found {
-            apply_capabilities(&mut capabilities, &entry.capabilities, source, &mut sources);
-            name.clone_from(&entry.name);
-        }
-        // Capability inheritance across hosts never imports another host's bill.
-        if let Some((entry, source)) = Self::lookup(
-            &layers,
-            provider,
-            patch
-                .and_then(|entry| entry.request_id.as_deref())
-                .unwrap_or(model),
-        ) {
-            price = entry.price;
-            tiers = entry.price_tiers;
-            if price.is_some() {
-                sources.insert("price".into(), source);
-            }
-        }
-        if official_fallback && let Some((entry, source)) = &found {
-            price = entry.price;
-            tiers.clone_from(&entry.price_tiers);
-            if price.is_some() {
-                sources.insert(
-                    "price".into(),
-                    format!("official estimate:{}:{source}", reference.provider),
-                );
-            }
-        }
-        drop(layers);
-        if let Some(patch) = patch {
-            apply_capabilities(&mut capabilities, &patch.capabilities, "user", &mut sources);
-            if let Some(value) = patch.price {
-                price = Some(value);
-                tiers.clone_from(&patch.price_tiers);
-                sources.insert("price".into(), "user".into());
-            }
-        }
-        capabilities.price_known = Some(price.is_some());
-        let requested_output = patch.and_then(|entry| entry.output_tokens);
-        let output_tokens = super::output_budget(
-            &capabilities,
-            requested_output.unwrap_or_else(|| {
-                crate::DEFAULT_MAX_OUTPUT.min(
-                    capabilities
-                        .context_window
-                        .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
-                        .saturating_div(4)
-                        .max(1),
+        let metadata = found
+            .as_ref()
+            .map(|r| format!("{}/{}", r.spec.provider.vendor(), r.spec.id));
+        let known = found.is_some();
+        let mut spec = found.map_or_else(
+            || {
+                ModelSpec::new(
+                    ProviderId::declare("solaris").expect("valid declared vendor"),
+                    request_id,
                 )
-            }),
+                .with_tools(true)
+            },
+            |r| r.spec.clone(),
+        );
+        let name = spec.display_name.clone();
+        let reference_price = metadata
+            .as_ref()
+            .is_some_and(|s| !s.starts_with(&format!("{vendor}/")));
+        // Bind metadata to the wire's requested alias, under a declared identity.
+        spec.provider = ProviderId::declare("solaris").expect("valid declared vendor");
+        spec.id = request_id.into();
+        let mut capabilities = capabilities(&spec, known);
+        let output_tokens = super::super::discovery::output_budget(
+            &capabilities,
+            selection.and_then(|s| s.output_tokens).unwrap_or(
+                crate::DEFAULT_MAX_OUTPUT
+                    .min(
+                        capabilities
+                            .context_window
+                            .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
+                            / 4,
+                    )
+                    .max(1),
+            ),
         );
         capabilities.output_budget = Some(output_tokens);
-        sources.insert(
-            "output_tokens".into(),
-            if requested_output.is_some() {
-                "user"
-            } else {
-                "default"
-            }
-            .into(),
-        );
         ResolvedModel {
             provider_id: provider.into(),
-            id: model.into(),
-            request_id: patch
-                .and_then(|entry| entry.request_id.clone())
-                .unwrap_or_else(|| model.into()),
-            catalog: found.map(|_| reference),
+            request_id: request_id.into(),
+            metadata,
             name,
             output_tokens,
             capabilities,
-            price,
-            price_tiers: tiers,
-            sources,
+            reference_price,
+            facts: ModelFacts::new(spec).with_catalog(&Catalog::default()),
         }
     }
-
-    fn lookup(
-        layers: &BTreeMap<String, CatalogSnapshot>,
-        provider: &str,
-        id: &str,
-    ) -> Option<(CatalogModel, String)> {
-        // Solaris's subscription endpoint corresponds to this upstream provider.
-        let provider = if provider == "opencode" {
-            "opencode-go"
-        } else {
-            provider
-        };
-        // Explicit order, independent of map key sorting.
-        for key in ["cache:openrouter", "cache:models.dev", "snapshot:bundled"] {
-            if let Some(entry) = layers
-                .get(key)
-                .and_then(|snapshot| snapshot.providers.get(provider))
-                .and_then(|models| models.get(id))
-            {
-                return Some((entry.clone(), key.into()));
-            }
-        }
-        None
-    }
-
     pub fn capabilities(&self, provider: &str, model: &str) -> ModelCapabilities {
         self.resolve(provider, model).capabilities
     }
-    pub fn price(&self, provider: &str, model: &str) -> Option<Price> {
-        self.resolve(provider, model).price
-    }
     pub fn model_ids(&self, provider: &str) -> Vec<String> {
-        let provider_key = if provider == "opencode" {
+        let vendor = if provider == "opencode" {
             "opencode-go"
         } else {
             provider
         };
-        let layers = self
-            .state
-            .0
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let mut ids: BTreeSet<String> = layers
-            .values()
-            .filter_map(|snapshot| snapshot.providers.get(provider_key))
-            .flat_map(|models| models.keys().cloned())
+        let catalog = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<_> = catalog
+            .iter()
+            .filter(|s| s.provider.vendor() == vendor && !s.deprecated)
+            .map(|s| s.id.clone())
             .collect();
         ids.extend(
-            self.models
+            self.selections
                 .iter()
-                .filter(|entry| entry.provider == provider)
-                .map(|entry| entry.id.clone()),
+                .filter(|(_, s)| s.provider == provider)
+                .map(|(name, _)| name.clone()),
         );
-        ids.into_iter().collect()
+        ids.sort();
+        ids.dedup();
+        ids
     }
-
-    /// Load only validated caches; offline startup always has the bundled snapshot.
     pub fn load_cache(&self, directory: &Path) {
         super::cache::load(self, directory);
     }
-    /// Spawn a bounded periodic refresh; callers retain this shared catalog across switches.
     pub fn start_refresh(&self, directory: std::path::PathBuf) {
         super::cache::start(self.clone(), directory);
+    }
+}
+fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
+    fn support(value: bool, known: bool) -> Support {
+        if !known {
+            Support::Unknown
+        } else if value {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        }
+    }
+    ModelCapabilities {
+        tool_calling: support(spec.tools, known),
+        structured_output: support(spec.structured_output, known),
+        image_input: support(spec.input.image, known),
+        reasoning: support(spec.reasoning.supported(), known),
+        prompt_caching: if spec.caching.retention.is_empty() {
+            Support::Unknown
+        } else {
+            Support::Supported
+        },
+        temperature: Support::Unknown,
+        context_window: spec.context_window,
+        max_input: spec.max_input_tokens,
+        max_output: spec.max_output_tokens,
+        price_known: Some(spec.pricing.is_some()),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn gateway_identity_preserves_request_id_and_uses_official_facts() {
+        let catalog = ModelCatalog::default();
+        let official = catalog.resolve("anthropic", "claude-sonnet-4-5");
+        let gateway = catalog.resolve("new-api", "claude-sonnet-4-5");
+        assert_eq!(gateway.request_id, "claude-sonnet-4-5");
+        assert_eq!(gateway.metadata, official.metadata);
+        assert_eq!(gateway.capabilities, official.capabilities);
+        assert!(gateway.reference_price);
+        assert!(!official.reference_price);
+    }
+    #[test]
+    fn explicit_alias_keeps_routing_separate_from_metadata() {
+        let catalog = ModelCatalog::from_json(r#"{"models":{"fast":{"provider":"new-api","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}}"#).expect("configuration");
+        let model = catalog.resolve("new-api", "fast");
+        assert_eq!(model.request_id, "private-alias");
+        assert_eq!(model.output_tokens, 4096);
+        assert_eq!(model.facts.spec().expect("facts").id, "private-alias");
+        assert!(model.metadata.expect("metadata").starts_with("anthropic/"));
+        assert_eq!(catalog.resolve("other", "fast").metadata, None);
+    }
+    #[test]
+    fn unknown_and_wrong_vendor_do_not_invent_metadata() {
+        let catalog = ModelCatalog::default();
+        let unknown = catalog.resolve("local", "unlisted-model");
+        assert_eq!(unknown.capabilities.tool_calling, Support::Unknown);
+        assert_eq!(unknown.capabilities.context_window, None);
+        assert_eq!(unknown.capabilities.price_known, Some(false));
+        assert!(catalog.resolve("anthropic", "gpt-5").metadata.is_none());
+        assert!(ModelCatalog::from_json(r#"{"models":{"x":{"provider":"new-api","request_id":"x","metadata":"anthropic/not-listed"}}}"#).is_err());
+    }
+    #[test]
+    fn official_override_parser_updates_facts_and_limits() {
+        let catalog = ModelCatalog::from_json(r#"{"overrides":{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":32000,"output":2000}}}}}}"#).expect("override");
+        let model = catalog.resolve("anthropic", "claude-sonnet-4-5");
+        assert_eq!(model.capabilities.context_window, Some(32000));
+        assert_eq!(model.output_tokens, 2000);
+        assert_eq!(
+            model.facts.spec().expect("facts").context_window,
+            Some(32000)
+        );
     }
 }

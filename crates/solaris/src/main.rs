@@ -284,12 +284,8 @@ fn main() -> Result<()> {
             Some(solaris_provider::Credential::ChatGpt { .. })
         ) && choice.provider_id == Some("openai")
         {
-            resolved.price = None;
-            resolved.price_tiers.clear();
             resolved.capabilities.price_known = Some(false);
-            resolved
-                .sources
-                .insert("price".into(), "account authorization".into());
+            resolved.reference_price = false;
         }
         println!(
             "model parameters: {}",
