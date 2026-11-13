@@ -48,11 +48,9 @@ pub enum SessionRecord {
         task: String,
         detail: serde_json::Value,
     },
-    #[serde(alias = "auxiliary_usage")]
     Usage {
         usage: solaris_backend::Usage,
-        cost_usd: f64,
-        #[serde(default)]
+        cost: Option<solaris_backend::Cost>,
         kind: crate::UsageKind,
     },
     Model {
@@ -67,9 +65,6 @@ pub enum SessionRecord {
     },
     Context {
         messages: Vec<Message>,
-    },
-    Message {
-        message: Message,
     },
     ToolIntent {
         call: solaris_backend::ToolCall,
@@ -114,7 +109,7 @@ impl SessionStore {
             CREATE TABLE IF NOT EXISTS records (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS records_session ON records(session_id, seq);
-            CREATE TABLE IF NOT EXISTS contexts (session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);")?;
+")?;
         if version < 2 {
             transaction.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
         }
@@ -297,7 +292,7 @@ impl SessionJournal {
         &self.store
     }
 
-    /// Commit a transition and its projection in the same transaction.
+    /// Append a product transition; model messages live only in official memory.
     pub fn append(&self, record: &SessionRecord) -> Result<(), StoreError> {
         let data = serde_json::to_string(record)?;
         let mut connection = self.store.lock()?;
@@ -306,24 +301,6 @@ impl SessionJournal {
             "INSERT INTO records(session_id,data) VALUES (?1,?2)",
             params![self.id, data],
         )?;
-        if let SessionRecord::Context { messages } = record {
-            transaction.execute("INSERT INTO contexts(session_id,data) VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET data=excluded.data", params![self.id, serde_json::to_string(messages)?])?;
-        }
-        if let SessionRecord::Message { message } = record {
-            let context: Option<String> = transaction
-                .query_row(
-                    "SELECT data FROM contexts WHERE session_id=?1",
-                    [&self.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let mut messages: Vec<Message> = match context {
-                Some(data) => serde_json::from_str(&data)?,
-                None => Vec::new(),
-            };
-            messages.push(message.clone());
-            transaction.execute("INSERT INTO contexts(session_id,data) VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET data=excluded.data", params![self.id, serde_json::to_string(&messages)?])?;
-        }
         if let SessionRecord::Model { provider, model } = record {
             transaction.execute(
                 "UPDATE sessions SET provider=?2,model=?3 WHERE id=?1",
@@ -349,35 +326,20 @@ impl SessionJournal {
         Ok(())
     }
 
-    /// Latest model context, independent of how the UI displays the journal.
+    pub(crate) fn memory_store(&self) -> Result<rig_memory::DirStore, StoreError> {
+        rig_memory::DirStore::open(self.store.directory.join("memory").join(&self.id))
+            .map_err(|error| StoreError::Invalid(error.to_string()))
+    }
+    /// Model history has exactly one source: the official memory store.
     pub fn context(&self) -> Result<Vec<Message>, StoreError> {
-        let memory = rig_memory::DirStore::open(self.store.directory.join("memory").join(&self.id))
+        let memory = self.memory_store()?;
+        let conversation = rig_memory::load(&memory, "conversation")
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
-        if rig_memory::Store::logs(&memory)?
+        Ok(conversation
+            .messages()
             .iter()
-            .any(|name| name == "conversation")
-        {
-            let conversation = rig_memory::load(&memory, "conversation")
-                .map_err(|error| StoreError::Invalid(error.to_string()))?;
-            return Ok(conversation
-                .messages()
-                .iter()
-                .map(|message| Message::from(message.as_ref()))
-                .collect());
-        }
-        let data: Option<String> = self
-            .store
-            .lock()?
-            .query_row(
-                "SELECT data FROM contexts WHERE session_id=?1",
-                [&self.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(match data {
-            Some(data) => serde_json::from_str(&data)?,
-            None => Vec::new(),
-        })
+            .map(|message| Message::from(message.as_ref()))
+            .collect())
     }
 
     /// Fork without copying credentials or sharing the execution lease.
@@ -387,9 +349,24 @@ impl SessionJournal {
             let mut connection = self.store.lock()?;
             let transaction = connection.transaction()?;
             transaction.execute("INSERT INTO records(session_id,data) SELECT ?1,data FROM records WHERE session_id=?2 ORDER BY seq", params![child.id, self.id])?;
-            transaction.execute("INSERT INTO contexts(session_id,data) SELECT ?1,data FROM contexts WHERE session_id=?2", params![child.id, self.id])?;
             transaction.commit()?;
         }
+        // Fork the native conversation, retaining message identity and summary
+        // asides while giving the child its own store and save cursor.
+        let original = rig_memory::load(&self.memory_store()?, "conversation")
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        let destination = child.memory_store()?;
+        let mut forked = rig_memory::load(&destination, "conversation")
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        let entries = (0..original.messages().len())
+            .filter_map(|at| original.entry(at))
+            .collect();
+        forked.set_entries(entries, rig_core::conversation::Author::plugin("solaris"));
+        for (_, aside) in original.asides() {
+            forked.add_aside(aside.clone());
+        }
+        rig_memory::save(&destination, "conversation", &mut forked)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
         let provider: Option<String> = self.store.lock()?.query_row(
             "SELECT provider FROM sessions WHERE id=?1",
             [&self.id],
@@ -408,6 +385,81 @@ impl SessionJournal {
 mod tests {
     use super::*;
 
+    fn seed_memory(journal: &SessionJournal, messages: Vec<Message>) {
+        let store = journal.memory_store().unwrap();
+        let mut native = rig_memory::load(&store, "conversation").unwrap();
+        native.extend(
+            messages
+                .iter()
+                .map(rig_core::message::Message::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        rig_memory::save(&store, "conversation", &mut native).unwrap();
+    }
+    #[test]
+    fn old_sql_context_is_not_imported_into_native_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let journal = store.create(directory.path(), "test", None).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE contexts (session_id TEXT PRIMARY KEY, data TEXT NOT NULL)",
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO contexts VALUES (?1,?2)",
+                params![
+                    journal.id(),
+                    serde_json::to_string(&vec![Message::user("legacy-only")]).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(journal.context().unwrap().is_empty());
+        let conversation = crate::conversation::Conversation::new();
+        conversation.attach(Arc::clone(&journal)).unwrap();
+        assert!(conversation.snapshot().is_empty());
+    }
+    #[test]
+    fn fork_copies_native_messages_and_asides_without_sharing_later_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let parent = store.create(directory.path(), "test", None).unwrap();
+        seed_memory(
+            &parent,
+            vec![Message::user("one"), Message::assistant("two")],
+        );
+        let native_store = parent.memory_store().unwrap();
+        let mut native = rig_memory::load(&native_store, "conversation").unwrap();
+        native.add_aside(
+            rig_core::conversation::Aside::new(
+                "fixture.summary",
+                rig_core::conversation::Author::plugin("test"),
+                serde_json::json!({"summary":"keep"}),
+            )
+            .after(native.id(1)),
+        );
+        rig_memory::save(&native_store, "conversation", &mut native).unwrap();
+        let child = parent.fork(directory.path(), "test").unwrap();
+        let child_store = child.memory_store().unwrap();
+        let mut copied = rig_memory::load(&child_store, "conversation").unwrap();
+        assert_eq!(copied.messages(), native.messages());
+        assert_eq!(copied.id(1), native.id(1));
+        assert!(
+            copied
+                .asides()
+                .any(|(_, aside)| aside.kind == "fixture.summary" && aside.after == copied.id(1))
+        );
+        copied.extend([rig_core::message::Message::user("child only")]);
+        rig_memory::save(&child_store, "conversation", &mut copied).unwrap();
+        assert_eq!(parent.context().unwrap().len(), 2);
+        assert_eq!(child.context().unwrap().len(), 3);
+    }
     #[test]
     fn dropping_journal_releases_lease_despite_a_duplicated_descriptor() {
         let directory = tempfile::tempdir().expect("directory");
@@ -439,11 +491,7 @@ mod tests {
             .create(Path::new("/project"), "model", None)
             .expect("session");
         let id = journal.id().to_string();
-        journal
-            .append(&SessionRecord::Message {
-                message: Message::user("preserve"),
-            })
-            .expect("message");
+        seed_memory(&journal, vec![Message::user("preserve")]);
         drop(journal);
         drop(store);
         let connection = Connection::open(&path).expect("old schema");
@@ -531,11 +579,7 @@ mod tests {
                 text: "hello".into(),
             })
             .expect("prompt");
-        session
-            .append(&SessionRecord::Context {
-                messages: vec![Message::user("hello")],
-            })
-            .expect("checkpoint");
+        seed_memory(&session, vec![Message::user("hello")]);
         session
             .append(&SessionRecord::ToolIntent {
                 call: solaris_backend::ToolCall::new(
@@ -590,13 +634,6 @@ mod tests {
             })
             .expect("prompt");
         assert_eq!(store.records(journal.id()).expect("read").len(), 1);
-        let old_fee: SessionRecord = serde_json::from_str(r#"{"type":"auxiliary_usage","usage":{"input_tokens":10,"output_tokens":2},"cost_usd":0.01}"#).expect("old fee");
-        assert!(matches!(
-            old_fee,
-            SessionRecord::Usage {
-                kind: crate::UsageKind::Manual,
-                ..
-            }
-        ));
+        assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"auxiliary_usage","usage":{"input_tokens":10,"output_tokens":2},"cost_usd":0.01}"#).is_err(), "legacy charge aliases are not imported");
     }
 }

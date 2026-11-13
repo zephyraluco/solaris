@@ -122,6 +122,26 @@ fn text_body(text: &str) -> String {
 }
 
 /// A backend pointed at `addr` speaking Chat Completions.
+fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_agent::Message>) {
+    let directory = journal
+        .store()
+        .artifact_dir()
+        .parent()
+        .unwrap()
+        .join("memory")
+        .join(journal.id());
+    let store = rig_memory::DirStore::open(directory).unwrap();
+    let mut native = rig_memory::load(&store, "conversation").unwrap();
+    native.extend(
+        messages
+            .iter()
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    rig_memory::save(&store, "conversation", &mut native).unwrap();
+}
+
 fn backend(addr: SocketAddr) -> Backend {
     backend_with_model(
         addr,
@@ -353,10 +373,11 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
     assert_eq!(saved.len(), 2);
     assert_eq!(saved[1].text(), "remembered");
     let records = store.records(journal.id()).unwrap();
-    assert!(!records.iter().any(|record| matches!(
-        record,
-        solaris_agent::SessionRecord::Message { .. } | solaris_agent::SessionRecord::Context { .. }
-    )));
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, solaris_agent::SessionRecord::Context { .. }))
+    );
     assert!(
         directory
             .path()
@@ -434,11 +455,7 @@ async fn manual_native_compaction_obeys_the_deadline_and_releases_the_connection
         solaris_backend::Message::assistant("earlier answer"),
         solaris_backend::Message::user("new request"),
     ];
-    journal
-        .append(&solaris_agent::SessionRecord::Context {
-            messages: saved.clone(),
-        })
-        .unwrap();
+    seed_memory(&journal, saved.clone());
     let mut options = AgentOptions::in_directory(directory.path());
     options.execution.budget.max_seconds = 1;
     options.compaction.keep_recent_tokens = 1;
@@ -477,15 +494,14 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
     let store =
         solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
     let journal = store.create(directory.path(), "test-model", None).unwrap();
-    journal
-        .append(&solaris_agent::SessionRecord::Context {
-            messages: vec![
-                solaris_backend::Message::user("old request"),
-                solaris_backend::Message::assistant("old answer"),
-                solaris_backend::Message::user("new request"),
-            ],
-        })
-        .unwrap();
+    seed_memory(
+        &journal,
+        vec![
+            solaris_backend::Message::user("old request"),
+            solaris_backend::Message::assistant("old answer"),
+            solaris_backend::Message::user("new request"),
+        ],
+    );
     let spec = rig_core::catalog::ModelSpec::new(
         rig_core::providers::registry::ProviderId::declare("test").unwrap(),
         "test-model",

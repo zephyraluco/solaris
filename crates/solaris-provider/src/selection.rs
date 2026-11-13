@@ -225,58 +225,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
         endpoint,
     };
 
-    match Backend::new(plan) {
-        Ok(backend) => {
-            let backend = match chatgpt {
-                Some((account, expiry)) => backend.with_chatgpt(account, expiry),
-                None => backend,
-            };
-            let base_url = backend.base_url().to_string();
-
-            // With no model named and none in the catalogue there is nothing a
-            // turn could ask for, but the endpoint is real: the model list is
-            // exactly how a name gets chosen in the first place, so it is still
-            // fetched instead of being refused along with the turn.
-            if model.is_empty() {
-                return BackendChoice {
-                    configuration: Arc::clone(&options.configuration),
-                    backend: Arc::new(NamelessBackend {
-                        endpoint: backend,
-                        message: format!(
-                            "no model is named for {} — run /model <name> to pick one",
-                            spec.name
-                        ),
-                    }),
-                    provider_id: Some(spec.id.into()),
-                    base_url: Some(base_url),
-                    model,
-                    source: CredentialSource::NoModel,
-                };
-            }
-
-            BackendChoice {
-                configuration: Arc::clone(&options.configuration),
-                backend: Arc::new(crate::discovery::ModelDiscovery {
-                    inner: Arc::new(backend),
-                    cache_dir: options.model_cache_dir.clone(),
-                    endpoint: format!("{}:{base_url}", spec.id),
-                    notice: std::sync::Mutex::new(None),
-                }),
-                provider_id: Some(spec.id.into()),
-                base_url: Some(base_url),
-                model,
-                source,
-            }
-        }
-        // The only way building a client fails is a broken TLS setup, which is
-        // a bug rather than a user error; the turn reports it rather than
-        // panicking.
-        Err(error) => BackendChoice::unconnected(
-            CredentialSource::Missing,
-            format!("could not set up HTTP for {}: {error}", spec.name),
-            &model,
-        ),
-    }
+    connect(spec.id, &model, plan, source, chatgpt, &options)
 }
 
 fn configured_backend(
@@ -309,7 +258,7 @@ fn configured_backend(
         endpoint: Endpoint {
             wire: endpoint.protocol.wire(),
             session_header: None,
-            base_url: base_url.clone(),
+            base_url,
             secret,
             name: provider.into(),
             label: provider.into(),
@@ -319,44 +268,60 @@ fn configured_backend(
 
         prompt_cache_key: None,
     };
-    let backend = match Backend::new(plan) {
-        Ok(backend) => backend,
-        Err(error) => {
-            return BackendChoice::unconnected(
-                CredentialSource::Missing,
-                format!("could not create provider connection: {error}"),
-                model,
-            );
-        }
-    };
-    if model.is_empty() {
-        return BackendChoice {
-            configuration: Arc::clone(&options.configuration),
-            backend: Arc::new(NamelessBackend {
-                endpoint: backend,
-                message: format!(
-                    "no model is named for {provider} — run /model <name> to pick one"
-                ),
-            }),
-            provider_id: Some(provider.into()),
-            base_url: Some(base_url),
-            model: model.into(),
-            source: CredentialSource::NoModel,
-        };
-    }
     let source = if credential.is_some() {
         CredentialSource::Stored
     } else {
         CredentialSource::None
     };
+    connect(provider, model, plan, source, None, options)
+}
+
+/// Built-in and configured routes share the same connection assembly.
+fn connect(
+    provider: &str,
+    model: &str,
+    plan: TurnPlan,
+    source: CredentialSource,
+    account: Option<(String, u64)>,
+    options: &BackendOptions,
+) -> BackendChoice {
+    let name = plan.endpoint.name.clone();
+    let backend = match Backend::new(plan) {
+        Ok(backend) => match account {
+            Some((id, expiry)) => backend.with_chatgpt(id, expiry),
+            None => backend,
+        },
+        Err(error) => {
+            return BackendChoice::unconnected(
+                CredentialSource::Missing,
+                format!("could not set up HTTP for {name}: {error}"),
+                model,
+            );
+        }
+    };
+    let base_url = backend.base_url().to_owned();
+    let (backend, source): (Arc<dyn AgentBackend>, _) = if model.is_empty() {
+        (
+            Arc::new(NamelessBackend {
+                endpoint: backend,
+                message: format!("no model is named for {name} — run /model <name> to pick one"),
+            }),
+            CredentialSource::NoModel,
+        )
+    } else {
+        (
+            Arc::new(crate::discovery::ModelDiscovery {
+                inner: Arc::new(backend),
+                cache_dir: options.model_cache_dir.clone(),
+                endpoint: format!("{provider}:{base_url}"),
+                notice: std::sync::Mutex::new(None),
+            }),
+            source,
+        )
+    };
     BackendChoice {
         configuration: Arc::clone(&options.configuration),
-        backend: Arc::new(crate::discovery::ModelDiscovery {
-            inner: Arc::new(backend),
-            cache_dir: options.model_cache_dir.clone(),
-            endpoint: format!("{provider}:{base_url}"),
-            notice: std::sync::Mutex::new(None),
-        }),
+        backend,
         provider_id: Some(provider.into()),
         base_url: Some(base_url),
         model: model.into(),

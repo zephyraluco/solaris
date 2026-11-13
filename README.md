@@ -375,8 +375,10 @@ changes so subsequent resume restores that choice unless explicitly overridden.
 
 Official SDK memory stores model messages and compaction state under
 `sessions/memory/<SESSION_ID>`. The SQLite journal retains the transcript, tool
-intents, usage, child activity and executor metadata. Legacy message journals are
-imported once when no SDK memory exists. Successful SDK tasks and explicit
+intents, usage, child activity and executor metadata. SDK memory is the sole message
+store; legacy SQL contexts are not imported. Forks copy native messages, identities and
+compaction asides into independent memory. Rig normalizes tool pairing on restore,
+with explicit interruption feedback for missing results. Successful SDK tasks and explicit
 safe-boundary handoffs commit messages; failed or cancelled phases retain earlier
 committed context. Tool side effects and
 billed usage can still occur before failure. Verify side effects before retrying;
@@ -609,8 +611,13 @@ projection as ordinary requests, without a separate recovery-validation task.
 
 Each completed model request records usage and the cost supplied by Rig immediately, including
 automatic and manual summary calls. Known charges survive later request failures or
-cancellation. Child usage is accounted separately from parent context occupancy. Old
-cumulative records are supported without double counting new per-request records.
+cancellation. Child usage is accounted separately from parent context occupancy. Only
+per-request records restore billing; cumulative UI events are not a second billing source.
 The default reply budget is reduced for small model windows, and compaction retention
 is bounded by the usable window. `ContextUsageUpdated` events expose occupancy while
 `TurnComplete.usage` remains cumulative for a successful task.
+
+Request accounting preserves the full SDK cost and its completeness flag. Unknown or
+partial costs remain incomplete in the ledger and core totals; a cost budget stops
+execution if a complete charge is unavailable. The current UI displays the known
+subtotal. No token-price fallback is used.

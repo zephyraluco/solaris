@@ -3,7 +3,7 @@ use crate::{Backend, BackendError, Usage};
 use rig_core::effect::{EffectKind, family};
 use rig_core::serve::{Dispatch, Reply, Serve, adapters::ModelAdapter};
 type UsageObserver =
-    std::sync::Arc<dyn Fn(Usage, Option<f64>) -> Result<(), BackendError> + Send + Sync>;
+    std::sync::Arc<dyn Fn(Usage, Option<crate::Cost>) -> Result<(), BackendError> + Send + Sync>;
 pub(crate) type StatusObservers =
     std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn Fn(String) + Send + Sync>>>>;
 #[derive(Clone)]
@@ -53,14 +53,21 @@ impl ModelClient {
     }
     pub fn with_usage_observer(
         mut self,
-        observer: impl Fn(Usage, Option<f64>) -> Result<(), BackendError> + Send + Sync + 'static,
+        observer: impl Fn(Usage, Option<crate::Cost>) -> Result<(), BackendError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.observers.insert(0, std::sync::Arc::new(observer));
         self
     }
     /// Record usage and accumulate only charges supplied by the SDK.
-    pub fn settle(&self, usage: Usage, reported_cost: Option<f64>) -> Result<f64, BackendError> {
-        let cost = reported_cost.unwrap_or(0.0);
+    pub fn settle(
+        &self,
+        usage: Usage,
+        reported_cost: Option<crate::Cost>,
+    ) -> Result<f64, BackendError> {
+        let cost = reported_cost.map_or(0.0, |cost| cost.total);
         for observer in &self.observers {
             observer(usage, reported_cost)?;
         }
@@ -212,11 +219,16 @@ mod tests {
         let client = ModelClient::native(backend)
             .unwrap()
             .with_usage_observer(move |_, cost| {
-                recorded.lock().unwrap().push(cost);
+                recorded.lock().unwrap().push(cost.map(|cost| cost.total));
                 Ok(())
             });
         let usage = Usage::new(1_000_000, 100);
-        assert_eq!(client.settle(usage, Some(0.25)).unwrap(), 0.25);
+        assert_eq!(
+            client
+                .settle(usage, Some(crate::Cost::from_parts(0.25, 0.0, 0.0, 0.0)))
+                .unwrap(),
+            0.25
+        );
         assert_eq!(
             client.settle(usage, None).unwrap(),
             0.0,

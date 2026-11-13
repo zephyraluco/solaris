@@ -208,15 +208,9 @@ struct Runner {
 mod driver;
 
 impl Runner {
-    /// Ask the model, run what it asks for, and repeat until it stops asking.
-    ///
-    /// There is no round ceiling: the model keeps going until it asks for
-    /// nothing, fails, or the caller stops the turn. Cancelling is therefore the
-    /// only bound on how much a turn may spend, which is why it is checked
-    /// before every round and again after each round's calls have run.
-    /// End a turn without a completion, leaving the conversation consistent.
+    /// Report a failed turn. Native checkpoints already retain consistent history;
+    /// recovery normalization belongs to session attachment.
     fn give_up(&self, message: String, tx: &UnboundedSender<AgentEvent>) {
-        self.conversation.repair();
         self.emit_context(tx);
         let _ = tx.send(AgentEvent::Error(message));
     }
@@ -457,7 +451,7 @@ impl Runner {
             ),
             cancel: self.cancel.clone(),
         };
-        let (output, usage, cost_usd) = if call.name == "tool_search" {
+        let (output, usage, cost_usd, cost_complete) = if call.name == "tool_search" {
             let query = call.input["query"]
                 .as_str()
                 .unwrap_or_default()
@@ -493,6 +487,7 @@ impl Runner {
                 ),
                 Usage::default(),
                 0.0,
+                true,
             )
         } else if call.name == SUBAGENT_TOOL {
             let Some(subagent) = &self.subagent else {
@@ -515,12 +510,18 @@ impl Runner {
                 task_id: task_id.clone(),
             });
             let result = subagent.run(task, &ctx, tx, &task_id).await;
-            (result.output, result.totals.usage, result.totals.cost_usd)
+            (
+                result.output,
+                result.totals.usage,
+                result.totals.cost_usd,
+                result.totals.cost_complete,
+            )
         } else {
             (
                 tool.run(call.input.clone(), &ctx).await,
                 Usage::default(),
                 0.0,
+                true,
             )
         };
 
@@ -534,6 +535,7 @@ impl Runner {
             result,
             usage,
             cost_usd,
+            cost_complete,
         }
     }
 
@@ -574,6 +576,7 @@ struct CallOutcome {
     result: ToolResult,
     usage: Usage,
     cost_usd: f64,
+    cost_complete: bool,
 }
 
 impl From<ToolResult> for CallOutcome {
@@ -582,6 +585,7 @@ impl From<ToolResult> for CallOutcome {
             result,
             usage: Usage::default(),
             cost_usd: 0.0,
+            cost_complete: true,
         }
     }
 }
@@ -713,11 +717,10 @@ async fn compact_memory(
             } else {
                 Usage::estimate(input, response.text().chars().count())
             };
-        outcome.cost_usd =
-            match client.settle(outcome.usage, response.usage.cost.map(|cost| cost.total)) {
-                Ok(cost) => cost,
-                Err(_) => return outcome,
-            };
+        outcome.cost_usd = match client.settle(outcome.usage, response.usage.cost) {
+            Ok(cost) => cost,
+            Err(_) => return outcome,
+        };
         match rig_memory::Summarizer::summary_text(&response) {
             Ok(summary) => summary,
             Err(_) => return outcome,

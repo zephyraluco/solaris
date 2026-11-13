@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solaris_backend::{AgentBackend, AgentEvent, AgentEventStream, BackendError, Usage};
+use solaris_backend::{AgentBackend, AgentEvent, AgentEventStream, BackendError};
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
@@ -103,11 +103,7 @@ pub(crate) struct SubagentRunner {
     pub slots: Semaphore,
 }
 
-#[derive(Default, Clone, Copy)]
-pub(crate) struct Totals {
-    pub usage: Usage,
-    pub cost_usd: f64,
-}
+pub(crate) type Totals = crate::UsageTotals;
 
 pub(crate) struct SubagentResult {
     pub output: ToolOutput,
@@ -452,16 +448,14 @@ impl AgentBackend for BoundedBackend {
         let totals = Arc::clone(&self.totals);
         let tx = self.usage_tx.clone();
         Ok(client.with_usage_observer(move |usage, cost| {
-            let cost = cost.unwrap_or(0.0);
             {
                 let mut totals = totals.lock().unwrap_or_else(|p| p.into_inner());
-                totals.usage = totals.usage.merge(usage);
-                totals.cost_usd += cost;
+                totals.add(usage, cost);
             }
             if let Some(tx) = &tx {
                 let _ = tx.send(AgentEvent::SubagentUsage {
                     usage,
-                    cost_usd: cost,
+                    cost_usd: cost.map_or(0.0, |cost| cost.total),
                 });
             }
             Ok(())
@@ -480,6 +474,7 @@ impl AgentBackend for BoundedBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_backend::Usage;
 
     #[tokio::test(start_paused = true)]
     async fn a_child_that_never_answers_times_out() {

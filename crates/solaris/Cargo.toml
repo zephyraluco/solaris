@@ -34,6 +34,8 @@ thiserror = { workspace = true }
 arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
+rig-core.workspace = true
+rig-memory = "0.46.0"
 solaris-backend = { workspace = true, features = ["test-utils"] }
 tempfile = "3"
 # The test suites implement `AgentBackend` for their own local fake backend.

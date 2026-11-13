@@ -255,14 +255,14 @@ impl AgentHook for Policy {
                     .sum();
                 Usage::estimate(phase.input_characters, output)
             };
-            let cost = match client.settle(measured, response.usage.cost.map(|cost| cost.total)) {
-                Ok(cost) => cost,
+            match client.settle(measured, response.usage.cost) {
+                Ok(_) => {}
                 Err(error) => return OutcomeAction::replace(Err(failure(error))),
             };
             self.runner
                 .conversation
                 .observe_usage(&self.runner.request_header(), measured);
-            phase.totals.add(measured, cost);
+            phase.totals.add(measured, response.usage.cost);
         }
         OutcomeAction::proceed()
     }
@@ -418,7 +418,11 @@ impl Serve for ToolBridge {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .totals
-            .add(outcome.usage, outcome.cost_usd);
+            .merge(crate::UsageTotals {
+                usage: outcome.usage,
+                cost_usd: outcome.cost_usd,
+                cost_complete: outcome.cost_complete,
+            });
         let message = match native::Message::try_from(&Message::tool_result(outcome.result.clone()))
         {
             Ok(message) => message,

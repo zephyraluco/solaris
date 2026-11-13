@@ -23,7 +23,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use solaris_backend::{Message, Role};
+use solaris_backend::Message;
+#[cfg(test)]
+use solaris_backend::Role;
 
 /// The messages a turn is built from and appends to.
 pub(crate) struct Conversation {
@@ -74,32 +76,10 @@ impl Conversation {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        let context = match journal.context() {
-            Ok(context) => context,
-            Err(error) => {
-                *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
-                return Err(error);
-            }
-        };
         let billing = crate::UsageTotals::restore(&journal.store().records(journal.id())?);
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = billing;
-        let directory = journal
-            .store()
-            .artifact_dir()
-            .parent()
-            .ok_or_else(|| StoreError::Invalid("missing session directory".into()))?
-            .join("memory")
-            .join(journal.id());
-        let storage = rig_memory::DirStore::open(directory)
-            .map_err(|error| StoreError::Invalid(error.to_string()))?;
-        let imported = rig_memory::Store::logs(&storage)
-            .map_err(StoreError::Io)?
-            .iter()
-            .any(|name| name == "conversation");
+        let storage = journal.memory_store()?;
         *self.storage.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(storage);
-        if !imported {
-            self.replace_with(context);
-        }
         *self
             .journal
             .write()
@@ -290,53 +270,90 @@ impl Conversation {
         *self.billing.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
     }
 
-    /// Complete missing results in the latest assistant round without replaying
-    /// tools. Older rounds may reuse the same call IDs, so only results after
-    /// this assistant message count as answers.
+    /// Delegate pairing and identity-preserving repair to the SDK, then annotate
+    /// its synthesized feedback. Tool operations are never replayed.
     pub(crate) fn repair(&self) {
-        let messages = self.snapshot();
-        let Some(round) = messages
-            .iter()
-            .rposition(|message| message.role == Role::Assistant)
-        else {
-            return;
-        };
-        let answered: std::collections::HashSet<_> = messages[round + 1..]
-            .iter()
-            .flat_map(|message| message.tool_results())
-            .map(|result| result.id.as_str())
-            .collect();
-        let missing: Vec<_> = messages[round]
-            .tool_calls()
-            .filter(|call| !answered.contains(call.id.as_str()))
-            .cloned()
-            .collect();
-        for call in missing {
-            self.push(Message::tool_result(solaris_backend::ToolResult::error(
-                &call,
-                "interrupted; execution outcome is unknown; verify side effects before retrying",
-            )));
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            use rig_core::conversation::{
+                Author,
+                pairing::{NO_RESULT_PROVIDED, PairingError},
+            };
+            use rig_core::message::{Message as NativeMessage, ToolResultContent, UserContent};
+            let mut native = self.native()?;
+            let original_ids: Vec<_> = (0..native.messages().len())
+                .map(|at| native.id(at))
+                .collect();
+            let repaired = native.normalize(Author::plugin("solaris"));
+            if repaired.repairs.is_empty()
+                && repaired.merged.is_empty()
+                && repaired.dropped.is_empty()
+            {
+                return Ok(());
+            }
+            // Pairing and entry identity are SDK-owned. Only annotate the SDK's
+            // synthesized missing-result feedback with the product's no-replay notice.
+            let missing: Vec<_> = repaired
+                .repairs
+                .iter()
+                .filter_map(|repair| {
+                    let PairingError::UnansweredToolCall { index, call_id } = repair else {
+                        return None;
+                    };
+                    let mut id = original_ids.get(*index).copied().flatten()?;
+                    while let Some((into, _)) = repaired.merged.iter().find(|(_, from)| *from == id)
+                    {
+                        id = *into;
+                    }
+                    Some((id, call_id.clone()))
+                })
+                .collect();
+            let mut entries: Vec<_> = (0..native.messages().len())
+                .filter_map(|at| native.entry(at))
+                .collect();
+            let mut turn = None;
+            for entry in &mut entries {
+                match Arc::make_mut(&mut entry.message) {
+                    NativeMessage::Assistant(_) => turn = entry.id,
+                    NativeMessage::User { content } => {
+                        for part in content {
+                            if let UserContent::ToolResult(result) = part
+                                && missing
+                                    .iter()
+                                    .any(|(id, call)| Some(*id) == turn && *call == result.call)
+                            {
+                                for part in &mut result.content {
+                                    if let ToolResultContent::Text(text) = part
+                                        && text.text == NO_RESULT_PROVIDED
+                                    {
+                                        text.text = "interrupted; execution outcome is unknown; verify side effects before retrying".into();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            native.set_entries(entries, Author::plugin("solaris"));
+            rig_memory::save(&self.storage(), "conversation", &mut native)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed(error);
         }
     }
 
     pub(crate) fn record_billing(
         &self,
         usage: solaris_backend::Usage,
-        cost_usd: f64,
+        cost: Option<solaris_backend::Cost>,
         kind: crate::UsageKind,
     ) -> bool {
-        if usage.is_empty() && cost_usd == 0.0 {
-            return true;
-        }
         self.billing
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .add(usage, cost_usd);
-        self.persist(SessionRecord::Usage {
-            usage,
-            cost_usd,
-            kind,
-        })
+            .add(usage, cost);
+        self.persist(SessionRecord::Usage { usage, cost, kind })
     }
 
     pub(crate) fn usage_totals(&self) -> Option<crate::UsageTotals> {
@@ -524,16 +541,21 @@ mod tests {
         let before = interrupted_reused_id_history();
         conversation.replace_with(before);
         let before = conversation.snapshot();
+        let original = conversation.native().unwrap();
+        let ids: Vec<_> = (0..before.len()).map(|at| original.id(at)).collect();
         conversation.repair();
         let after = conversation.snapshot();
-        assert_eq!(after.len(), before.len() + 1);
-        assert_eq!(&after[..before.len()], before.as_slice());
-        let repaired = after
-            .last()
-            .expect("repair")
-            .tool_results()
-            .next()
-            .expect("result");
+        let native = conversation.native().unwrap();
+        assert_eq!(
+            (0..after.len()).map(|at| native.id(at)).collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(&after[..5], &before[..5]);
+        let results: Vec<_> = after.iter().flat_map(Message::tool_results).collect();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].output, "old result");
+        assert_eq!(results[1].output, "current partial result");
+        let repaired = results.last().expect("repair");
         assert_eq!(repaired.id, "reused");
         assert!(repaired.is_error);
         conversation.repair();
@@ -564,25 +586,24 @@ mod tests {
             .expect("session");
         let id = journal.id().to_owned();
         let before = interrupted_reused_id_history();
-        journal
-            .append(&SessionRecord::Context {
-                messages: before.clone(),
-            })
-            .expect("interrupted context");
+        let seed = Conversation::new();
+        seed.attach(Arc::clone(&journal)).unwrap();
+        seed.replace_with(before.clone());
+        drop(seed);
         drop(journal);
         let conversation = Conversation::new();
         conversation
             .attach(store.resume(&id).expect("resume"))
             .expect("attach");
         let repaired = conversation.snapshot();
-        assert_eq!(repaired.len(), before.len() + 1);
-        assert_eq!(&repaired[..before.len()], before.as_slice());
+        assert_eq!(&repaired[..5], &before[..5]);
+        assert_eq!(repaired.iter().flat_map(Message::tool_results).count(), 3);
         assert!(
             repaired
                 .last()
                 .expect("repair")
                 .tool_results()
-                .next()
+                .last()
                 .expect("result")
                 .is_error
         );

@@ -96,9 +96,13 @@ impl AgentBackend for BudgetedBackend {
         self.budget.request()?;
         let budget = Arc::clone(&self.budget);
         Ok(client.with_usage_observer(move |_, cost| {
-            if let Some(cost) = cost { budget.charge(cost); }
-            else if budget.limits.max_cost_usd.is_some() {
-                return Err(BackendError::new("Rig did not report request cost; execution stopped because a cost budget is enabled"));
+            if let Some(cost) = cost {
+                budget.charge(cost.total);
+            }
+            if budget.limits.max_cost_usd.is_some() && !cost.is_some_and(|cost| cost.is_complete()) {
+                return Err(BackendError::new(
+                    "Rig did not report complete request cost; execution stopped because a cost budget is enabled",
+                ));
             }
             Ok(())
         }))
@@ -149,15 +153,20 @@ mod tests {
                 ..Default::default()
             }),
         });
-        let client = source.model_client().await.unwrap();
-        let error = client
-            .settle(solaris_backend::Usage::new(100, 1), None)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Rig did not report request cost")
-        );
+        let partial: solaris_backend::Cost =
+            serde_json::from_value(serde_json::json!({"input":0.1,"total":0.1,"incomplete":true}))
+                .unwrap();
+        for cost in [None, Some(partial)] {
+            let client = source.clone().model_client().await.unwrap();
+            let error = client
+                .settle(solaris_backend::Usage::new(100, 1), cost)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Rig did not report complete request cost")
+            );
+        }
     }
 
     #[tokio::test]

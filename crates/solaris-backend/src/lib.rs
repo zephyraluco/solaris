@@ -78,3 +78,5 @@ pub use solaris_types::InlineImage;
 
 #[cfg(feature = "test-utils")]
 pub mod testing;
+
+pub use rig_core::completion::Cost;

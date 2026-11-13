@@ -4,6 +4,26 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::Duration;
 
+fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_agent::Message>) {
+    let directory = journal
+        .store()
+        .artifact_dir()
+        .parent()
+        .unwrap()
+        .join("memory")
+        .join(journal.id());
+    let store = rig_memory::DirStore::open(directory).unwrap();
+    let mut native = rig_memory::load(&store, "conversation").unwrap();
+    native.extend(
+        messages
+            .iter()
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    rig_memory::save(&store, "conversation", &mut native).unwrap();
+}
+
 fn message_contains(message: &serde_json::Value, expected: &str) -> bool {
     message["content"]
         .as_str()
@@ -149,11 +169,10 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let child = store
         .create_subagent(&cwd, "test-model", id)
         .expect("child");
-    child
-        .append(&solaris_agent::SessionRecord::Message {
-            message: solaris_agent::Message::user("isolated child history"),
-        })
-        .expect("child history");
+    seed_memory(
+        &child,
+        vec![solaris_agent::Message::user("isolated child history")],
+    );
     assert_eq!(store.list(&cwd).expect("sessions")[0].id, child.id());
     drop(child);
     drop(store);
@@ -352,11 +371,7 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             model: "test-model".into(),
         })
         .expect("source model");
-    source
-        .append(&SessionRecord::Message {
-            message: Message::user("source private history"),
-        })
-        .expect("history");
+    seed_memory(&source, vec![Message::user("source private history")]);
     let source_id = source.id().to_owned();
     drop(source);
     let mut auth = AuthStore::new();
