@@ -110,6 +110,7 @@ pub enum CredentialSource {
 pub struct BackendChoice {
     /// The backend to use.
     pub backend: Arc<dyn AgentBackend>,
+    pub configuration: Arc<crate::ProviderConfig>,
     /// Provider this resolved to, when one was picked at all.
     pub provider_id: Option<String>,
     /// Endpoint requests go to, when a real client was built.
@@ -127,6 +128,7 @@ impl BackendChoice {
     fn unconnected(reason: CredentialSource, message: String, model: &str) -> Self {
         Self {
             backend: Arc::new(UnconnectedBackend::new(message)),
+            configuration: Arc::new(crate::ProviderConfig::default()),
             provider_id: None,
             base_url: None,
             model: model.to_string(),
@@ -195,7 +197,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     let model = if chatgpt.is_some() {
         model.to_string()
     } else {
-        real_model(spec, model)
+        real_model(&options.configuration, spec.id, model)
     };
     let resolved = options.configuration.resolve(spec.id, &model);
     let resolved = if chatgpt.is_some() {
@@ -206,7 +208,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     let wire = if chatgpt.is_some() {
         solaris_backend::Wire::OpenAiResponses
     } else {
-        spec.wire_for(&resolved.request_id)
+        options.configuration.wire(spec.id, &resolved, spec.wire)
     };
 
     let endpoint = Endpoint {
@@ -229,7 +231,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     }
     let plan = TurnPlan {
         max_tokens: resolved.output_tokens,
-        price: None,
+
         prompt_cache_key,
         model: resolved.request_id.clone(),
         endpoint,
@@ -257,6 +259,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             // fetched instead of being refused along with the turn.
             if model.is_empty() {
                 return BackendChoice {
+                    configuration: Arc::clone(&options.configuration),
                     backend: Arc::new(NamelessBackend {
                         endpoint: backend,
                         message: format!(
@@ -272,6 +275,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
             }
 
             BackendChoice {
+                configuration: Arc::clone(&options.configuration),
                 backend: Arc::new(crate::discovery::ModelDiscovery {
                     inner: Arc::new(crate::request::SelectedBackend {
                         configuration: Arc::clone(&options.configuration),
@@ -339,7 +343,7 @@ fn configured_backend(
         },
         model: resolved.request_id.clone(),
         max_tokens: resolved.output_tokens,
-        price: None,
+
         prompt_cache_key: None,
     };
     let backend = match Backend::new(plan) {
@@ -359,6 +363,7 @@ fn configured_backend(
     };
     if model.is_empty() {
         return BackendChoice {
+            configuration: Arc::clone(&options.configuration),
             backend: Arc::new(NamelessBackend {
                 endpoint: backend,
                 message: format!(
@@ -377,6 +382,7 @@ fn configured_backend(
         CredentialSource::None
     };
     BackendChoice {
+        configuration: Arc::clone(&options.configuration),
         backend: Arc::new(crate::discovery::ModelDiscovery {
             inner: Arc::new(crate::request::SelectedBackend {
                 configuration: Arc::clone(&options.configuration),
@@ -502,25 +508,16 @@ fn missing_credential_message(spec: &ProviderSpec) -> String {
 /// for the first model it offers rather than sent an empty string it would
 /// reject. A model the user did name travels as written, even when the
 /// catalogue does not list it.
-fn real_model(spec: &'static ProviderSpec, model: &str) -> String {
+fn real_model(configuration: &crate::ProviderConfig, provider: &str, model: &str) -> String {
     if !model.is_empty() {
-        return model.to_string();
+        return model.into();
     }
-    spec.models
-        .first()
-        .map(|offered| offered.id.to_string())
-        .unwrap_or_else(|| model.to_string())
+    configuration
+        .models(provider)
+        .into_iter()
+        .next()
+        .map_or_else(String::new, |(id, _)| id)
 }
-
-/// Just the backend, for callers that do not care how it was chosen.
-pub fn build_backend(
-    auth: &AuthStore,
-    model: &str,
-    options: BackendOptions,
-) -> Arc<dyn AgentBackend> {
-    choose_backend(auth, model, options).backend
-}
-
 /// The provider requests go to.
 ///
 /// The active one when `/connect` has been used, otherwise the first whose key
@@ -812,7 +809,10 @@ mod tests {
         // Nothing named: the provider would reject an empty model, so its own
         // first offer is sent instead.
         let choice = choose_backend(&auth, "", options());
-        assert_eq!(choice.model, "claude-sonnet-4-5");
+        assert_eq!(
+            choice.model,
+            options().configuration.models("anthropic")[0].0
+        );
     }
 
     #[test]
@@ -1025,13 +1025,6 @@ mod tests {
                 "{model}"
             );
         }
-    }
-
-    #[test]
-    fn build_backend_is_the_choice_without_the_reason() {
-        let auth = auth_with("local", None);
-        let backend = build_backend(&auth, "llama3.2", options());
-        assert_eq!(backend.label(), "local");
     }
 
     #[test]

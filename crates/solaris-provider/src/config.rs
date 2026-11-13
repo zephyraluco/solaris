@@ -81,6 +81,8 @@ pub struct ResolvedModel {
     pub output_tokens: u32,
     pub capabilities: ModelCapabilities,
     pub reference_price: bool,
+    #[serde(skip)]
+    pub(crate) format: Option<rig_core::providers::registry::Format>,
     #[serde(serialize_with = "serialize_facts")]
     pub facts: ModelFacts,
 }
@@ -243,6 +245,7 @@ impl ProviderConfig {
         let reference_price = metadata
             .as_ref()
             .is_some_and(|s| !s.starts_with(&format!("{vendor}/")));
+        let format = known.then(|| spec.format()).flatten();
         // Bind metadata to the wire's requested alias, under a declared identity.
         spec.provider = ProviderId::declare("solaris").expect("valid declared vendor");
         spec.id = request_id.into();
@@ -269,33 +272,67 @@ impl ProviderConfig {
             output_tokens,
             capabilities,
             reference_price,
+            format,
             facts: ModelFacts::new(spec).with_catalog(&Catalog::default()),
         }
     }
-    pub fn capabilities(&self, provider: &str, model: &str) -> ModelCapabilities {
-        self.resolve(provider, model).capabilities
-    }
-    pub fn model_ids(&self, provider: &str) -> Vec<String> {
+    /// Official catalog rows and explicitly configured aliases for the picker.
+    pub fn models(&self, provider: &str) -> Vec<(String, String)> {
         let vendor = if provider == "opencode" {
             "opencode-go"
         } else {
             provider
         };
         let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
-        let mut ids: Vec<_> = catalog
+        let mut models: BTreeMap<String, String> = catalog
             .iter()
-            .filter(|s| s.provider.vendor() == vendor && !s.deprecated)
-            .map(|s| s.id.clone())
+            .filter(|s| s.provider.vendor() == vendor && !s.deprecated && s.input.text)
+            .map(|s| (s.id.clone(), s.display_name.clone()))
             .collect();
-        ids.extend(
-            self.selections
-                .iter()
-                .filter(|(_, s)| s.provider == provider)
-                .map(|(name, _)| name.clone()),
-        );
-        ids.sort();
-        ids.dedup();
-        ids
+        for (name, selection) in self
+            .selections
+            .iter()
+            .filter(|(_, s)| s.provider == provider)
+        {
+            models.insert(
+                name.clone(),
+                selection
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| selection.request_id.clone()),
+            );
+        }
+        models.into_iter().collect()
+    }
+    pub(crate) fn wire(
+        &self,
+        provider: &str,
+        model: &ResolvedModel,
+        fallback: solaris_backend::Wire,
+    ) -> solaris_backend::Wire {
+        // Only this preset multiplexes protocol families. Custom endpoints and
+        // ordinary gateways always honor their explicitly configured protocol.
+        if provider != "opencode" || model.metadata.is_none() {
+            return fallback;
+        }
+        match model.format {
+            Some(rig_core::providers::registry::Format::Anthropic) => {
+                solaris_backend::Wire::AnthropicMessages
+            }
+            Some(rig_core::providers::registry::Format::OpenAi) => {
+                if model.facts.spec().is_some_and(|s| {
+                    matches!(
+                        s.compat.chat_tools,
+                        Some(rig_core::catalog::ChatTools::Never)
+                    )
+                }) {
+                    solaris_backend::Wire::OpenAiResponses
+                } else {
+                    solaris_backend::Wire::OpenAiChat
+                }
+            }
+            _ => fallback,
+        }
     }
 }
 fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
@@ -334,6 +371,27 @@ fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn picker_and_protocol_use_official_facts_instead_of_manual_model_records() {
+        let config = ProviderConfig::default();
+        let models = config.models("anthropic");
+        assert!(models.iter().any(|(id, _)| id == "claude-sonnet-4-5"));
+        assert!(
+            !models.iter().any(|(id, _)| id == "claude-opus-4-1"),
+            "deprecated rows are excluded"
+        );
+        let claude = config.resolve("opencode", "claude-haiku-5-5");
+        assert_eq!(
+            config.wire("opencode", &claude, solaris_backend::Wire::OpenAiChat),
+            solaris_backend::Wire::AnthropicMessages
+        );
+        assert_eq!(
+            config.wire("new-api", &claude, solaris_backend::Wire::OpenAiChat),
+            solaris_backend::Wire::OpenAiChat,
+            "gateway protocol is explicit"
+        );
+    }
+
     #[test]
     fn gateway_identity_preserves_request_id_and_uses_official_facts() {
         let catalog = ProviderConfig::default();

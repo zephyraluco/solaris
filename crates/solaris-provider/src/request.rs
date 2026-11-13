@@ -24,9 +24,8 @@ impl SelectedBackend {
         let wire = if self.account_authorized {
             solaris_backend::Wire::OpenAiResponses
         } else {
-            crate::provider_spec(&self.provider)
-                .map(|provider| provider.wire_for(&resolved.request_id))
-                .unwrap_or_else(|| self.prototype.wire())
+            self.configuration
+                .wire(&self.provider, &resolved, self.prototype.wire())
         };
         self.prototype.clone().with_wire(wire).with_model_facts(
             resolved.request_id,

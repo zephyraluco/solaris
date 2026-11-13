@@ -160,6 +160,7 @@ impl AppOptions {
     ) -> Self {
         Self {
             backend_factory: Arc::new(move |_, model| BackendChoice {
+                configuration: Default::default(),
                 backend: Arc::clone(&backend),
                 provider_id: None,
                 base_url: None,
@@ -323,6 +324,7 @@ pub struct App {
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
     discovered: Vec<String>,
+    provider_config: Arc<solaris_provider::ProviderConfig>,
     /// Answer from the background model-discovery task, while one is in flight.
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
     models_error: Option<String>,
@@ -430,6 +432,7 @@ impl App {
         };
 
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
+        let provider_config = Arc::clone(&choice.configuration);
         let (agent, tool_cancel) = with_tools(
             choice,
             Arc::clone(&registry),
@@ -496,6 +499,7 @@ impl App {
             quit_press: None,
             inline: None,
             discovered: Vec::new(),
+            provider_config,
             models_rx: None,
             models_error: None,
             oauth: None,
@@ -672,6 +676,7 @@ impl App {
             }
         }
         let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
+        self.provider_config = Arc::clone(&choice.configuration);
         let (agent, cancel) = with_tools(
             choice,
             Arc::clone(&self.registry),
@@ -758,6 +763,7 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+        self.provider_config = Arc::clone(&choice.configuration);
         let source = choice.source;
         let (agent, cancel) = with_tools(
             choice,
@@ -1978,30 +1984,26 @@ impl App {
     /// context windows for the models we ship while leaving a gateway's own
     /// list intact. With nothing reported, the catalogue is the whole answer.
     fn model_choices(&self) -> Vec<SelectItem> {
-        let catalogue = self.provider_id().and_then(solaris_provider::provider_spec);
-
+        let catalogue = self
+            .provider_id()
+            .map(|id| self.provider_config.models(id))
+            .unwrap_or_default();
         if self.discovered.is_empty() {
             if self.uses_chatgpt() {
                 return Vec::new();
             }
             return catalogue
-                .map(|spec| {
-                    spec.models
-                        .iter()
-                        .map(|model| {
-                            SelectItem::new(model.id, model.id).description(model.description)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                .into_iter()
+                .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
+                .collect();
         }
-
         self.discovered
             .iter()
             .map(|id| {
                 let description = catalogue
-                    .and_then(|provider| provider.models.iter().find(|model| model.id == id))
-                    .map_or("", |model| model.description);
+                    .iter()
+                    .find(|(model, _)| model == id)
+                    .map_or("", |(_, name)| name.as_str());
                 SelectItem::new(id.as_str(), id.as_str()).description(description)
             })
             .collect()
@@ -2358,16 +2360,11 @@ impl App {
         ) {
             Vec::new()
         } else {
-            solaris_provider::provider_spec(&provider_id)
-                .map(|spec| {
-                    spec.models
-                        .iter()
-                        .map(|model| {
-                            SelectItem::new(model.id, model.id).description(model.description)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            self.provider_config
+                .models(&provider_id)
+                .into_iter()
+                .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
+                .collect()
         };
         let pending = self.models_rx.is_some();
         let current = self.config.model.clone();
@@ -3450,6 +3447,7 @@ mod tests {
     fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
         Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             crate::agent_backend(BackendChoice {
+                configuration: Default::default(),
                 backend: fake_backend(),
                 provider_id: Some(provider.into()),
                 base_url: None,
@@ -3497,6 +3495,7 @@ mod tests {
         let mut options = AppOptions::new(pinned, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            configuration: Default::default(),
             backend: Arc::clone(&resolved),
             provider_id: Some(provider.into()),
             base_url: None,
@@ -3516,6 +3515,7 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            configuration: Default::default(),
             backend: fake_backend(),
             provider_id: Some(provider.into()),
             base_url: None,
@@ -3984,7 +3984,10 @@ mod tests {
 
         app.submit("/model".to_string());
         let text = rendered_text(&mut app, 90, 24);
-        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert!(
+            text.contains(&app.provider_config.models("anthropic")[1].0),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -4023,7 +4026,7 @@ mod tests {
         let mut app = app_connected_to("anthropic");
         // Nothing was named, so the provider's first model was adopted.
         let current = app.model().to_string();
-        assert_eq!(current, "claude-sonnet-4-5");
+        assert_eq!(current, app.provider_config.models("anthropic")[0].0);
 
         app.submit("/model".to_string());
 
@@ -4035,7 +4038,10 @@ mod tests {
         assert!(text.contains("Select a model:"), "{text}");
         assert!(text.contains(current.as_str()), "{text}");
         // Exactly what the connected provider offers, and nothing else.
-        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert!(
+            text.contains(&app.provider_config.models("anthropic")[1].0),
+            "{text}"
+        );
         assert!(text.contains("claude-haiku-4-5"), "{text}");
 
         // The active model is the highlighted row, so Enter keeps it.
@@ -4060,15 +4066,15 @@ mod tests {
     #[test]
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
-        let names: Vec<&str> = solaris_provider::provider_spec("anthropic")
-            .expect("a known provider")
-            .models
-            .iter()
-            .map(|model| model.id)
+        let names: Vec<String> = app
+            .provider_config
+            .models("anthropic")
+            .into_iter()
+            .map(|(id, _)| id)
             .collect();
         let start = names
             .iter()
-            .position(|name| *name == app.model())
+            .position(|name| name == app.model())
             .expect("the active model is on the list");
 
         app.submit("/model".to_string());
@@ -5143,7 +5149,7 @@ mod tests {
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
 
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), "claude-sonnet-4-5");
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
         assert!(!app.connect_open());
     }
 
@@ -5226,7 +5232,11 @@ mod tests {
 
         assert_eq!(app.active_provider(), Some("local"));
         assert!(app.auth.credential("local").is_none());
-        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        assert_eq!(
+            app.connect_step(),
+            None,
+            "local models require endpoint discovery"
+        );
     }
 
     #[test]
@@ -5472,7 +5482,7 @@ mod tests {
         assert_eq!(app.backend_label(), "anthropic");
         let footer = footer_text(&mut app);
         assert!(footer.contains(" anthropic · "), "{footer:?}");
-        assert!(footer.contains("claude-sonnet-4-5"), "{footer:?}");
+        assert!(footer.contains(app.model()), "{footer:?}");
     }
 
     #[tokio::test]
@@ -5486,15 +5496,27 @@ mod tests {
         // Connecting a provider replaces both the backend and the model: with
         // nothing named, the provider's own first model is adopted.
         assert_eq!(app.backend_label(), "anthropic");
-        assert_eq!(app.model(), "claude-sonnet-4-5");
-        assert_eq!(app.config.context_window, 200_000);
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
+        let expected = app
+            .provider_config
+            .resolve("anthropic", app.model())
+            .capabilities
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(app.config.context_window, u64::from(expected));
 
         // The wizard's model step can still change it.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), "claude-opus-4-1");
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[1].0);
         // The official catalog also supplies the selected model's limits.
-        assert_eq!(app.config.context_window, 200_000);
+        let expected = app
+            .provider_config
+            .resolve("anthropic", app.model())
+            .capabilities
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(app.config.context_window, u64::from(expected));
     }
 
     #[tokio::test]

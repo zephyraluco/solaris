@@ -49,6 +49,7 @@ mod tests {
     fn application_resolves_endpoint_instructions_and_context_fallback() {
         let backend: Arc<dyn AgentBackend> = Arc::new(Backend);
         let config = agent_backend(BackendChoice {
+            configuration: Default::default(),
             backend: Arc::clone(&backend),
             provider_id: Some("local".into()),
             base_url: Some("http://localhost:8080/v1".into()),
@@ -69,6 +70,7 @@ mod tests {
     #[test]
     fn unresolved_provider_does_not_add_endpoint_instructions() {
         let config = agent_backend(BackendChoice {
+            configuration: Default::default(),
             backend: Arc::new(Backend),
             provider_id: None,
             base_url: None,

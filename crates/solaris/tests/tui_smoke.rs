@@ -925,7 +925,10 @@ async fn the_model_command_needs_a_provider_then_lists_its_models() {
     assert!(harness.tui.overlay_queue().borrow().is_empty());
     let frame = harness.draw();
     assert!(frame.contains("Select a model:"), "{frame}");
-    assert!(frame.contains("claude-opus-4-1"), "{frame}");
+    assert!(
+        frame.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[1].0),
+        "{frame}"
+    );
 
     harness.key(KeyCode::Down);
     harness.key(KeyCode::Enter);
@@ -1193,13 +1196,17 @@ fn connecting_an_api_key_flows_into_the_model_picker() {
 
     let text = harness.draw();
     assert!(text.contains("Select a model:"), "{text}");
-    assert!(text.contains("claude-sonnet-4-5"), "{text}");
+    assert!(
+        text.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[0].0),
+        "{text}"
+    );
 
     harness.key(KeyCode::Enter); // pick the first model
     let text = harness.draw();
     assert!(!text.contains("Select a model:"), "{text}");
     assert!(
-        text.contains("anthropic") && text.contains("claude-sonnet-4-5"),
+        text.contains("anthropic")
+            && text.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[0].0),
         "the footer should report the connection:\n{text}"
     );
 }

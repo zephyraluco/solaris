@@ -11,14 +11,13 @@ mod selection;
 pub use credentials::refreshing_backend_factory;
 
 pub use selection::{
-    BackendChoice, BackendOptions, CredentialSource, Environment, build_backend, choose_backend,
+    BackendChoice, BackendOptions, CredentialSource, Environment, choose_backend,
     empty_environment, process_environment,
 };
 pub use solaris_backend::Wire;
 
 pub use providers::{
-    AuthKind, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelSpec, PROVIDERS, ProviderSpec,
-    provider_spec,
+    AuthKind, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, PROVIDERS, ProviderSpec, provider_spec,
 };
 
 pub use credentials::{Active, AuthError, AuthStore, Credential, mask_secret};

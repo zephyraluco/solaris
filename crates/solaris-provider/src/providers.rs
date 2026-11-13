@@ -1,11 +1,5 @@
-//! The provider catalogue: what each platform offers, and how to reach it.
-//!
-//! Mirrors claurst's `claurst-api` provider list in miniature: each entry says
-//! how it authenticates, which wire protocol it speaks, where its endpoint
-//! lives, which environment variables carry its credentials, and which models
-//! it offers. The wizard's steps and protocol selection are
-//! driven from this one table, and [`crate::choose_backend`] turns one of them
-//! into a backend.
+//! Connection presets: authentication, endpoints and environment keys.
+//! Model lists and per-model facts come exclusively from the official catalog.
 
 use serde::{Deserialize, Serialize};
 use solaris_backend::Wire;
@@ -22,43 +16,6 @@ pub enum AuthKind {
     ApiKeyWithUrl,
     /// ChatGPT account authorization in a browser.
     ChatGpt,
-}
-
-/// One model a provider offers.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelSpec {
-    /// Identifier sent to the provider.
-    pub id: &'static str,
-    /// One-line description shown after the ` · ` separator in the picker.
-    pub description: &'static str,
-    /// Protocol this model is answered over, when the provider's is not it.
-    ///
-    /// The protocol belongs to the model, not to the subscription that carries
-    /// it: one gateway can answer GPT models on the Responses API and Claude
-    /// models on the Messages API under a single key.
-    pub wire: Option<Wire>,
-}
-
-impl ProviderSpec {
-    /// The protocol `model` is answered over.
-    ///
-    /// What this provider lists for the model decides; its own wire covers the
-    /// models it does not list, because `/model <name>` may name anything and
-    /// most platforms speak one protocol for all of it.
-    pub fn wire_for(&self, model: &str) -> Wire {
-        self.listed(model)
-            .and_then(|spec| spec.wire)
-            .unwrap_or(self.wire)
-    }
-
-    /// This provider's entry for `model`, when it lists one.
-    ///
-    /// Scoped to the provider on purpose: `claude-sonnet-4-5` is reachable both
-    /// from Anthropic itself and through a gateway, and the two need not answer
-    /// it the same way. IDs are matched exactly.
-    fn listed(&self, model: &str) -> Option<&ModelSpec> {
-        self.models.iter().find(|spec| spec.id == model)
-    }
 }
 
 /// One selectable provider.
@@ -82,8 +39,6 @@ pub struct ProviderSpec {
     pub env_keys: &'static [&'static str],
     /// Environment variables that override `base_url`.
     pub base_url_envs: &'static [&'static str],
-    /// Models offered once the provider is connected.
-    pub models: &'static [ModelSpec],
     /// Header this platform routes a conversation by, when it asks for one.
     ///
     /// It wants a stable id per conversation: opencode's Go plan uses it to tell
@@ -144,23 +99,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: Some("https://api.anthropic.com/v1"),
         env_keys: &["ANTHROPIC_API_KEY"],
         base_url_envs: &["ANTHROPIC_BASE_URL"],
-        models: &[
-            ModelSpec {
-                id: "claude-sonnet-4-5",
-                description: "balanced",
-                wire: None,
-            },
-            ModelSpec {
-                id: "claude-opus-4-1",
-                description: "most capable",
-                wire: None,
-            },
-            ModelSpec {
-                id: "claude-haiku-4-5",
-                description: "fastest",
-                wire: None,
-            },
-        ],
     },
     ProviderSpec {
         id: "opencode",
@@ -168,8 +106,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         description: "Monthly plan — open coding models",
         auth: AuthKind::ApiKey,
         badge: None,
-        // The floor for a model the table below does not name: most of the plan's
-        // lineup is OpenAI-compatible.
+        // Default for models without official protocol metadata.
         wire: Wire::OpenAiChat,
         session_header: Some("x-opencode-session"),
         prompt: Some(GATEWAY_PROMPT),
@@ -179,60 +116,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // The key comes from the console, so `/connect` is where it is collected.
         env_keys: &[],
         base_url_envs: &[],
-        models: &[
-            // The families answered on something other than the chat wire.
-            ModelSpec {
-                id: "grok-4.7",
-                description: "flagship",
-                wire: Some(Wire::OpenAiResponses),
-            },
-            ModelSpec {
-                id: "gpt-5.6-luna",
-                description: "cheap and fast",
-                wire: Some(Wire::OpenAiResponses),
-            },
-            ModelSpec {
-                id: "muse-spark-1.3-contributor",
-                description: "contributor tier",
-                wire: Some(Wire::OpenAiResponses),
-            },
-            ModelSpec {
-                id: "claude-haiku-5-5",
-                description: "fastest of the family",
-                wire: Some(Wire::AnthropicMessages),
-            },
-            // The floor: the open models that speak the chat wire.
-            ModelSpec {
-                id: "glm-5.3",
-                description: "open weights",
-                wire: None,
-            },
-            ModelSpec {
-                id: "kimi-k3",
-                description: "open weights",
-                wire: None,
-            },
-            ModelSpec {
-                id: "qwen3.8-max",
-                description: "open weights",
-                wire: None,
-            },
-            ModelSpec {
-                id: "deepseek-v4-pro",
-                description: "open weights, peak-hours price",
-                wire: None,
-            },
-            ModelSpec {
-                id: "minimax-m3",
-                description: "open weights",
-                wire: None,
-            },
-            ModelSpec {
-                id: "longcat-2.0",
-                description: "open weights",
-                wire: None,
-            },
-        ],
     },
     ProviderSpec {
         id: "openai",
@@ -246,18 +129,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: Some("https://api.openai.com/v1"),
         env_keys: &["OPENAI_API_KEY"],
         base_url_envs: &["OPENAI_BASE_URL"],
-        models: &[
-            ModelSpec {
-                id: "gpt-5",
-                description: "flagship",
-                wire: None,
-            },
-            ModelSpec {
-                id: "gpt-5-mini",
-                description: "cheap and fast",
-                wire: None,
-            },
-        ],
     },
     ProviderSpec {
         id: "google",
@@ -273,18 +144,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         env_keys: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         base_url_envs: &[],
-        models: &[
-            ModelSpec {
-                id: "gemini-2.5-pro",
-                description: "long context",
-                wire: None,
-            },
-            ModelSpec {
-                id: "gemini-2.5-flash",
-                description: "fast",
-                wire: None,
-            },
-        ],
     },
     ProviderSpec {
         id: "new-api",
@@ -303,7 +162,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // Its model list is whatever the operator configured upstreams for, so
         // there is nothing honest to ship here; `/model <name>` sends one
         // as written.
-        models: &[],
     },
     ProviderSpec {
         id: "openrouter",
@@ -317,13 +175,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: Some("https://openrouter.ai/api/v1"),
         env_keys: &["OPENROUTER_API_KEY"],
         base_url_envs: &["OPENROUTER_BASE_URL"],
-        models: &[ModelSpec {
-            id: "auto",
-            description: "the router picks a model",
-            // Billed at whichever upstream the router chose, so there is no
-            // list price to report.
-            wire: None,
-        }],
     },
     ProviderSpec {
         id: "local",
@@ -337,18 +188,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: Some("http://localhost:11434/v1"),
         env_keys: &[],
         base_url_envs: &["SOLARIS_LOCAL_BASE_URL"],
-        models: &[
-            ModelSpec {
-                id: "llama3.2",
-                description: "local",
-                wire: None,
-            },
-            ModelSpec {
-                id: "qwen2.5-coder",
-                description: "local",
-                wire: None,
-            },
-        ],
     },
     ProviderSpec {
         id: "custom",
@@ -363,7 +202,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         base_url: None,
         env_keys: &[],
         base_url_envs: &[],
-        models: &[],
     },
 ];
 
@@ -402,14 +240,6 @@ mod tests {
                 "{} has no description",
                 spec.id
             );
-            for model in spec.models {
-                assert!(!model.id.is_empty());
-                assert!(
-                    !model.description.is_empty(),
-                    "{} has no description",
-                    model.id
-                );
-            }
         }
     }
 
@@ -479,20 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gateway_answers_each_model_on_its_own_protocol() {
-        let go = provider_spec("opencode").expect("a known provider");
-
-        // One key, three protocols: the model decides, not the plan
-        // that carries it.
-        assert_eq!(go.wire_for("grok-4.7"), Wire::OpenAiResponses);
-        assert_eq!(go.wire_for("claude-haiku-5-5"), Wire::AnthropicMessages);
-        // A model the table does not name takes the platform's floor.
-        assert_eq!(go.wire_for("qwen3.8-max"), Wire::OpenAiChat);
-        // An unlisted suffix keeps the provider default protocol.
-        assert_eq!(go.wire_for("claude-haiku-5-5-20260101"), Wire::OpenAiChat);
-    }
-
-    #[test]
     fn only_the_platform_that_routes_by_conversation_asks_for_a_session() {
         let go = provider_spec("opencode").expect("a known provider");
         assert_eq!(go.session_header, Some("x-opencode-session"));
@@ -500,23 +316,6 @@ mod tests {
         for spec in PROVIDERS.iter().filter(|spec| spec.id != "opencode") {
             assert!(spec.session_header.is_none(), "{} asks for one", spec.id);
         }
-    }
-
-    #[test]
-    fn a_model_entry_belongs_to_the_provider_that_lists_it() {
-        // The same id is offered by Anthropic itself and through the gateway,
-        // and a lookup must not cross between them: one that searched the whole
-        // table would hand the gateway's answer to whichever came first in it.
-        let direct = provider_spec("anthropic").expect("a known provider");
-        assert_eq!(
-            direct.wire_for("claude-sonnet-4-5"),
-            Wire::AnthropicMessages
-        );
-        assert_eq!(
-            direct.wire_for("gpt-5.5"),
-            Wire::AnthropicMessages,
-            "a model this provider does not list keeps its own floor"
-        );
     }
 
     #[test]
@@ -529,7 +328,6 @@ mod tests {
         assert!(gateway.base_url.is_none());
         // Nothing honest can be listed: the upstreams behind it are the
         // operator's choice.
-        assert!(gateway.models.is_empty());
         // The wire is the compatibility floor, which is what a gateway speaks.
         assert_eq!(gateway.wire, Wire::OpenAiChat);
     }

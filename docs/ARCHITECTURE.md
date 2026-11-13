@@ -29,7 +29,7 @@ solaris                  应用组装、配置、认证、TUI 与 CLI
 
 | Crate | 目录 | 依赖 | 职责 |
 | --- | --- | --- | --- |
-| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`rig-core`、`rig-reqwest`、`reqwest`（rustls）、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 连接准备接口、`Backend`（SDK 模型连接）、事件适配与请求策略；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`/`Price`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
+| `solaris-backend` | [`crates/solaris-backend`](../crates/solaris-backend) | `async-trait`、`futures`、`tokio`、`rig-core`、`rig-reqwest`、`reqwest`（rustls）、`serde`、`serde_json`、`thiserror` | 传输层，外加一轮对话的词汇：`AgentBackend` 连接准备接口、`Backend`（SDK 模型连接）、事件适配与请求策略；`message`（`Message`/`Content`/`Role`）、`event`（`AgentEvent`/`TurnRequest`/`BackendError`）、`tool`（`ToolSpec`/`ToolCall`/`ToolResult`）、`usage`（`Usage`）。它只接收一个已经解析好的请求，因此既不认识平台也不认识工具。 |
 | `solaris-tools` | [`crates/solaris-tools`](../crates/solaris-tools) | `async-trait`、`futures`、`tokio`（`process`/`io-util`/`fs`）、`serde_json`、`thiserror`、`libc`（仅 Unix） | 工具层：八个内建工具（`read`/`write`/`edit`/`ls`/`grep`/`find` 与所在平台的 shell）、`ToolRegistry`、命令 runner、截断与文件写入串行化、`edit` 的 diff。不依赖工作区里任何其他 crate。 |
 | `solaris-provider` | [`crates/solaris-provider`](../crates/solaris-provider) | `solaris-backend`、`async-trait`、`serde`、`serde_json`、`thiserror` | 平台层：`providers`（provider 目录——认证方式、wire、端点、环境变量、每个模型的上下文窗口/最大输出/单价）、`choose`（`Credential` 解析成后端，`AuthStore`、`mask_secret`）。向导步骤、模型选择器与价格表都从这一张表读。 |
 | `solaris-agent` | [`crates/solaris-agent`](../crates/solaris-agent) | `solaris-backend`、`solaris-tools`、`rig-agent`、`rig-core`、`async-trait`、`futures`、`serde`、`tokio` | agent 会话：`Agent`（持有对话并驱动 SDK 多轮状态机）、`Mode` 与它声明给一轮的默认工具集、`Approver` 审批钩子，并把应用需要的词汇（消息、事件、工具、用量、注册表与选择）再导出。 |
@@ -50,7 +50,7 @@ solaris                  应用组装、配置、认证、TUI 与 CLI
 | `message` | `Message` / `Role` / `Content`：一条消息是**内容块列表**——`Text`、`ToolUse`、`ToolResult`。工具结果放在 user 的 `Content::ToolResult` 里，正是 Messages API 要求的位置；纯文本消息只有一个 `Text` 块，所以不碰工具的路径与从前一样。 |
 | `event` | `AgentEvent`、`TurnRequest`、`BackendError` —— 后端与其调用方之间的唯一契约。 |
 | `tool` | `ToolSpec`（下发给模型的声明）、`ToolCall`（模型的请求）、`ToolResult`（执行结果）。纯数据：谁声明工具是 `solaris-agent` 的事，谁执行调用是 `solaris-tools` 的事。 |
-| `usage` | `Usage` / `Price`：四个互不重叠的 token 桶（普通输入、输出、缓存读、缓存写）外加「这是估算」标记；`Price` 是 USD / 百万 token 的单价。`Usage::merge` 把一轮里的多次模型调用加起来（工具往返就是这种情况）。 |
+| `usage` | `Usage`：四个互不重叠的 token 桶（普通输入、输出、缓存读、缓存写）外加「这是估算」标记；价格计算直接使用官方模型事实。`Usage::merge` 把一轮里的多次模型调用加起来（工具往返就是这种情况）。 |
 
 斜杠命令表、偏好设置、伙伴与提示语不属于「一轮对话的词汇」，它们住在应用层（`solaris` 的 `commands` / `config` / `buddy` / `recent` / `tips`，见 §6.1）；模式 `Mode` 属于 agent（见 §3）。
 
@@ -87,7 +87,7 @@ enum AgentEvent {
 
 ### 2.3 Provider 配置与认证
 
-`solaris-provider` 保留厂商选择、凭据存储、外部模型目录、用户覆盖、价格和列表缓存。每次请求从目录解析实际模型 ID，同时选择对应协议；不只更换模型名称而沿用旧协议。模型能力映射为官方 ModelFacts / ModelSpec，agent 只消费连接提供的固定能力。
+`solaris-provider` 保留厂商选择、凭据存储、外部模型目录、用户覆盖、价格和列表缓存。每次请求从目录解析实际模型 ID，同时选择对应协议；不只更换模型名称而沿用旧协议。模型参数直接使用官方 ModelFacts / ModelSpec，agent 只消费连接提供的固定能力。
 
 浏览器登录和刷新使用官方 ChatGPT `Authenticator`：SDK 负责 PKCE、state、回调监听及固定 issuer 的令牌交换；Solaris 显示登录 URL、限制五分钟期限并保存既有凭据格式。SDK 尝试本机 1455、1457 端口；取消会停止监听。后台刷新禁用交互式设备登录。
 
@@ -634,7 +634,7 @@ Model 步可以先于清单打开：[`ConnectFlow::enter_models`](../crates/sola
 | 限制一次工具往返的次数 | 没有上限：循环跑到模型不再请求为止（见 §3.3）。要加回来就在 [`solaris-agent/src/session.rs`](../crates/solaris-agent/src/session.rs) 的 `drive` 循环里计数并在 `AgentOptions` 上加一个字段。 |
 | 换掉 ripgrep / fd | 实现 `CommandRunner` 并传给 `ToolRegistry::with_runners`（`grep` 与 `find` 都经它起子进程）。 |
 | 接入新的 wire 协议 | 在 backend 私有模型工厂选择官方 SDK 实现，更新业务 `Wire` 与 provider 配置，并补齐 HTTP 契约测试；不新增自绘协议编码器。 |
-| 增删 provider 目录项 / 模型 | [`solaris-provider/src/providers.rs`](../crates/solaris-provider/src/providers.rs) 的 `PROVIDERS`（向导步骤、模型选择器、端点、环境变量、价格表，以及每个模型自己的 wire 都从这里读）。 |
+| 增删连接预设 / 模型 | [`solaris-provider/src/providers.rs`](../crates/solaris-provider/src/providers.rs) 的 `PROVIDERS` 只管理认证、端点、环境变量及默认协议；模型列表、参数和价格来自官方 Catalog，用户通过 `models.json` 配置别名和覆盖。 |
 | 调整重试 / 超时策略 | [`solaris-backend/src/http.rs`](../crates/solaris-backend/src/http.rs)：`BACKOFF`、`IDLE_TIMEOUT`、`CONNECT_TIMEOUT`。 |
 | 新增斜杠命令 | [`crates/solaris/src/commands.rs`](../crates/solaris/src/commands.rs) 的命令表 + `App::execute_command` 加一个分支；补全、面板、帮助会自动跟随。 |
 | 新增浮层对话框 | 在 [`dialogs.rs`](../crates/solaris/src/dialogs.rs) 实现 `Component`，经 `DialogMessage` 回传结果，再用 `push_overlay` 打开。 |
@@ -735,3 +735,8 @@ Model and child charges are separate from context annotations. Billing restore
 supports legacy cumulative completions and manual summary charges without counting
 new request records twice. Successful task completion remains a cumulative API
 event, while the session ledger also retains charges before failures/cancellation.
+
+模型选择器直接读取当前官方目录和用户命名模型，过滤已弃用模型，不再维护手工推荐列表。
+连接预设只声明地址、认证及默认协议。OpenCode 的多协议选择读取官方模型格式，
+自定义端点始终遵守显式协议。后端已删除 `Price`、`with_capabilities` 和旧便利构造接口，
+测试同样通过官方 ModelFacts 设置能力与价格。

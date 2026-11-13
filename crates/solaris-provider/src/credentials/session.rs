@@ -222,6 +222,7 @@ mod tests {
                 panic!("OAuth credential")
             };
             BackendChoice {
+                configuration: Default::default(),
                 backend: Arc::new(Recording {
                     token: access_token.clone(),
                     calls: Arc::clone(&recorded),
