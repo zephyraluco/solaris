@@ -740,3 +740,14 @@ event, while the session ledger also retains charges before failures/cancellatio
 连接预设只声明地址、认证及默认协议。OpenCode 的多协议选择读取官方模型格式，
 自定义端点始终遵守显式协议。后端已删除 `Price`、`with_capabilities` 和旧便利构造接口，
 测试同样通过官方 ModelFacts 设置能力与价格。
+
+### 模型参数与请求策略清理
+
+`TurnPlan.model` 直接接收不可变 `ModelParameters`，由官方 ModelSpec 一次派生模型名、
+能力与请求输出预算。Backend 创建时即取得完整参数，不再构造临时事实，也不提供
+with_model_facts 事后覆盖。连接参数、UI 能力和输出预算共享同一来源。
+
+HTTP middleware 只保留产品头和显式网关拒绝后的兼容修复，不按能力重新编写 SDK
+生成的请求正文。工具 strict 策略使用 Rig 原生选项；Responses 保留原生 strict 关闭选项，
+以保持工具可选参数语义。业务 usage 通过唯一的 From<Rig Usage> 转换统一生成。
+MessageContext 及 solaris.context 的读写和清理分支已删除，当前上下文只使用内存投影。

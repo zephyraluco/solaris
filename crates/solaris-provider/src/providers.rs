@@ -56,11 +56,7 @@ pub struct ProviderSpec {
     pub prompt: Option<&'static str>,
 }
 
-/// Context window assumed for a model the catalogue does not list.
-pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
-
-/// Largest reply asked of a model the catalogue does not list.
-pub const DEFAULT_MAX_OUTPUT: u32 = 8_192;
+pub use solaris_backend::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT};
 
 /// Prompt text for an endpoint that routes to whichever model family it likes.
 ///

@@ -1,5 +1,5 @@
 //! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
-use crate::{AgentBackend, BackendError, Support, Wire};
+use crate::{AgentBackend, BackendError, Wire};
 use crate::{http, transport::CompletionRoute};
 use rig_core::driver::{DynModel, Model};
 use rig_core::operation::Completion;
@@ -76,15 +76,13 @@ pub(super) fn session_id() -> &'static str {
 ///
 /// Everything platform-specific has been decided before this point: which
 /// endpoint, which model, how large a reply to ask for, and whether a prompt-cache
-/// key should ride along. Official model facts are attached separately.
+/// key should ride along. Model facts and derived limits are supplied together.
 #[derive(Debug, Clone)]
 pub struct TurnPlan {
     /// Where the turn goes and how it authenticates.
     pub endpoint: Endpoint,
-    /// Model id to send, exactly as the caller wants it.
-    pub model: String,
-    /// Largest reply to ask for.
-    pub max_tokens: u32,
+    /// Immutable model facts and the requested reply budget.
+    pub model: crate::ModelParameters,
     /// Prompt-cache routing key, for the platforms that want one.
     pub prompt_cache_key: Option<&'static str>,
 }
@@ -118,43 +116,16 @@ impl Backend {
     }
     /// A backend for `plan`.
     pub fn new(plan: TurnPlan) -> Result<Self, BackendError> {
-        use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
-        use rig_core::providers::registry::ProviderId;
-        let mut spec = ModelSpec::new(
-            ProviderId::declare("solaris").expect("valid declared vendor"),
-            &plan.model,
-        )
-        .with_tools(true);
-        spec.input.image = true;
-        spec.max_output_tokens = Some(plan.max_tokens);
         Ok(Self {
             client: http::client()?,
             endpoint: plan.endpoint,
-            model: plan.model,
-            max_tokens: plan.max_tokens,
-            facts: ModelFacts::new(spec).with_catalog(&Catalog::default()),
+            model: plan.model.model().into(),
+            max_tokens: plan.model.output_tokens(),
+            facts: plan.model.facts().clone(),
             prompt_cache_key: plan.prompt_cache_key,
             chatgpt: None,
-            capabilities: crate::ModelCapabilities {
-                output_budget: Some(plan.max_tokens),
-                ..Default::default()
-            },
+            capabilities: plan.model.capabilities(),
         })
-    }
-
-    /// Bind the official catalog facts to an immutable request configuration.
-    pub fn with_model_facts(
-        mut self,
-        model: String,
-        max_tokens: u32,
-        facts: rig_core::catalog::ModelFacts,
-        capabilities: crate::ModelCapabilities,
-    ) -> Self {
-        self.model = model;
-        self.max_tokens = max_tokens;
-        self.capabilities = capabilities;
-        self.facts = facts;
-        self
     }
 
     /// The protocol selected for this immutable request configuration.
@@ -171,11 +142,6 @@ impl Backend {
     /// Where requests go, for `--print-config`.
     pub fn base_url(&self) -> &str {
         &self.endpoint.base_url
-    }
-
-    /// The model this backend asks for.
-    pub fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -210,9 +176,7 @@ impl Backend {
             Wire::AnthropicMessages => {
                 let config = self.anthropic_config();
                 let mut wire = config.completion(&self.model).with_facts(facts);
-                if self.capabilities.prompt_caching != Support::Unsupported {
-                    wire = wire.with_prompt_caching();
-                }
+                wire = wire.with_prompt_caching();
                 Model::new(wire, transport)
                     .with_idle_timeout(Some(http::IDLE_TIMEOUT))
                     .erase()

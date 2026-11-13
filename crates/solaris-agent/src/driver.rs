@@ -45,21 +45,6 @@ struct Policy {
 fn failure(error: impl std::fmt::Display) -> ErrorReport {
     ErrorReport::new(ErrorKind::Provider, error.to_string())
 }
-pub(super) fn usage(value: rig_core::completion::Usage) -> Usage {
-    let read = value.cached_input_tokens.unwrap_or(0);
-    let write = value.cache_creation_input_tokens.unwrap_or(0);
-    let bounded = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
-    Usage::new(
-        bounded(
-            value
-                .input_tokens
-                .unwrap_or(0)
-                .saturating_sub(read.saturating_add(write)),
-        ),
-        bounded(value.output_tokens.unwrap_or(0)),
-    )
-    .with_cache(bounded(read), bounded(write))
-}
 impl AgentHook for Policy {
     async fn on_dispatch(
         &self,
@@ -258,7 +243,7 @@ impl AgentHook for Policy {
             let measured = if response.usage.input_tokens.is_some()
                 || response.usage.output_tokens.is_some()
             {
-                usage(response.usage)
+                Usage::from(response.usage)
             } else {
                 let output = response
                     .choice

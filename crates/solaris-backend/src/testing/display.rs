@@ -7,7 +7,7 @@ use rig_core::message::AssistantContent;
 use rig_core::streaming::{Item, Relayed, StreamEvent, StreamEvents};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{AgentEvent, AgentEventStream, BackendError, Usage, convert};
+use crate::{AgentEvent, AgentEventStream, BackendError, Usage};
 
 pub(crate) fn adapt(
     stream: StreamEvents,
@@ -121,7 +121,7 @@ impl Events {
                     let usage = if response.usage.input_tokens.is_some()
                         || response.usage.output_tokens.is_some()
                     {
-                        convert::usage(response.usage)
+                        Usage::from(response.usage)
                     } else {
                         Usage::estimate(self.input_characters, self.output_characters)
                     };

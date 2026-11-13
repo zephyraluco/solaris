@@ -551,7 +551,7 @@ Prices are USD per million tokens. Rig attaches standard API list-price estimate
 long-context tiers, service tiers and hosted-tool fees are not included. Gateway
 metadata inherited from a manufacturer is marked as a reference price. Unknown
 prices remain unknown, and ChatGPT account sessions do not use API prices.
-`--print-config` shows the resolved official facts. Each request fixes its facts and reuses the HTTP connection pool.
+`--print-config` shows the resolved official facts. Each request fixes its facts and reuses the HTTP connection pool. Backend construction accepts a complete immutable model parameter snapshot; capabilities and reply budgets are derived from the same official facts.
 
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched

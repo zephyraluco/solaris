@@ -123,6 +123,13 @@ fn text_body(text: &str) -> String {
 
 /// A backend pointed at `addr` speaking Chat Completions.
 fn backend(addr: SocketAddr) -> Backend {
+    backend_with_model(
+        addr,
+        solaris_backend::testing::parameters("test-model", 4096),
+    )
+}
+
+fn backend_with_model(addr: SocketAddr, model: solaris_backend::ModelParameters) -> Backend {
     Backend::new(TurnPlan {
         endpoint: Endpoint {
             wire: Wire::OpenAiChat,
@@ -133,8 +140,7 @@ fn backend(addr: SocketAddr) -> Backend {
             label: "local".into(),
             env_keys: &[],
         },
-        model: "test-model".to_string(),
-        max_tokens: 4096,
+        model,
 
         prompt_cache_key: None,
     })
@@ -290,8 +296,7 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
             label: "local".into(),
             env_keys: &[],
         },
-        model: "native-model".into(),
-        max_tokens: 1234,
+        model: solaris_backend::testing::parameters("native-model", 1234),
 
         prompt_cache_key: None,
     })
@@ -488,15 +493,9 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
     .with_tools(true)
     .with_context_window(8192)
     .with_max_output_tokens(4096);
-    let model = backend(addr).with_model_facts(
-        "test-model".into(),
-        4096,
-        rig_core::catalog::ModelFacts::new(spec),
-        solaris_backend::ModelCapabilities {
-            context_window: Some(8192),
-            max_output: Some(4096),
-            ..Default::default()
-        },
+    let model = backend_with_model(
+        addr,
+        solaris_backend::ModelParameters::new(spec, Some(4096), true),
     );
     let mut options = AgentOptions::in_directory(directory.path());
     options.compaction.keep_recent_tokens = 1;

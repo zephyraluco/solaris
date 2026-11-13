@@ -107,6 +107,25 @@ fn backend_with(
     max_tokens: u32,
     price: Option<rig_core::catalog::Pricing>,
 ) -> Backend {
+    let mut spec = rig_core::catalog::ModelSpec::new(
+        rig_core::providers::registry::ProviderId::declare("test").unwrap(),
+        model,
+    )
+    .with_tools(true);
+    spec.pricing = price;
+    spec.input.image = true;
+    backend_with_parameters(
+        addr,
+        wire,
+        solaris_backend::ModelParameters::new(spec, Some(max_tokens), true),
+    )
+}
+
+fn backend_with_parameters(
+    addr: SocketAddr,
+    wire: Wire,
+    model: solaris_backend::ModelParameters,
+) -> Backend {
     Backend::new(TurnPlan {
         endpoint: Endpoint {
             wire,
@@ -117,26 +136,49 @@ fn backend_with(
             label: "local".into(),
             env_keys: &[],
         },
-        model: model.to_string(),
-        max_tokens,
+        model,
         prompt_cache_key: None,
     })
-    .map(|backend| {
-        let mut spec = rig_core::catalog::ModelSpec::new(
-            rig_core::providers::registry::ProviderId::declare("test").unwrap(),
-            model,
-        )
-        .with_tools(true);
-        spec.pricing = price;
-        spec.input.image = true;
-        backend.with_model_facts(
-            model.into(),
-            max_tokens,
-            rig_core::catalog::ModelFacts::new(spec),
-            Default::default(),
-        )
-    })
     .expect("client")
+}
+
+#[tokio::test]
+async fn structured_output_metadata_does_not_override_rigs_native_tool_schema_policy() {
+    let (addr, seen) = serve(response(
+        "200 OK",
+        "text/event-stream",
+        &completion(Wire::OpenAiChat),
+    ))
+    .await;
+    let mut spec = rig_core::catalog::ModelSpec::new(
+        rig_core::providers::registry::ProviderId::declare("test").unwrap(),
+        "test",
+    )
+    .with_tools(true);
+    spec.structured_output = true;
+    let model = backend_with_parameters(
+        addr,
+        Wire::OpenAiChat,
+        solaris_backend::ModelParameters::new(spec, Some(100), true),
+    );
+    let schema = serde_json::json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false});
+    let mut input = turn();
+    input.tools.push(solaris_backend::ToolSpec::new(
+        "read",
+        "Read",
+        schema.clone(),
+    ));
+    let events: Vec<_> = model.complete(input).await.unwrap().collect().await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnComplete { .. })
+    ));
+    let raw = seen.await.unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let tool = &body["tools"][0]["function"];
+    assert_ne!(tool.get("strict"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(tool["parameters"], schema);
 }
 
 fn turn() -> TurnRequest {
@@ -272,17 +314,20 @@ async fn a_responses_turn_streams_over_a_real_socket() {
                 event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":2}}}\n\n";
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
 
-    let events: Vec<AgentEvent> = backend_with(
+    let mut spec = rig_core::catalog::Catalog::builtin()
+        .resolve("openai/gpt-5")
+        .unwrap()
+        .spec
+        .clone();
+    spec.pricing = Some(
+        rig_core::catalog::Pricing::new(1.25, 10.00)
+            .with_cache_read(0.125)
+            .with_cache_write(0.00),
+    );
+    let events: Vec<AgentEvent> = backend_with_parameters(
         addr,
         Wire::OpenAiResponses,
-        "gpt-5",
-        128_000,
-        // The rate the catalogue would have handed over.
-        Some(
-            rig_core::catalog::Pricing::new(1.25, 10.00)
-                .with_cache_read(0.125)
-                .with_cache_write(0.00),
-        ),
+        solaris_backend::ModelParameters::new(spec, Some(128_000), true),
     )
     .complete(turn())
     .await
@@ -530,7 +575,7 @@ fn completion(wire: Wire) -> String {
 
 #[tokio::test]
 async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_metadata() {
-    use solaris_backend::{Content, InlineImage, MessageContext, ToolCall, ToolResult};
+    use solaris_backend::{Content, InlineImage, ToolCall, ToolResult};
     for wire in [
         Wire::OpenAiChat,
         Wire::OpenAiResponses,
@@ -541,7 +586,7 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
             data: "aW1hZ2U=".into(),
         };
         for tool_image in [false, true] {
-            let mut history = if tool_image {
+            let history = if tool_image {
                 let call = ToolCall::new(
                     "image-call",
                     "read",
@@ -549,6 +594,7 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                 );
                 let mut result = ToolResult::ok(&call, "image result");
                 result.metadata.images.push(image.clone());
+                result.metadata.details = serde_json::json!({"journal": "journal-only-marker"});
                 vec![Message::tool_use(call), Message::tool_result(result)]
             } else {
                 vec![Message::with_content(
@@ -561,11 +607,6 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                     ],
                 )]
             };
-            history[0].context = Some(MessageContext::Measurement {
-                usage: Usage::new(99999, 1),
-                base_id: "private-base".into(),
-                request_id: "private-request".into(),
-            });
             let (addr, seen) =
                 serve(response("200 OK", "text/event-stream", &completion(wire))).await;
             let mut input = TurnRequest::new(history, "");
@@ -589,11 +630,7 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
             let request = seen.await.expect("request");
             let body = request.split_once("\r\n\r\n").expect("body").1;
             assert!(body.contains("aW1hZ2U="), "{wire:?}: {body}");
-            assert!(
-                !body.contains("private-base")
-                    && !body.contains("private-request")
-                    && !body.contains("99999")
-            );
+            assert!(!body.contains("journal-only-marker"), "{body}");
             if tool_image {
                 assert!(
                     body.contains("image-call") && body.contains("image result"),
@@ -775,8 +812,7 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
             label: "custom".into(),
             env_keys: &[],
         },
-        model: "test".into(),
-        max_tokens: 100,
+        model: solaris_backend::testing::parameters("test", 100),
 
         prompt_cache_key: None,
     })

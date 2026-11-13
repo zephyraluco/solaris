@@ -1,8 +1,4 @@
-#[cfg(feature = "test-utils")]
-use crate::Usage;
 use crate::{BackendError, Content, Role};
-#[cfg(feature = "test-utils")]
-use rig_core::completion::Usage as RigUsage;
 use rig_core::message::{self as rig, AssistantContent, AssistantMessage, UserContent};
 
 fn message_to_native(message: &crate::Message) -> Result<rig::Message, BackendError> {
@@ -52,19 +48,6 @@ fn message_to_native(message: &crate::Message) -> Result<rig::Message, BackendEr
 
 fn name(value: &str) -> Result<rig::ToolName, BackendError> {
     rig::ToolName::new(value).map_err(|error| BackendError::new(error.to_string()))
-}
-
-#[cfg(feature = "test-utils")]
-pub(crate) fn usage(value: RigUsage) -> Usage {
-    let read = value.cached_input_tokens.unwrap_or(0);
-    let write = value.cache_creation_input_tokens.unwrap_or(0);
-    let input = value
-        .input_tokens
-        .unwrap_or(0)
-        .saturating_sub(read.saturating_add(write));
-    let bounded = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
-    Usage::new(bounded(input), bounded(value.output_tokens.unwrap_or(0)))
-        .with_cache(bounded(read), bounded(write))
 }
 
 fn media_type(value: &str) -> Result<rig::ImageMediaType, BackendError> {
@@ -183,20 +166,4 @@ fn inline_image(image: &rig::Image) -> Option<crate::InlineImage> {
         media_type: media_type.into(),
         data: data.clone(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn cached_input_is_not_counted_twice() {
-        let mut measured = RigUsage::new();
-        measured.input_tokens = Some(1000);
-        measured.output_tokens = Some(50);
-        measured.cached_input_tokens = Some(700);
-        measured.cache_creation_input_tokens = Some(100);
-        let converted = usage(measured);
-        assert_eq!(converted, Usage::new(200, 50).with_cache(700, 100));
-        assert_eq!(converted.total(), 1050);
-    }
 }

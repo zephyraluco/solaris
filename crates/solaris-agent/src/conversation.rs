@@ -192,35 +192,11 @@ impl Conversation {
     }
     pub(crate) fn snapshot(&self) -> Vec<Message> {
         match self.native() {
-            Ok(conversation) => {
-                let saved: std::collections::BTreeMap<_, _> = conversation
-                    .asides()
-                    .filter_map(|(_, aside)| {
-                        (aside.kind == "solaris.context")
-                            .then(|| {
-                                aside.after.zip(
-                                    serde_json::from_value::<solaris_backend::MessageContext>(
-                                        aside.value.clone(),
-                                    )
-                                    .ok(),
-                                )
-                            })
-                            .flatten()
-                    })
-                    .collect();
-                conversation
-                    .messages()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, message)| {
-                        let mut message = Message::from(message.as_ref());
-                        message.context = conversation
-                            .id(index)
-                            .and_then(|id| saved.get(&id).cloned());
-                        message
-                    })
-                    .collect()
-            }
+            Ok(conversation) => conversation
+                .messages()
+                .iter()
+                .map(|message| Message::from(message.as_ref()))
+                .collect(),
             Err(error) => {
                 self.failed(error);
                 Vec::new()
@@ -234,17 +210,6 @@ impl Conversation {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut conversation = self.native()?;
             conversation.extend([rig_core::message::Message::try_from(&message)?]);
-            if let Some(context) = &message.context {
-                let after = conversation.id(conversation.messages().len() - 1);
-                conversation.add_aside(
-                    rig_core::conversation::Aside::new(
-                        "solaris.context",
-                        rig_core::conversation::Author::plugin("solaris"),
-                        serde_json::to_value(context)?,
-                    )
-                    .after(after),
-                );
-            }
             rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
             Ok(())
         })();
@@ -271,18 +236,6 @@ impl Conversation {
                     .map(rig_core::conversation::Entry::new),
                 rig_core::conversation::Author::plugin("solaris"),
             );
-            for (index, message) in messages.iter().enumerate() {
-                if let Some(context) = &message.context {
-                    conversation.add_aside(
-                        rig_core::conversation::Aside::new(
-                            "solaris.context",
-                            rig_core::conversation::Author::plugin("solaris"),
-                            serde_json::to_value(context)?,
-                        )
-                        .after(conversation.id(index)),
-                    );
-                }
-            }
             rig_memory::save(&self.storage(), "conversation", &mut conversation)?;
             Ok(())
         })();

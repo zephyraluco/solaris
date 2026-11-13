@@ -122,6 +122,12 @@ mod tests {
     #[tokio::test]
     async fn cost_budget_stops_when_rig_does_not_report_a_charge() {
         use solaris_backend::{Backend, Endpoint, TurnPlan, Wire};
+        let mut spec = solaris_backend::testing::parameters("test", 100)
+            .facts()
+            .spec()
+            .unwrap()
+            .clone();
+        spec.pricing = Some(rig_core::catalog::Pricing::new(1.0, 1.0));
         let inner = Backend::new(TurnPlan {
             endpoint: Endpoint {
                 wire: Wire::OpenAiChat,
@@ -132,8 +138,7 @@ mod tests {
                 label: "test".into(),
                 env_keys: &[],
             },
-            model: "test".into(),
-            max_tokens: 100,
+            model: solaris_backend::ModelParameters::new(spec, Some(100), true),
             prompt_cache_key: None,
         })
         .unwrap();

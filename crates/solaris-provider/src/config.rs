@@ -1,8 +1,9 @@
 //! Model facts come exclusively from the official catalog.
-use rig_core::catalog::{Catalog, ModelFacts, ModelSpec};
+use rig_core::catalog::{Catalog, ModelSpec};
 use rig_core::providers::registry::ProviderId;
 use serde::{Deserialize, Serialize};
-use solaris_types::{ModelCapabilities, Support};
+#[cfg(test)]
+use solaris_types::Support;
 use std::{collections::BTreeMap, sync::Arc};
 
 const MANUFACTURERS: &[&str] = &[
@@ -78,29 +79,16 @@ pub struct ResolvedModel {
     pub request_id: String,
     pub metadata: Option<String>,
     pub name: String,
-    pub output_tokens: u32,
-    pub capabilities: ModelCapabilities,
+    #[serde(flatten)]
+    pub parameters: solaris_backend::ModelParameters,
     pub reference_price: bool,
     #[serde(skip)]
     pub(crate) format: Option<rig_core::providers::registry::Format>,
-    #[serde(serialize_with = "serialize_facts")]
-    pub facts: ModelFacts,
 }
 
-fn serialize_facts<S: serde::Serializer>(
-    facts: &ModelFacts,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    facts.spec().serialize(serializer)
-}
 impl ResolvedModel {
     pub fn without_pricing(mut self) -> Self {
-        if let Some(spec) = self.facts.spec() {
-            let mut spec = spec.clone();
-            spec.pricing = None;
-            self.facts = ModelFacts::new(spec).with_catalog(&Catalog::default());
-        }
-        self.capabilities.price_known = Some(false);
+        self.parameters = self.parameters.without_pricing();
         self.reference_price = false;
         self
     }
@@ -235,31 +223,19 @@ impl ProviderConfig {
         // Bind metadata to the wire's requested alias, under a declared identity.
         spec.provider = ProviderId::declare("solaris").expect("valid declared vendor");
         spec.id = request_id.into();
-        let mut capabilities = capabilities(&spec, known);
-        let output_tokens = output_budget(
-            &capabilities,
-            selection.and_then(|s| s.output_tokens).unwrap_or(
-                crate::DEFAULT_MAX_OUTPUT
-                    .min(
-                        capabilities
-                            .context_window
-                            .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
-                            / 4,
-                    )
-                    .max(1),
-            ),
+        let parameters = solaris_backend::ModelParameters::new(
+            spec,
+            selection.and_then(|s| s.output_tokens),
+            known,
         );
-        capabilities.output_budget = Some(output_tokens);
         ResolvedModel {
             provider_id: provider.into(),
             request_id: request_id.into(),
             metadata,
             name,
-            output_tokens,
-            capabilities,
+            parameters,
             reference_price,
             format,
-            facts: ModelFacts::new(spec).with_catalog(&Catalog::default()),
         }
     }
     /// Official catalog rows and explicitly configured aliases for the picker.
@@ -306,7 +282,7 @@ impl ProviderConfig {
                 solaris_backend::Wire::AnthropicMessages
             }
             Some(rig_core::providers::registry::Format::OpenAi) => {
-                if model.facts.spec().is_some_and(|s| {
+                if model.parameters.facts().spec().is_some_and(|s| {
                     matches!(
                         s.compat.chat_tools,
                         Some(rig_core::catalog::ChatTools::Never)
@@ -320,52 +296,6 @@ impl ProviderConfig {
             _ => fallback,
         }
     }
-}
-fn capabilities(spec: &ModelSpec, known: bool) -> ModelCapabilities {
-    fn support(value: bool, known: bool) -> Support {
-        if !known {
-            Support::Unknown
-        } else if value {
-            Support::Supported
-        } else {
-            Support::Unsupported
-        }
-    }
-    ModelCapabilities {
-        tool_calling: support(spec.tools, known),
-        structured_output: support(spec.structured_output, known),
-        image_input: support(spec.input.image, known),
-        reasoning: support(spec.reasoning.supported(), known),
-        prompt_caching: if spec.caching.retention.is_empty() {
-            Support::Unknown
-        } else {
-            Support::Supported
-        },
-        temperature: match spec.sampling {
-            Some(rig_core::catalog::Sampling::Any) => Support::Supported,
-            Some(rig_core::catalog::Sampling::Never) => Support::Unsupported,
-            _ => Support::Unknown,
-        },
-        context_window: spec.context_window,
-        max_input: spec.max_input_tokens,
-        max_output: spec.max_output_tokens,
-        price_known: Some(spec.pricing.is_some()),
-        ..Default::default()
-    }
-}
-
-fn output_budget(capabilities: &ModelCapabilities, requested: u32) -> u32 {
-    capabilities
-        .max_output
-        .unwrap_or(crate::DEFAULT_MAX_OUTPUT)
-        .min(requested)
-        .min(
-            capabilities
-                .context_window
-                .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW)
-                .saturating_sub(1)
-                .max(1),
-        )
 }
 
 #[cfg(test)]
@@ -399,7 +329,10 @@ mod tests {
         let gateway = catalog.resolve("new-api", "claude-sonnet-4-5");
         assert_eq!(gateway.request_id, "claude-sonnet-4-5");
         assert_eq!(gateway.metadata, official.metadata);
-        assert_eq!(gateway.capabilities, official.capabilities);
+        assert_eq!(
+            gateway.parameters.capabilities(),
+            official.parameters.capabilities()
+        );
         assert!(gateway.reference_price);
         assert!(!official.reference_price);
     }
@@ -408,8 +341,11 @@ mod tests {
         let catalog = ProviderConfig::from_json(r#"{"models":{"fast":{"provider":"new-api","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}}"#).expect("configuration");
         let model = catalog.resolve("new-api", "fast");
         assert_eq!(model.request_id, "private-alias");
-        assert_eq!(model.output_tokens, 4096);
-        assert_eq!(model.facts.spec().expect("facts").id, "private-alias");
+        assert_eq!(model.parameters.output_tokens(), 4096);
+        assert_eq!(
+            model.parameters.facts().spec().expect("facts").id,
+            "private-alias"
+        );
         assert!(model.metadata.expect("metadata").starts_with("anthropic/"));
         assert_eq!(catalog.resolve("other", "fast").metadata, None);
     }
@@ -417,9 +353,12 @@ mod tests {
     fn unknown_and_wrong_vendor_do_not_invent_metadata() {
         let catalog = ProviderConfig::default();
         let unknown = catalog.resolve("local", "unlisted-model");
-        assert_eq!(unknown.capabilities.tool_calling, Support::Unknown);
-        assert_eq!(unknown.capabilities.context_window, None);
-        assert_eq!(unknown.capabilities.price_known, Some(false));
+        assert_eq!(
+            unknown.parameters.capabilities().tool_calling,
+            Support::Unknown
+        );
+        assert_eq!(unknown.parameters.capabilities().context_window, None);
+        assert_eq!(unknown.parameters.capabilities().price_known, Some(false));
         assert!(catalog.resolve("anthropic", "gpt-5").metadata.is_none());
         assert!(ProviderConfig::from_json(r#"{"models":{"x":{"provider":"new-api","request_id":"x","metadata":"anthropic/not-listed"}}}"#).is_err());
     }
@@ -427,10 +366,15 @@ mod tests {
     fn official_override_parser_updates_facts_and_limits() {
         let catalog = ProviderConfig::from_json(r#"{"overrides":{"anthropic":{"models":{"claude-sonnet-4-5":{"limit":{"context":32000,"output":2000}}}}}}"#).expect("override");
         let model = catalog.resolve("anthropic", "claude-sonnet-4-5");
-        assert_eq!(model.capabilities.context_window, Some(32000));
-        assert_eq!(model.output_tokens, 2000);
+        assert_eq!(model.parameters.capabilities().context_window, Some(32000));
+        assert_eq!(model.parameters.output_tokens(), 2000);
         assert_eq!(
-            model.facts.spec().expect("facts").context_window,
+            model
+                .parameters
+                .facts()
+                .spec()
+                .expect("facts")
+                .context_window,
             Some(32000)
         );
     }

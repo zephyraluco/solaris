@@ -219,27 +219,14 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
     // Everything platform-specific is decided here, so the backend can stay a
     // transport: which model, how long a reply, what it costs, and whether a
     // prompt-cache key rides along.
-    let mut capabilities = resolved.capabilities.clone();
-    if chatgpt.is_some() {
-        capabilities.price_known = Some(false);
-    }
     let plan = TurnPlan {
-        max_tokens: resolved.output_tokens,
-
         prompt_cache_key,
-        model: resolved.request_id.clone(),
+        model: resolved.parameters,
         endpoint,
     };
 
     match Backend::new(plan) {
         Ok(backend) => {
-            let facts = resolved.facts;
-            let backend = backend.with_model_facts(
-                resolved.request_id,
-                resolved.output_tokens,
-                facts,
-                capabilities,
-            );
             let backend = match chatgpt {
                 Some((account, expiry)) => backend.with_chatgpt(account, expiry),
                 None => backend,
@@ -328,18 +315,12 @@ fn configured_backend(
             label: provider.into(),
             env_keys: &[],
         },
-        model: resolved.request_id.clone(),
-        max_tokens: resolved.output_tokens,
+        model: resolved.parameters,
 
         prompt_cache_key: None,
     };
     let backend = match Backend::new(plan) {
-        Ok(backend) => backend.with_model_facts(
-            resolved.request_id,
-            resolved.output_tokens,
-            resolved.facts,
-            resolved.capabilities,
-        ),
+        Ok(backend) => backend,
         Err(error) => {
             return BackendChoice::unconnected(
                 CredentialSource::Missing,

@@ -102,10 +102,39 @@ pub fn tokens_for_characters(characters: usize) -> u32 {
     (characters as u32).div_ceil(4)
 }
 
+impl From<rig_core::completion::Usage> for Usage {
+    fn from(value: rig_core::completion::Usage) -> Self {
+        let read = value.cached_input_tokens.unwrap_or(0);
+        let write = value.cache_creation_input_tokens.unwrap_or(0);
+        let bounded = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        Usage::new(
+            bounded(
+                value
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_sub(read.saturating_add(write)),
+            ),
+            bounded(value.output_tokens.unwrap_or(0)),
+        )
+        .with_cache(bounded(read), bounded(write))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_input_is_not_counted_twice() {
+        let mut measured = rig_core::completion::Usage::new();
+        measured.input_tokens = Some(1000);
+        measured.output_tokens = Some(50);
+        measured.cached_input_tokens = Some(700);
+        measured.cache_creation_input_tokens = Some(100);
+        let converted = Usage::from(measured);
+        assert_eq!(converted, Usage::new(200, 50).with_cache(700, 100));
+        assert_eq!(converted.total(), 1050);
+    }
     #[test]
     fn buckets_add_up() {
         let usage = Usage::new(100, 40).with_cache(1_000, 200);

@@ -5506,7 +5506,8 @@ mod tests {
         let expected = app
             .provider_config
             .resolve("anthropic", app.model())
-            .capabilities
+            .parameters
+            .capabilities()
             .context_window
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         assert_eq!(app.config.context_window, u64::from(expected));
@@ -5519,7 +5520,8 @@ mod tests {
         let expected = app
             .provider_config
             .resolve("anthropic", app.model())
-            .capabilities
+            .parameters
+            .capabilities()
             .context_window
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         assert_eq!(app.config.context_window, u64::from(expected));

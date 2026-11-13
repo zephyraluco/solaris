@@ -16,7 +16,6 @@ impl crate::Backend {
                 session_header: self.endpoint.session_header,
                 session: super::client::session_id(),
                 account: self.chatgpt.as_ref().map(|(account, _)| account.clone()),
-                capabilities: self.capabilities.clone(),
                 repairs: repairs.to_vec(),
             },
         )
@@ -26,7 +25,6 @@ struct RequestOptions {
     session_header: Option<&'static str>,
     session: &'static str,
     account: Option<String>,
-    capabilities: crate::ModelCapabilities,
     repairs: Vec<crate::policy::Repair>,
 }
 impl HttpMiddleware for RequestOptions {
@@ -66,17 +64,11 @@ impl HttpMiddleware for RequestOptions {
         bytes: Bytes,
     ) -> WasmBoxedFuture<'a, Result<Bytes>> {
         Box::pin(async move {
-            use crate::Support;
-            let enforce = !self.repairs.is_empty()
-                || self.capabilities.streaming_usage == Support::Unsupported
-                || self.capabilities.prompt_caching == Support::Unsupported
-                || self.capabilities.structured_output == Support::Supported;
-            if bytes.is_empty() || !enforce {
+            if bytes.is_empty() || self.repairs.is_empty() {
                 return Ok(bytes);
             }
             let mut body: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(rig_core::http_client::Error::instance)?;
-            crate::policy::apply_capabilities(&mut body, &self.capabilities);
             for repair in &self.repairs {
                 crate::policy::apply_repair(&mut body, *repair);
             }

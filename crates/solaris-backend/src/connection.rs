@@ -164,9 +164,7 @@ impl Backend {
         if self.endpoint.wire == crate::Wire::OpenAiResponses {
             params["store"] = false.into();
         }
-        if let Some(key) = self.prompt_cache_key
-            && self.capabilities.prompt_caching != crate::Support::Unsupported
-        {
+        if let Some(key) = self.prompt_cache_key {
             params["prompt_cache_key"] = key.into();
         }
         request.additional_params = Some(params);
@@ -181,6 +179,9 @@ impl Backend {
 mod tests {
     use super::*;
     fn backend() -> Backend {
+        backend_with_model(crate::testing::parameters("test", 100))
+    }
+    fn backend_with_model(model: crate::ModelParameters) -> Backend {
         Backend::new(crate::TurnPlan {
             endpoint: crate::Endpoint {
                 wire: crate::Wire::OpenAiResponses,
@@ -191,8 +192,7 @@ mod tests {
                 label: "test".into(),
                 env_keys: &[],
             },
-            model: "test".into(),
-            max_tokens: 100,
+            model,
 
             prompt_cache_key: None,
         })
@@ -200,18 +200,13 @@ mod tests {
     }
     #[test]
     fn settlement_uses_only_sdk_cost_and_preserves_missing_cost_for_observers() {
-        use rig_core::catalog::{ModelFacts, ModelSpec, Pricing};
+        use rig_core::catalog::{ModelSpec, Pricing};
         let mut spec = ModelSpec::new(
             rig_core::providers::registry::ProviderId::declare("test").unwrap(),
             "test",
         );
         spec.pricing = Some(Pricing::new(999.0, 999.0));
-        let backend = backend().with_model_facts(
-            "test".into(),
-            100,
-            ModelFacts::new(spec),
-            Default::default(),
-        );
+        let backend = backend_with_model(crate::ModelParameters::new(spec, Some(100), true));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
         let client = ModelClient::native(backend)

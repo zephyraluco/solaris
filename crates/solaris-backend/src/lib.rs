@@ -6,6 +6,8 @@
 //! provider layer, while conversation and execution policy belong to the agent.
 
 mod client;
+mod parameters;
+pub use parameters::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelParameters};
 mod connection;
 mod discovery;
 pub use connection::ModelClient;
@@ -23,7 +25,7 @@ mod wire;
 pub use client::{Backend, Endpoint, TurnPlan};
 pub use event::{AgentEvent, BackendError};
 pub use http::IDLE_TIMEOUT;
-pub use message::{Content, Message, MessageContext, Role};
+pub use message::{Content, Message, Role};
 pub use tool::{ToolCall, ToolResult, ToolSpec};
 pub use usage::{Usage, tokens_for_characters};
 pub use wire::Wire;

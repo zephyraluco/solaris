@@ -37,7 +37,7 @@
 - 子任务沿用共享预算和计费链。后台执行是 Solaris 的生命周期服务，模型和工具执行仍由 SDK 完成。
 - Recorder 只保留 effect 标识、状态、请求标识和用量等元数据，不复制完整请求、参数、原始响应或认证信息。
 
-持久会话使用 `sessions/memory/<SESSION_ID>`；只有不存在官方 memory 时才导入旧 SQLite 消息。上下文估算使用官方 Prepared、RequestStart、Anchor 与 next_request_tokens。锚点只在进程内保存；恢复、替换、压缩或请求配置变化后重新估算，不将旧计费值当作上下文占用。UI 与预算读取同一投影；投影引用 SDK 原生消息，不写入 memory。旧版上下文 aside 只为读取兼容保留。
+持久会话使用 `sessions/memory/<SESSION_ID>`；只有不存在官方 memory 时才导入旧 SQLite 消息。上下文估算使用官方 Prepared、RequestStart、Anchor 与 next_request_tokens。锚点只在进程内保存；恢复、替换、压缩或请求配置变化后重新估算，不将旧计费值当作上下文占用。UI 与预算读取同一投影；投影引用 SDK 原生消息，不写入 memory。旧版上下文测量元数据的读写已移除。
 
 ## 验证
 
@@ -79,3 +79,11 @@ ModelFacts，编码和标准参考费用均使用官方实现。认证仍通过�
 显示适配仅位于开发依赖启用的 test-utils 中，不属于生产 API。
 费用只读取 Rig 的 usage.cost；不再按 token 重新估算。缺失费用保留为缺失，
 账本仅累加已知金额；启用费用预算时缺失费用会停止执行，避免被当作免费请求。
+
+## 冗余实现清理
+
+Backend 通过 TurnPlan.model 一次接收 ModelParameters，删除临时模型事实和事后覆盖接口。
+能力与请求预算从官方模型事实派生，默认预算常量统一定义。删除 HTTP 能力改写、
+自建 strict schema 检查以及旧 MessageContext / solaris.context 兼容逻辑。
+模型回复、摘要与测试使用同一个原生 usage 转换。测试改用完整原生参数构造，
+并验证参数一致性、缓存 token 计数和 SDK 工具策略不会被 HTTP 层覆盖。

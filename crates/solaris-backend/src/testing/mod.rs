@@ -109,3 +109,15 @@ pub trait NativeRequest: crate::AgentBackend + Clone + Sized + 'static {
     }
 }
 impl NativeRequest for crate::Backend {}
+
+/// Explicit native facts for unpriced HTTP test models.
+pub fn parameters(id: &str, output_tokens: u32) -> crate::ModelParameters {
+    let mut spec = rig_core::catalog::ModelSpec::new(
+        rig_core::providers::registry::ProviderId::declare("fixture").unwrap(),
+        id,
+    )
+    .with_tools(true)
+    .with_max_output_tokens(output_tokens);
+    spec.input.image = true;
+    crate::ModelParameters::new(spec, Some(output_tokens), true)
+}

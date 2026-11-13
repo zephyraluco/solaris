@@ -709,7 +709,7 @@ async fn compact_memory(
         };
         outcome.usage =
             if response.usage.input_tokens.is_some() || response.usage.output_tokens.is_some() {
-                driver::usage(response.usage)
+                Usage::from(response.usage)
             } else {
                 Usage::estimate(input, response.text().chars().count())
             };
@@ -726,14 +726,6 @@ async fn compact_memory(
     state.summary = summary.clone();
     if rig_memory::apply_summary(&mut native, keep, &state).is_none() {
         return outcome;
-    }
-    let old_measurements: Vec<_> = native
-        .asides()
-        .filter(|(_, aside)| aside.kind == "solaris.context")
-        .map(|(id, _)| id)
-        .collect();
-    for id in old_measurements {
-        native.remove_aside(id);
     }
     if let Err(error) = rig_memory::save(&conversation.storage(), "conversation", &mut native) {
         conversation.failed(error);
