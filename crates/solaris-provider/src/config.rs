@@ -92,7 +92,7 @@ fn serialize_facts<S: serde::Serializer>(
     facts.spec().serialize(serializer)
 }
 impl ResolvedModel {
-    pub(crate) fn without_pricing(mut self) -> Self {
+    pub fn without_pricing(mut self) -> Self {
         if let Some(spec) = self.facts.spec() {
             let mut spec = spec.clone();
             spec.pricing = None;
@@ -107,6 +107,13 @@ impl ResolvedModel {
 impl ProviderConfig {
     /// New configuration: named selections and an official catalog override object.
     pub fn from_json(text: &str) -> Result<Self, String> {
+        Self::parse(text, None)
+    }
+    /// Load cached upstream facts before checking explicit model references.
+    pub fn from_json_with_cache(text: &str, directory: &std::path::Path) -> Result<Self, String> {
+        Self::parse(text, Some(directory))
+    }
+    fn parse(text: &str, directory: Option<&std::path::Path>) -> Result<Self, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Config {
@@ -129,6 +136,8 @@ impl ProviderConfig {
                 || model.provider.is_empty()
                 || model.request_id.is_empty()
                 || model.output_tokens == Some(0)
+                || (crate::provider_spec(&model.provider).is_none()
+                    && !config.providers.contains_key(&model.provider))
             {
                 return Err("model selections need a name, provider, request_id and a positive output budget".into());
             }
@@ -153,16 +162,27 @@ impl ProviderConfig {
         let base = Catalog::builtin();
         let patch = Catalog::from_overrides(&overrides, base).map_err(|e| e.to_string())?;
         let catalog = base.with_overrides(&patch);
-        for selection in config.models.values() {
-            if let Some(reference) = &selection.metadata {
-                catalog.resolve(reference).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(Self {
+        let result = Self {
             catalog: crate::catalog::ModelCatalog::new(catalog, overrides),
             selections: Arc::new(config.models),
             endpoints: Arc::new(config.providers),
-        })
+        };
+        if let Some(directory) = directory {
+            result.catalog.load_cache(directory);
+        }
+        {
+            let catalog = result
+                .catalog
+                .state
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            for selection in result.selections.values() {
+                if let Some(reference) = &selection.metadata {
+                    catalog.resolve(reference).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub fn selection(&self, name: &str) -> Option<&ModelSelection> {
@@ -186,14 +206,20 @@ impl ProviderConfig {
         let catalog = self.catalog.state.read().unwrap_or_else(|p| p.into_inner());
         let explicit = selection.and_then(|s| s.metadata.as_deref());
         let direct = format!("{vendor}/{request_id}");
-        let mut found = catalog.resolve(explicit.unwrap_or(&direct)).ok();
+        // Missing models are ordinary for local servers. `resolve` builds typo
+        // suggestions across the whole catalog; the hot path needs only lookup.
+        let lookup = |reference: &str| {
+            let (vendor, id) = reference.split_once('/')?;
+            catalog.get(ProviderId::catalog(vendor)?, id)
+        };
+        let mut found = lookup(explicit.unwrap_or(&direct));
         if found.is_none()
             && explicit.is_none()
             && !catalog.iter().any(|s| s.provider.vendor() == vendor)
         {
             let mut matches = MANUFACTURERS
                 .iter()
-                .filter_map(|vendor| catalog.resolve(&format!("{vendor}/{request_id}")).ok());
+                .filter_map(|vendor| lookup(&format!("{vendor}/{request_id}")));
             let first = matches.next();
             if matches.next().is_none() {
                 found = first;

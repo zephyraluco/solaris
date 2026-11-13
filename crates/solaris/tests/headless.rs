@@ -107,7 +107,7 @@ fn serve_responses(
 #[test]
 fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let directory = tempfile::tempdir().expect("directory");
-    std::fs::write(directory.path().join("models.json"), r#"{"models":[{"provider":"local","id":"test-model","capabilities":{"image_input":"supported"}}]}"#).expect("model metadata");
+    std::fs::write(directory.path().join("models.json"), r#"{"models":{"test-model":{"provider":"local","request_id":"test-model","metadata":"ollama/test-model"}},"overrides":{"ollama":{"models":{"test-model":{"tool_call":true,"reasoning":false,"modalities":{"input":["text","image"],"output":["text"]}}}}}}"#).expect("model metadata");
     let image_path = directory.path().join("pixel.png");
     std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npayload").expect("image fixture");
     let response = sse_reply(serde_json::json!({"content":"headless smoke ok"}), "stop");
@@ -468,12 +468,12 @@ fn headless_confirmation_preserves_automatic_reads_and_refuses_required_approval
             args.push("--plan");
         }
         let output = run(directory.path(), &endpoint, &args);
-        let requests = server.join().expect("fixture server");
         assert!(
             output.status.success(),
             "{case}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let requests = server.join().expect("fixture server");
         let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
             .expect("UTF8")
             .lines()
@@ -504,4 +504,40 @@ fn headless_confirmation_preserves_automatic_reads_and_refuses_required_approval
         }
         assert!(!target.exists(), "confirmation must not allow writes");
     }
+}
+
+#[test]
+fn named_model_routes_to_custom_endpoint_with_original_request_alias() {
+    let directory = tempfile::tempdir().expect("directory");
+    let (endpoint, server) = serve_responses(vec![sse_reply(
+        serde_json::json!({"content":"named route ok"}),
+        "stop",
+    )]);
+    let config = serde_json::json!({
+        "providers":{"gateway":{"protocol":"openai-chat","base_url":endpoint}},
+        "models":{"fast":{"provider":"gateway","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":2048}}
+    });
+    std::fs::write(directory.path().join("models.json"), config.to_string()).expect("config");
+    let output = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--model", "fast", "--print", "hello", "--ephemeral"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("named route ok"));
+    let requests = server.join().expect("server");
+    assert_eq!(requests[0]["model"], "private-alias");
+    let printed = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--model", "fast", "--print-config"],
+    );
+    assert!(printed.status.success());
+    let printed = String::from_utf8_lossy(&printed.stdout);
+    assert!(printed.contains("backend: gateway"), "{printed}");
+    assert!(printed.contains("anthropic/claude-sonnet-4-5"), "{printed}");
 }

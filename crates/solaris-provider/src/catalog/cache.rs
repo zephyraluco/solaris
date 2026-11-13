@@ -141,3 +141,23 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reference_tests {
+    #[test]
+    fn explicit_reference_can_use_a_model_only_present_in_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"anthropic":{"models":{"cached-only":{"name":"Cached","tool_call":true,"reasoning":false,"modalities":{"input":["text"],"output":["text"]},"limit":{"context":32000,"output":4096}}}}}"#;
+        std::fs::write(dir.path().join(super::FILE), raw).unwrap();
+        let config = r#"{"models":{"fast":{"provider":"new-api","request_id":"alias","metadata":"anthropic/cached-only"}}}"#;
+        assert!(crate::ProviderConfig::from_json(config).is_err());
+        let config = crate::ProviderConfig::from_json_with_cache(config, dir.path()).unwrap();
+        assert_eq!(
+            config
+                .resolve("new-api", "fast")
+                .capabilities
+                .context_window,
+            Some(32000)
+        );
+    }
+}

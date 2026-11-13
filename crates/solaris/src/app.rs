@@ -5493,8 +5493,8 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.model(), "claude-opus-4-1");
-        // An ID absent from the upstream snapshot uses conservative defaults.
-        assert_eq!(app.config.context_window, 128_000);
+        // The official catalog also supplies the selected model's limits.
+        assert_eq!(app.config.context_window, 200_000);
     }
 
     #[tokio::test]

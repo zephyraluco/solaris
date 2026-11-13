@@ -1,13 +1,7 @@
-//! Resolving a platform and its credential into a backend.
-//!
-//! This is the platform half of the workspace: it knows which providers exist
-//! (see [`crate::providers`]), how each authenticates, where its endpoint lives,
-//! which models it offers, and what they cost. [`choose_backend`] is the only
-//! entry point the application needs — it returns a backend already configured
-//! for the credentials at hand, so the UI never learns which platform it is
-//! talking to. Until `/connect` has stored something usable, an
-//! [`UnconnectedBackend`] stands in and answers every turn with what to do
-//! about that.
+//! Select routing and authentication, then bind official model facts.
+//! Custom endpoints and named selections share the same request preparation as
+//! built-in connection presets. Missing credentials or model names refuse model
+//! execution while allowing endpoint discovery when a connection exists.
 
 use std::sync::Arc;
 
@@ -248,7 +242,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
                 resolved.request_id,
                 resolved.output_tokens,
                 facts,
-                capabilities.clone(),
+                capabilities,
             );
             let account_authorized = chatgpt.is_some();
             let backend = match chatgpt {
@@ -283,7 +277,7 @@ pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) ->
                         configuration: Arc::clone(&options.configuration),
                         provider: spec.id.into(),
                         model: model.clone(),
-                        prototype: backend.clone(),
+                        prototype: backend,
                         account_authorized,
                     }),
                     cache_dir: options.model_cache_dir.clone(),
@@ -353,7 +347,7 @@ fn configured_backend(
             resolved.request_id,
             resolved.output_tokens,
             resolved.facts,
-            resolved.capabilities.clone(),
+            resolved.capabilities,
         ),
         Err(error) => {
             return BackendChoice::unconnected(
@@ -363,6 +357,20 @@ fn configured_backend(
             );
         }
     };
+    if model.is_empty() {
+        return BackendChoice {
+            backend: Arc::new(NamelessBackend {
+                endpoint: backend,
+                message: format!(
+                    "no model is named for {provider} — run /model <name> to pick one"
+                ),
+            }),
+            provider_id: Some(provider.into()),
+            base_url: Some(base_url),
+            model: model.into(),
+            source: CredentialSource::NoModel,
+        };
+    }
     let source = if credential.is_some() {
         CredentialSource::Stored
     } else {
@@ -1175,5 +1183,11 @@ mod configured_tests {
     fn endpoint_configuration_rejects_credentials_in_url_and_unknown_fields() {
         assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://secret@example.com/v1"}}}"#).is_err());
         assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://example.com/v1","api_key":"secret"}}}"#).is_err());
+        assert!(
+            crate::ProviderConfig::from_json(
+                r#"{"models":{"bad":{"provider":"typo-provider","request_id":"test"}}}"#
+            )
+            .is_err()
+        );
     }
 }

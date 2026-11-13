@@ -211,8 +211,11 @@ fn main() -> Result<()> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 backend_options.configuration = Arc::new(
-                    solaris_provider::ProviderConfig::from_json(&text)
-                        .map_err(anyhow::Error::msg)?,
+                    solaris_provider::ProviderConfig::from_json_with_cache(
+                        &text,
+                        &directory.join("model-cache"),
+                    )
+                    .map_err(anyhow::Error::msg)?,
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -280,8 +283,7 @@ fn main() -> Result<()> {
             Some(solaris_provider::Credential::ChatGpt { .. })
         ) && choice.provider_id.as_deref() == Some("openai")
         {
-            resolved.capabilities.price_known = Some(false);
-            resolved.reference_price = false;
+            resolved = resolved.without_pricing();
         }
         println!(
             "model parameters: {}",
