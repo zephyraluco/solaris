@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use solaris_agent::{
     Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions, Approval,
     BackendError, FnApprover, Mode, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
-    ToolOutput, ToolRegistry, ToolSelection, TurnRequest, Usage,
+    ToolOutput, ToolRegistry, ToolSelection, Usage,
 };
+use solaris_backend::testing::TurnRequest;
 use tokio::sync::{Barrier, Notify};
 
 fn complete(text: &str) -> Vec<AgentEvent> {
@@ -82,10 +83,21 @@ impl AgentBackend for Model {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-        Ok(solaris_backend::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "scripted"
+    }
+}
+impl Model {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = is_child(&request);
         let answered = request
             .history
@@ -146,9 +158,6 @@ impl AgentBackend for Model {
             calling("subagent", input)
         };
         Ok(Box::pin(futures::stream::iter(events)))
-    }
-    fn label(&self) -> &str {
-        "scripted"
     }
 }
 

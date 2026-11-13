@@ -3310,9 +3310,8 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{
-        BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, TurnRequest, Usage,
-    };
+    use solaris_agent::{BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
+    use solaris_backend::testing::TurnRequest;
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -3396,10 +3395,25 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
 
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        fn label(&self) -> &str {
+            "fake"
+        }
+
+        async fn models(&self) -> Result<Vec<String>, BackendError> {
+            self.models.clone().map_err(BackendError::new)
+        }
+    }
+    impl FakeBackend {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             let reply = format!(
                 "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
                 asked(&request)
@@ -3414,14 +3428,6 @@ mod tests {
                 },
             ];
             Ok(Box::pin(futures::stream::iter(events)))
-        }
-
-        fn label(&self) -> &str {
-            "fake"
-        }
-
-        async fn models(&self) -> Result<Vec<String>, BackendError> {
-            self.models.clone().map_err(BackendError::new)
         }
     }
 

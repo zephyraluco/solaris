@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use solaris_backend::{
-    AgentBackend, AgentEventStream, Backend, BackendError, Endpoint, TurnPlan, TurnRequest,
-};
+use solaris_backend::{AgentBackend, Backend, BackendError, Endpoint, TurnPlan};
 
 use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, provider_spec};
 use crate::{AuthStore, Credential};
@@ -32,10 +30,6 @@ impl UnconnectedBackend {
 #[async_trait::async_trait]
 impl AgentBackend for UnconnectedBackend {
     async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
-        Err(BackendError::new(self.message.clone()))
-    }
-
-    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         Err(BackendError::new(self.message.clone()))
     }
 
@@ -408,10 +402,6 @@ impl AgentBackend for NamelessBackend {
         Err(BackendError::new(self.message.clone()))
     }
 
-    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        Err(BackendError::new(self.message.clone()))
-    }
-
     fn label(&self) -> &str {
         self.endpoint.label()
     }
@@ -580,6 +570,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_backend::testing::TurnRequest;
 
     /// Options with a fixed environment, so tests never touch the process's
     /// variables or the network.
@@ -628,7 +619,7 @@ mod tests {
         assert_eq!(choice.provider_id.as_deref(), None);
         assert_eq!(choice.backend.label(), "unconnected");
 
-        let error = match choice.backend.run_turn(request()).await {
+        let error = match solaris_backend::testing::request(choice.backend, request()).await {
             Ok(_) => panic!("an unconnected backend must not answer"),
             Err(error) => error,
         };
@@ -748,7 +739,7 @@ mod tests {
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
-        let error = match choice.backend.run_turn(request()).await {
+        let error = match solaris_backend::testing::request(choice.backend, request()).await {
             Ok(_) => panic!("a model-less provider must not be asked"),
             Err(error) => error,
         };

@@ -15,8 +15,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
 use solaris_agent::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Role, ToolCall, TurnRequest, Usage,
+    AgentBackend, AgentEvent, AgentEventStream, BackendError, Role, ToolCall, Usage,
 };
+use solaris_backend::testing::TurnRequest;
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 
@@ -53,10 +54,21 @@ impl AgentBackend for FakeBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "fake"
+    }
+}
+impl FakeBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
             asked(&request)
@@ -70,10 +82,6 @@ impl AgentBackend for FakeBackend {
             },
         ];
         Ok(Box::pin(futures::stream::iter(events)))
-    }
-
-    fn label(&self) -> &str {
-        "fake"
     }
 }
 
@@ -92,10 +100,21 @@ impl AgentBackend for ToolBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "tool"
+    }
+}
+impl ToolBackend {
+    async fn respond(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let round = self.round.fetch_add(1, Ordering::Relaxed);
         let events = if round == 0 {
             vec![
@@ -120,10 +139,6 @@ impl AgentBackend for ToolBackend {
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
-
-    fn label(&self) -> &str {
-        "tool"
-    }
 }
 
 struct Harness {
@@ -143,10 +158,21 @@ impl AgentBackend for InspectingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "inspecting"
+    }
+}
+impl InspectingBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let answered = request
             .history
             .iter()
@@ -179,10 +205,6 @@ impl AgentBackend for InspectingBackend {
         });
         Ok(Box::pin(futures::stream::iter(events)))
     }
-
-    fn label(&self) -> &str {
-        "inspecting"
-    }
 }
 
 #[async_trait::async_trait]
@@ -190,10 +212,21 @@ impl AgentBackend for DelegatingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "delegating"
+    }
+}
+impl DelegatingBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = asked(&request).starts_with("You are an isolated");
         let answered = request
             .history
@@ -244,9 +277,6 @@ impl AgentBackend for DelegatingBackend {
                 cost_usd: 0.0,
             },
         ])))
-    }
-    fn label(&self) -> &str {
-        "delegating"
     }
 }
 

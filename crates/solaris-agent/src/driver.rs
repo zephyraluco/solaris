@@ -142,6 +142,10 @@ impl AgentHook for Policy {
             Ok(client) => client,
             Err(error) => return CompletionCallAction::stop(error.to_string()),
         };
+        let notices = self.tx.clone();
+        let client = client.with_status_observer(move |text| {
+            let _ = notices.send(AgentEvent::Status(text));
+        });
         let capabilities = client.capabilities();
         self.phase.lock().unwrap_or_else(|p| p.into_inner()).client = Some(client);
         let context = self
@@ -266,8 +270,7 @@ impl AgentHook for Policy {
                     .sum();
                 Usage::estimate(phase.input_characters, output)
             };
-            let measured = client.usage(measured);
-            let cost = match client.settle(measured) {
+            let cost = match client.settle(measured, response.usage.cost.map(|cost| cost.total)) {
                 Ok(cost) => cost,
                 Err(error) => return OutcomeAction::replace(Err(failure(error))),
             };

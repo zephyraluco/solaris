@@ -1,5 +1,6 @@
-//! Explicit adapter for injected event sources. Production providers use native models.
-use crate::{AgentBackend, AgentEvent, AgentEventStream, Message, ToolSpec, TurnRequest};
+//! Scripted test replies exposed as native Rig Serve handlers.
+use super::TurnRequest;
+use crate::{AgentEvent, AgentEventStream, BackendError, Message, ModelClient, ToolSpec};
 use futures::StreamExt;
 use rig_core::{
     completion::{CompletionResponse, FinishReason, Usage as NativeUsage},
@@ -9,23 +10,36 @@ use rig_core::{
     serve::{Dispatch, Reply, Serve},
     streaming::{Item, Part, PartKind, Relayed, StreamEvent},
 };
-use std::collections::VecDeque;
-use std::sync::Arc;
-
-pub(crate) struct EventModel<T: ?Sized> {
-    pub backend: Arc<T>,
-    pub reported: crate::connection::ReportedUsage,
+use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
+type Response = Pin<Box<dyn Future<Output = Result<AgentEventStream, BackendError>> + Send>>;
+struct Fixture {
+    reply: Box<dyn Fn(TurnRequest) -> Response + Send + Sync>,
 }
-fn error(message: impl ToString) -> ErrorReport {
-    ErrorReport::new(ErrorKind::Provider, message.to_string())
+pub fn client<F, Fut>(capabilities: crate::ModelCapabilities, reply: F) -> ModelClient
+where
+    F: Fn(TurnRequest) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<AgentEventStream, BackendError>> + Send + 'static,
+{
+    ModelClient::fixture(
+        Fixture {
+            reply: Box::new(move |request| Box::pin(reply(request))),
+        },
+        capabilities,
+    )
 }
-impl<T: AgentBackend + ?Sized + 'static> Serve for EventModel<T> {
+fn error(value: impl ToString) -> ErrorReport {
+    ErrorReport::new(ErrorKind::Provider, value.to_string())
+}
+fn origin() -> Origin {
+    Origin::new("fixture", "fixture", "fixture")
+}
+impl Serve for Fixture {
     type Family = family::Completion;
     fn descriptor(&self) -> HandlerDescriptor {
         HandlerDescriptor {
-            key: "model:injected".into(),
+            key: "model:fixture".into(),
             family: FamilyDescriptor::Completion {
-                model: "injected".into(),
+                model: "fixture".into(),
                 capabilities: Default::default(),
             },
             layers: Vec::new(),
@@ -33,15 +47,14 @@ impl<T: AgentBackend + ?Sized + 'static> Serve for EventModel<T> {
     }
     async fn serve(&self, kind: EffectKind, _: Dispatch) -> Reply {
         let EffectKind::Completion { request, .. } = kind else {
-            return Reply::Outcome(Err(error("expected a model request")));
+            return Reply::Outcome(Err(error("expected a completion")));
         };
-        let history: Vec<_> = request
-            .chat_history
-            .iter()
-            .map(|message| Message::from(message.as_ref()))
-            .collect();
         let request = TurnRequest {
-            history,
+            history: request
+                .chat_history
+                .iter()
+                .map(|message| Message::from(message.as_ref()))
+                .collect(),
             prompt: String::new(),
             tools: request
                 .tools
@@ -55,13 +68,12 @@ impl<T: AgentBackend + ?Sized + 'static> Serve for EventModel<T> {
                 })
                 .collect(),
         };
-        let stream = match self.backend.run_turn(request).await {
+        let stream = match (self.reply)(request).await {
             Ok(stream) => stream,
-            Err(value) => return Reply::Outcome(Err(error(value))),
+            Err(err) => return Reply::Outcome(Err(error(err))),
         };
-        let state = Events {
+        let events = Events {
             stream,
-            reported: Arc::clone(&self.reported),
             content: Vec::new(),
             active: None,
             pending: VecDeque::from([Ok(Relayed::Origin(origin()))]),
@@ -69,17 +81,13 @@ impl<T: AgentBackend + ?Sized + 'static> Serve for EventModel<T> {
             truncated: false,
         };
         Reply::Stream(Box::pin(futures::stream::unfold(
-            state,
-            |mut state| async move { state.next().await.map(|event| (event, state)) },
+            events,
+            |mut events| async move { events.next().await.map(|item| (item, events)) },
         )))
     }
 }
-fn origin() -> Origin {
-    Origin::new("injected", "injected", "injected")
-}
 struct Events {
     stream: AgentEventStream,
-    reported: crate::connection::ReportedUsage,
     content: Vec<AssistantContent>,
     active: Option<(PartKind, String)>,
     pending: VecDeque<Result<Relayed, ErrorReport>>,
@@ -162,8 +170,6 @@ impl Events {
                 Some(AgentEvent::OutputTruncated) => self.truncated = true,
                 Some(AgentEvent::TurnComplete { usage, cost_usd }) => {
                     self.close_part();
-                    *self.reported.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some((usage, cost_usd));
                     let mut measured = NativeUsage::new();
                     measured.input_tokens = Some(
                         u64::from(usage.input_tokens)
@@ -174,6 +180,12 @@ impl Events {
                     measured.cached_input_tokens = Some(u64::from(usage.cache_read_tokens));
                     measured.cache_creation_input_tokens =
                         Some(u64::from(usage.cache_write_tokens));
+                    if usage.estimated {
+                        measured = NativeUsage::new();
+                    }
+                    measured.cost = Some(rig_core::completion::Cost::from_parts(
+                        cost_usd, 0.0, 0.0, 0.0,
+                    ));
                     let response = CompletionResponse::new(
                         std::mem::take(&mut self.content),
                         measured,
@@ -200,69 +212,5 @@ impl Events {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{BackendError, ModelClient, Usage};
-    struct Source;
-    #[async_trait::async_trait]
-    impl AgentBackend for Source {
-        async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
-            Ok(ModelClient::from_events(self))
-        }
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            Ok(Box::pin(futures::stream::iter([
-                AgentEvent::TextDelta("ok".into()),
-                AgentEvent::TurnComplete {
-                    usage: Usage {
-                        estimated: true,
-                        ..Usage::new(7, 2).with_cache(3, 1)
-                    },
-                    cost_usd: 0.25,
-                },
-            ])))
-        }
-    }
-    #[tokio::test]
-    async fn explicit_event_connection_preserves_estimates_cache_usage_and_accounting() {
-        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let records = Arc::clone(&observed);
-        let client = Arc::new(Source)
-            .model_client()
-            .await
-            .unwrap()
-            .with_usage_observer(move |usage, cost| {
-                records.lock().unwrap().push((usage, cost));
-                Ok(())
-            });
-        let reply = client
-            .serve(
-                EffectKind::Completion {
-                    request: Arc::new(rig_core::completion::CompletionRequest::new("hello")),
-                    stream: true,
-                },
-                Dispatch::new(rig_core::effect::EffectId::from_raw(1), true),
-            )
-            .await;
-        let rig_core::effect::Answered::Completion(response) = reply.into_outcome().await.unwrap()
-        else {
-            panic!("completion expected")
-        };
-        assert_eq!(response.text(), "ok");
-        assert_eq!(response.usage.input_tokens, Some(11));
-        let usage = client.usage(crate::convert::usage(response.usage));
-        assert!(usage.estimated);
-        assert_eq!(
-            usage,
-            Usage {
-                estimated: true,
-                ..Usage::new(7, 2).with_cache(3, 1)
-            }
-        );
-        assert_eq!(client.settle(usage).unwrap(), 0.25);
-        assert_eq!(*observed.lock().unwrap(), [(usage, 0.25)]);
     }
 }

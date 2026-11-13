@@ -2,11 +2,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, TurnRequest, Usage,
-};
+use solaris_backend::{AgentBackend, AgentEvent, BackendError, Usage};
 
 use crate::{SessionRecord, conversation::Conversation};
 
@@ -73,7 +70,7 @@ impl AgentBackend for AccountingBackend {
         let conversation = Arc::clone(&self.conversation);
         let kind = self.kind;
         Ok(client.with_usage_observer(move |usage, cost| {
-            if conversation.record_billing(usage, cost, kind) {
+            if conversation.record_billing(usage, cost.unwrap_or(0.0), kind) {
                 Ok(())
             } else {
                 Err(BackendError::new(
@@ -88,28 +85,6 @@ impl AgentBackend for AccountingBackend {
     }
     fn capabilities(&self) -> solaris_backend::ModelCapabilities {
         self.inner.capabilities()
-    }
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        let stream = self.inner.run_turn(request).await?;
-        let conversation = Arc::clone(&self.conversation);
-        let kind = self.kind;
-        Ok(Box::pin(futures::stream::unfold(
-            (stream, conversation, false),
-            move |(mut stream, conversation, ended)| async move {
-                if ended {
-                    return None;
-                }
-                let mut event = stream.next().await?;
-                if let AgentEvent::TurnComplete { usage, cost_usd } = event
-                    && !conversation.record_billing(usage, cost_usd, kind)
-                {
-                    event =
-                        AgentEvent::Error("cannot persist request usage; session stopped".into());
-                }
-                let ended = event.is_terminal();
-                Some((event, (stream, conversation, ended)))
-            },
-        )))
     }
 }
 

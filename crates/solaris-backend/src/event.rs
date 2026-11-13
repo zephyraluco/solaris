@@ -1,7 +1,6 @@
 //! Events streamed from a backend during a turn.
 
-use crate::message::Message;
-use crate::tool::{ToolCall, ToolResult, ToolSpec};
+use crate::tool::{ToolCall, ToolResult};
 use crate::usage::Usage;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -111,37 +110,6 @@ impl AgentEvent {
     }
 }
 
-/// Everything a backend needs to answer one turn.
-///
-/// The mode a turn runs in is deliberately absent: which tools a turn may use is
-/// the agent's decision, and by the time a request reaches a backend its tool
-/// list is already settled.
-#[derive(Debug, Clone)]
-pub struct TurnRequest {
-    /// Prior conversation, oldest first, excluding the new prompt.
-    pub history: Vec<Message>,
-    /// The new user prompt.
-    ///
-    /// Empty means the caller has already put the prompt in `history` — which
-    /// is what a tool round trip does — and the request bodies then append no
-    /// further user message.
-    pub prompt: String,
-    /// Tools declared to the model for this request. Empty means none, and the
-    /// request bodies then carry no `tools` field at all.
-    pub tools: Vec<ToolSpec>,
-}
-
-impl TurnRequest {
-    /// A request that declares no tools.
-    pub fn new(history: Vec<Message>, prompt: impl Into<String>) -> Self {
-        Self {
-            history,
-            prompt: prompt.into(),
-            tools: Vec::new(),
-        }
-    }
-}
-
 /// Errors a backend can fail with before/while streaming.
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -158,6 +126,7 @@ impl BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TurnRequest;
 
     #[test]
     fn a_tool_exchange_does_not_end_the_turn() {

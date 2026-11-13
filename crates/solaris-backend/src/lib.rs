@@ -11,9 +11,7 @@ mod discovery;
 pub use connection::ModelClient;
 mod convert;
 mod event;
-mod events;
 mod http;
-mod injected;
 mod message;
 mod policy;
 mod request;
@@ -23,7 +21,7 @@ mod usage;
 mod wire;
 
 pub use client::{Backend, Endpoint, TurnPlan};
-pub use event::{AgentEvent, BackendError, TurnRequest};
+pub use event::{AgentEvent, BackendError};
 pub use http::IDLE_TIMEOUT;
 pub use message::{Content, Message, MessageContext, Role};
 pub use tool::{ToolCall, ToolResult, ToolSpec};
@@ -37,14 +35,13 @@ use futures::Stream;
 /// Boxed, `Send` stream of events produced by one turn.
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
 
-/// Produces a stream of [`AgentEvent`]s for a turn.
+/// Prepares Rig model connections and exposes connection metadata.
 ///
-/// The uniform contract every backend implements. `solaris-provider` resolves a
-/// platform into one of these, and the UI only ever sees this.
+/// The provider resolves routing and credentials; policy wrappers prepare the
+/// same Rig connection and attach accounting, budgets, or authentication refresh.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
-    /// Prepare one immutable model connection. Injected event sources must
-    /// explicitly opt into `ModelClient::from_events`; there is no fallback.
+    /// Prepare one immutable Rig model connection.
     async fn model_client(self: std::sync::Arc<Self>) -> Result<ModelClient, BackendError>;
 
     /// Explicit model metadata, with unknown values kept distinct from refusal.
@@ -55,9 +52,6 @@ pub trait AgentBackend: Send + Sync {
     fn model_catalog_notice(&self) -> Option<String> {
         None
     }
-
-    /// Start a turn.
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError>;
 
     /// Short human-readable label shown in the status bar.
     fn label(&self) -> &str {
@@ -79,3 +73,6 @@ pub trait AgentBackend: Send + Sync {
 pub use solaris_types::{ContextUsage, ModelCapabilities, Support};
 
 pub use solaris_types::InlineImage;
+
+#[cfg(feature = "test-utils")]
+pub mod testing;

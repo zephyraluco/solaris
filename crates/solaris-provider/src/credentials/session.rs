@@ -7,9 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use solaris_backend::{
-    AgentBackend, AgentEventStream, BackendError, ModelCapabilities, TurnRequest,
-};
+use solaris_backend::{AgentBackend, BackendError, ModelCapabilities};
 use tokio::sync::Mutex;
 
 use crate::{AuthStore, BackendChoice, BackendOptions, Credential, choose_backend, oauth};
@@ -145,13 +143,6 @@ impl AgentBackend for RefreshingBackend {
             .await
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        self.credentials
-            .backend(&self.model)
-            .await?
-            .run_turn(request)
-            .await
-    }
     async fn models(&self) -> Result<Vec<String>, BackendError> {
         self.credentials.backend(&self.model).await?.models().await
     }
@@ -180,6 +171,8 @@ impl AgentBackend for RefreshingBackend {
 mod tests {
     use super::*;
     use crate::CredentialSource;
+    use solaris_backend::AgentEventStream;
+    use solaris_backend::testing::TurnRequest;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -201,14 +194,27 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::ModelClient::from_events(self))
-        }
-
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            self.calls.lock().expect("calls").push(self.token.clone());
-            Ok(Box::pin(futures::stream::empty()))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
     }
+    impl Recording {
+        async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            self.calls.lock().expect("calls").push(self.token.clone());
+            Ok(Box::pin(futures::stream::iter([
+                solaris_backend::AgentEvent::TurnComplete {
+                    usage: Default::default(),
+                    cost_usd: 0.0,
+                },
+            ])))
+        }
+    }
+
     fn setup(path: PathBuf, refresh: Refresh) -> (Arc<Credentials>, Arc<StdMutex<Vec<String>>>) {
         let mut auth = AuthStore::new();
         auth.activate("openai");
@@ -292,8 +298,8 @@ mod tests {
         let parent = shared.choice("parent");
         let child = shared.choice("child");
         let (one, two) = tokio::join!(
-            parent.backend.run_turn(request()),
-            child.backend.run_turn(request())
+            solaris_backend::testing::request(parent.backend, request()),
+            solaris_backend::testing::request(child.backend, request())
         );
         drop(one.expect("parent request"));
         drop(two.expect("child request"));
@@ -331,7 +337,11 @@ mod tests {
         });
         let (shared, calls) = setup(directory.path().join("auth.json"), refresh);
         let backend = shared.choice("model").backend;
-        drop(backend.run_turn(request()).await.expect("first prompt"));
+        drop(
+            solaris_backend::testing::request(Arc::clone(&backend), request())
+                .await
+                .expect("first prompt"),
+        );
         let mut state = shared.current.lock().await;
         let mut expired = state.auth.credential("openai").expect("credential").clone();
         if let Credential::ChatGpt { expires_at, .. } = &mut expired {
@@ -339,7 +349,11 @@ mod tests {
         }
         state.auth.store("openai", expired);
         drop(state);
-        drop(backend.run_turn(request()).await.expect("second prompt"));
+        drop(
+            solaris_backend::testing::request(Arc::clone(&backend), request())
+                .await
+                .expect("second prompt"),
+        );
         assert_eq!(*calls.lock().expect("calls"), vec!["fresh-1", "fresh-2"]);
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
@@ -354,7 +368,8 @@ mod tests {
         );
         shared.initial.save(&path).expect("original credentials");
         let before = std::fs::read(&path).expect("before");
-        let result = shared.choice("model").backend.run_turn(request()).await;
+        let result =
+            solaris_backend::testing::request(shared.choice("model").backend, request()).await;
         assert!(matches!(result, Err(error) if error.to_string().contains("refresh rejected")));
         assert!(calls.lock().expect("calls").is_empty());
         assert_eq!(std::fs::read(path).expect("after"), before);
@@ -375,12 +390,15 @@ mod tests {
             }),
         );
         let backend = shared.choice("model").backend;
-        assert!(backend.run_turn(request()).await.is_err());
+        assert!(
+            solaris_backend::testing::request(Arc::clone(&backend), request())
+                .await
+                .is_err()
+        );
         assert!(calls.lock().expect("calls").is_empty());
         std::fs::remove_dir(&path).expect("restore storage");
         drop(
-            backend
-                .run_turn(request())
+            solaris_backend::testing::request(Arc::clone(&backend), request())
                 .await
                 .expect("retry saved token"),
         );
@@ -401,10 +419,7 @@ mod tests {
         owned.current.get_mut().auth = owned.initial.clone();
         owned.path = None;
         drop(
-            shared
-                .choice("model")
-                .backend
-                .run_turn(request())
+            solaris_backend::testing::request(shared.choice("model").backend, request())
                 .await
                 .expect("valid request"),
         );

@@ -6,19 +6,18 @@ use rig_core::effect::EffectKind;
 use rig_core::error::ErrorReport;
 use rig_core::serve::{Dispatch, ErasedHandler, Reply, adapters::ModelAdapter};
 use rig_core::streaming::{Relayed, StreamEvents};
-use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{AgentEvent, ModelClient, Wire, http, policy::Repair};
+use crate::{Wire, http, policy::Repair};
 
 pub(crate) fn execute(
-    client: ModelClient,
+    adapter: ErasedHandler,
     backend: crate::Backend,
     kind: EffectKind,
     dispatch: Dispatch,
-    status: Option<UnboundedSender<AgentEvent>>,
+    status: crate::connection::StatusObservers,
 ) -> Reply {
     let state = Request {
-        adapter: client.adapter,
+        adapter,
         backend,
         kind,
         dispatch,
@@ -39,7 +38,7 @@ struct Request {
     adapter: ErasedHandler,
     kind: EffectKind,
     dispatch: Dispatch,
-    status: Option<UnboundedSender<AgentEvent>>,
+    status: crate::connection::StatusObservers,
     stream: Option<StreamEvents>,
     delivered: bool,
     done: bool,
@@ -113,17 +112,24 @@ impl Request {
                             .min(Duration::from_secs(30));
                         self.retries += 1;
                         self.stream = None;
-                        if let Some(status) = &self.status {
-                            let _ = status.send(AgentEvent::Status(format!(
+                        let observers = self
+                            .status
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        for observer in observers {
+                            observer(format!(
                                 "{} is busy — retrying in {:.1}s",
                                 self.backend.endpoint.name,
                                 wait.as_secs_f32()
-                            )));
+                            ));
                         }
                         tokio::time::sleep(wait).await;
                         continue;
                     }
                     self.done = true;
+                    let mut error = error;
+                    error.message = self.backend.describe_error(&error).to_string();
                     return Some(Err(error));
                 }
                 None => {

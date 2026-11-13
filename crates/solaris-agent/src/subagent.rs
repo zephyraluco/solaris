@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, TurnRequest, Usage,
-};
+use solaris_backend::{AgentBackend, AgentEvent, AgentEventStream, BackendError, Usage};
 use solaris_tools::{Cancel, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
@@ -454,6 +452,7 @@ impl AgentBackend for BoundedBackend {
         let totals = Arc::clone(&self.totals);
         let tx = self.usage_tx.clone();
         Ok(client.with_usage_observer(move |usage, cost| {
+            let cost = cost.unwrap_or(0.0);
             {
                 let mut totals = totals.lock().unwrap_or_else(|p| p.into_inner());
                 totals.usage = totals.usage.merge(usage);
@@ -473,32 +472,6 @@ impl AgentBackend for BoundedBackend {
         self.inner.capabilities()
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        if self.requests.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
-            return Err(BackendError::new(
-                "subagent exceeded its 20 model-request budget",
-            ));
-        }
-        let stream = self.inner.run_turn(request).await?;
-        let totals = Arc::clone(&self.totals);
-        let usage_tx = self.usage_tx.clone();
-        Ok(Box::pin(stream.map(move |event| {
-            if let AgentEvent::TurnComplete { usage, cost_usd } = &event {
-                let mut totals = totals
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                totals.usage = totals.usage.merge(*usage);
-                totals.cost_usd += cost_usd;
-                if let Some(tx) = &usage_tx {
-                    let _ = tx.send(AgentEvent::SubagentUsage {
-                        usage: *usage,
-                        cost_usd: *cost_usd,
-                    });
-                }
-            }
-            event
-        })))
-    }
     fn label(&self) -> &str {
         self.inner.label()
     }

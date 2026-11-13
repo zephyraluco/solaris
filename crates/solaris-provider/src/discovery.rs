@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use solaris_backend::{AgentBackend, AgentEventStream, BackendError, TurnRequest};
+use solaris_backend::{AgentBackend, BackendError};
 use solaris_types::ModelCapabilities;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -84,9 +84,7 @@ impl AgentBackend for ModelDiscovery {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        self.inner.run_turn(request).await
-    }
+
     async fn models(&self) -> Result<Vec<String>, BackendError> {
         match self.inner.models().await {
             Ok(ids) => {

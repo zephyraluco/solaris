@@ -1,8 +1,7 @@
 //! A shared per-turn request, time and observed-cost budget for parent and children.
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use solaris_backend::{AgentBackend, AgentEvent, AgentEventStream, BackendError, TurnRequest};
+use solaris_backend::{AgentBackend, BackendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -97,7 +96,10 @@ impl AgentBackend for BudgetedBackend {
         self.budget.request()?;
         let budget = Arc::clone(&self.budget);
         Ok(client.with_usage_observer(move |_, cost| {
-            budget.charge(cost);
+            if let Some(cost) = cost { budget.charge(cost); }
+            else if budget.limits.max_cost_usd.is_some() {
+                return Err(BackendError::new("Rig did not report request cost; execution stopped because a cost budget is enabled"));
+            }
             Ok(())
         }))
     }
@@ -106,38 +108,6 @@ impl AgentBackend for BudgetedBackend {
         self.inner.capabilities()
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        if self.budget.limits.max_cost_usd.is_some()
-            && self.inner.capabilities().price_known == Some(false)
-        {
-            return Err(BackendError::new(
-                "cost budget requires known model pricing; configure models.json or omit --max-cost",
-            ));
-        }
-        self.budget.request()?;
-        let stream = tokio::time::timeout_at(self.budget.deadline, self.inner.run_turn(request))
-            .await
-            .map_err(|_| BackendError::new("execution deadline exceeded"))??;
-        let budget = Arc::clone(&self.budget);
-        Ok(Box::pin(futures::stream::unfold(
-            (stream, budget, false),
-            |(mut stream, budget, ended)| async move {
-                if ended {
-                    return None;
-                }
-                let event = tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(budget.deadline) => AgentEvent::Error("execution deadline exceeded".into()),
-                    event = stream.next() => event?,
-                };
-                if let AgentEvent::TurnComplete { cost_usd, .. } = &event {
-                    budget.charge(*cost_usd);
-                }
-                let ended = event.is_terminal();
-                Some((event, (stream, budget, ended)))
-            },
-        )))
-    }
     fn label(&self) -> &str {
         self.inner.label()
     }
@@ -149,6 +119,42 @@ impl AgentBackend for BudgetedBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cost_budget_stops_when_rig_does_not_report_a_charge() {
+        use solaris_backend::{Backend, Endpoint, TurnPlan, Wire};
+        let inner = Backend::new(TurnPlan {
+            endpoint: Endpoint {
+                wire: Wire::OpenAiChat,
+                session_header: None,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                secret: None,
+                name: "test".into(),
+                label: "test".into(),
+                env_keys: &[],
+            },
+            model: "test".into(),
+            max_tokens: 100,
+            prompt_cache_key: None,
+        })
+        .unwrap();
+        let source = Arc::new(BudgetedBackend {
+            inner: Arc::new(inner),
+            budget: ExecutionBudget::new(BudgetLimits {
+                max_cost_usd: Some(1.0),
+                ..Default::default()
+            }),
+        });
+        let client = source.model_client().await.unwrap();
+        let error = client
+            .settle(solaris_backend::Usage::new(100, 1), None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Rig did not report request cost")
+        );
+    }
+
     #[tokio::test]
     async fn children_share_request_counts_and_observed_cost() {
         let budget = ExecutionBudget::new(BudgetLimits {

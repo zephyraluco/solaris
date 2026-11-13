@@ -1,7 +1,6 @@
 //! Rig-backed completion calls with Solaris endpoint, retry and billing policy.
-use crate::{AgentBackend, AgentEventStream, BackendError, Support, TurnRequest, Usage, Wire};
-use crate::{convert, http, transport::CompletionRoute};
-use futures::StreamExt;
+use crate::{AgentBackend, BackendError, Support, Wire};
+use crate::{http, transport::CompletionRoute};
 use rig_core::driver::{DynModel, Model};
 use rig_core::operation::Completion;
 use std::sync::OnceLock;
@@ -104,13 +103,6 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub(super) fn usage_cost(&self, usage: Usage) -> f64 {
-        self.facts
-            .spec()
-            .and_then(|s| s.pricing.as_ref())
-            .and_then(|p| p.cost(&usage.native()))
-            .map_or(0.0, |c| c.total)
-    }
     pub(super) fn check_credentials(&self) -> Result<(), BackendError> {
         if let Some((_, expires)) = &self.chatgpt
             && *expires
@@ -198,39 +190,6 @@ impl AgentBackend for Backend {
     fn label(&self) -> &str {
         &self.endpoint.label
     }
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        // Compatibility display API; every request uses the native connection.
-        let client = crate::ModelClient::native(self.clone())?;
-        let input_characters = request_characters(&request);
-        let request = convert::request(&request, self.max_tokens)?;
-        let kind = self.prepare_effect(rig_core::effect::EffectKind::Completion {
-            request: std::sync::Arc::new(request),
-            stream: true,
-        })?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let reply = crate::request::execute(
-            client.clone(),
-            self.clone(),
-            kind,
-            rig_core::serve::Dispatch::new(rig_core::effect::EffectId::from_raw(0), true),
-            Some(tx),
-        );
-        let mut events = crate::events::adapt(client, reply.into_stream(), rx, input_characters);
-        let mut opening = Vec::new();
-        while let Some(event) = events.next().await {
-            match event {
-                crate::AgentEvent::Error(error) => return Err(BackendError::new(error)),
-                event @ crate::AgentEvent::Status(_) => opening.push(event),
-                event => {
-                    opening.push(event);
-                    return Ok(Box::pin(futures::stream::iter(opening).chain(events)));
-                }
-            }
-        }
-        Err(BackendError::new(
-            "model stream ended without a complete response",
-        ))
-    }
     /// Ask the provider which models it offers.
     ///
     /// One attempt, no retries: this feeds a picker, so a slow or unreachable
@@ -238,16 +197,6 @@ impl AgentBackend for Backend {
     async fn models(&self) -> Result<Vec<String>, BackendError> {
         self.discover_models().await
     }
-}
-
-/// Characters of prompt and history, for the estimate fallback.
-fn request_characters(request: &TurnRequest) -> usize {
-    request.prompt.chars().count()
-        + request
-            .history
-            .iter()
-            .map(|message| message.characters())
-            .sum::<usize>()
 }
 
 impl Backend {
@@ -340,54 +289,5 @@ impl Backend {
         } else {
             BackendError::new(text)
         }
-    }
-}
-
-#[cfg(test)]
-mod pricing_tests {
-    use super::*;
-    use rig_core::catalog::{Catalog, ModelFacts, ModelSpec, Pricing};
-    use rig_core::providers::registry::ProviderId;
-    fn backend(price: Option<Pricing>) -> Backend {
-        let mut spec = ModelSpec::new(ProviderId::declare("solaris").unwrap(), "alias");
-        spec.pricing = price;
-        Backend::new(TurnPlan {
-            endpoint: Endpoint {
-                wire: Wire::OpenAiChat,
-                session_header: None,
-                base_url: "http://localhost/v1".into(),
-                secret: None,
-                name: "test".into(),
-                label: "test".into(),
-                env_keys: &[],
-            },
-            model: "alias".into(),
-            max_tokens: 4096,
-
-            prompt_cache_key: None,
-        })
-        .unwrap()
-        .with_model_facts(
-            "alias".into(),
-            4096,
-            ModelFacts::new(spec).with_catalog(&Catalog::default()),
-            Default::default(),
-        )
-    }
-    #[test]
-    fn official_pricing_counts_additive_cache_buckets_once() {
-        let backend = backend(Some(
-            Pricing::new(1.0, 2.0)
-                .with_cache_read(0.1)
-                .with_cache_write(1.25),
-        ));
-        let usage = Usage::new(1000, 2000).with_cache(3000, 4000);
-        assert!((backend.usage_cost(usage) - 0.0103).abs() < 1e-12);
-    }
-    #[test]
-    fn absent_prices_are_not_inherited_from_builtin_model_names() {
-        let backend = backend(None);
-        assert_eq!(backend.usage_cost(Usage::new(1000, 2000)), 0.0);
-        assert!(backend.facts.spec().unwrap().pricing.is_none());
     }
 }

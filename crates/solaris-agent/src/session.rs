@@ -13,7 +13,7 @@
 //! there rather than having to be reconstructed from the transcript.
 
 #[cfg(test)]
-use solaris_backend::TurnRequest;
+use solaris_backend::testing::TurnRequest;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -713,11 +713,11 @@ async fn compact_memory(
             } else {
                 Usage::estimate(input, response.text().chars().count())
             };
-        outcome.usage = client.usage(outcome.usage);
-        outcome.cost_usd = match client.settle(outcome.usage) {
-            Ok(cost) => cost,
-            Err(_) => return outcome,
-        };
+        outcome.cost_usd =
+            match client.settle(outcome.usage, response.usage.cost.map(|cost| cost.total)) {
+                Ok(cost) => cost,
+                Err(_) => return outcome,
+            };
         match rig_memory::Summarizer::summary_text(&response) {
             Ok(summary) => summary,
             Err(_) => return outcome,
@@ -792,7 +792,7 @@ impl Stream for EventStream {
 }
 #[cfg(test)]
 mod tests {
-    fn request_text(request: &solaris_backend::TurnRequest) -> String {
+    fn request_text(request: &solaris_backend::testing::TurnRequest) -> String {
         request
             .history
             .iter()
@@ -942,10 +942,21 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
 
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        fn label(&self) -> &str {
+            "scripted"
+        }
+    }
+    impl Scripted {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.seen.lock().expect("lock").push(request);
             let events = self
                 .rounds
@@ -954,10 +965,6 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
             Ok(Box::pin(futures::stream::iter(events)))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
         }
     }
 
@@ -1344,10 +1351,21 @@ mod tests {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(solaris_backend::ModelClient::from_events(self))
+                Ok(solaris_backend::testing::client(
+                    self.capabilities(),
+                    move |request| {
+                        let fixture = std::sync::Arc::clone(&self);
+                        async move { fixture.respond(request).await }
+                    },
+                ))
             }
 
-            async fn run_turn(
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+        impl Endless {
+            async fn respond(
                 &self,
                 _request: TurnRequest,
             ) -> Result<AgentEventStream, BackendError> {
@@ -1358,10 +1376,6 @@ mod tests {
                         cost_usd: 0.0,
                     },
                 ])))
-            }
-
-            fn label(&self) -> &str {
-                "endless"
             }
         }
 
@@ -1510,10 +1524,21 @@ mod tests {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(solaris_backend::ModelClient::from_events(self))
+                Ok(solaris_backend::testing::client(
+                    self.capabilities(),
+                    move |request| {
+                        let fixture = std::sync::Arc::clone(&self);
+                        async move { fixture.respond(request).await }
+                    },
+                ))
             }
 
-            async fn run_turn(
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+        impl Endless {
+            async fn respond(
                 &self,
                 _request: TurnRequest,
             ) -> Result<AgentEventStream, BackendError> {
@@ -1525,10 +1550,6 @@ mod tests {
                         cost_usd: 0.0,
                     },
                 ])))
-            }
-
-            fn label(&self) -> &str {
-                "endless"
             }
         }
 
@@ -1729,10 +1750,21 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
 
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        fn label(&self) -> &str {
+            "steering"
+        }
+    }
+    impl SteersOnFirstRound {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.seen.lock().expect("lock").push(request);
             let events = if self.steered.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.steering.push("actually, use the other file");
@@ -1741,10 +1773,6 @@ mod tests {
                 vec![AgentEvent::TextDelta("second".to_string())]
             };
             Ok(Box::pin(futures::stream::iter(round(events))))
-        }
-
-        fn label(&self) -> &str {
-            "steering"
         }
     }
 

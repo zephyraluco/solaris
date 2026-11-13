@@ -7,11 +7,13 @@
 //! content length, chunked reads, teardown) is exercised too. Nothing here
 //! reaches the network.
 
+use solaris_backend::testing::NativeRequest;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
-use solaris_backend::{AgentBackend, AgentEvent, Message, TurnRequest, Usage, Wire};
+use solaris_backend::testing::TurnRequest;
+use solaris_backend::{AgentBackend, AgentEvent, Message, Usage, Wire};
 use solaris_backend::{Backend, Endpoint, TurnPlan};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -151,7 +153,7 @@ async fn chatgpt_profile_sends_account_header_and_supported_responses_fields() {
         "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")).await;
     let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-5-codex", 8192, None)
         .with_chatgpt("account-123".into(), u64::MAX);
-    let events: Vec<_> = backend.run_turn(turn()).await.unwrap().collect().await;
+    let events: Vec<_> = backend.complete(turn()).await.unwrap().collect().await;
     assert!(events.iter().any(AgentEvent::is_terminal));
     let request = tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
     assert!(
@@ -176,7 +178,7 @@ async fn expired_chatgpt_credentials_are_refused_before_network_access() {
         None,
     )
     .with_chatgpt("account".into(), 0);
-    let error = match backend.run_turn(turn()).await {
+    let error = match backend.complete(turn()).await {
         Ok(_) => panic!("expired credentials must not reach the network"),
         Err(error) => error,
     };
@@ -216,7 +218,7 @@ async fn a_streamed_reply_arrives_over_a_real_socket() {
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
 
     let events: Vec<AgentEvent> = backend(addr)
-        .run_turn(turn())
+        .complete(turn())
         .await
         .expect("the turn started")
         .collect()
@@ -282,7 +284,7 @@ async fn a_responses_turn_streams_over_a_real_socket() {
                 .with_cache_write(0.00),
         ),
     )
-    .run_turn(turn())
+    .complete(turn())
     .await
     .expect("the turn started")
     .collect()
@@ -428,7 +430,7 @@ async fn a_rejected_key_is_reported_with_the_providers_words() {
     let (addr, _seen) = serve(response("401 Unauthorized", "application/json", body)).await;
 
     // `AgentEventStream` is not `Debug`, so this cannot use `expect_err`.
-    let error = match backend(addr).run_turn(turn()).await {
+    let error = match backend(addr).complete(turn()).await {
         Ok(_) => panic!("a 401 must not produce a stream"),
         Err(error) => error,
     };
@@ -474,7 +476,7 @@ async fn a_rate_limited_request_is_retried_before_it_streams() {
     });
 
     let events: Vec<AgentEvent> = backend(addr)
-        .run_turn(turn())
+        .complete(turn())
         .await
         .expect("the retry succeeded")
         .collect()
@@ -499,7 +501,7 @@ async fn a_connection_that_answers_nothing_fails_before_it_streams() {
     // from `run_turn` rather than as a stream that ends in silence.
     let (addr, _seen) = serve(String::new()).await;
 
-    let error = match backend(addr).run_turn(turn()).await {
+    let error = match backend(addr).complete(turn()).await {
         Ok(_) => panic!("a closed connection is not a stream"),
         Err(error) => error,
     };
@@ -575,7 +577,7 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                 ));
             }
             let events: Vec<_> = backend_with(addr, wire, "vision", 1000, None)
-                .run_turn(input)
+                .complete(input)
                 .await
                 .expect("start")
                 .collect()
@@ -614,7 +616,7 @@ async fn dropping_a_model_stream_closes_the_pending_socket() {
         let mut byte = [0];
         socket.read(&mut byte).await.unwrap()
     });
-    let mut stream = backend(addr).run_turn(turn()).await.unwrap();
+    let mut stream = backend(addr).complete(turn()).await.unwrap();
     assert!(matches!(
         stream.next().await,
         Some(AgentEvent::TextDelta(_))
@@ -633,7 +635,7 @@ async fn dropping_a_model_stream_closes_the_pending_socket() {
 async fn a_truncated_stream_is_not_retried_after_visible_output_or_reported_as_success() {
     let (addr, _) = serve("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 999999\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".into()).await;
     let events: Vec<_> = backend(addr)
-        .run_turn(turn())
+        .complete(turn())
         .await
         .unwrap()
         .collect()
@@ -671,7 +673,7 @@ async fn rejected_stream_options_are_removed_once_without_changing_prompt() {
         }
         bodies
     });
-    let error = match tokio::time::timeout(PATIENCE, backend(addr).run_turn(turn()))
+    let error = match tokio::time::timeout(PATIENCE, backend(addr).complete(turn()))
         .await
         .unwrap()
     {

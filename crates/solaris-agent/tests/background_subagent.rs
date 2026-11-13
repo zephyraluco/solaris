@@ -9,8 +9,9 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use solaris_agent::{
     Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions,
-    BackendError, Mode, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, TurnRequest, Usage,
+    BackendError, Mode, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, Usage,
 };
+use solaris_backend::testing::TurnRequest;
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Default)]
@@ -99,10 +100,21 @@ impl AgentBackend for Model {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-        Ok(solaris_backend::ModelClient::from_events(self))
+        Ok(solaris_backend::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
     }
 
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    fn label(&self) -> &str {
+        "background-script"
+    }
+}
+impl Model {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let is_child = child(&request);
         let child_answered = request
             .history
@@ -180,10 +192,6 @@ impl AgentBackend for Model {
             cost_usd: 0.25,
         });
         Ok(Box::pin(futures::stream::iter(events)))
-    }
-
-    fn label(&self) -> &str {
-        "background-script"
     }
 }
 

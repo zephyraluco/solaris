@@ -33,19 +33,6 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub(crate) fn native(&self) -> rig_core::completion::Usage {
-        let mut usage = rig_core::completion::Usage::new();
-        usage.input_tokens = Some(
-            u64::from(self.input_tokens)
-                + u64::from(self.cache_read_tokens)
-                + u64::from(self.cache_write_tokens),
-        );
-        usage.output_tokens = Some(u64::from(self.output_tokens));
-        usage.cached_input_tokens = Some(u64::from(self.cache_read_tokens));
-        usage.cache_creation_input_tokens = Some(u64::from(self.cache_write_tokens));
-        usage
-    }
-
     /// Measured usage, with the two counts every provider reports.
     pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
         Self {

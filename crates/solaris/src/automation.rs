@@ -135,8 +135,8 @@ mod tests {
     use super::*;
     use solaris_agent::{
         Agent, AgentBackend, AgentBackendConfig, AgentOptions, BackendError, ToolRegistry,
-        TurnRequest,
     };
+    use solaris_backend::testing::TurnRequest;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
@@ -146,13 +146,21 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
-
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    }
+    impl Waiting {
+        async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             std::future::pending().await
         }
     }
+
     fn session() -> SessionRuntime {
         SessionRuntime::new(Agent::new(
             AgentBackendConfig {

@@ -7,16 +7,14 @@ use rig_core::message::AssistantContent;
 use rig_core::streaming::{Item, Relayed, StreamEvent, StreamEvents};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{AgentEvent, AgentEventStream, BackendError, ModelClient, Usage, convert};
+use crate::{AgentEvent, AgentEventStream, BackendError, Usage, convert};
 
 pub(crate) fn adapt(
-    client: ModelClient,
     stream: StreamEvents,
     status: UnboundedReceiver<AgentEvent>,
     input_characters: usize,
 ) -> AgentEventStream {
     let state = Events {
-        client,
         stream,
         status,
         input_characters,
@@ -30,7 +28,6 @@ pub(crate) fn adapt(
     }))
 }
 struct Events {
-    client: ModelClient,
     stream: StreamEvents,
     status: UnboundedReceiver<AgentEvent>,
     input_characters: usize,
@@ -130,7 +127,7 @@ impl Events {
                     };
                     let complete = AgentEvent::TurnComplete {
                         usage,
-                        cost_usd: self.client.cost(usage),
+                        cost_usd: response.usage.cost.map_or(0.0, |cost| cost.total),
                     };
                     if matches!(response.finish_reason(), Some(FinishReason::Length)) {
                         self.pending.push_back(complete);
@@ -141,10 +138,7 @@ impl Events {
                 Some(Ok(_)) => {}
                 Some(Err(error)) => {
                     self.done = true;
-                    return Some(AgentEvent::Error(self.client.backend.as_ref().map_or_else(
-                        || error.to_string(),
-                        |backend| backend.describe_error(&error).to_string(),
-                    )));
+                    return Some(AgentEvent::Error(error.to_string()));
                 }
                 None => {
                     self.done = true;

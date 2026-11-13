@@ -27,7 +27,8 @@ pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_agent::{AgentBackend, AgentEventStream, BackendError, TurnRequest};
+    use solaris_agent::{AgentBackend, AgentEventStream, BackendError};
+    use solaris_backend::testing::TurnRequest;
     use solaris_provider::CredentialSource;
     use std::sync::Arc;
 
@@ -37,10 +38,17 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
-
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    }
+    impl Backend {
+        async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             Ok(Box::pin(futures::stream::empty()))
         }
     }

@@ -688,8 +688,9 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use serde_json::{Value, json};
+    use solaris_backend::testing::TurnRequest;
     use solaris_backend::{
-        AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, TurnRequest, Usage,
+        AgentBackend, AgentEvent, AgentEventStream, BackendError, ToolCall, Usage,
     };
     use solaris_tools::{SHELL_TOOL, Tool, ToolContext, ToolOutput};
 
@@ -890,10 +891,21 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::ModelClient::from_events(self))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
 
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        fn label(&self) -> &str {
+            "scripted"
+        }
+    }
+    impl Scripted {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             self.seen.lock().expect("lock").push(request);
             let events = self
                 .rounds
@@ -902,10 +914,6 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
             Ok(Box::pin(futures::stream::iter(events)))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
         }
     }
 
@@ -917,11 +925,13 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(solaris_backend::ModelClient::from_events(self))
-        }
-
-        async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            Ok(Box::pin(futures::stream::iter(Vec::new())))
+            Ok(solaris_backend::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
         }
 
         fn label(&self) -> &str {
@@ -930,6 +940,11 @@ mod tests {
 
         async fn models(&self) -> Result<Vec<String>, BackendError> {
             Ok(vec!["first".to_string()])
+        }
+    }
+    impl Listed {
+        async fn respond(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            Ok(Box::pin(futures::stream::iter(Vec::new())))
         }
     }
 
