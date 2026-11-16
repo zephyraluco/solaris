@@ -1,4 +1,4 @@
-//! Plain text block with optional word wrapping.
+//! Plain text block with word wrapping.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -11,7 +11,6 @@ use crate::util::{truncate_to_width, wrap_text};
 pub struct Text {
     text: String,
     style: Style,
-    wrap: bool,
     version: u64,
 }
 
@@ -21,7 +20,6 @@ impl Text {
         Self {
             text: text.into(),
             style: Style::default(),
-            wrap: true,
             version: 0,
         }
     }
@@ -29,12 +27,6 @@ impl Text {
     /// Apply a style to every line.
     pub fn styled(mut self, style: Style) -> Self {
         self.style = style;
-        self
-    }
-
-    /// Disable wrapping; long lines are truncated instead.
-    pub fn no_wrap(mut self) -> Self {
-        self.wrap = false;
         self
     }
 
@@ -58,11 +50,7 @@ impl Text {
         if width == 0 {
             return Vec::new();
         }
-        if self.wrap {
-            wrap_text(&self.text, width as usize)
-        } else {
-            self.text.lines().map(str::to_string).collect()
-        }
+        wrap_text(&self.text, width as usize)
     }
 }
 

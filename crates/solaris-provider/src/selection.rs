@@ -1,0 +1,1088 @@
+//! Select routing and authentication, then bind official model facts.
+//! Custom endpoints and named selections share the same request preparation as
+//! built-in connection presets. Missing credentials or model names refuse model
+//! execution while allowing endpoint discovery when a connection exists.
+
+use std::sync::Arc;
+
+use solaris_backend::{Backend, BackendError, Endpoint, ModelConnector, TurnPlan};
+
+use crate::providers::{AuthKind, PROVIDERS, ProviderSpec, provider_spec};
+use crate::{AuthStore, Credential};
+
+/// The backend that stands in while nothing is connected.
+///
+/// It refuses every turn with an explanation rather than a canned reply: there
+/// is no model to ask until `/connect` has stored a credential, and inventing
+/// an answer would hide that.
+struct UnavailableConnection {
+    label: String,
+    /// What the user can do about it.
+    message: String,
+}
+
+impl UnavailableConnection {
+    /// A backend whose turns fail with `message`.
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            label: "unconnected".into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelConnector for UnavailableConnection {
+    async fn model_client(self: Arc<Self>) -> Result<solaris_backend::ModelClient, BackendError> {
+        Err(BackendError::new(self.message.clone()))
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Where provider keys are looked up besides the credential store.
+///
+/// The process environment in production; a fixed table in tests, so a test
+/// neither inherits the machine's keys nor reaches the network.
+pub type Environment =
+    Arc<dyn Fn(&'static [&'static str]) -> Option<(&'static str, String)> + Send + Sync>;
+
+/// Look names up in the real process environment.
+pub fn process_environment() -> Environment {
+    Arc::new(|names: &'static [&'static str]| {
+        names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| (*name, value))
+        })
+    })
+}
+
+/// An environment with nothing set.
+pub fn empty_environment() -> Environment {
+    Arc::new(|_| None)
+}
+
+/// How the backend is resolved.
+#[derive(Clone)]
+pub struct BackendOptions {
+    /// Where provider keys are looked up.
+    pub environment: Environment,
+    pub configuration: Arc<crate::ProviderConfig>,
+    pub model_cache_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for BackendOptions {
+    fn default() -> Self {
+        Self {
+            environment: process_environment(),
+            configuration: Arc::new(crate::ProviderConfig::default()),
+            model_cache_dir: None,
+        }
+    }
+}
+
+/// Where the credential a backend will use came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// A key or endpoint stored by `/connect`.
+    Stored,
+    /// A key read from this environment variable.
+    Env(&'static str),
+    /// The provider is a runtime on this machine and wants no credentials, or
+    /// the backend was handed in directly rather than resolved.
+    None,
+    /// Nothing usable, so no provider can be asked and every turn says so.
+    Missing,
+    /// The credential is fine, but no model is named and the catalogue has none
+    /// to offer — so there is nothing to ask the provider for.
+    NoModel,
+}
+
+/// The backend the current credentials call for, and why it was chosen.
+#[derive(Clone)]
+pub struct BackendChoice {
+    /// The backend to use.
+    pub backend: Arc<dyn ModelConnector>,
+    pub models: Arc<dyn crate::ModelSource>,
+    pub configuration: Arc<crate::ProviderConfig>,
+    /// Provider this resolved to, when one was picked at all.
+    pub provider_id: Option<String>,
+    /// Endpoint requests go to, when a real client was built.
+    pub base_url: Option<String>,
+    /// Model that will actually be asked for, which is not always the one that
+    /// was requested: an unnamed model is filled in with the provider's first
+    /// offer, so callers should adopt this value rather than keep their own.
+    pub model: String,
+    /// Where the credential came from.
+    pub source: CredentialSource,
+}
+
+impl BackendChoice {
+    /// Nothing to talk to, for `reason`, with `message` explaining the refusal.
+    fn unconnected(reason: CredentialSource, message: String, model: &str) -> Self {
+        Self {
+            backend: Arc::new(UnavailableConnection::new(message)),
+            models: Arc::new(crate::UnavailableModels),
+            configuration: Arc::new(crate::ProviderConfig::default()),
+            provider_id: None,
+            base_url: None,
+            model: model.to_string(),
+            source: reason,
+        }
+    }
+}
+
+/// The environment lookup the selection uses.
+type EnvLookup<'a> = &'a Environment;
+
+/// Assemble the backend for the current credentials and model.
+///
+/// This is the only function the application needs: it never learns which
+/// provider it is talking to. With no usable credential it returns a backend
+/// that refuses turns with an explanation instead of reaching the network.
+pub fn choose_backend(auth: &AuthStore, model: &str, options: BackendOptions) -> BackendChoice {
+    let selected = options
+        .configuration
+        .selection(model)
+        .map(|s| s.provider.as_str())
+        .or_else(|| auth.active_provider());
+    if let Some(provider) = selected {
+        if options.configuration.endpoint(provider).is_some() {
+            return configured_backend(auth, provider, model, &options);
+        }
+        if auth.active_provider() != Some(provider) && provider_spec(provider).is_some() {
+            let mut selected_auth = auth.clone();
+            selected_auth.activate(provider);
+            return choose_backend(&selected_auth, model, options);
+        }
+    }
+    let lookup = &options.environment;
+
+    let Some(spec) = active_provider(auth, lookup) else {
+        return BackendChoice::unconnected(
+            CredentialSource::Missing,
+            "no provider is connected — run /connect to add a credential".to_string(),
+            model,
+        );
+    };
+
+    let Some((base_url, secret, source)) = resolve(spec, auth, lookup) else {
+        return BackendChoice::unconnected(
+            CredentialSource::Missing,
+            missing_credential_message(spec),
+            model,
+        );
+    };
+
+    // The protocol follows the model, so it is resolved once the model is.
+    let chatgpt = if spec.id == "openai" {
+        match auth.credential("openai") {
+            Some(Credential::ChatGpt {
+                account_id,
+                expires_at,
+                ..
+            }) => Some((account_id.clone(), *expires_at)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Account-authorized models come from the remote Codex catalog, not the
+    // public API catalog. Keep an unnamed model empty until discovery answers.
+    let model = if chatgpt.is_some() {
+        model.to_string()
+    } else {
+        real_model(&options.configuration, spec.id, model)
+    };
+    let resolved = options.configuration.resolve(spec.id, &model);
+    let resolved = if chatgpt.is_some() {
+        resolved.without_pricing()
+    } else {
+        resolved
+    };
+    let wire = if chatgpt.is_some() {
+        solaris_backend::Wire::OpenAiResponses
+    } else {
+        options.configuration.wire(spec.id, &resolved, spec.wire)
+    };
+
+    let endpoint = Endpoint {
+        wire,
+        session_header: spec.session_header,
+        base_url,
+        secret,
+        name: spec.name.into(),
+        label: spec.id.into(),
+        env_keys: spec.env_keys,
+    };
+    let prompt_cache_key = is_openai_host(&endpoint.base_url).then_some(PROMPT_CACHE_KEY);
+
+    // Everything platform-specific is decided here, so the backend can stay a
+    // transport: which model, how long a reply, what it costs, and whether a
+    // prompt-cache key rides along.
+    let plan = TurnPlan {
+        prompt_cache_key,
+        model: resolved.parameters,
+        endpoint,
+    };
+
+    connect(spec.id, &model, plan, source, chatgpt, &options)
+}
+
+fn configured_backend(
+    auth: &AuthStore,
+    provider: &str,
+    model: &str,
+    options: &BackendOptions,
+) -> BackendChoice {
+    let endpoint = options
+        .configuration
+        .endpoint(provider)
+        .expect("selected endpoint");
+    let credential = endpoint.credential.as_deref();
+    let secret = credential
+        .and_then(|id| auth.credential(id))
+        .and_then(secret_of);
+    // Subscription OAuth tokens must never be forwarded to a custom host.
+    if credential.is_some_and(|id| matches!(auth.credential(id), Some(Credential::ChatGpt { .. })))
+        || (credential.is_some() && secret.is_none())
+    {
+        return BackendChoice::unconnected(
+            CredentialSource::Missing,
+            format!("{provider} needs its configured API credential — run /connect"),
+            model,
+        );
+    }
+    let resolved = options.configuration.resolve(provider, model);
+    let base_url = endpoint.base_url.trim_end_matches('/').to_owned();
+    let plan = TurnPlan {
+        endpoint: Endpoint {
+            wire: endpoint.protocol.wire(),
+            session_header: None,
+            base_url,
+            secret,
+            name: provider.into(),
+            label: provider.into(),
+            env_keys: &[],
+        },
+        model: resolved.parameters,
+
+        prompt_cache_key: None,
+    };
+    let source = if credential.is_some() {
+        CredentialSource::Stored
+    } else {
+        CredentialSource::None
+    };
+    connect(provider, model, plan, source, None, options)
+}
+
+/// Built-in and configured routes share the same connection assembly.
+fn connect(
+    provider: &str,
+    model: &str,
+    plan: TurnPlan,
+    source: CredentialSource,
+    account: Option<(String, u64)>,
+    options: &BackendOptions,
+) -> BackendChoice {
+    let name = plan.endpoint.name.clone();
+    let backend = match Backend::new(plan) {
+        Ok(backend) => match account {
+            Some((id, expiry)) => backend.with_chatgpt(id, expiry),
+            None => backend,
+        },
+        Err(error) => {
+            return BackendChoice::unconnected(
+                CredentialSource::Missing,
+                format!("could not set up HTTP for {name}: {error}"),
+                model,
+            );
+        }
+    };
+    let base_url = backend.base_url().to_owned();
+    let backend = Arc::new(backend);
+    let models = Arc::new(crate::discovery::ModelDiscovery {
+        inner: Arc::clone(&backend),
+        cache_dir: options.model_cache_dir.clone(),
+        endpoint: format!("{provider}:{base_url}"),
+        notice: std::sync::Mutex::new(None),
+    });
+    let (backend, source): (Arc<dyn ModelConnector>, _) = if model.is_empty() {
+        (
+            Arc::new(UnavailableConnection {
+                label: backend.label().into(),
+                message: format!("no model is named for {name} — run /model <name> to pick one"),
+            }),
+            CredentialSource::NoModel,
+        )
+    } else {
+        (backend, source)
+    };
+    BackendChoice {
+        configuration: Arc::clone(&options.configuration),
+        backend,
+        models,
+        provider_id: Some(provider.into()),
+        base_url: Some(base_url),
+        model: model.into(),
+        source,
+    }
+}
+
+/// Cache-routing key sent to OpenAI, which caches prompt prefixes without being
+/// asked. The key groups a client's requests onto one cache shard, and a single
+/// user wants every turn of a session on the same one.
+const PROMPT_CACHE_KEY: &str = "solaris";
+
+/// Whether `base_url` points at OpenAI's own host.
+///
+/// The cache key is only sent there. OpenAI's cache is automatic, so the field
+/// buys routing and nothing else, while a compatible gateway that does not
+/// implement it may reject the whole request — not worth the risk.
+fn is_openai_host(base_url: &str) -> bool {
+    base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|host| host == "api.openai.com")
+}
+
+/// The base URL a wire should really be called at, given what was configured.
+///
+/// Every wire hangs its paths off the API version — `/messages`,
+/// `/chat/completions`, `/responses` — so the version has to be part of the
+/// base, while the URL a person types into `/connect` or exports as
+/// `OPENAI_BASE_URL` usually stops at the host. `GET …/models` then lands on the
+/// gateway's web front end, which answers 200 with a page that parses as "this
+/// provider has no models at all": an empty provider rather than a visible
+/// error, and the reason a self-hosted gateway appears to list nothing.
+///
+/// A URL with no path of its own therefore gets the prefix, and one that
+/// already carries a path is left exactly as written — only its owner knows
+/// where the API is mounted, and a gateway that answers several protocols
+/// beneath one root has to be taken at its word.
+fn endpoint_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Everything after the scheme up to the first path, query or fragment: a
+    // bare authority is the only shape that is missing its prefix.
+    let authority = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    if authority.contains(['/', '?', '#']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+/// The secret a stored credential carries, or `None` when it carries none.
+fn secret_of(credential: &Credential) -> Option<String> {
+    credential
+        .secret()
+        .map(|secret| secret.trim().to_string())
+        .filter(|secret| !secret.is_empty())
+}
+
+/// What to tell the user when `spec` has no usable credential.
+fn missing_credential_message(spec: &ProviderSpec) -> String {
+    match spec.env_keys.first() {
+        Some(key) => format!(
+            "{} has no credential — run /connect, or set {key}",
+            spec.name
+        ),
+        None => format!("{} has no credential — run /connect", spec.name),
+    }
+}
+
+/// The model to ask `spec` for.
+///
+/// An empty model means the user has not named one, so the provider is asked
+/// for the first model it offers rather than sent an empty string it would
+/// reject. A model the user did name travels as written, even when the
+/// catalogue does not list it.
+fn real_model(configuration: &crate::ProviderConfig, provider: &str, model: &str) -> String {
+    if !model.is_empty() {
+        return model.into();
+    }
+    configuration
+        .models(provider)
+        .into_iter()
+        .next()
+        .map_or_else(String::new, |(id, _)| id)
+}
+/// The provider requests go to.
+///
+/// The active one when `/connect` has been used, otherwise the first whose key
+/// is already in the environment — so `ANTHROPIC_API_KEY=… solaris` works with
+/// no setup at all.
+fn active_provider(auth: &AuthStore, lookup: EnvLookup<'_>) -> Option<&'static ProviderSpec> {
+    if let Some(spec) = auth.active_provider().and_then(provider_spec) {
+        return Some(spec);
+    }
+    PROVIDERS
+        .iter()
+        .find(|spec| lookup(spec.env_keys).is_some())
+}
+
+/// Resolve `spec` to an endpoint, a secret and where that secret came from.
+///
+/// `None` means there is nothing to send a request to at all. The environment
+/// wins over the file, so a shell can point solaris at a different key without
+/// editing `auth.json`.
+fn resolve(
+    spec: &'static ProviderSpec,
+    auth: &AuthStore,
+    lookup: EnvLookup<'_>,
+) -> Option<(String, Option<String>, CredentialSource)> {
+    let stored = auth.credential(spec.id);
+
+    // Account tokens are scoped to the Codex integration, never the public API
+    // or a base-URL override. An environment API key must not change this route.
+    if let Some(Credential::ChatGpt {
+        access_token,
+        account_id,
+        ..
+    }) = stored
+    {
+        return (spec.id == "openai" && !access_token.is_empty() && !account_id.is_empty()).then(
+            || {
+                (
+                    "https://chatgpt.com/backend-api/codex".to_string(),
+                    Some(access_token.clone()),
+                    CredentialSource::Stored,
+                )
+            },
+        );
+    }
+
+    let base_url = match spec.base_url {
+        Some(default) => lookup(spec.base_url_envs)
+            .map(|(_, url)| url)
+            .unwrap_or_else(|| default.to_string()),
+        // Only the custom endpoint takes its URL from the credential.
+        None => match stored {
+            Some(Credential::Endpoint { base_url, .. }) if !base_url.trim().is_empty() => {
+                base_url.trim().to_string()
+            }
+            _ => return None,
+        },
+    };
+    let base_url = endpoint_base_url(&base_url);
+
+    if let Some((name, key)) = lookup(spec.env_keys) {
+        return Some((base_url, Some(key), CredentialSource::Env(name)));
+    }
+
+    match stored.map(secret_of).unwrap_or_default() {
+        Some(secret) => Some((base_url, Some(secret), CredentialSource::Stored)),
+        // A provider that authenticates with a key cannot be called without
+        // one; a local runtime and a keyless endpoint can.
+        None if matches!(spec.auth, AuthKind::ApiKey | AuthKind::ChatGpt) => None,
+        None => Some((base_url, None, CredentialSource::None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solaris_agent::testing::TurnRequest;
+
+    /// Options with a fixed environment, so tests never touch the process's
+    /// variables or the network.
+    fn options_with(pairs: &'static [(&'static str, &'static str)]) -> BackendOptions {
+        BackendOptions {
+            environment: Arc::new(move |names: &'static [&'static str]| {
+                names.iter().find_map(|name| {
+                    pairs
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map(|(key, value)| (*key, (*value).to_string()))
+                })
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Options with nothing set in the environment.
+    fn options() -> BackendOptions {
+        options_with(&[])
+    }
+
+    fn auth_with(provider: &str, credential: Option<Credential>) -> AuthStore {
+        let mut auth = AuthStore::new();
+        if let Some(credential) = credential {
+            auth.store(provider, credential);
+        }
+        auth.activate(provider);
+        auth
+    }
+
+    /// One turn, for driving a backend that must refuse it.
+    fn request() -> TurnRequest {
+        TurnRequest {
+            history: Vec::new(),
+            prompt: "hello".to_string(),
+            tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_connected_refuses_the_turn_with_advice() {
+        let choice = choose_backend(&AuthStore::new(), "", options());
+
+        assert_eq!(choice.source, CredentialSource::Missing);
+        assert_eq!(choice.provider_id.as_deref(), None);
+        assert_eq!(choice.backend.label(), "unconnected");
+
+        let error = match solaris_agent::testing::request(choice.backend, request()).await {
+            Ok(_) => panic!("an unconnected backend must not answer"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("/connect"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_key_builds_a_real_backend() {
+        let auth = auth_with(
+            "anthropic",
+            Some(Credential::ApiKey {
+                key: "sk-test".to_string(),
+            }),
+        );
+        let choice = choose_backend(&auth, "claude-sonnet-4-5", options());
+
+        assert_eq!(choice.source, CredentialSource::Stored);
+        assert_eq!(choice.provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(choice.backend.label(), "anthropic");
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("https://api.anthropic.com/v1")
+        );
+    }
+
+    #[test]
+    fn only_a_stored_secret_is_used() {
+        assert_eq!(
+            secret_of(&Credential::ApiKey {
+                key: " sk-1 ".to_string()
+            }),
+            Some("sk-1".to_string()),
+            "a key is trimmed before it is sent"
+        );
+        assert_eq!(
+            secret_of(&Credential::Endpoint {
+                base_url: "http://localhost:8080/v1".to_string(),
+                api_key: "  ".to_string(),
+            }),
+            None,
+            "an endpoint with no key sends no auth header"
+        );
+        assert_eq!(
+            secret_of(&Credential::Token {
+                token: "oauth".to_string()
+            }),
+            Some("oauth".to_string())
+        );
+    }
+
+    #[test]
+    fn only_openais_own_host_gets_the_cache_key() {
+        assert!(is_openai_host("https://api.openai.com/v1"));
+        assert!(!is_openai_host("https://openrouter.ai/api/v1"));
+        assert!(!is_openai_host(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ));
+        assert!(!is_openai_host("http://localhost:11434/v1"));
+        // A lookalike host must not qualify — hence comparing the host rather
+        // than searching the URL for a substring.
+        assert!(!is_openai_host("https://api.openai.com.example.test/v1"));
+        assert!(!is_openai_host("not a url"));
+    }
+
+    #[test]
+    fn a_url_without_a_path_gets_the_api_prefix() {
+        // Every wire's paths hang off the API version, so a base has to carry
+        // it, and a URL that stops at the host is the one shape certainly
+        // missing it — the same host a person exports as `ANTHROPIC_BASE_URL`.
+        assert_eq!(
+            endpoint_base_url("http://one-api.test"),
+            "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url("  http://one-api.test/  "),
+            "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1"
+        );
+        // A path is left exactly as written: only whoever deployed the gateway
+        // knows where its API is mounted, and one that answers several
+        // protocols beneath a single root has to be taken at its word.
+        assert_eq!(
+            endpoint_base_url("http://one-api.test/v1"),
+            "http://one-api.test/v1"
+        );
+        assert_eq!(
+            endpoint_base_url("http://one-api.test/api/v1"),
+            "http://one-api.test/api/v1"
+        );
+        assert_eq!(
+            endpoint_base_url("https://opencode.ai/zen/go/v1"),
+            "https://opencode.ai/zen/go/v1"
+        );
+        assert_eq!(endpoint_base_url("   "), "");
+    }
+
+    #[tokio::test]
+    async fn a_named_model_is_required_before_a_turn_but_not_to_list_models() {
+        // A gateway's catalogue is empty, so an unnamed model leaves nothing to
+        // send. Refusing here beats sending an empty name and collecting a 400.
+        let auth = auth_with(
+            "new-api",
+            Some(Credential::Endpoint {
+                base_url: "https://gateway.test/v1".to_string(),
+                api_key: "k".to_string(),
+            }),
+        );
+
+        let choice = choose_backend(&auth, "", options());
+        assert_eq!(choice.source, CredentialSource::NoModel);
+        // The endpoint is resolved all the same: it is the provider that will
+        // be asked what it offers, since nothing else can name a model here.
+        assert_eq!(choice.provider_id.as_deref(), Some("new-api"));
+        assert_eq!(choice.backend.label(), "new-api");
+        assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
+
+        let error = match solaris_agent::testing::request(choice.backend, request()).await {
+            Ok(_) => panic!("a model-less provider must not be asked"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("/model"), "{error}");
+
+        // Naming one is all it takes.
+        let choice = choose_backend(&auth, "glm-5.3", options());
+        assert_eq!(choice.backend.label(), "new-api");
+        assert_eq!(choice.model, "glm-5.3");
+        assert_eq!(choice.source, CredentialSource::Stored);
+    }
+
+    #[tokio::test]
+    async fn a_nameless_gateway_still_asks_its_endpoint_for_models() {
+        // Nothing is listening on this port, so the point is which error comes
+        // back: a transport one from the client proves the request went out,
+        // rather than being refused as "this backend cannot list models".
+        let auth = auth_with(
+            "new-api",
+            Some(Credential::Endpoint {
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                api_key: "k".to_string(),
+            }),
+        );
+        let choice = choose_backend(&auth, "", options());
+
+        let error = choice
+            .models
+            .models()
+            .await
+            .expect_err("nothing is listening");
+        let message = error.to_string();
+        assert!(message.contains("could not reach New API"), "{message}");
+    }
+
+    #[test]
+    fn an_unnamed_model_becomes_the_providers_first() {
+        let auth = auth_with(
+            "anthropic",
+            Some(Credential::ApiKey {
+                key: "k".to_string(),
+            }),
+        );
+
+        // Nothing named: the provider would reject an empty model, so its own
+        // first offer is sent instead.
+        let choice = choose_backend(&auth, "", options());
+        assert_eq!(
+            choice.model,
+            options().configuration.models("anthropic")[0].0
+        );
+    }
+
+    #[test]
+    fn a_model_the_user_named_is_left_alone() {
+        let auth = auth_with(
+            "anthropic",
+            Some(Credential::ApiKey {
+                key: "k".to_string(),
+            }),
+        );
+
+        let choice = choose_backend(&auth, "claude-haiku-4-5", options());
+        assert_eq!(choice.model, "claude-haiku-4-5");
+
+        // Including one the catalogue does not list: the user may know better
+        // than the bundled snapshot does.
+        let choice = choose_backend(&auth, "claude-something-new", options());
+        assert_eq!(choice.model, "claude-something-new");
+    }
+
+    #[test]
+    fn an_unconnected_choice_keeps_the_named_model() {
+        let choice = choose_backend(&AuthStore::new(), "my-model", options());
+        assert_eq!(choice.model, "my-model");
+        assert_eq!(choice.backend.label(), "unconnected");
+    }
+
+    #[test]
+    fn a_provider_with_no_catalogue_keeps_the_named_model() {
+        // A custom endpoint has no model list, so nothing better than what the
+        // user typed exists to send.
+        let auth = auth_with(
+            "custom",
+            Some(Credential::Endpoint {
+                base_url: "https://example.test/v1".to_string(),
+                api_key: String::new(),
+            }),
+        );
+        let choice = choose_backend(&auth, "my-model", options());
+        assert_eq!(choice.backend.label(), "custom");
+        assert_eq!(choice.model, "my-model");
+    }
+
+    #[test]
+    fn an_environment_key_wins_over_the_stored_one() {
+        let auth = auth_with(
+            "anthropic",
+            Some(Credential::ApiKey {
+                key: "sk-stored".to_string(),
+            }),
+        );
+        let choice = choose_backend(
+            &auth,
+            "claude-sonnet-4-5",
+            options_with(&[("ANTHROPIC_API_KEY", "sk-env")]),
+        );
+
+        assert_eq!(choice.source, CredentialSource::Env("ANTHROPIC_API_KEY"));
+        assert_eq!(choice.backend.label(), "anthropic");
+    }
+
+    #[test]
+    fn an_environment_key_alone_is_enough_to_start() {
+        // No `/connect`, no auth.json: the provider is found by its key alone.
+        let choice = choose_backend(
+            &AuthStore::new(),
+            "gemini-2.5-flash",
+            options_with(&[("GOOGLE_API_KEY", "gsk-test")]),
+        );
+
+        assert_eq!(choice.source, CredentialSource::Env("GOOGLE_API_KEY"));
+        assert_eq!(choice.provider_id.as_deref(), Some("google"));
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai")
+        );
+    }
+
+    #[test]
+    fn a_base_url_override_is_honoured() {
+        let choice = choose_backend(
+            &AuthStore::new(),
+            "gpt-5",
+            options_with(&[
+                ("OPENAI_API_KEY", "sk-test"),
+                ("OPENAI_BASE_URL", "https://gateway.internal/v1"),
+            ]),
+        );
+
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("https://gateway.internal/v1")
+        );
+    }
+
+    #[test]
+    fn a_key_provider_with_no_key_cannot_answer() {
+        let mut auth = AuthStore::new();
+        auth.activate("openai");
+        let choice = choose_backend(&auth, "gpt-5", options());
+
+        assert_eq!(choice.source, CredentialSource::Missing);
+        assert_eq!(choice.backend.label(), "unconnected");
+    }
+
+    #[test]
+    fn a_local_runtime_needs_no_credentials_at_all() {
+        let auth = auth_with("local", None);
+        let choice = choose_backend(&auth, "llama3.2", options());
+
+        assert_eq!(choice.source, CredentialSource::None);
+        assert_eq!(choice.backend.label(), "local");
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+    }
+
+    #[test]
+    fn the_local_runtime_endpoint_can_be_pointed_elsewhere() {
+        let auth = auth_with("local", None);
+        let choice = choose_backend(
+            &auth,
+            "llama3.2",
+            options_with(&[("SOLARIS_LOCAL_BASE_URL", "http://127.0.0.1:8080/v1")]),
+        );
+
+        assert_eq!(choice.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    }
+
+    #[test]
+    fn a_gateway_stored_without_a_path_still_reaches_its_api() {
+        // What someone types into `/connect` is `http://host`, which used to be
+        // called as `http://host/models` — the gateway's web front end, whose
+        // 200 + HTML page parses as "this provider lists no models".
+        let auth = auth_with(
+            "new-api",
+            Some(Credential::Endpoint {
+                base_url: "http://one-api.server22.jz".to_string(),
+                api_key: "sk-test".to_string(),
+            }),
+        );
+        let choice = choose_backend(&auth, "gpt-4o", options());
+
+        assert_eq!(choice.provider_id.as_deref(), Some("new-api"));
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("http://one-api.server22.jz/v1")
+        );
+    }
+
+    #[test]
+    fn a_local_runtime_endpoint_override_without_a_path_is_completed() {
+        let auth = auth_with("local", None);
+        let choice = choose_backend(
+            &auth,
+            "llama3.2",
+            options_with(&[("SOLARIS_LOCAL_BASE_URL", "http://127.0.0.1:8080")]),
+        );
+
+        assert_eq!(choice.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+    }
+
+    #[test]
+    fn a_custom_endpoint_supplies_its_own_url() {
+        let auth = auth_with(
+            "custom",
+            Some(Credential::Endpoint {
+                base_url: "https://example.test/v1".to_string(),
+                api_key: String::new(),
+            }),
+        );
+        let choice = choose_backend(&auth, "my-model", options());
+
+        assert_eq!(choice.backend.label(), "custom");
+        assert_eq!(choice.base_url.as_deref(), Some("https://example.test/v1"));
+        // A keyless endpoint is legitimate, so it is not reported as missing.
+        assert_eq!(choice.source, CredentialSource::None);
+    }
+
+    #[test]
+    fn a_custom_endpoint_without_a_url_cannot_answer() {
+        let mut auth = AuthStore::new();
+        auth.activate("custom");
+        let choice = choose_backend(&auth, "my-model", options());
+
+        assert_eq!(choice.source, CredentialSource::Missing);
+        assert_eq!(choice.backend.label(), "unconnected");
+    }
+
+    #[test]
+    fn one_gateway_key_answers_every_family_it_offers() {
+        // The protocol changes per model, but the credential and the endpoint
+        // do not: whichever family is asked for, the same key reaches the same
+        // root.
+        let auth = auth_with(
+            "opencode",
+            Some(Credential::ApiKey {
+                key: "sk-go".to_string(),
+            }),
+        );
+
+        for model in ["grok-4.7", "claude-haiku-5-5", "qwen3.8-max"] {
+            let choice = choose_backend(&auth, model, options());
+            assert_eq!(choice.source, CredentialSource::Stored, "{model}");
+            assert_eq!(choice.provider_id.as_deref(), Some("opencode"), "{model}");
+            assert_eq!(
+                choice.base_url.as_deref(),
+                Some("https://opencode.ai/zen/go/v1"),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_active_provider_is_treated_as_unconfigured() {
+        let mut auth = AuthStore::new();
+        auth.activate("something-else");
+        let choice = choose_backend(&auth, "gpt-5", options());
+
+        assert_eq!(choice.backend.label(), "unconnected");
+    }
+
+    #[test]
+    fn the_real_environment_is_consulted_by_default() {
+        // The default options must be the process environment, or a key in the
+        // shell would be ignored.
+        let options = BackendOptions::default();
+        assert_eq!((options.environment)(&[]), None, "no names, no lookup");
+    }
+
+    #[test]
+    fn an_empty_environment_reports_nothing() {
+        assert_eq!((empty_environment())(&["HOME"]), None);
+    }
+
+    #[test]
+    fn chatgpt_tokens_ignore_api_key_and_url_overrides() {
+        let auth = auth_with(
+            "openai",
+            Some(Credential::ChatGpt {
+                access_token: "account-access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        let choice = choose_backend(
+            &auth,
+            "gpt-5-codex",
+            options_with(&[
+                ("OPENAI_API_KEY", "api-key"),
+                ("OPENAI_BASE_URL", "https://untrusted.test/v1"),
+            ]),
+        );
+        assert_eq!(
+            choice.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex")
+        );
+        assert_eq!(choice.source, CredentialSource::Stored);
+    }
+
+    #[test]
+    fn chatgpt_without_a_selected_model_does_not_adopt_a_public_api_default() {
+        let auth = auth_with(
+            "openai",
+            Some(Credential::ChatGpt {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        let choice = choose_backend(&auth, "", options());
+        assert!(choice.model.is_empty());
+        assert_eq!(choice.source, CredentialSource::NoModel);
+        assert_eq!(choice.provider_id.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn chatgpt_tokens_cannot_authenticate_other_providers() {
+        let auth = auth_with(
+            "custom",
+            Some(Credential::ChatGpt {
+                access_token: "account-access".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                account_id: "account".into(),
+                expires_at: u64::MAX,
+            }),
+        );
+        assert_eq!(
+            choose_backend(&auth, "gpt-5", options()).source,
+            CredentialSource::Missing
+        );
+    }
+}
+
+#[cfg(test)]
+mod configured_tests {
+    use super::*;
+    fn options() -> BackendOptions {
+        BackendOptions {
+            configuration: Arc::new(crate::ProviderConfig::from_json(r#"{
+              "providers":{"gateway":{"protocol":"openai-chat","base_url":"http://localhost:9999/v1","credential":"gateway-key"}},
+              "models":{"fast":{"provider":"gateway","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":4096}}
+            }"#).expect("config")),
+            environment: empty_environment(), ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn named_model_selects_custom_endpoint_and_fixes_request_facts_without_io() {
+        let mut auth = AuthStore::new();
+        auth.store(
+            "gateway-key",
+            Credential::ApiKey {
+                key: "test-key".into(),
+            },
+        );
+        let choice = choose_backend(&auth, "fast", options());
+        assert_eq!(choice.provider_id.as_deref(), Some("gateway"));
+        assert_eq!(choice.base_url.as_deref(), Some("http://localhost:9999/v1"));
+        assert_eq!(choice.model, "fast");
+        assert_eq!(choice.backend.label(), "gateway");
+        let client = choice
+            .backend
+            .model_client()
+            .await
+            .expect("local preparation");
+        assert_eq!(client.capabilities().output_budget, Some(4096));
+        assert_eq!(
+            client.capabilities().tool_calling,
+            solaris_types::Support::Supported
+        );
+    }
+    #[test]
+    fn custom_host_refuses_subscription_tokens_and_missing_credentials() {
+        let mut auth = AuthStore::new();
+        assert_eq!(
+            choose_backend(&auth, "fast", options()).source,
+            CredentialSource::Missing
+        );
+        auth.store(
+            "gateway-key",
+            Credential::ChatGpt {
+                access_token: "token".into(),
+                refresh_token: "refresh".into(),
+                id_token: "id".into(),
+                expires_at: u64::MAX,
+                account_id: "account".into(),
+            },
+        );
+        assert_eq!(
+            choose_backend(&auth, "fast", options()).source,
+            CredentialSource::Missing
+        );
+    }
+    #[test]
+    fn endpoint_configuration_rejects_credentials_in_url_and_unknown_fields() {
+        assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://secret@example.com/v1"}}}"#).is_err());
+        assert!(crate::ProviderConfig::from_json(r#"{"providers":{"gateway":{"protocol":"openai-chat","base_url":"https://example.com/v1","api_key":"secret"}}}"#).is_err());
+        assert!(
+            crate::ProviderConfig::from_json(
+                r#"{"models":{"bad":{"provider":"typo-provider","request_id":"test"}}}"#
+            )
+            .is_err()
+        );
+    }
+}

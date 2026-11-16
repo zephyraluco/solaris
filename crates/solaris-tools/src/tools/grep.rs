@@ -141,7 +141,7 @@ impl Tool for GrepTool {
             literal,
             context,
         );
-        let output = match self.runner.run_with_context("rg", &args, ctx).await {
+        let output = match self.runner.run("rg", &args, ctx).await {
             Ok(output) => output,
             Err(error) => return ToolOutput::error(error),
         };
@@ -431,7 +431,7 @@ mod tests {
                 &self,
                 program: &str,
                 _args: &[String],
-                _cwd: &Path,
+                _ctx: &ToolContext,
             ) -> Result<CommandOutput, String> {
                 Err(format!(
                     "`{program}` was not found on PATH — install it and try again"

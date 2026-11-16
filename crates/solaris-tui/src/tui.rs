@@ -49,7 +49,6 @@ pub struct Tui {
     quit: QuitFlag,
     overlay_flag: Rc<Cell<bool>>,
     selection: SelectionHandle,
-    frame: u64,
     poll_interval: Duration,
 }
 
@@ -69,7 +68,6 @@ impl Tui {
             quit: Rc::new(Cell::new(false)),
             overlay_flag: Rc::new(Cell::new(false)),
             selection: Selection::handle(),
-            frame: 0,
             poll_interval: Duration::from_millis(16),
         }
     }
@@ -103,26 +101,6 @@ impl Tui {
     /// the highlight colours and decides what to do with a finished selection.
     pub fn selection(&self) -> SelectionHandle {
         Rc::clone(&self.selection)
-    }
-
-    /// Ask the loop to exit after the current frame.
-    pub fn request_quit(&self) {
-        self.quit.set(true);
-    }
-
-    /// Whether any overlay is currently visible.
-    pub fn has_overlay(&self) -> bool {
-        !self.overlays.is_empty()
-    }
-
-    /// Close the topmost overlay.
-    pub fn close_top_overlay(&mut self) {
-        self.overlays.pop();
-    }
-
-    /// Frames rendered so far.
-    pub fn frame_count(&self) -> u64 {
-        self.frame
     }
 
     /// Run until the quit flag is raised.
@@ -192,7 +170,6 @@ impl Tui {
 
     /// Render the root component and then every overlay, bottom to top.
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
-        self.frame = self.frame.wrapping_add(1);
         self.selection.borrow_mut().set_area(area);
 
         // Promote overlays queued by the root since the previous frame, then

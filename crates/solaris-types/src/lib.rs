@@ -62,7 +62,6 @@ pub struct ModelCapabilities {
     pub structured_output: Support,
     pub image_input: Support,
     pub reasoning: Support,
-    pub streaming_usage: Support,
     pub prompt_caching: Support,
     pub temperature: Support,
     pub max_input: Option<u32>,
@@ -79,11 +78,6 @@ pub struct InlineImage {
     pub media_type: String,
     pub data: String,
 }
-impl InlineImage {
-    pub fn data_url(&self) -> String {
-        format!("data:{};base64,{}", self.media_type, self.data)
-    }
-}
 
 /// Current context occupancy; independent from cumulative task billing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,3 +86,6 @@ pub struct ContextUsage {
     pub window: u32,
     pub estimated: bool,
 }
+
+mod tool;
+pub use tool::{ToolCall, ToolResult, ToolSpec};

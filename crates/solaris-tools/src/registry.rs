@@ -222,11 +222,6 @@ impl ToolSelection {
         entries.extend(self.remove.iter().cloned());
         entries
     }
-
-    /// Whether this selection changes anything.
-    pub fn is_default(&self) -> bool {
-        self.only.is_empty() && self.add.is_empty() && self.remove.is_empty()
-    }
 }
 
 /// Split a comma-separated list, dropping blanks.
@@ -276,7 +271,7 @@ mod tests {
     use super::*;
     use crate::runner::CommandOutput;
     use crate::runner::tests::StubRunner;
-    use crate::tools::shell::{ShellConfig, ShellOutcome};
+    use crate::tools::shell::ShellOutcome;
 
     struct StubShell;
 
@@ -284,7 +279,6 @@ mod tests {
     impl ShellRunner for StubShell {
         async fn run(
             &self,
-            _config: ShellConfig,
             _command: &str,
             _ctx: &crate::tool::ToolContext,
             _timeout: Option<std::time::Duration>,
@@ -419,10 +413,9 @@ mod tests {
         assert_eq!(selection.add, vec!["codemode"]);
 
         assert!(ToolSelection::parse(Some("read,+grep"), None).is_err());
-        assert!(
-            ToolSelection::parse(Some("   "), None)
-                .expect("blank")
-                .is_default()
+        assert_eq!(
+            ToolSelection::parse(Some("   "), None).expect("blank"),
+            ToolSelection::default()
         );
     }
 

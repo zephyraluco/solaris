@@ -10,7 +10,7 @@ mod automation;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use solaris::tips;
 use solaris::{
@@ -104,17 +104,13 @@ struct Args {
     #[arg(long, value_parser = ["trusted", "ask", "read-only"], default_value = "trusted")]
     policy: String,
 
-    /// Shared model request limit across the parent, compaction and all children.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
-    max_requests: u32,
-
-    /// Whole-turn deadline, including child tasks and tools.
-    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=604800))]
-    max_seconds: u64,
-
-    /// Stop further work once observed model cost reaches this amount (USD).
+    /// Optional per-run model step limit; the last step produces a text-only report.
     #[arg(long)]
-    max_cost: Option<f64>,
+    steps: Option<std::num::NonZeroU32>,
+
+    /// Maximum nested subagent depth; zero disables delegation.
+    #[arg(long, default_value_t = 1)]
+    subagent_depth: u32,
 
     /// Resume a saved session by ID. Interrupted tools are never automatically rerun.
     #[arg(long, conflicts_with = "continue_session")]
@@ -173,7 +169,7 @@ fn main() -> Result<()> {
     let recent_path = state_dir.as_ref().map(|dir| dir.join("recent.json"));
     let settings_path = state_dir.as_ref().map(|dir| dir.join("settings.json"));
 
-    let mut auth = load_auth(auth_path.as_deref());
+    let mut auth = load_auth(auth_path.as_deref())?;
     let user = user_id();
     let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
     let recent = load_recent(recent_path.as_deref());
@@ -191,14 +187,6 @@ fn main() -> Result<()> {
         eprintln!("solaris: {} — {}", warning.path.display(), warning.message);
     }
 
-    // `--provider` moves this run without rewriting the saved choice.
-    if let Some(id) = &args.provider {
-        if provider_spec(id).is_none() {
-            anyhow::bail!("unknown provider `{id}` — one of: {}", provider_ids());
-        }
-        auth.activate(id.clone());
-    }
-
     // What the last session left, unless this run overrides it: a flag always
     // wins, so `--plan` in a script keeps meaning plan. The model follows the
     // provider it was chosen for, and is kept in `auth.json` beside it.
@@ -213,30 +201,33 @@ fn main() -> Result<()> {
         config.mode = mode;
     }
 
-    // Without `--model`, a session starts on the model this provider was last
-    // used with: the catalogue's first entry is a fallback, not a decision, and
-    // reconnecting should not quietly move the user onto it.
-    if args.model.is_none()
-        && let Some(model) = auth.active_model()
-    {
-        config.model = model.to_string();
-    }
-
     let mut backend_options = BackendOptions::default();
     if let Some(directory) = config_dir() {
         let path = directory.join("models.json");
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                backend_options.catalog = Arc::new(
-                    solaris_provider::ModelCatalog::from_json(&text).map_err(anyhow::Error::msg)?,
+                backend_options.configuration = Arc::new(
+                    solaris_provider::ProviderConfig::from_json(&text)
+                        .map_err(anyhow::Error::msg)?,
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let cache_dir = directory.join("model-cache");
-        backend_options.catalog.load_cache(&cache_dir);
         backend_options.model_cache_dir = Some(cache_dir);
+    }
+    // Custom endpoints are validated after their configuration has been loaded.
+    if let Some(id) = &args.provider {
+        if provider_spec(id).is_none() && backend_options.configuration.endpoint(id).is_none() {
+            anyhow::bail!("unknown provider `{id}` — built-ins: {}", provider_ids());
+        }
+        auth.activate(id.clone());
+    }
+    if args.model.is_none()
+        && let Some(model) = auth.active_model()
+    {
+        config.model = model.to_owned();
     }
     // Resolved here for reporting, and again by the app whenever the
     // credentials or the model change.
@@ -277,19 +268,14 @@ fn main() -> Result<()> {
             }
         );
         let mut resolved = backend_options
-            .catalog
-            .resolve(choice.provider_id.unwrap_or(""), &choice.model);
+            .configuration
+            .resolve(choice.provider_id.as_deref().unwrap_or(""), &choice.model);
         if matches!(
             auth.credential("openai"),
             Some(solaris_provider::Credential::ChatGpt { .. })
-        ) && choice.provider_id == Some("openai")
+        ) && choice.provider_id.as_deref() == Some("openai")
         {
-            resolved.price = None;
-            resolved.price_tiers.clear();
-            resolved.capabilities.price_known = Some(false);
-            resolved
-                .sources
-                .insert("price".into(), "account authorization".into());
+            resolved = resolved.without_pricing();
         }
         println!(
             "model parameters: {}",
@@ -367,12 +353,6 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if args
-        .max_cost
-        .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
-    {
-        anyhow::bail!("--max-cost must be finite and positive");
-    }
     let rules_path = config_dir().map(|dir| dir.join("permissions.json"));
     let rules = match rules_path.as_deref().map(std::fs::read_to_string) {
         Some(Ok(text)) => serde_json::from_str(&text)?,
@@ -388,11 +368,8 @@ fn main() -> Result<()> {
             _ => solaris_agent::PolicyProfile::Trusted,
         },
         rules,
-        budget: solaris_agent::BudgetLimits {
-            max_requests: args.max_requests as usize,
-            max_seconds: args.max_seconds,
-            max_cost_usd: args.max_cost,
-        },
+        steps: args.steps,
+        subagent_depth: args.subagent_depth,
     };
     let ask_approval = args.confirm_tools
         || args.policy == "ask"
@@ -470,14 +447,9 @@ fn main() -> Result<()> {
                 }
             }
         };
-        let _ = journal.context()?;
         Some(journal)
     };
     let runtime = tokio::runtime::Runtime::new()?;
-    if let Some(directory) = &backend_options.model_cache_dir {
-        let _runtime_guard = runtime.enter();
-        backend_options.catalog.start_refresh(directory.clone());
-    }
     let _guard = runtime.enter();
     let mcp_path = args
         .mcp_config
@@ -521,9 +493,12 @@ fn main() -> Result<()> {
 
     if args.print.is_some() || args.rpc {
         let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
-            .with_selection(tools)
-            .with_skills(skills)
-            .with_prompt_context(resources.prompt);
+            .with_selection(tools);
+        let session_resources = solaris_agent::ResourceSnapshot {
+            skills,
+            prompt: resources.prompt,
+            warnings: resources.warnings,
+        };
         options.execution = execution;
         let factory = Arc::new(solaris_provider::refreshing_backend_factory(
             auth,
@@ -531,9 +506,8 @@ fn main() -> Result<()> {
             backend_options,
         ));
         let choice = factory(&config.model);
-        options.child_backend = Some(Arc::new(move |model| {
-            Ok(solaris::agent_backend(factory(model)))
-        }));
+        let child_factory: solaris_agent::ChildBackendFactory =
+            Arc::new(move |model| Ok(solaris::agent_backend(factory(model))));
         // Noninteractive runs cannot wait for a UI approval. Explicit rules may
         // allow a call; anything that needs an answer is refused.
         if ask_approval {
@@ -544,11 +518,12 @@ fn main() -> Result<()> {
             }
             options.approver = Arc::new(solaris_agent::DenyAll);
         }
-        let session = solaris_agent::SessionRuntime::new(solaris_agent::Agent::new(
-            solaris::agent_backend(choice),
-            Arc::new(registry),
-            options,
-        ));
+        let sessions = solaris_agent::Runtime::default();
+        let session = sessions.open(
+            solaris_agent::Agent::new(solaris::agent_backend(choice), Arc::new(registry), options)
+                .with_resources(session_resources)
+                .with_child_backend(child_factory),
+        )?;
         if let Some(journal) = journal {
             session.attach_journal(journal)?;
         }
@@ -584,9 +559,10 @@ fn main() -> Result<()> {
     let mut terminal = solaris_tui::setup_terminal()?;
 
     let mut tui = Tui::new();
-    let factory: BackendFactory = Arc::new(move |auth: &AuthStore, model: &str| {
-        choose_backend(auth, model, backend_options.clone())
-    });
+    let factory: BackendFactory = Arc::new(solaris_provider::session_backend_factory(
+        auth_path.clone(),
+        backend_options,
+    ));
     let app = App::new(AppOptions {
         backend_factory: factory,
         config,
@@ -688,16 +664,21 @@ fn home_dir() -> Option<PathBuf> {
     home.map(PathBuf::from)
 }
 
-/// Read the credential store, treating a missing or unreadable file as empty:
-/// losing the file must never stop the app from starting.
-fn load_auth(path: Option<&Path>) -> AuthStore {
+/// Missing credentials start an unconnected session; existing files must be readable and valid.
+fn load_auth(path: Option<&Path>) -> Result<AuthStore> {
     let Some(path) = path else {
-        return AuthStore::new();
+        return Ok(AuthStore::new());
     };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| AuthStore::from_json(&text).ok())
-        .unwrap_or_default()
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(AuthStore::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read credential store {}", path.display()));
+        }
+    };
+    AuthStore::from_json(&text)
+        .with_context(|| format!("invalid credential store {}", path.display()))
 }
 
 /// The companion's saved name, if it has one.
@@ -745,5 +726,31 @@ fn greeting(user: &str) -> String {
         "Welcome back!".to_string()
     } else {
         format!("Welcome back {user}!")
+    }
+}
+
+#[cfg(test)]
+mod credential_loading_tests {
+    use super::*;
+    #[test]
+    fn existing_invalid_credentials_are_not_silently_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let original =
+            r#"{"entries":{"anthropic":{"kind":"api_key","key":"test-key"}},"active":"anthropic"}"#;
+        std::fs::write(&path, original).unwrap();
+        assert!(load_auth(Some(&path)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            load_auth(Some(directory.path())).is_err(),
+            "unreadable files must not become empty stores"
+        );
+        assert_eq!(
+            load_auth(Some(&directory.path().join("missing.json")))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(load_auth(None).unwrap().len(), 0);
     }
 }

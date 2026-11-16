@@ -1,10 +1,8 @@
-//! Token accounting: what one turn used, and what that cost.
+//! Request token usage normalized from native SDK responses.
 //!
 //! Providers report usage under different names and disagree about what "input
 //! tokens" includes, so [`Usage`] normalises everything into four additive
-//! buckets. [`Price`] turns those buckets into dollars using the bundled
-//! snapshot of list prices, which is why a turn's cost is an estimate rather
-//! than a bill.
+//! buckets. Costs are supplied separately by the SDK; this type never prices tokens.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,20 +15,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens billed at the full input rate.
-    #[serde(default)]
     pub input_tokens: u32,
     /// Tokens the model generated.
-    #[serde(default)]
     pub output_tokens: u32,
     /// Input tokens served from the provider's prompt cache.
-    #[serde(default)]
     pub cache_read_tokens: u32,
     /// Input tokens written to the provider's prompt cache.
-    #[serde(default)]
     pub cache_write_tokens: u32,
     /// Set when the provider reported nothing and these numbers are a size
     /// estimate rather than a measurement.
-    #[serde(default)]
     pub estimated: bool,
 }
 
@@ -50,16 +43,6 @@ impl Usage {
             cache_read_tokens: read_tokens,
             cache_write_tokens: write_tokens,
             ..self
-        }
-    }
-
-    /// A size estimate for a turn whose provider reported nothing at all.
-    pub fn estimate(input_characters: usize, output_characters: usize) -> Self {
-        Self {
-            input_tokens: tokens_for_characters(input_characters),
-            output_tokens: tokens_for_characters(output_characters),
-            estimated: true,
-            ..Default::default()
         }
     }
 
@@ -96,72 +79,21 @@ impl Usage {
     }
 }
 
-/// Rough token count for `characters` characters of text.
-///
-/// Four characters per token is the usual rule of thumb for English prose and
-/// source code; it is close enough to keep the context gauge honest.
-pub fn tokens_for_characters(characters: usize) -> u32 {
-    (characters as u32).div_ceil(4)
-}
-
-/// List price for one model, in USD per million tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Price {
-    /// Rate for input tokens.
-    pub input: f64,
-    /// Rate for generated tokens.
-    pub output: f64,
-    /// Rate for input served from the prompt cache.
-    pub cache_read: f64,
-    /// Rate for input written to the prompt cache.
-    pub cache_write: f64,
-}
-
-/// Rates that apply when total input (including caches) exceeds a threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PriceTier {
-    pub input_tokens_above: u32,
-    #[serde(flatten)]
-    pub price: Price,
-}
-
-impl Price {
-    /// A price from its four rates, each in USD per million tokens.
-    pub const fn per_million(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
-        Self {
-            input,
-            output,
-            cache_read,
-            cache_write,
-        }
-    }
-
-    /// A model running on this machine, which costs nothing to call.
-    pub const FREE: Price = Price::per_million(0.0, 0.0, 0.0, 0.0);
-
-    /// Choose the highest applicable context tier before calculating cost.
-    pub fn cost_with_tiers(&self, usage: &Usage, tiers: &[PriceTier]) -> f64 {
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
-        tiers
-            .iter()
-            .filter(|tier| input > tier.input_tokens_above)
-            .max_by_key(|tier| tier.input_tokens_above)
-            .map_or(*self, |tier| tier.price)
-            .cost(usage)
-    }
-
-    /// What `usage` costs at this price.
-    pub fn cost(&self, usage: &Usage) -> f64 {
-        let billed = |tokens: u32, rate: f64| f64::from(tokens) * rate / 1_000_000.0;
-
-        billed(usage.input_tokens, self.input)
-            + billed(usage.output_tokens, self.output)
-            + billed(usage.cache_read_tokens, self.cache_read)
-            + billed(usage.cache_write_tokens, self.cache_write)
+impl From<rig_core::completion::Usage> for Usage {
+    fn from(value: rig_core::completion::Usage) -> Self {
+        let read = value.cached_input_tokens.unwrap_or(0);
+        let write = value.cache_creation_input_tokens.unwrap_or(0);
+        let bounded = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        Usage::new(
+            bounded(
+                value
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_sub(read.saturating_add(write)),
+            ),
+            bounded(value.output_tokens.unwrap_or(0)),
+        )
+        .with_cache(bounded(read), bounded(write))
     }
 }
 
@@ -169,6 +101,17 @@ impl Price {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_input_is_not_counted_twice() {
+        let mut measured = rig_core::completion::Usage::new();
+        measured.input_tokens = Some(1000);
+        measured.output_tokens = Some(50);
+        measured.cached_input_tokens = Some(700);
+        measured.cache_creation_input_tokens = Some(100);
+        let converted = Usage::from(measured);
+        assert_eq!(converted, Usage::new(200, 50).with_cache(700, 100));
+        assert_eq!(converted.total(), 1050);
+    }
     #[test]
     fn buckets_add_up() {
         let usage = Usage::new(100, 40).with_cache(1_000, 200);
@@ -190,36 +133,12 @@ mod tests {
         assert!(!total.estimated);
 
         // One estimated half makes the total partly a guess.
-        assert!(first.merge(Usage::estimate(4, 4)).estimated);
-        assert!(Usage::estimate(4, 4).merge(first).estimated);
-    }
-
-    #[test]
-    fn cost_charges_each_bucket_at_its_own_rate() {
-        // Sonnet-shaped rates: a million plain input tokens, a million output
-        // tokens, and a million cached reads.
-        let price = Price::per_million(3.0, 15.0, 0.3, 3.75);
-        let usage = Usage::new(1_000_000, 1_000_000).with_cache(1_000_000, 1_000_000);
-
-        let expected = 3.0 + 15.0 + 0.3 + 3.75;
-        assert!((price.cost(&usage) - expected).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_free_model_costs_nothing() {
-        let usage = Usage::new(500_000, 500_000);
-        assert_eq!(Price::FREE.cost(&usage), 0.0);
-    }
-
-    #[test]
-    fn estimation_is_flagged_and_rounded_up() {
-        let usage = Usage::estimate(5, 0);
-        assert!(usage.estimated);
-        assert_eq!(usage.input_tokens, 2);
-        assert_eq!(usage.output_tokens, 0);
-        assert_eq!(tokens_for_characters(0), 0);
-        assert_eq!(tokens_for_characters(4), 1);
-        assert_eq!(tokens_for_characters(5), 2);
+        let estimate = Usage {
+            estimated: true,
+            ..Usage::new(1, 1)
+        };
+        assert!(first.merge(estimate).estimated);
+        assert!(estimate.merge(first).estimated);
     }
 
     #[test]
@@ -228,11 +147,6 @@ mod tests {
         let json = serde_json::to_string(&usage).expect("encode");
         assert_eq!(serde_json::from_str::<Usage>(&json).expect("decode"), usage);
 
-        // A record written before a field existed still decodes.
-        let legacy = r#"{"input_tokens":7,"output_tokens":8}"#;
-        assert_eq!(
-            serde_json::from_str::<Usage>(legacy).expect("decode"),
-            Usage::new(7, 8)
-        );
+        assert!(serde_json::from_str::<Usage>(r#"{"input_tokens":7,"output_tokens":8}"#).is_err());
     }
 }

@@ -62,11 +62,6 @@ impl Panel {
     pub fn set_content(&mut self, content: Box<dyn Component>) {
         self.content = Some(content);
     }
-
-    /// The area available to the child.
-    pub fn inner_area(&self, area: Rect) -> Rect {
-        block(&self.title, self.border_type).inner(area)
-    }
 }
 
 impl Default for Panel {

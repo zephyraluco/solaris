@@ -64,5 +64,5 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo +1.97.1 check --workspace --all-targets --all-features --locked

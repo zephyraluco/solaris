@@ -66,11 +66,6 @@ impl ScrollView {
         self.offset >= self.max_offset
     }
 
-    /// Rows currently visible.
-    pub fn viewport_height(&self) -> u16 {
-        self.last_area.height
-    }
-
     /// Scroll by `lines` (negative scrolls up).
     pub fn scroll_by(&mut self, lines: i32) {
         let target = (self.offset as i32 + lines).clamp(0, self.max_offset as i32);

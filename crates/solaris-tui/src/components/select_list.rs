@@ -112,15 +112,6 @@ impl SelectList {
         self
     }
 
-    /// Replace the items and clear the filter.
-    pub fn set_items(&mut self, items: Vec<SelectItem>) {
-        self.items = items;
-        self.query.clear();
-        self.selected = 0;
-        self.scroll = 0;
-        self.refilter();
-    }
-
     /// Current filter text.
     pub fn query(&self) -> &str {
         &self.query

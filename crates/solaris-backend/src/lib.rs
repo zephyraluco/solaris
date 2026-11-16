@@ -1,77 +1,56 @@
-//! Backend abstraction and the conversation vocabulary for solaris.
+//! Native model connections and request policy.
 //!
-//! One client serves every platform: it is handed an endpoint, a model, and
-//! whatever the caller knows about pricing, and it streams a turn back over
-//! whichever wire that endpoint speaks. **Which platform an endpoint belongs to,
-//! how its credentials were found, and which models it offers are all the
-//! caller's business** — that is `solaris-provider`'s job, and this crate never
-//! learns any of it.
-//!
-//! What it does own is the vocabulary a turn is written in: the messages and
-//! their content blocks ([`Message`], [`Content`], [`Role`]), the tool
-//! declarations, calls and results the wire carries ([`ToolSpec`], [`ToolCall`],
-//! [`ToolResult`]), what a turn consumes and costs ([`Usage`], [`Price`]), and
-//! the events a backend streams back ([`AgentEvent`]). Those types are the wire's
-//! own shape — every protocol here serialises them — so they live beside the
-//! protocols that speak them rather than in a layer of their own.
+//! Connection errors and request usage are independent of session events. The
+//! single production [`Backend`] delegates protocol encoding and stream decoding
+//! to the official model SDK; authentication and model resolution belong to the
+//! provider layer, while conversation and execution policy belong to the agent.
 
 mod client;
-mod event;
+mod parameters;
+pub use parameters::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelParameters};
+mod connection;
+mod discovery;
+pub use connection::ModelClient;
+#[cfg(any(test, feature = "test-utils"))]
+mod convert;
+mod error;
 mod http;
+#[cfg(any(test, feature = "test-utils"))]
 mod message;
-mod protocols;
-mod sse;
-mod tool;
+mod policy;
+mod request;
+mod transport;
 mod usage;
 mod wire;
 
-pub use client::{Endpoint, HttpBackend, TurnPlan};
-pub use event::{AgentEvent, BackendError, TurnRequest};
+pub use client::{Backend, Endpoint, TurnPlan};
+pub use error::BackendError;
 pub use http::IDLE_TIMEOUT;
-pub use message::{Content, Message, MessageContext, Role};
-pub use tool::{ToolCall, ToolResult, ToolSpec};
-pub use usage::{Price, PriceTier, Usage, tokens_for_characters};
+#[cfg(any(test, feature = "test-utils"))]
+pub use message::{Content, Message, Role};
+#[cfg(any(test, feature = "test-utils"))]
+use solaris_types::ToolCall;
+#[cfg(any(test, feature = "test-utils"))]
+use solaris_types::ToolResult;
+pub use usage::Usage;
 pub use wire::Wire;
 
-use std::pin::Pin;
-
-use futures::Stream;
-
-/// Boxed, `Send` stream of events produced by one turn.
-pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentEvent> + Send>>;
-
-/// Produces a stream of [`AgentEvent`]s for a turn.
+/// Prepares Rig model connections and exposes connection metadata.
 ///
-/// The uniform contract every backend implements. `solaris-provider` resolves a
-/// platform into one of these, and the UI only ever sees this.
+/// The provider resolves routing and credentials; policy wrappers prepare the
+/// same Rig connection and attach accounting, budgets, or authentication refresh.
 #[async_trait::async_trait]
-pub trait AgentBackend: Send + Sync {
+pub trait ModelConnector: Send + Sync {
+    /// Prepare one immutable Rig model connection.
+    async fn model_client(self: std::sync::Arc<Self>) -> Result<ModelClient, BackendError>;
+
     /// Explicit model metadata, with unknown values kept distinct from refusal.
     fn capabilities(&self) -> solaris_types::ModelCapabilities {
         solaris_types::ModelCapabilities::default()
     }
-    /// Explains a stale/offline model-list fallback to the caller.
-    fn model_catalog_notice(&self) -> Option<String> {
-        None
-    }
-
-    /// Start a turn.
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError>;
-
     /// Short human-readable label shown in the status bar.
     fn label(&self) -> &str {
         "backend"
-    }
-
-    /// The models the endpoint offers, for the picker to choose from.
-    ///
-    /// Best-effort, and the reason this returns a `Result` rather than a list:
-    /// a caller with its own catalogue wants to fall back to that, so "this
-    /// backend cannot ask" has to stay distinguishable from "nothing is offered".
-    async fn models(&self) -> Result<Vec<String>, BackendError> {
-        Err(BackendError::new(
-            "this backend cannot list models — the catalogue is all there is",
-        ))
     }
 }
 
@@ -79,5 +58,4 @@ pub use solaris_types::{ContextUsage, ModelCapabilities, Support};
 
 pub use solaris_types::InlineImage;
 
-#[cfg(test)]
-mod image_tests;
+pub use rig_core::completion::Cost;

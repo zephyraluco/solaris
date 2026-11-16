@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 
 use crate::BackendError;
@@ -49,49 +48,10 @@ pub fn max_retries() -> usize {
 ///
 /// The server's own `Retry-After` wins when it sent one, but is never allowed
 /// to hold the turn for longer than [`MAX_RETRY_AFTER`].
-pub fn backoff(attempt: usize, headers: Option<&HeaderMap>) -> Duration {
-    let asked = headers.and_then(retry_after).unwrap_or_default();
+pub fn backoff(attempt: usize, server_delay: Option<Duration>) -> Duration {
+    let asked = server_delay.unwrap_or_default();
     let scheduled = BACKOFF[attempt.min(BACKOFF.len() - 1)];
     asked.clamp(scheduled, MAX_RETRY_AFTER)
-}
-
-/// Whether `status` is worth retrying.
-///
-/// Only ever consulted before the first event reaches the UI, where a retry
-/// cannot duplicate text the user has already seen.
-pub fn is_retryable(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::CONFLICT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-}
-
-/// Whether a transport error is worth retrying.
-pub fn is_transient(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect()
-}
-
-/// The innermost message of a reqwest error.
-///
-/// The top-level display repeats the URL and the method; the root cause is the
-/// one that names what actually went wrong — DNS, TLS, a refused connection.
-pub fn root_cause(error: &reqwest::Error) -> String {
-    let mut source: &dyn std::error::Error = error;
-    while let Some(next) = source.source() {
-        source = next;
-    }
-    source.to_string()
-}
-
-/// A transport failure in the user's terms.
-pub fn describe_transport(error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        "the request timed out".to_string()
-    } else if error.is_connect() {
-        format!("could not connect ({})", root_cause(error))
-    } else {
-        root_cause(error)
-    }
 }
 
 /// A message the user can act on, preferring the provider's own wording.
@@ -147,36 +107,9 @@ fn ellipsise(text: &str) -> String {
     format!("{head}…")
 }
 
-/// Seconds the server asked us to wait.
-fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn headers(retry_after: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if let Some(value) = retry_after {
-            headers.insert(RETRY_AFTER, value.parse().expect("header value"));
-        }
-        headers
-    }
-
-    #[test]
-    fn retryable_statuses_are_the_transient_ones() {
-        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable(StatusCode::BAD_GATEWAY));
-        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(is_retryable(StatusCode::REQUEST_TIMEOUT));
-
-        // A rejected key or a bad model is not going to fix itself.
-        assert!(!is_retryable(StatusCode::UNAUTHORIZED));
-        assert!(!is_retryable(StatusCode::BAD_REQUEST));
-        assert!(!is_retryable(StatusCode::NOT_FOUND));
-    }
 
     #[test]
     fn backoff_grows_and_honours_retry_after() {
@@ -187,18 +120,15 @@ mod tests {
         assert_eq!(plain(9), plain(2));
 
         // A server asking for longer than our schedule gets what it asked for.
-        let asked = backoff(0, Some(&headers(Some("5"))));
+        let asked = backoff(0, Some(Duration::from_secs(5)));
         assert_eq!(asked, Duration::from_secs(5));
 
         // …but never longer than the cap.
-        let capped = backoff(0, Some(&headers(Some("600"))));
+        let capped = backoff(0, Some(Duration::from_secs(600)));
         assert_eq!(capped, MAX_RETRY_AFTER);
 
         // A server asking for less than our schedule does not shorten it.
-        assert_eq!(backoff(2, Some(&headers(Some("0")))), plain(2));
-
-        // A malformed header is ignored rather than fatal.
-        assert_eq!(backoff(0, Some(&headers(Some("soon")))), plain(0));
+        assert_eq!(backoff(2, Some(Duration::ZERO)), plain(2));
     }
 
     #[test]

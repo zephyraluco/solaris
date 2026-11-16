@@ -1,12 +1,12 @@
 //! Application-owned translation from provider resolution to agent inputs.
 
-use solaris_agent::AgentBackendConfig;
+use solaris_agent::ConnectionConfig;
 use solaris_provider::{BackendChoice, DEFAULT_CONTEXT_WINDOW, provider_spec};
 
 /// Resolve provider catalogue metadata into the agent's execution contract.
 /// Authentication provenance and endpoint configuration remain in the app.
-pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
-    AgentBackendConfig {
+pub fn agent_backend(choice: BackendChoice) -> ConnectionConfig {
+    ConnectionConfig {
         fallback_context_window: choice
             .backend
             .capabilities()
@@ -14,10 +14,11 @@ pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
             .unwrap_or(DEFAULT_CONTEXT_WINDOW),
         instructions: choice
             .provider_id
+            .as_deref()
             .and_then(provider_spec)
             .and_then(|spec| spec.prompt)
             .map(str::to_owned),
-        provider_id: choice.provider_id.map(str::to_owned),
+        provider_id: choice.provider_id,
         backend: choice.backend,
         model: choice.model,
     }
@@ -26,24 +27,40 @@ pub fn agent_backend(choice: BackendChoice) -> AgentBackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_agent::{AgentBackend, AgentEventStream, BackendError, TurnRequest};
+    use solaris_agent::testing::TurnRequest;
+    use solaris_agent::{AgentEventStream, BackendError, ModelConnector};
     use solaris_provider::CredentialSource;
     use std::sync::Arc;
 
     struct Backend;
     #[async_trait::async_trait]
-    impl AgentBackend for Backend {
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    impl ModelConnector for Backend {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+            Ok(solaris_agent::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
+        }
+    }
+    impl Backend {
+        async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             Ok(Box::pin(futures::stream::empty()))
         }
     }
 
     #[test]
     fn application_resolves_endpoint_instructions_and_context_fallback() {
-        let backend: Arc<dyn AgentBackend> = Arc::new(Backend);
+        let backend: Arc<dyn ModelConnector> = Arc::new(Backend);
         let config = agent_backend(BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
+            configuration: Default::default(),
             backend: Arc::clone(&backend),
-            provider_id: Some("local"),
+            provider_id: Some("local".into()),
             base_url: Some("http://localhost:8080/v1".into()),
             model: "claude-sonnet-4-5".into(),
             source: CredentialSource::None,
@@ -62,6 +79,8 @@ mod tests {
     #[test]
     fn unresolved_provider_does_not_add_endpoint_instructions() {
         let config = agent_backend(BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
+            configuration: Default::default(),
             backend: Arc::new(Backend),
             provider_id: None,
             base_url: None,

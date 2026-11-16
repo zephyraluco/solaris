@@ -1,5 +1,6 @@
 //! Delegation through the public Agent API, with scripted model replies.
 
+use solaris_agent::testing::AgentFixture;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,10 +8,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
-    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions, Approval,
-    BackendError, FnApprover, Mode, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
-    ToolOutput, ToolRegistry, ToolSelection, TurnRequest, Usage,
+    Agent, AgentEvent, AgentEventStream, AgentOptions, Approval, BackendError, ConnectionConfig,
+    FnApprover, Mode, ModelConnector, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
+    ToolOutput, ToolRegistry, ToolSelection, Usage,
 };
 use tokio::sync::{Barrier, Notify};
 
@@ -78,13 +80,31 @@ fn is_child(request: &TurnRequest) -> bool {
 }
 
 #[async_trait]
-impl AgentBackend for Model {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+impl ModelConnector for Model {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+        Ok(solaris_agent::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "scripted"
+    }
+}
+impl Model {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = is_child(&request);
         let answered = request
             .history
             .iter()
             .any(|message| message.tool_results().next().is_some());
+        let can_read = !request.tools.is_empty();
         self.seen.lock().unwrap().push(request);
         let events = if child {
             if self.hang {
@@ -105,7 +125,10 @@ impl AgentBackend for Model {
             if self.fail {
                 return Err(BackendError::new("child backend unavailable"));
             }
-            if let Some(tool) = self.child_tool.filter(|_| !answered || self.endless) {
+            if let Some(tool) = self
+                .child_tool
+                .filter(|_| (!answered || self.endless) && can_read)
+            {
                 calling(tool, json!({"path":"child-path"}))
             } else {
                 complete("child final report")
@@ -140,9 +163,6 @@ impl AgentBackend for Model {
             calling("subagent", input)
         };
         Ok(Box::pin(futures::stream::iter(events)))
-    }
-    fn label(&self) -> &str {
-        "scripted"
     }
 }
 
@@ -183,7 +203,7 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
         }),
     ]);
     Agent::new(
-        AgentBackendConfig {
+        ConnectionConfig {
             backend: model,
             provider_id: None,
             model: "test-model".into(),
@@ -198,7 +218,7 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
 async fn run(agent: &Agent, mode: Mode) -> Vec<AgentEvent> {
     tokio::time::timeout(
         Duration::from_secs(3),
-        agent.run_turn("ROOT_PRIVATE_CONTEXT", mode).collect(),
+        agent.run_fixture("ROOT_PRIVATE_CONTEXT", mode).collect(),
     )
     .await
     .expect("turn must finish")
@@ -220,14 +240,17 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
     model.child_tool = Some("read");
     let model = Arc::new(model);
     let runs = Arc::new(AtomicUsize::new(0));
-    let options = AgentOptions::default().with_prompt_context(PromptContext {
-        project_rules: vec![PromptFile {
-            path: "AGENTS.md".into(),
-            content: "PROJECT_RULE".into(),
-        }],
+    let resources = solaris_agent::ResourceSnapshot {
+        prompt: PromptContext {
+            project_rules: vec![PromptFile {
+                path: "AGENTS.md".into(),
+                content: "PROJECT_RULE".into(),
+            }],
+            ..Default::default()
+        },
         ..Default::default()
-    });
-    let agent = agent(Arc::clone(&model), options, &runs);
+    };
+    let agent = agent(Arc::clone(&model), AgentOptions::default(), &runs).with_resources(resources);
     let events = run(&agent, Mode::Build).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(result(&events).output, "child final report");
@@ -264,13 +287,13 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
     assert_eq!(agent.conversation_len(), 4);
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::SubagentStarted { call_id, task_id }
-            if call_id == "work" && task_id == "foreground-work")));
+            if call_id == "work" && task_id.starts_with("job-"))));
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::SubagentToolCall { task_id, call }
-            if task_id == "foreground-work" && call.name == "read")));
+            if task_id.starts_with("job-") && call.name == "read")));
     assert!(events.iter().any(|event| matches!(event,
         AgentEvent::SubagentToolResult { task_id, result, .. }
-            if task_id == "foreground-work" && result.output == "private child tool output")));
+            if task_id.starts_with("job-") && result.output == "private child tool output")));
     for request in model.requests().iter().filter(|request| !is_child(request)) {
         assert!(!request.history.iter().any(|message| {
             message.text().contains("private child tool output")
@@ -435,28 +458,33 @@ async fn child_failure_is_a_tool_error_not_a_parent_terminal_event() {
 }
 
 #[tokio::test]
-async fn child_budget_stops_an_endless_tool_loop_and_counts_consumed_usage() {
+async fn child_steps_return_a_report_without_sharing_a_parent_budget() {
     let mut model = Model::new("explore");
     model.child_tool = Some("read");
     model.endless = true;
     let model = Arc::new(model);
     let runs = Arc::new(AtomicUsize::new(0));
-    let agent = agent(Arc::clone(&model), AgentOptions::default(), &runs);
+    let mut options = AgentOptions::default();
+    options.execution.steps = std::num::NonZeroU32::new(24);
+    let agent = agent(Arc::clone(&model), options, &runs);
     let events = run(&agent, Mode::Build).await;
-    assert!(result(&events).is_error);
-    assert!(result(&events).output.contains("20 model-request budget"));
-    assert_eq!(runs.load(Ordering::SeqCst), 20);
+    assert!(!result(&events).is_error);
+    assert_eq!(
+        result(&events).metadata.details["finish_reason"],
+        "step_limit"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 23);
     assert_eq!(
         model
             .requests()
             .iter()
             .filter(|request| is_child(request))
             .count(),
-        20
+        24
     );
     assert!(
         matches!(events.last(), Some(AgentEvent::TurnComplete {usage, cost_usd})
-        if *usage == Usage::new(44, 22) && *cost_usd == 5.5)
+        if *usage == Usage::new(52, 26) && *cost_usd == 6.5)
     );
 }
 
@@ -517,7 +545,9 @@ async fn parallel_child_tools_with_identical_ids_keep_distinct_display_task_ids(
         })
         .collect();
     scopes.sort_unstable();
-    assert_eq!(scopes, ["foreground-one", "foreground-two"]);
+    assert_eq!(scopes.len(), 2);
+    assert_ne!(scopes[0], scopes[1]);
+    assert!(scopes.iter().all(|id| id.starts_with("job-")));
     assert_eq!(
         events
             .iter()
@@ -538,7 +568,7 @@ async fn cancellation_and_dropped_parent_stream_stop_pending_child_network_reque
             AgentOptions::default(),
             &Arc::new(AtomicUsize::new(0)),
         );
-        let mut stream = agent.run_turn("ROOT_PRIVATE_CONTEXT", Mode::Build);
+        let mut stream = agent.run_fixture("ROOT_PRIVATE_CONTEXT", Mode::Build);
         tokio::time::timeout(Duration::from_secs(1), model.started.notified())
             .await
             .unwrap();
@@ -619,19 +649,20 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     let child_model = Arc::clone(&model);
     let factory_called = Arc::new(AtomicUsize::new(0));
     let called = Arc::clone(&factory_called);
-    let mut options = AgentOptions::in_directory(directory.path());
-    options.child_backend = Some(Arc::new(move |name| {
+    let options = AgentOptions::in_directory(directory.path());
+    let child_factory: solaris_agent::ChildBackendFactory = Arc::new(move |name| {
         assert_eq!(name, "child-model");
         called.fetch_add(1, Ordering::SeqCst);
-        Ok(AgentBackendConfig {
+        Ok(ConnectionConfig {
             backend: child_model.clone(),
             provider_id: None,
             model: name.into(),
             fallback_context_window: 128_000,
             instructions: Some("Child model instructions resolved by the caller".into()),
         })
-    }));
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    });
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     parent.attach_journal(journal).expect("attach");
     let events = run(&parent, Mode::Build).await;
     assert_eq!(factory_called.load(Ordering::SeqCst), 1);
@@ -693,13 +724,11 @@ async fn blank_child_selectors_inherit_the_parent_without_a_factory_or_saved_ses
 async fn blank_child_model_does_not_invoke_the_override_factory() {
     let mut model = Model::new("explore");
     model.model_override = Some(String::new());
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(|_| {
-            panic!("blank override must inherit parent backend")
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(|_| panic!("blank override must inherit parent backend"));
+    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -710,20 +739,19 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
     model.model_override = Some(" \tchild-model\r\n ".into());
     let model = Arc::new(model);
     let child_backend = Arc::clone(&model);
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(move |name| {
-            assert_eq!(name, "child-model");
-            Ok(AgentBackendConfig {
-                backend: Arc::clone(&child_backend) as Arc<dyn AgentBackend>,
-                provider_id: None,
-                model: name.into(),
-                fallback_context_window: 128_000,
-                instructions: None,
-            })
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(model, options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory = Arc::new(move |name| {
+        assert_eq!(name, "child-model");
+        Ok(ConnectionConfig {
+            backend: Arc::clone(&child_backend) as Arc<dyn ModelConnector>,
+            provider_id: None,
+            model: name.into(),
+            fallback_context_window: 128_000,
+            instructions: None,
+        })
+    });
+    let parent =
+        agent(model, options, &Arc::new(AtomicUsize::new(0))).with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -737,13 +765,11 @@ async fn invalid_child_model_is_rejected_before_resolving_or_running_a_child() {
         let mut model = Model::new("explore");
         model.model_override = Some(invalid);
         let model = Arc::new(model);
-        let options = AgentOptions {
-            child_backend: Some(Arc::new(|_| {
-                panic!("invalid model must not reach the factory")
-            })),
-            ..AgentOptions::default()
-        };
-        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+        let options = AgentOptions::default();
+        let child_factory: solaris_agent::ChildBackendFactory =
+            Arc::new(|_| panic!("invalid model must not reach the factory"));
+        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory);
         let events = run(&parent, Mode::Build).await;
         let output = result(&events);
         assert!(output.is_error);
@@ -757,13 +783,11 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
     let mut model = Model::new("explore");
     model.model_override = Some("missing-model".into());
     let model = Arc::new(model);
-    let options = AgentOptions {
-        child_backend: Some(Arc::new(|_| {
-            Err("requested child model is unavailable".into())
-        })),
-        ..AgentOptions::default()
-    };
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)));
+    let options = AgentOptions::default();
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(|_| Err("requested child model is unavailable".into()));
+    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+        .with_child_backend(child_factory);
     let events = run(&parent, Mode::Build).await;
     assert!(result(&events).is_error);
     assert!(

@@ -4,12 +4,44 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::Duration;
 
+fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_agent::Message>) {
+    let directory = journal
+        .store()
+        .artifact_dir()
+        .parent()
+        .unwrap()
+        .join("memory")
+        .join(journal.id());
+    let store = rig_memory::DirStore::open(directory).unwrap();
+    let mut native = rig_memory::load(&store, "conversation").unwrap();
+    native.extend(
+        messages
+            .iter()
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    rig_memory::save(&store, "conversation", &mut native).unwrap();
+}
+
+fn message_contains(message: &serde_json::Value, expected: &str) -> bool {
+    message["content"]
+        .as_str()
+        .is_some_and(|text| text.contains(expected))
+        || message["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(expected))
+            })
+        })
+}
+
 fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_solaris"));
     command
         .env("SOLARIS_CONFIG_DIR", directory)
         .env("SOLARIS_LOCAL_BASE_URL", endpoint)
-        .args(["--max-seconds", "5"])
         .args(args);
     for name in [
         "ANTHROPIC_API_KEY",
@@ -94,7 +126,7 @@ fn serve_responses(
 #[test]
 fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let directory = tempfile::tempdir().expect("directory");
-    std::fs::write(directory.path().join("models.json"), r#"{"models":[{"provider":"local","id":"test-model","capabilities":{"image_input":"supported"}}]}"#).expect("model metadata");
+    std::fs::write(directory.path().join("models.json"), r#"{"models":{"test-model":{"provider":"local","request_id":"test-model","metadata":"ollama/test-model"}},"overrides":{"ollama":{"models":{"test-model":{"tool_call":true,"reasoning":false,"modalities":{"input":["text","image"],"output":["text"]}}}}}}"#).expect("model metadata");
     let image_path = directory.path().join("pixel.png");
     std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npayload").expect("image fixture");
     let response = sse_reply(serde_json::json!({"content":"headless smoke ok"}), "stop");
@@ -136,11 +168,10 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let child = store
         .create_subagent(&cwd, "test-model", id)
         .expect("child");
-    child
-        .append(&solaris_agent::SessionRecord::Message {
-            message: solaris_agent::Message::user("isolated child history"),
-        })
-        .expect("child history");
+    seed_memory(
+        &child,
+        vec![solaris_agent::Message::user("isolated child history")],
+    );
     assert_eq!(store.list(&cwd).expect("sessions")[0].id, child.id());
     drop(child);
     drop(store);
@@ -175,14 +206,14 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
             .as_array()
             .expect("history")
             .iter()
-            .any(|message| message["content"] == "first prompt")
+            .any(|message| message_contains(message, "first prompt"))
     );
     assert!(
         !requests[1]["messages"]
             .as_array()
             .expect("history")
             .iter()
-            .any(|message| message["content"] == "isolated child history")
+            .any(|message| message_contains(message, "isolated child history"))
     );
 }
 
@@ -339,11 +370,7 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             model: "test-model".into(),
         })
         .expect("source model");
-    source
-        .append(&SessionRecord::Message {
-            message: Message::user("source private history"),
-        })
-        .expect("history");
+    seed_memory(&source, vec![Message::user("source private history")]);
     let source_id = source.id().to_owned();
     drop(source);
     let mut auth = AuthStore::new();
@@ -455,12 +482,12 @@ fn headless_confirmation_preserves_automatic_reads_and_refuses_required_approval
             args.push("--plan");
         }
         let output = run(directory.path(), &endpoint, &args);
-        let requests = server.join().expect("fixture server");
         assert!(
             output.status.success(),
             "{case}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let requests = server.join().expect("fixture server");
         let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
             .expect("UTF8")
             .lines()
@@ -491,4 +518,40 @@ fn headless_confirmation_preserves_automatic_reads_and_refuses_required_approval
         }
         assert!(!target.exists(), "confirmation must not allow writes");
     }
+}
+
+#[test]
+fn named_model_routes_to_custom_endpoint_with_original_request_alias() {
+    let directory = tempfile::tempdir().expect("directory");
+    let (endpoint, server) = serve_responses(vec![sse_reply(
+        serde_json::json!({"content":"named route ok"}),
+        "stop",
+    )]);
+    let config = serde_json::json!({
+        "providers":{"gateway":{"protocol":"openai-chat","base_url":endpoint}},
+        "models":{"fast":{"provider":"gateway","request_id":"private-alias","metadata":"anthropic/claude-sonnet-4-5","output_tokens":2048}}
+    });
+    std::fs::write(directory.path().join("models.json"), config.to_string()).expect("config");
+    let output = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--model", "fast", "--print", "hello", "--ephemeral"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("named route ok"));
+    let requests = server.join().expect("server");
+    assert_eq!(requests[0]["model"], "private-alias");
+    let printed = run(
+        directory.path(),
+        "http://127.0.0.1:1/v1",
+        &["--model", "fast", "--print-config"],
+    );
+    assert!(printed.status.success());
+    let printed = String::from_utf8_lossy(&printed.stdout);
+    assert!(printed.contains("backend: gateway"), "{printed}");
+    assert!(printed.contains("anthropic/claude-sonnet-4-5"), "{printed}");
 }

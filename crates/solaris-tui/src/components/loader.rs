@@ -47,11 +47,6 @@ impl Loader {
         self
     }
 
-    /// Replace the message.
-    pub fn set_message(&mut self, message: impl Into<String>) {
-        self.message = message.into();
-    }
-
     /// Stop animating; the render shows a static glyph.
     pub fn stop(&mut self) {
         self.running = false;
@@ -60,11 +55,6 @@ impl Loader {
     /// Resume animating.
     pub fn start(&mut self) {
         self.running = true;
-    }
-
-    /// Whether the spinner is animating.
-    pub fn is_running(&self) -> bool {
-        self.running
     }
 }
 

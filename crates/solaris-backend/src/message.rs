@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool::{ToolCall, ToolResult};
+use solaris_types::{ToolCall, ToolResult};
 
 /// Who produced a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,17 +65,6 @@ impl Content {
     }
 }
 
-/// Journal-only context annotations, excluded by protocol message encoders.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum MessageContext {
-    Boundary,
-    Measurement {
-        usage: crate::Usage,
-        base_id: String,
-        request_id: String,
-    },
-}
-
 /// A single message in the conversation history.
 ///
 /// `Eq` is deliberately absent: tool arguments are JSON, and a JSON number is
@@ -84,8 +73,6 @@ pub enum MessageContext {
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<MessageContext>,
 }
 
 impl Message {
@@ -94,17 +81,12 @@ impl Message {
         Self {
             role,
             content: vec![Content::text(content)],
-            context: None,
         }
     }
 
     /// A message built from blocks of the caller's choosing.
     pub fn with_content(role: Role, content: Vec<Content>) -> Self {
-        Self {
-            role,
-            content,
-            context: None,
-        }
+        Self { role, content }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
@@ -136,29 +118,6 @@ impl Message {
     pub fn text(&self) -> String {
         let parts: Vec<&str> = self.content.iter().filter_map(Content::as_text).collect();
         parts.join("\n")
-    }
-
-    /// Characters across every block, for the estimate fallback.
-    pub fn characters(&self) -> usize {
-        self.content
-            .iter()
-            .map(|block| match block {
-                Content::Text { text } => text.chars().count(),
-                Content::Image { image } => image.data.len().min(32768),
-                Content::ToolUse { call } => {
-                    call.name.chars().count() + call.input.to_string().chars().count()
-                }
-                Content::ToolResult { result } => {
-                    result.output.chars().count()
-                        + result
-                            .metadata
-                            .images
-                            .iter()
-                            .map(|image| image.data.len().min(32768))
-                            .sum::<usize>()
-                }
-            })
-            .sum()
     }
 
     /// Images from direct attachments or tool results, in message order.
@@ -215,7 +174,6 @@ mod tests {
         assert!(message.tool_calls().next().is_none());
         assert!(message.tool_results().next().is_none());
         assert!(!message.is_tool_results());
-        assert_eq!(message.characters(), 5);
     }
 
     #[test]
@@ -236,14 +194,6 @@ mod tests {
 
         assert_eq!(message.role, Role::User);
         assert!(message.is_tool_results());
-        assert_eq!(message.characters(), "no such file".chars().count());
-    }
-
-    #[test]
-    fn tool_characters_count_towards_the_estimate() {
-        let call = ToolCall::new("call-1", "read", json!({ "path": "a" }));
-        let message = Message::tool_use(call);
-        assert!(message.characters() > 0);
     }
 
     #[test]

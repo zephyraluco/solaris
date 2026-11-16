@@ -160,11 +160,6 @@ impl Editor {
         editor
     }
 
-    /// Replace the placeholder text.
-    pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
-        self.placeholder = placeholder.into();
-    }
-
     /// Provide the slash commands offered by completion.
     pub fn set_hints(&mut self, hints: Vec<CommandHint>) {
         self.hints = hints;
@@ -180,11 +175,6 @@ impl Editor {
     /// Mark the editor as focused (draws the cursor).
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
-    }
-
-    /// Whether the editor is focused.
-    pub fn is_focused(&self) -> bool {
-        self.focused
     }
 
     /// The current text, with lines joined by `\n`.
@@ -210,11 +200,6 @@ impl Editor {
     /// Take the submitted text, if the user pressed Enter since the last call.
     pub fn take_submitted(&mut self) -> Option<String> {
         self.submitted.take()
-    }
-
-    /// Number of history entries.
-    pub fn history_len(&self) -> usize {
-        self.history.len()
     }
 
     /// Add a submitted prompt to the history.

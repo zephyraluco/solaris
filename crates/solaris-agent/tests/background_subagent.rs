@@ -1,753 +1,370 @@
-//! Background delegation through the public API, synchronized without sleeps.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::{Value, json};
-use solaris_agent::{
-    Agent, AgentBackend, AgentBackendConfig, AgentEvent, AgentEventStream, AgentOptions,
-    BackendError, Mode, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, TurnRequest, Usage,
+use solaris_agent::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use tokio::sync::{Notify, Semaphore};
-
-#[derive(Default)]
-struct Active {
-    count: AtomicUsize,
-    peak: AtomicUsize,
-}
-
-struct ActiveGuard<'a>(&'a Active);
-impl Drop for ActiveGuard<'_> {
-    fn drop(&mut self) {
-        self.0.count.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
+use tokio::sync::Semaphore;
 struct Model {
-    inputs: Vec<Value>,
-    seen: Mutex<Vec<TurnRequest>>,
-    parent_rounds: AtomicUsize,
+    parent: AtomicUsize,
+    background: bool,
+    observed_followup: AtomicBool,
     started: Semaphore,
     release: Semaphore,
-    progressed: Notify,
-    idle: Notify,
-    active: Active,
-    fail_child: bool,
-    panic_child: bool,
-    fail_parent: bool,
-    child_tool_before_wait: bool,
-    hold_parent_request: bool,
-    parent_release: Semaphore,
 }
-
-impl Model {
-    fn new(count: usize) -> Self {
-        Self {
-            inputs: (0..count)
-                .map(|index| {
-                    json!({
-                        "agent": "explore", "prompt": format!("Task {index}"), "background": true,
-                    })
-                })
-                .collect(),
-            seen: Mutex::default(),
-            parent_rounds: AtomicUsize::new(0),
-            started: Semaphore::new(0),
-            release: Semaphore::new(0),
-            progressed: Notify::new(),
-            idle: Notify::new(),
-            active: Active::default(),
-            fail_child: false,
-            panic_child: false,
-            fail_parent: false,
-            child_tool_before_wait: false,
-            hold_parent_request: false,
-            parent_release: Semaphore::new(0),
-        }
-    }
-
-    fn requests(&self) -> Vec<TurnRequest> {
-        self.seen.lock().unwrap().clone()
-    }
-
-    async fn wait_started(&self, count: u32) {
-        self.started.acquire_many(count).await.unwrap().forget();
-    }
-}
-
-fn child(request: &TurnRequest) -> bool {
-    request
-        .history
-        .iter()
-        .any(|message| message.text().starts_with("You are an isolated"))
-}
-
-fn notifications(request: &TurnRequest) -> Vec<String> {
-    request
-        .history
-        .iter()
-        .map(|message| message.text())
-        .filter(|text| text.starts_with("Background subagent notification "))
-        .collect()
-}
-
 #[async_trait]
-impl AgentBackend for Model {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        let is_child = child(&request);
-        let child_answered = request
-            .history
-            .iter()
-            .any(|message| message.tool_results().next().is_some());
-        let received = notifications(&request);
-        self.seen.lock().unwrap().push(request);
-        let mut events = if is_child && self.child_tool_before_wait && !child_answered {
-            vec![AgentEvent::ToolCall(ToolCall::new(
-                "child-read",
-                "read",
-                json!({}),
-            ))]
-        } else if is_child {
-            let count = self.active.count.fetch_add(1, Ordering::SeqCst) + 1;
-            self.active.peak.fetch_max(count, Ordering::SeqCst);
-            let _guard = ActiveGuard(&self.active);
-            self.started.add_permits(1);
-            self.release.acquire().await.unwrap().forget();
-            assert!(!self.panic_child, "scripted child panic");
-            if self.fail_child {
-                return Err(BackendError::new("child backend unavailable"));
-            }
-            vec![AgentEvent::TextDelta("child final report".into())]
-        } else {
-            let round = self.parent_rounds.fetch_add(1, Ordering::SeqCst);
-            if round == 0 {
-                self.inputs
+impl ModelConnector for Model {
+    async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
+        Ok(testing::client(Default::default(), move |request| {
+            let this = self.clone();
+            async move {
+                let child = request
+                    .history
                     .iter()
-                    .enumerate()
-                    .map(|(index, input)| {
-                        AgentEvent::ToolCall(ToolCall::new(
-                            format!("launch-{index}"),
-                            "subagent",
-                            input.clone(),
-                        ))
-                    })
-                    .collect()
-            } else if round == 1 {
-                if self.fail_parent {
-                    self.wait_started(1).await;
-                    if self.hold_parent_request {
-                        self.parent_release.acquire().await.unwrap().forget();
+                    .any(|m| m.role == Role::User && m.text().starts_with("You are an isolated"));
+                let events = if child {
+                    if request
+                        .history
+                        .iter()
+                        .any(|m| m.text().contains("follow-up instructions"))
+                    {
+                        this.observed_followup.store(true, Ordering::SeqCst);
                     }
-                    return Err(BackendError::new("parent backend unavailable"));
-                }
-                self.progressed.notify_one();
-                if self.hold_parent_request {
-                    self.parent_release.acquire().await.unwrap().forget();
-                }
-                vec![AgentEvent::ToolCall(ToolCall::new(
-                    "independent",
-                    "read",
-                    json!({}),
-                ))]
-            } else if received.len()
-                == self
-                    .inputs
-                    .iter()
-                    .filter(|input| input["background"] == true)
-                    .count()
-            {
-                vec![AgentEvent::TextDelta(
-                    "Parent integrated background reports.".into(),
-                )]
-            } else {
-                self.idle.notify_one();
-                vec![AgentEvent::TextDelta(
-                    "Parent has finished independent work.".into(),
-                )]
+                    this.started.add_permits(1);
+                    this.release.acquire().await.unwrap().forget();
+                    vec![AgentEvent::TextDelta("child result".into())]
+                } else if this.parent.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec![AgentEvent::ToolCall(ToolCall::new(
+                        "launch",
+                        "subagent",
+                        serde_json::json!({"agent":"explore","prompt":"inspect","background":this.background}),
+                    ))]
+                } else {
+                    let received = request
+                        .history
+                        .iter()
+                        .any(|m| m.text().contains("Background subagent notification"));
+                    vec![AgentEvent::TextDelta(
+                        if received {
+                            "parent received"
+                        } else {
+                            "parent finished"
+                        }
+                        .into(),
+                    )]
+                };
+                Ok(Box::pin(futures::stream::iter(events.into_iter().chain([
+                    AgentEvent::TurnComplete {
+                        usage: Usage::new(2, 1),
+                        cost_usd: 0.0,
+                    },
+                ]))) as AgentEventStream)
             }
-        };
-        events.push(AgentEvent::TurnComplete {
-            usage: Usage::new(2, 1),
-            cost_usd: 0.25,
-        });
-        Ok(Box::pin(futures::stream::iter(events)))
-    }
-
-    fn label(&self) -> &str {
-        "background-script"
+        }))
     }
 }
+fn model() -> Arc<Model> {
+    Arc::new(Model {
+        parent: AtomicUsize::new(0),
+        background: true,
+        observed_followup: AtomicBool::new(false),
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+    })
+}
 
-#[derive(Default)]
-struct Read(AtomicUsize);
-
+struct Nested;
 #[async_trait]
-impl Tool for Read {
-    fn name(&self) -> &str {
-        "read"
-    }
-    fn description(&self) -> &str {
-        "Record independent parent work"
-    }
-    fn parameters(&self) -> Value {
-        json!({"type": "object"})
-    }
-    async fn run(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        ToolOutput::ok("independent work done")
+impl ModelConnector for Nested {
+    async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
+        Ok(testing::client(Default::default(), |request| async move {
+            let delegated = request
+                .history
+                .iter()
+                .any(|message| message.tool_results().next().is_some());
+            let leaf = request
+                .history
+                .iter()
+                .any(|message| message.text().contains("level-two"));
+            let child = request
+                .history
+                .iter()
+                .any(|message| message.text().contains("level-one"));
+            let mut events = if leaf || delegated {
+                vec![AgentEvent::TextDelta("finished".into())]
+            } else {
+                vec![AgentEvent::ToolCall(ToolCall::new(
+                    "nested",
+                    "subagent",
+                    serde_json::json!({"agent":"explore","prompt":if child {"level-two"} else {"level-one"}}),
+                ))]
+            };
+            events.push(AgentEvent::TurnComplete {
+                usage: Usage::new(2, 1),
+                cost_usd: 0.0,
+            });
+            Ok(Box::pin(futures::stream::iter(events)) as AgentEventStream)
+        }))
     }
 }
-
-fn agent(model: &Arc<Model>, options: AgentOptions, read: &Arc<Read>) -> Agent {
-    Agent::new(
-        AgentBackendConfig {
-            backend: model.clone(),
+#[tokio::test]
+async fn nested_foreground_delegation_does_not_hold_the_only_execution_slot() {
+    let mut options = AgentOptions {
+        max_parallel: 1,
+        ..Default::default()
+    };
+    options.execution.subagent_depth = 2;
+    let session = SessionRuntime::new(Agent::new(
+        ConnectionConfig {
+            backend: Arc::new(Nested),
+            model: "test".into(),
             provider_id: None,
-            model: "test-model".into(),
             fallback_context_window: 128_000,
             instructions: None,
         },
-        Arc::new(ToolRegistry::with_tools(vec![read.clone()])),
+        Arc::new(ToolRegistry::with_tools(vec![])),
         options,
-    )
-}
-
-async fn run_with_release(model: &Arc<Model>, agent: &Agent) -> Vec<AgentEvent> {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let (events, ()) = tokio::join!(
-            agent
-                .run_turn("Delegate and continue working.", Mode::Build)
-                .collect(),
-            async {
-                model.wait_started(1).await;
-                model.progressed.notified().await;
-                model.release.add_permits(model.inputs.len());
-            }
-        );
-        events
-    })
-    .await
-    .expect("background turn must finish")
-}
-
-fn completions(events: &[AgentEvent]) -> Vec<(&str, &str, bool)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::SubagentComplete {
-                task_id,
-                output,
-                is_error,
-                ..
-            } => Some((task_id.as_str(), output.as_str(), *is_error)),
-            _ => None,
-        })
-        .collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_launch_returns_an_id_and_parent_work_runs_before_child_finishes() {
-    let model = Arc::new(Model::new(1));
-    let read = Arc::new(Read::default());
-    let agent = agent(&model, AgentOptions::default(), &read);
-    let events = run_with_release(&model, &agent).await;
-    let requests = model.requests();
-    let parent = requests
-        .iter()
-        .filter(|request| !child(request))
-        .nth(1)
-        .unwrap();
-    let results: Vec<_> = parent
-        .history
-        .iter()
-        .flat_map(|message| message.tool_results())
-        .collect();
-    assert_eq!(
-        serde_json::from_str::<Value>(&results[0].output).unwrap(),
-        json!({"task_id": "subagent-1", "status": "started"})
-    );
-    assert_eq!(read.0.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        completions(&events),
-        vec![("subagent-1", "child final report", false)]
-    );
-    let final_request = requests
-        .iter()
-        .rev()
-        .find(|request| !child(request))
-        .unwrap();
-    assert_eq!(notifications(final_request).len(), 1);
-    // Completion is data, not a second ToolResult for the launch call.
-    assert_eq!(
-        final_request
-            .history
-            .iter()
-            .flat_map(|m| m.tool_results())
-            .filter(|result| result.id == "launch-0")
-            .count(),
-        1
-    );
-    let rounds = u32::try_from(requests.len()).unwrap();
-    let billed = agent.usage_totals().unwrap();
-    assert_eq!(billed.usage, Usage::new(rounds * 2, rounds));
-    assert_eq!(billed.cost_usd, f64::from(rounds) * 0.25);
-    let child_usage = events
-        .iter()
-        .fold(Usage::default(), |total, event| match event {
-            AgentEvent::SubagentUsage { usage, .. } => total.merge(*usage),
-            _ => total,
-        });
-    assert_eq!(child_usage, Usage::new(2, 1));
-    assert!(
-        matches!(events.last(), Some(AgentEvent::TurnComplete { usage, cost_usd })
-        if *usage == Usage::new(rounds * 2, rounds) && *cost_usd == f64::from(rounds) * 0.25)
-    );
-    assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
-}
-
-#[tokio::test]
-async fn foreground_default_and_explicit_false_wait_before_parent_work_continues() {
-    for background in [None, Some(false)] {
-        let mut model = Model::new(1);
-        model.inputs[0]
-            .as_object_mut()
-            .unwrap()
-            .remove("background");
-        if let Some(background) = background {
-            model.inputs[0]["background"] = json!(background);
-        }
-        let model = Arc::new(model);
-        let read = Arc::new(Read::default());
-        let agent = agent(&model, AgentOptions::default(), &read);
-        let events = tokio::time::timeout(Duration::from_secs(3), async {
-            let (events, ()) = tokio::join!(
-                agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
-                async {
-                    model.wait_started(1).await;
-                    assert_eq!(model.parent_rounds.load(Ordering::SeqCst), 1);
-                    assert_eq!(read.0.load(Ordering::SeqCst), 0);
-                    model.release.add_permits(1);
-                }
-            );
-            events
-        })
-        .await
-        .unwrap();
-        let rounds = u32::try_from(model.requests().len()).unwrap();
-        let billed = agent.usage_totals().unwrap();
-        assert_eq!(billed.usage, Usage::new(rounds * 2, rounds));
-        assert_eq!(billed.cost_usd, f64::from(rounds) * 0.25);
-        assert!(completions(&events).is_empty());
-        assert!(events.iter().any(|event| matches!(event,
-            AgentEvent::ToolResult { result, .. } if result.output == "child final report")));
-        assert_eq!(read.0.load(Ordering::SeqCst), 1);
-    }
-}
-
-#[tokio::test]
-async fn an_idle_parent_waits_for_a_notification_without_polling_the_model() {
-    let model = Arc::new(Model::new(1));
-    let read = Arc::new(Read::default());
-    let agent = agent(&model, AgentOptions::default(), &read);
-    let events = tokio::time::timeout(Duration::from_secs(3), async {
-        let (events, ()) = tokio::join!(
-            agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
-            async {
-                model.wait_started(1).await;
-                model.idle.notified().await;
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-                assert_eq!(model.parent_rounds.load(Ordering::SeqCst), 3);
-                assert_eq!(read.0.load(Ordering::SeqCst), 1);
-                model.release.add_permits(1);
-            }
-        );
-        events
-    })
-    .await
-    .unwrap();
-    assert_eq!(completions(&events).len(), 1);
-}
-
-#[tokio::test]
-async fn completion_notifies_immediately_even_while_the_parent_request_is_pending() {
-    let mut model = Model::new(1);
-    model.hold_parent_request = true;
-    let model = Arc::new(model);
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        model.wait_started(1).await;
-        model.progressed.notified().await;
-        model.release.add_permits(1);
-        loop {
-            if matches!(
-                stream.next().await,
-                Some(AgentEvent::SubagentComplete { .. })
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("notification must not wait for the parent request");
-    assert_eq!(model.parent_rounds.load(Ordering::SeqCst), 2);
-    model.parent_release.add_permits(1);
-    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(1), stream.collect())
-        .await
-        .unwrap();
-    assert!(
-        completions(&rest).is_empty(),
-        "notification must not be duplicated at delivery"
-    );
-    let requests = model.requests();
-    assert_eq!(notifications(requests.last().unwrap()).len(), 1);
-}
-
-#[tokio::test]
-async fn steering_reaches_a_parent_waiting_for_background_reports() {
-    let model = Arc::new(Model::new(1));
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        model.wait_started(1).await;
-        model.idle.notified().await;
-        agent
-            .steering_handle()
-            .push("Continue with another independent check.");
-        loop {
-            if let Some(AgentEvent::Steered { text }) = stream.next().await {
-                assert_eq!(text, "Continue with another independent check.");
-                break;
-            }
-        }
-    })
-    .await
-    .expect("steering must not wait for background work");
-    assert_eq!(model.active.count.load(Ordering::SeqCst), 1);
-    model.release.add_permits(1);
-    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(1), stream.collect())
-        .await
-        .unwrap();
-    assert_eq!(completions(&rest).len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_children_share_the_parallel_cap_across_batches() {
-    let model = Arc::new(Model::new(5));
-    let agent = agent(
-        &model,
-        AgentOptions {
-            max_parallel: 2,
-            ..Default::default()
-        },
-        &Arc::new(Read::default()),
-    );
-    let events = tokio::time::timeout(Duration::from_secs(3), async {
-        let (events, ()) = tokio::join!(
-            agent
-                .run_turn("Delegate five tasks", Mode::Build)
-                .collect::<Vec<_>>(),
-            async {
-                model.wait_started(2).await;
-                model.progressed.notified().await;
-                assert_eq!(model.active.count.load(Ordering::SeqCst), 2);
-                model.release.add_permits(5);
-            }
-        );
-        events
-    })
-    .await
-    .unwrap();
-    assert_eq!(model.active.peak.load(Ordering::SeqCst), 2);
-    let mut ids: Vec<_> = completions(&events).iter().map(|entry| entry.0).collect();
-    ids.sort_unstable();
-    assert_eq!(
-        ids,
-        [
-            "subagent-1",
-            "subagent-2",
-            "subagent-3",
-            "subagent-4",
-            "subagent-5"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn foreground_and_background_children_share_the_same_execution_slots() {
-    let mut model = Model::new(2);
-    model.inputs[1]["background"] = json!(false);
-    let model = Arc::new(model);
-    let agent = agent(
-        &model,
-        AgentOptions {
-            max_parallel: 1,
-            ..Default::default()
-        },
-        &Arc::new(Read::default()),
-    );
-    let events = tokio::time::timeout(Duration::from_secs(3), async {
-        let (events, ()) = tokio::join!(
-            agent.run_turn("Delegate", Mode::Build).collect::<Vec<_>>(),
-            async {
-                model.wait_started(1).await;
-                assert_eq!(model.active.count.load(Ordering::SeqCst), 1);
-                model.release.add_permits(1);
-                model.wait_started(1).await;
-                model.release.add_permits(1);
-            }
-        );
-        events
-    })
-    .await
-    .unwrap();
-    assert_eq!(model.active.peak.load(Ordering::SeqCst), 1);
-    assert_eq!(completions(&events).len(), 1);
-}
-
-#[tokio::test]
-async fn failed_and_panicking_background_children_notify_the_parent_without_ending_its_turn() {
-    for panic in [false, true] {
-        let mut model = Model::new(1);
-        model.fail_child = !panic;
-        model.panic_child = panic;
-        let model = Arc::new(model);
-        let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-        let events = run_with_release(&model, &agent).await;
-        let reports = completions(&events);
-        assert_eq!(reports.len(), 1);
-        assert!(reports[0].2);
-        assert!(reports[0].1.contains(if panic {
-            "without completing"
-        } else {
-            "child backend unavailable"
-        }));
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::TurnComplete { .. })
-        ));
-        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
-    }
-}
-
-#[tokio::test]
-async fn invalid_background_arguments_and_plan_writes_are_rejected_before_launch() {
-    for input in [
-        json!({"agent":"general", "prompt":"write", "background":true}),
-        json!({"agent":"explore", "prompt":"read", "background":"true"}),
-        json!({"agent":"explore", "prompt":" ", "background":true}),
-    ] {
-        let mut model = Model::new(1);
-        model.inputs = vec![input];
-        let model = Arc::new(model);
-        let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-        let mut stream = agent.run_turn("Delegate", Mode::Plan);
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
-            while let Some(event) = stream.next().await {
-                if let AgentEvent::ToolResult { result, .. } = event {
-                    return result;
-                }
-            }
-            panic!("launch must return an error")
-        })
-        .await
-        .unwrap();
-        assert!(result.is_error);
-        assert!(!model.requests().iter().any(child));
-        drop(stream);
-    }
-}
-
-async fn wait_stopped(model: &Model) {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while model.active.count.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("no background child may be left running");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelling_or_dropping_the_parent_stops_running_and_queued_background_children() {
-    for drop_stream in [false, true] {
-        let model = Arc::new(Model::new(3));
-        let agent = agent(
-            &model,
-            AgentOptions {
-                max_parallel: 1,
-                ..Default::default()
-            },
-            &Arc::new(Read::default()),
-        );
-        let stream = agent.run_turn("Delegate", Mode::Build);
-        tokio::time::timeout(Duration::from_secs(1), model.wait_started(1))
-            .await
-            .unwrap();
-        if drop_stream {
-            drop(stream);
-        } else {
-            agent.cancel_handle().cancel();
-            let events: Vec<_> = tokio::time::timeout(Duration::from_secs(1), stream.collect())
-                .await
-                .unwrap();
-            assert!(
-                matches!(events.last(), Some(AgentEvent::Error(error)) if error.contains("cancelled"))
-            );
-        }
-        wait_stopped(&model).await;
-        model.release.add_permits(3);
-        let next: Vec<_> = tokio::time::timeout(
-            Duration::from_secs(1),
-            agent.run_turn("A new turn", Mode::Build).collect(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(next.last(), Some(AgentEvent::TurnComplete { .. })));
-        assert!(
-            completions(&next).is_empty(),
-            "old tasks must not leak into a new turn"
-        );
-        assert_eq!(
-            model
-                .requests()
-                .iter()
-                .filter(|request| child(request))
-                .count(),
-            1
-        );
-    }
-}
-
-#[tokio::test]
-async fn completed_child_request_usage_survives_parent_cancellation() {
-    let mut model = Model::new(1);
-    model.child_tool_before_wait = true;
-    let model = Arc::new(model);
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let stream = agent.run_turn("Delegate", Mode::Build);
-    tokio::time::timeout(Duration::from_secs(1), model.wait_started(1))
-        .await
-        .unwrap();
-    agent.cancel_handle().cancel();
-    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(1), stream.collect())
-        .await
-        .unwrap();
-    let billed: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::SubagentUsage { usage, cost_usd } => Some((*usage, *cost_usd)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(billed, vec![(Usage::new(2, 1), 0.25)]);
-    assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
-    wait_stopped(&model).await;
-}
-
-#[tokio::test]
-async fn background_tool_display_events_are_linked_before_the_child_starts() {
-    let mut model = Model::new(1);
-    model.child_tool_before_wait = true;
-    let model = Arc::new(model);
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let events = run_with_release(&model, &agent).await;
-    let started = events.iter().position(|event| matches!(event,
-        AgentEvent::SubagentStarted { call_id, task_id } if call_id == "launch-0" && task_id == "subagent-1")).unwrap();
-    let tool = events.iter().position(|event| matches!(event,
-        AgentEvent::SubagentToolCall { task_id, call } if task_id == "subagent-1" && call.id == "child-read")).unwrap();
-    assert!(started < tool);
-    assert!(events.iter().any(|event| matches!(event,
-        AgentEvent::SubagentToolResult { task_id, result, .. } if task_id == "subagent-1" && result.id == "child-read")));
-    assert_eq!(completions(&events).len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parent_failure_aborts_its_background_children() {
-    let mut model = Model::new(1);
-    model.fail_parent = true;
-    let model = Arc::new(model);
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let events: Vec<_> = tokio::time::timeout(
-        Duration::from_secs(1),
-        agent.run_turn("Delegate", Mode::Build).collect(),
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(events.last(), Some(AgentEvent::Error(error)) if error.contains("parent backend unavailable"))
-    );
-    wait_stopped(&model).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn background_timeout_is_a_notification_and_the_parent_can_finish() {
-    let model = Arc::new(Model::new(1));
-    let agent = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-    let mut stream = agent.run_turn("Delegate", Mode::Build);
-    model.wait_started(1).await;
-    model.idle.notified().await;
-    tokio::time::advance(Duration::from_secs(301)).await;
-    let events: Vec<_> = stream.by_ref().collect().await;
-    let reports = completions(&events);
-    assert_eq!(reports.len(), 1);
-    assert!(reports[0].2 && reports[0].1.contains("timed out"));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::TurnComplete { .. })
     ));
-    wait_stopped(&model).await;
+    let events: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        session
+            .execute(RuntimeCommand::Prompt {
+                text: "root".into(),
+                mode: Mode::Build,
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await
+    })
+    .await
+    .expect("nested delegation must release waiting capacity");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::TurnComplete { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::Error(_)))
+    );
+    assert_eq!(session.jobs().list(&session.snapshot().session_id).len(), 1);
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn child_requests_are_billed_before_parent_failure_or_cancellation_and_survive_restore() {
-    for fail_parent in [true, false] {
-        let mut model = Model::new(1);
-        model.child_tool_before_wait = true;
-        model.hold_parent_request = true;
-        model.fail_parent = fail_parent;
-        let model = Arc::new(model);
-        let original = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-        let directory = tempfile::tempdir().unwrap();
-        let store =
-            solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
-        let journal = store.create(directory.path(), "test-model", None).unwrap();
-        original.attach_journal(journal.clone()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut stream = original.run_turn("Delegate", Mode::Build);
-            while let Some(event) = stream.next().await {
-                if matches!(event, AgentEvent::SubagentUsage { .. }) {
-                    // The child's first request completed; its next request is still blocked.
-                    assert_eq!(original.usage_totals().unwrap().usage.total(), 6);
-                    if fail_parent {
-                        model.parent_release.add_permits(1);
-                    } else {
-                        original.cancel_handle().cancel();
-                    }
-                }
-                if let AgentEvent::Error(error) = event {
-                    assert!(error.contains(if fail_parent {
-                        "parent backend unavailable"
-                    } else {
-                        "cancelled"
-                    }));
-                    break;
-                }
+fn agent(model: Arc<Model>) -> Agent {
+    Agent::new(
+        ConnectionConfig {
+            backend: model,
+            model: "test".into(),
+            provider_id: None,
+            fallback_context_window: 128_000,
+            instructions: None,
+        },
+        Arc::new(ToolRegistry::with_tools(vec![])),
+        AgentOptions::default(),
+    )
+}
+#[tokio::test]
+async fn background_job_outlives_parent_turn_and_delivers_to_idle_session() {
+    let model = model();
+    let runtime = Runtime::default();
+    let session = runtime.open(agent(model.clone())).unwrap();
+    let mut updates = session.subscribe();
+    let events: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        session
+            .execute(RuntimeCommand::Prompt {
+                text: "delegate".into(),
+                mode: Mode::Build,
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::TurnComplete { .. }))
+    );
+    model.started.acquire().await.unwrap().forget();
+    let owner = session.snapshot().session_id;
+    let jobs = runtime.jobs();
+    let info = jobs.list(&owner).pop().unwrap();
+    assert_eq!(info.status, JobStatus::Running);
+    drop(session.execute(RuntimeCommand::Cancel).await.unwrap());
+    assert_eq!(jobs.get(&info.id).unwrap().status, JobStatus::Running);
+    model.release.add_permits(1);
+    assert_eq!(
+        jobs.wait(&info.id).await.unwrap().status,
+        JobStatus::Completed
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(&event.event,AgentEvent::TextDelta(text) if text=="parent received") {
+                break;
             }
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn application_shutdown_marks_running_jobs_interrupted() {
+    let model = model();
+    let runtime = Runtime::default();
+    let session = runtime.open(agent(model.clone())).unwrap();
+    let _: Vec<_> = session
+        .execute(RuntimeCommand::Prompt {
+            text: "delegate".into(),
+            mode: Mode::Build,
         })
         .await
-        .expect("parent stops without waiting for child completion");
-        wait_stopped(&model).await;
-        let totals = original.usage_totals().unwrap();
-        assert_eq!(totals.usage.total(), 6);
-        assert_eq!(totals.cost_usd, 0.5);
-        let restored = agent(&model, AgentOptions::default(), &Arc::new(Read::default()));
-        restored.attach_journal(journal).unwrap();
-        assert_eq!(restored.usage_totals(), Some(totals));
-    }
+        .unwrap()
+        .collect()
+        .await;
+    model.started.acquire().await.unwrap().forget();
+    let info = runtime
+        .jobs()
+        .list(&session.snapshot().session_id)
+        .pop()
+        .unwrap();
+    runtime.shutdown();
+    let result = runtime.jobs().wait(&info.id).await.unwrap();
+    assert_eq!(result.status, JobStatus::Interrupted);
+    assert_eq!(result.stop_reason, Some(StopReason::Shutdown));
+}
+
+#[tokio::test]
+async fn explicit_job_cancel_stops_only_the_requested_child() {
+    let model = model();
+    let runtime = Runtime::default();
+    let session = runtime.open(agent(model.clone())).unwrap();
+    let _: Vec<_> = session
+        .execute(RuntimeCommand::Prompt {
+            text: "delegate".into(),
+            mode: Mode::Build,
+        })
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    model.started.acquire().await.unwrap().forget();
+    let owner = session.snapshot().session_id;
+    let info = runtime.jobs().list(&owner).pop().unwrap();
+    assert!(!runtime.jobs().cancel("another-parent", &info.id));
+    assert!(runtime.jobs().cancel(&owner, &info.id));
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runtime.jobs().wait(&info.id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(done.status, JobStatus::Cancelled);
+    assert_eq!(done.stop_reason, Some(StopReason::UserCancelled));
+}
+#[tokio::test]
+async fn cancelling_foreground_wait_cancels_the_child_job() {
+    let mut fixture = model();
+    Arc::get_mut(&mut fixture).unwrap().background = false;
+    let runtime = Runtime::default();
+    let session = runtime.open(agent(fixture.clone())).unwrap();
+    let events = session
+        .execute(RuntimeCommand::Prompt {
+            text: "delegate".into(),
+            mode: Mode::Build,
+        })
+        .await
+        .unwrap();
+    fixture.started.acquire().await.unwrap().forget();
+    let id = runtime
+        .jobs()
+        .list(&session.snapshot().session_id)
+        .pop()
+        .unwrap()
+        .id;
+    drop(session.execute(RuntimeCommand::Cancel).await.unwrap());
+    let _: Vec<_> = events.collect().await;
+    let done = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.jobs().wait(&id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.status, JobStatus::Cancelled);
+}
+#[tokio::test]
+async fn restart_restores_interrupted_jobs_without_replaying_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.sqlite");
+    let store = SessionStore::open(&path).unwrap();
+    let journal = store.create(dir.path(), "test", None).unwrap();
+    let owner = journal.id().to_owned();
+    let fixture = model();
+    let agent = agent(fixture.clone());
+    agent.attach_journal(journal.clone()).unwrap();
+    let runtime = Runtime::default();
+    let session = runtime.open(agent).unwrap();
+    let _: Vec<_> = session
+        .execute(RuntimeCommand::Prompt {
+            text: "delegate".into(),
+            mode: Mode::Build,
+        })
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    fixture.started.acquire().await.unwrap().forget();
+    let id = runtime.jobs().list(&owner).pop().unwrap().id;
+    runtime.shutdown();
+    drop(session);
+    drop(runtime);
+    let restored = crate_agent(fixture.clone());
+    restored.attach_journal(journal).unwrap();
+    let runtime = Runtime::default();
+    let session = runtime.open(restored).unwrap();
+    assert_eq!(
+        runtime.jobs().get(&id).unwrap().status,
+        JobStatus::Interrupted
+    );
+    assert_eq!(fixture.started.available_permits(), 0);
+    assert_eq!(session.snapshot().session_id, owner);
+}
+fn crate_agent(model: Arc<Model>) -> Agent {
+    agent(model)
+}
+
+#[tokio::test]
+async fn running_child_accepts_a_followup_without_starting_a_second_job() {
+    let model = model();
+    let runtime = Runtime::default();
+    let session = runtime.open(agent(model.clone())).unwrap();
+    let _: Vec<_> = session
+        .execute(RuntimeCommand::Prompt {
+            text: "delegate".into(),
+            mode: Mode::Build,
+        })
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    model.started.acquire().await.unwrap().forget();
+    let owner = session.snapshot().session_id;
+    let info = runtime.jobs().list(&owner).pop().unwrap();
+    runtime
+        .jobs()
+        .send(&owner, &info.id, "follow-up instructions")
+        .unwrap();
+    model.release.add_permits(2);
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runtime.jobs().wait(&info.id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(done.status, JobStatus::Completed);
+    assert!(model.observed_followup.load(Ordering::SeqCst));
+    assert_eq!(runtime.jobs().list(&owner).len(), 1);
 }
