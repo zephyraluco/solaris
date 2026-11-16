@@ -247,6 +247,7 @@ impl SubagentRunner {
         let mut services = self.services.clone();
         services.depth = self.services.depth + 1;
         services.report = Some(crate::runtime::services::ChildReport {
+            task_id: task_id.to_owned(),
             totals: Arc::clone(&totals),
             tx: task.background.then(|| tx.clone()),
         });

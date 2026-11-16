@@ -548,13 +548,14 @@ impl Runner {
                 Ok(info) => info,
                 Err(error) => return ToolResult::error(call, error).into(),
             };
-            let Some(result) = info.result else {
+            let Some(mut result) = info.result else {
                 return ToolResult::error(
                     call,
                     format!("subagent stopped: {:?}", info.stop_reason),
                 )
                 .into();
             };
+            result.metadata.details["job_id"] = id.into();
             (
                 solaris_tools::ToolOutput {
                     text: result.output,
@@ -600,6 +601,10 @@ impl Runner {
 
         if !result.totals.usage.is_empty() || result.totals.cost_usd != 0.0 {
             tx.send(AgentEvent::SubagentUsage {
+                task_id: result.result.metadata.details["job_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 usage: result.totals.usage,
                 cost_usd: result.totals.cost_usd,
             })

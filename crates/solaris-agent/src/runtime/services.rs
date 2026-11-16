@@ -11,6 +11,7 @@ pub(crate) struct SessionServices {
 }
 #[derive(Clone)]
 pub(crate) struct ChildReport {
+    pub task_id: String,
     pub totals: Arc<std::sync::Mutex<UsageTotals>>,
     pub tx: Option<tokio::sync::mpsc::UnboundedSender<crate::AgentEvent>>,
 }

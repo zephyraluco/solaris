@@ -105,6 +105,25 @@ impl Tui {
 
     /// Run until the quit flag is raised.
     pub fn run(&mut self, terminal: &mut PiTerminal) -> io::Result<()> {
+        let result = self.run_loop(terminal);
+        self.shutdown_components(result)
+    }
+    fn shutdown_components(&mut self, mut result: io::Result<()>) -> io::Result<()> {
+        for overlay in &mut self.overlays {
+            let cleanup = overlay.component.shutdown();
+            if result.is_ok() {
+                result = cleanup;
+            }
+        }
+        if let Some(root) = &mut self.root {
+            let cleanup = root.shutdown();
+            if result.is_ok() {
+                result = cleanup;
+            }
+        }
+        result
+    }
+    fn run_loop(&mut self, terminal: &mut PiTerminal) -> io::Result<()> {
         let mut force_first_frame = true;
 
         while !self.quit.get() {
@@ -321,6 +340,30 @@ mod tests {
         fn cursor_position(&self) -> Option<(u16, u16)> {
             self.0.borrow().cursor_position()
         }
+    }
+
+    #[test]
+    fn shutdown_runs_even_after_an_error_and_preserves_the_primary_failure() {
+        struct Probe(Rc<Cell<bool>>);
+        impl Component for Probe {
+            fn render(&mut self, _: &mut Buffer, _: Rect) {}
+            fn shutdown(&mut self) -> io::Result<()> {
+                self.0.set(true);
+                Err(io::Error::other("save failed"))
+            }
+        }
+        let called = Rc::new(Cell::new(false));
+        let mut tui = Tui::new();
+        tui.set_root(Box::new(Probe(called.clone())));
+        let error = tui
+            .shutdown_components(Err(io::Error::other("draw failed")))
+            .unwrap_err();
+        assert!(called.get());
+        assert_eq!(error.to_string(), "draw failed");
+        assert_eq!(
+            tui.shutdown_components(Ok(())).unwrap_err().to_string(),
+            "save failed"
+        );
     }
 
     #[test]

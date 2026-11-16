@@ -1,5 +1,7 @@
 //! Persistent event boundary shared by interactive and headless clients.
 pub(crate) mod jobs;
+mod subscription;
+pub use subscription::RuntimeSubscription;
 
 #[cfg(any(test, feature = "test-utils"))]
 use crate::SessionRecord;
@@ -62,11 +64,13 @@ impl Drop for TurnLease {
 }
 
 /// Ordered product event. Sequence numbers belong to the session, not a client.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeEvent {
     pub session_id: String,
     pub sequence: Option<u64>,
     pub task_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub event: AgentEvent,
 }
 
@@ -103,24 +107,45 @@ impl RuntimeSnapshot {
 pub type RuntimeEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = RuntimeEvent> + Send>>;
 
 pub struct CommandReceipt {
-    ready: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ready: tokio::sync::oneshot::Receiver<Result<RuntimeSnapshot, String>>,
     events: RuntimeEventStream,
 }
 impl CommandReceipt {
     pub async fn accepted(self) -> Result<RuntimeEventStream, String> {
-        self.ready
+        self.accepted_with_snapshot()
+            .await
+            .map(|(_, events)| events)
+    }
+    pub async fn accepted_with_snapshot(
+        self,
+    ) -> Result<(RuntimeSnapshot, RuntimeEventStream), String> {
+        let snapshot = self
+            .ready
             .await
             .map_err(|_| "session runtime stopped".to_string())??;
-        Ok(self.events)
+        Ok((snapshot, self.events))
+    }
+}
+
+pub struct DispatchReceipt {
+    ready: tokio::sync::oneshot::Receiver<Result<RuntimeSnapshot, String>>,
+}
+impl DispatchReceipt {
+    pub async fn accepted(self) -> Result<RuntimeSnapshot, String> {
+        self.ready
+            .await
+            .map_err(|_| "session runtime stopped".to_string())?
     }
 }
 
 struct Request {
     command: RuntimeCommand,
-    output: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    accepted: tokio::sync::oneshot::Sender<Result<(), String>>,
+    output: Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>,
+    accepted: tokio::sync::oneshot::Sender<Result<RuntimeSnapshot, String>>,
 }
 struct Core {
+    closed: tokio::sync::watch::Sender<bool>,
+    history: std::sync::Mutex<std::collections::VecDeque<RuntimeEvent>>,
     auto_wake: bool,
     view: std::sync::RwLock<Arc<crate::Agent>>,
     sender: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Request>>>,
@@ -140,12 +165,18 @@ impl Drop for Core {
 /// Application lifetime owner of loaded sessions and their independent jobs.
 #[derive(Default)]
 pub struct Runtime {
+    stopped: std::sync::atomic::AtomicBool,
     jobs: crate::Jobs,
     sessions: std::sync::Mutex<std::collections::HashMap<String, SessionRuntime>>,
 }
 impl Runtime {
     pub fn open(&self, mut agent: crate::Agent) -> Result<SessionRuntime, crate::StoreError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::StoreError::Invalid(
+                "application runtime stopped".into(),
+            ));
+        }
         let id = agent.session_id();
         if let Some(session) = sessions
             .values()
@@ -170,15 +201,17 @@ impl Runtime {
         self.jobs.clone()
     }
     pub fn shutdown(&self) {
-        self.jobs.shutdown();
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
         for session in self
             .sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
         {
-            session.cancel_handle().cancel();
+            session.shutdown();
         }
+        self.jobs.shutdown();
     }
 }
 impl Drop for Runtime {
@@ -229,6 +262,8 @@ impl SessionRuntime {
         };
         Self {
             core: Arc::new(Core {
+                closed: tokio::sync::watch::channel(false).0,
+                history: Default::default(),
                 auto_wake,
                 view: std::sync::RwLock::new(agent),
                 sender: Default::default(),
@@ -254,7 +289,14 @@ impl SessionRuntime {
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
         self.core.events.subscribe()
     }
+    pub fn shutdown(&self) {
+        self.core.closed.send_replace(true);
+        self.cancel_handle().cancel();
+    }
     pub fn activate(&self) -> Result<(), String> {
+        if *self.core.closed.borrow() {
+            return Err("session runtime stopped".into());
+        }
         let mut sender = self.core.sender.lock().unwrap_or_else(|p| p.into_inner());
         if sender.is_none() {
             let runtime = tokio::runtime::Handle::try_current()
@@ -282,7 +324,7 @@ impl SessionRuntime {
         let (accepted, ready) = tokio::sync::oneshot::channel();
         self.send(Request {
             command,
-            output,
+            output: Some(output),
             accepted,
         })?;
         Ok(CommandReceipt {
@@ -292,6 +334,18 @@ impl SessionRuntime {
             })),
         })
     }
+    /// Submit an application-owned operation. Lifetime is independent of observers;
+    /// use Cancel explicitly. The receipt contains no duplicate event stream.
+    pub fn dispatch(&self, command: RuntimeCommand) -> Result<DispatchReceipt, String> {
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        self.send(Request {
+            command,
+            output: None,
+            accepted,
+        })?;
+        Ok(DispatchReceipt { ready })
+    }
+
     pub async fn execute(&self, command: RuntimeCommand) -> Result<RuntimeEventStream, String> {
         self.submit(command)?.accepted().await
     }
@@ -387,6 +441,15 @@ fn publish(
     mode: crate::Mode,
     event: AgentEvent,
 ) -> RuntimeEvent {
+    publish_with_prompt(core, task_id, mode, event, None)
+}
+fn publish_with_prompt(
+    core: &Core,
+    task_id: Option<u64>,
+    mode: crate::Mode,
+    event: AgentEvent,
+    prompt: Option<String>,
+) -> RuntimeEvent {
     refresh(core, if event.is_terminal() { None } else { task_id }, mode);
     let mut event = event;
     let journal = core
@@ -396,7 +459,8 @@ fn publish(
         .journal();
     let persisted = journal
         .as_ref()
-        .map(|journal| journal.publish_event(&event));
+        .map(|journal| journal.publish_runtime_event(task_id, &event, prompt.clone()));
+    let mut history = core.history.lock().unwrap_or_else(|p| p.into_inner());
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
     let sequence = match persisted {
         Some(Ok(sequence)) => {
@@ -419,18 +483,22 @@ fn publish(
         session_id: snapshot.session_id.clone(),
         sequence,
         task_id,
+        prompt,
         event,
     };
+    history.push_back(event.clone());
+    if history.len() > 1024 {
+        history.pop_front();
+    }
+    drop(history);
     let _ = core.events.send(event.clone());
     event
 }
 struct Active {
-    _output_guard: Option<tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>>,
     id: u64,
     mode: crate::Mode,
     stream: AgentEventStream,
-    output: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    abandoned: bool,
+    output: Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>,
     terminal: Option<AgentEvent>,
 }
 async fn serve(
@@ -439,63 +507,59 @@ async fn serve(
 ) {
     let Some(core) = weak.upgrade() else { return };
     let jobs = core.view.read().unwrap_or_else(|p| p.into_inner()).jobs();
+    let mut closed = core.closed.subscribe();
+    let mut deferred = std::collections::VecDeque::<Request>::new();
     let mut job_changes = jobs.subscribe();
     let mut progress = jobs.progress();
+    let mut next_id = core
+        .snapshot
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .sequence;
     drop(core);
     let mut active: Option<Active> = None;
-    let mut next_id = 0;
     loop {
-        if active.is_none() {
+        if *closed.borrow() {
+            break;
+        }
+        if active.is_none() && deferred.is_empty() {
             let Some(core) = weak.upgrade() else { break };
             let agent = Arc::clone(&core.view.read().unwrap_or_else(|p| p.into_inner()));
             if core.auto_wake && agent.has_notifications() {
                 let mode = core.snapshot.read().unwrap_or_else(|p| p.into_inner()).mode;
-                let (output, guard) = tokio::sync::mpsc::unbounded_channel();
                 next_id += 1;
                 active = Some(Active {
-                    _output_guard: Some(guard),
                     id: next_id,
                     mode,
                     stream: agent.run_pending(mode),
-                    output,
-                    abandoned: false,
+                    output: None,
                     terminal: None,
                 });
             }
         }
-        let abandoned_output = active
-            .as_ref()
-            .filter(|run| !run.abandoned)
-            .map(|run| run.output.clone());
+        let abandoned_output = active.as_ref().and_then(|run| run.output.clone());
+        let idle = active.is_none();
         tokio::select! {
             biased;
-            event = progress.recv() => {
-                let Some(core) = weak.upgrade() else { break };
-                let state = core.snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
-                match event {
-                    Ok((owner, event)) if owner == state.session_id => {
-                        let event = publish(&core, active.as_ref().map(|run|run.id), state.mode, event);
-                        if let Some(run) = &active { let _ = run.output.send(event); }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        publish(&core, None, state.mode, AgentEvent::Error("background progress subscriber lagged; consult the child session journal".into()));
-                    }
-                    _ => {}
-                }
-            }
-            _ = job_changes.changed() => {},
-            request = commands.recv() => {
+            _ = closed.changed()=>break,
+            request = async {if idle && !deferred.is_empty(){deferred.pop_front()}else{commands.recv().await}} => {
                 let Some(Request { command, output, accepted }) = request else { break };
                 let Some(core) = weak.upgrade() else { break };
                 let agent = Arc::clone(&core.view.read().unwrap_or_else(|p| p.into_inner()));
                 let busy = active.is_some();
+                if busy && matches!(&command,RuntimeCommand::ReplaceResources {..} | RuntimeCommand::ReplaceConnection {..}) {
+                    deferred.push_back(Request {command,output,accepted});continue;
+                }
                 let mut result = Ok(());
                 match command {
                     RuntimeCommand::Prompt { text, mode } if !busy => {
                         next_id += 1;
+                        let display=text.clone();
                         let stream = agent.run_turn(text, mode);
-                        active = Some(Active { _output_guard:None, id: next_id, mode, stream, output: output.clone(), abandoned: false, terminal: None });
+                        active = Some(Active { id: next_id, mode, stream, output: output.clone(), terminal: None });
                         refresh(&core, Some(next_id), mode);
+                        let event=publish_with_prompt(&core,Some(next_id),mode,AgentEvent::Status("working".into()),Some(display));
+                        if let Some(output)=&output {let _=output.send(event);}
                     }
                     RuntimeCommand::Cancel => agent.cancel_handle().cancel(),
                     RuntimeCommand::Steer { text } => { result = agent.enqueue_input(&text,false); }
@@ -503,7 +567,7 @@ async fn serve(
                     RuntimeCommand::PreparedSteer { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,false,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::PreparedQueue { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,true,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::CancelTask { id } => { if !agent.cancel_task(&id) { result = Err("task is not active".into()); } }
-                    RuntimeCommand::Clear if !busy => agent.clear(),
+                    RuntimeCommand::Clear if !busy => result=agent.clear_checked(),
                     RuntimeCommand::AttachImage { image } if !busy => result = agent.attach_image(image),
                     RuntimeCommand::AttachJournal { journal } if !busy => result = agent.attach_journal(journal).map_err(|e| e.to_string()),
                     RuntimeCommand::ReplaceResources { resources } if !busy => agent.replace_resources(resources),
@@ -529,21 +593,35 @@ async fn serve(
                             }
                         });
                         let _ = ready.await;
-                        active = Some(Active { _output_guard:None, id: next_id, mode, stream: receiver(rx), output: output.clone(), abandoned: false, terminal: None });
+                        active = Some(Active { id: next_id, mode, stream: receiver(rx), output: output.clone(), terminal: None });
                     }
                     _ => result = Err("session already has an active operation".into()),
                 }
-                if let Err(error) = &result { let event = publish(&core, None, crate::Mode::Build, AgentEvent::Error(error.clone())); let _ = output.send(event); }
                 refresh(&core, active.as_ref().map(|a| a.id), active.as_ref().map_or(crate::Mode::Build, |a| a.mode));
-                let _ = accepted.send(result);
+                let _ = accepted.send(result.map(|()|core.snapshot.read().unwrap_or_else(|p|p.into_inner()).clone()));
             }
+            event = progress.recv() => {
+                let Some(core) = weak.upgrade() else { break };
+                let state = core.snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                match event {
+                    Ok((owner, event)) if owner == state.session_id => {
+                        let event = publish(&core, active.as_ref().map(|run|run.id), state.mode, event);
+                        if let Some(run) = &active && let Some(output) = &run.output { let _ = output.send(event); }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        publish(&core, None, state.mode, AgentEvent::Error("background progress subscriber lagged; consult the child session journal".into()));
+                    }
+                    _ => {}
+                }
+            }
+            _ = job_changes.changed() => {},
             _ = async { match &abandoned_output {
                 Some(output) => output.closed().await,
                 _ => std::future::pending().await,
             }} => {
                 let Some(core) = weak.upgrade() else { break };
-                if core.events.receiver_count() == 0 { core.view.read().unwrap_or_else(|p| p.into_inner()).cancel_handle().cancel(); }
-                if let Some(run) = active.as_mut() { run.abandoned = true; }
+                core.view.read().unwrap_or_else(|p| p.into_inner()).cancel_handle().cancel();
+                if let Some(run) = active.as_mut() { run.output = None; }
             }
             event = async { match active.as_mut() {
                 Some(active) => active.stream.next().await,
@@ -558,18 +636,29 @@ async fn serve(
                             continue;
                         }
                         let event = publish(&core, Some(run.id), run.mode, event);
-                        if run.output.send(event).is_err() && core.events.receiver_count() == 0 { core.view.read().unwrap_or_else(|p| p.into_inner()).cancel_handle().cancel(); }
+                        if let Some(output) = &run.output && output.send(event).is_err() { core.view.read().unwrap_or_else(|p| p.into_inner()).cancel_handle().cancel(); }
                     }
                     None => {
                         let run = active.take().unwrap();
                         if let Some(terminal) = run.terminal {
                             let event = publish(&core, Some(run.id), run.mode, terminal);
-                            let _ = run.output.send(event);
+                            if let Some(output) = &run.output { let _ = output.send(event); }
                         }
                         refresh(&core, None, crate::Mode::Build);
                     }
                 }
             }
+        }
+    }
+    let running = active.is_some();
+    drop(active);
+    if let Some(core) = weak.upgrade() {
+        refresh(&core, None, crate::Mode::Build);
+        if running && *closed.borrow() {
+            core.snapshot
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .stop_reason = Some(crate::StopReason::Shutdown);
         }
     }
 }
@@ -667,6 +756,193 @@ mod tests {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn stopping_a_session_wakes_subscribers_and_refuses_new_commands() {
+        let session = runtime();
+        let mut events = session.subscribe_from(0);
+        session.shutdown();
+        assert!(
+            session
+                .dispatch(RuntimeCommand::Prompt {
+                    text: "no".into(),
+                    mode: crate::Mode::Build
+                })
+                .is_err()
+        );
+        assert!(events.next().await.unwrap_err().contains("stopped"));
+    }
+    #[tokio::test]
+    async fn resource_replacement_waits_for_the_execution_boundary_before_acknowledging() {
+        let session = runtime();
+        session
+            .dispatch(RuntimeCommand::Prompt {
+                text: "wait".into(),
+                mode: crate::Mode::Build,
+            })
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        let receipt = session
+            .dispatch(RuntimeCommand::ReplaceResources {
+                resources: crate::ResourceSnapshot::default(),
+            })
+            .unwrap();
+        let accepted = receipt.accepted();
+        tokio::pin!(accepted);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut accepted)
+                .await
+                .is_err()
+        );
+        session
+            .dispatch(RuntimeCommand::Cancel)
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_dispatch_outlives_subscribers_and_cancels_only_explicitly() {
+        let runtime = runtime();
+        let observer = runtime.subscribe();
+        let accepted = runtime
+            .dispatch(RuntimeCommand::Prompt {
+                text: "wait".into(),
+                mode: crate::Mode::Build,
+            })
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        assert!(accepted.task_id.is_some());
+        drop(observer);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(runtime.snapshot().task_id.is_some());
+        let mut observer = runtime.subscribe_from(runtime.snapshot().sequence);
+        runtime
+            .dispatch(RuntimeCommand::Cancel)
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(observer.next().await.unwrap().event, AgentEvent::Error(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.snapshot().task_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn lagging_durable_subscription_replays_pages_without_gaps_or_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::SessionStore::open(&dir.path().join("sessions.sqlite")).unwrap();
+        let journal = store.create(dir.path(), "fixture", None).unwrap();
+        let runtime = runtime();
+        runtime.attach_journal(journal.clone()).unwrap();
+        let mut observer = runtime.subscribe_from(0);
+        for index in 0..1500 {
+            publish(
+                &runtime.core,
+                Some(8),
+                crate::Mode::Build,
+                AgentEvent::TextDelta(index.to_string()),
+            );
+        }
+        for sequence in 1..=1500 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(3), observer.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.sequence, Some(sequence));
+            assert_eq!(event.task_id, Some(8));
+        }
+        assert_eq!(observer.sequence(), 1500);
+        let (records, sequence) = journal.history().unwrap();
+        assert_eq!(sequence, 1500);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, crate::SessionRecord::RuntimeEvent { .. }))
+                .count(),
+            1500
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_ephemeral_history_requires_explicit_resynchronization() {
+        let runtime = runtime();
+        for _ in 0..1100 {
+            publish(
+                &runtime.core,
+                None,
+                crate::Mode::Build,
+                AgentEvent::Status("status".into()),
+            );
+        }
+        assert!(
+            runtime
+                .replay_after(0)
+                .await
+                .unwrap_err()
+                .contains("reload")
+        );
+    }
+
+    #[tokio::test]
+    async fn forked_event_history_preserves_waterline_and_rebinds_session_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::SessionStore::open(&dir.path().join("sessions.sqlite")).unwrap();
+        let journal = store.create(dir.path(), "fixture", None).unwrap();
+        let source = runtime();
+        source.attach_journal(journal.clone()).unwrap();
+        publish(
+            &source.core,
+            Some(1),
+            crate::Mode::Build,
+            AgentEvent::TextDelta("saved".into()),
+        );
+        let fork = journal.fork(dir.path(), "fixture").unwrap();
+        assert_eq!(fork.history().unwrap().1, 1);
+        let branch = runtime();
+        branch.attach_journal(fork.clone()).unwrap();
+        let events = collect(
+            branch
+                .execute(RuntimeCommand::Prompt {
+                    text: "next".into(),
+                    mode: crate::Mode::Build,
+                })
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(events.iter().all(|event| event.sequence.unwrap() > 1));
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| event.task_id)
+                .all(|id| id > 1)
+        );
+        assert!(
+            fork.events_after(0)
+                .unwrap()
+                .iter()
+                .all(|event| event.session_id == fork.id())
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_keeps_controls_responsive_and_cannot_poison_the_next_task() {
         let runtime = runtime();

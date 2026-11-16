@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use solaris_agent::{ContextUsage, ToolCall, ToolResult, Usage};
+use solaris_agent::{ToolCall, ToolResult, Usage};
 use solaris_tui::components::CollapsibleState;
 
 /// One tool call the model made, and what running it produced.
@@ -223,107 +223,30 @@ impl Turn {
     }
 }
 
-/// The conversation plus its streaming state.
+/// Viewport state is local to the terminal; product state is a display projection.
 #[derive(Debug, Default)]
 pub struct SessionState {
-    pub billing: Option<solaris_agent::UsageTotals>,
-    pub context: ContextUsage,
-    /// Completed and in-flight turns, oldest first.
-    pub turns: Vec<Turn>,
-    /// Transient status line shown while working.
-    pub status: Option<String>,
-    /// Scroll offset in transcript lines.
+    pub projection: crate::presentation::session::SessionProjection,
     pub scroll: usize,
-    /// Whether the transcript should stay pinned to the newest line.
     pub follow_end: bool,
-    /// Monotonic revision, used to invalidate the rendered transcript.
-    pub version: u64,
 }
-
+impl std::ops::Deref for SessionState {
+    type Target = crate::presentation::session::SessionProjection;
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
+}
+impl std::ops::DerefMut for SessionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.projection
+    }
+}
 impl SessionState {
-    /// An empty session.
     pub fn new() -> Self {
         Self {
             follow_end: true,
             ..Default::default()
         }
-    }
-
-    /// Bump the revision so the transcript re-renders.
-    pub fn bump(&mut self) {
-        self.version = self.version.wrapping_add(1);
-    }
-
-    /// The turn currently being streamed, if any.
-    pub fn active_turn(&self) -> Option<&Turn> {
-        self.turns.last().filter(|turn| !turn.complete)
-    }
-
-    /// Mutable access to the turn being streamed.
-    pub fn active_turn_mut(&mut self) -> Option<&mut Turn> {
-        let turn = self.turns.last_mut()?;
-        if turn.complete {
-            return None;
-        }
-        turn.layout_revision = turn.layout_revision.wrapping_add(1);
-        Some(turn)
-    }
-
-    /// Whether a response is currently streaming.
-    pub fn is_streaming(&self) -> bool {
-        self.active_turn().is_some()
-    }
-
-    /// Total tokens across all turns.
-    ///
-    /// This is a session total, not a measure of the context window; see
-    /// [`SessionState::context_tokens`] for that.
-    pub fn total_tokens(&self) -> u32 {
-        self.billing.map_or_else(
-            || {
-                self.turns
-                    .iter()
-                    .fold(0u32, |sum, turn| sum.saturating_add(turn.tokens()))
-            },
-            |total| total.usage.total(),
-        )
-    }
-
-    /// Occupancy reported by Agent, never inferred from cumulative task usage.
-    pub fn context_tokens(&self) -> Option<u32> {
-        self.context.tokens
-    }
-
-    /// Every bucket summed across all turns, for the stats dialog.
-    ///
-    /// The result is flagged as an estimate when any turn in it was one.
-    pub fn total_usage(&self) -> Usage {
-        if let Some(totals) = self.billing {
-            return totals.usage;
-        }
-        self.turns
-            .iter()
-            .fold(Usage::default(), |total, turn| Usage {
-                input_tokens: total.input_tokens.saturating_add(turn.usage.input_tokens),
-                output_tokens: total.output_tokens.saturating_add(turn.usage.output_tokens),
-                cache_read_tokens: total
-                    .cache_read_tokens
-                    .saturating_add(turn.usage.cache_read_tokens),
-                cache_write_tokens: total
-                    .cache_write_tokens
-                    .saturating_add(turn.usage.cache_write_tokens),
-                estimated: total.estimated || turn.usage.estimated,
-            })
-    }
-
-    /// Total cost reported across all turns.
-    pub fn total_cost(&self) -> f64 {
-        if let Some(totals) = self.billing {
-            return totals.cost_usd;
-        }
-        // `Iterator::sum` seeds floats with `-0.0`, which would render as
-        // `$-0.0000`; adding zero normalises the sign.
-        self.turns.iter().map(|turn| turn.cost_usd).sum::<f64>() + 0.0
     }
 }
 
@@ -441,6 +364,7 @@ impl NotificationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_agent::ContextUsage;
 
     #[test]
     fn child_usage_is_billed_but_does_not_fill_the_parent_context_window() {

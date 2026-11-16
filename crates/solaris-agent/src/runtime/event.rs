@@ -26,7 +26,12 @@ pub enum AgentEvent {
     },
     /// Usage spent in isolated subagent contexts. Included in the eventual
     /// turn total, but must not be counted as occupying the parent's window.
-    SubagentUsage { usage: Usage, cost_usd: f64 },
+    SubagentUsage {
+        #[serde(default)]
+        task_id: String,
+        usage: Usage,
+        cost_usd: f64,
+    },
     /// Associates a running child with the parent tool call that launched it.
     /// Display-only: these events never become parent conversation messages.
     SubagentStarted { call_id: String, task_id: String },
@@ -148,6 +153,7 @@ mod tests {
         }
         assert!(
             !AgentEvent::SubagentUsage {
+                task_id: String::new(),
                 usage: Usage::new(1, 1),
                 cost_usd: 0.0
             }

@@ -373,6 +373,10 @@ impl Agent {
     pub fn clear(&self) {
         self.conversation.clear();
     }
+    pub(crate) fn clear_checked(&self) -> Result<(), String> {
+        self.conversation.clear();
+        self.conversation.error().map_or(Ok(()), Err)
+    }
 
     /// How many messages the model will be sent next turn.
     ///

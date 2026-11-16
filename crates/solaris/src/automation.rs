@@ -81,13 +81,29 @@ pub async fn serve_rpc(
     let mut active: Option<RuntimeEventStream> = None;
     let mut request_id: Option<String> = None;
     let mut request_task = None;
-    let mut events = session.subscribe();
+    let mut last_sequence = 0;
+    let mut pending_end: Option<u64> = None;
+    let mut needs_terminal = false;
+    let mut saw_terminal = false;
+    let mut events = session.subscribe_from(session.snapshot().sequence);
     session.activate().map_err(anyhow::Error::msg)?;
     loop {
+        if pending_end.is_some_and(|sequence| events.sequence() >= sequence)
+            && (!needs_terminal || saw_terminal)
+        {
+            send(
+                &mut output,
+                &json!({"version":1,"type":"end","request_id":request_id.take()}),
+            )?;
+            request_task = None;
+            pending_end = None;
+            needs_terminal = false;
+            saw_terminal = false;
+        }
         tokio::select! {
-            biased;
-            event = events.recv() => {
+            event = events.next() => {
                 let event = event.map_err(anyhow::Error::msg)?;
+                if event.task_id==request_task && event.event.is_terminal(){saw_terminal=true;}
                 let mut envelope = event_envelope(&event);
                 envelope["type"] = json!("event");
                 envelope["request_id"] = if event.task_id == request_task {
@@ -127,15 +143,16 @@ pub async fn serve_rpc(
                 }
                 let result = match serde_json::from_value::<RuntimeCommand>(command) {
                     Err(error) => Err(error.to_string()),
-                    Ok(command) if matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact) && active.is_some() => Err("a prompt is already running".into()),
+                    Ok(command) if matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact) && (active.is_some() || pending_end.is_some()) => Err("a prompt is already running".into()),
                     Ok(command) => {
                         let streaming = matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact);
-                        match session.execute(command).await {
-                            Ok(stream) => {
+                        match match session.submit(command) { Ok(receipt)=>receipt.accepted_with_snapshot().await,Err(error)=>Err(error)} {
+                            Ok((accepted,stream)) => {
                                 if streaming {
                                     active = Some(stream);
                                     request_id = Some(request.id.clone());
-                                    request_task = session.snapshot().task_id;
+                                    request_task = accepted.task_id;
+                                    last_sequence=events.sequence();saw_terminal=false;needs_terminal=false;
                                 }
                                 Ok(())
                             }
@@ -149,10 +166,11 @@ pub async fn serve_rpc(
                 Some(stream) => stream.next().await,
                 None => std::future::pending().await,
             }} => {
-                if event.is_none() {
-                    active = None;
-                    request_task = None;
-                    send(&mut output, &json!({"version":1,"type":"end","request_id":request_id.take()}))?;
+                if let Some(event)=event {
+                    last_sequence=event.sequence.unwrap_or(last_sequence);
+                    needs_terminal=event.sequence.is_none() && event.event.is_terminal();
+                } else {
+                    active=None;pending_end=Some(last_sequence);
                 }
             }
         }
@@ -316,6 +334,91 @@ mod tests {
         drop(client);
         server.await.unwrap().unwrap();
     }
+    struct Immediate;
+    #[async_trait::async_trait]
+    impl ModelConnector for Immediate {
+        async fn model_client(self: Arc<Self>) -> Result<solaris_agent::ModelClient, BackendError> {
+            Ok(solaris_agent::testing::client(
+                Default::default(),
+                |_| async {
+                    Ok(Box::pin(futures::stream::iter([
+                        AgentEvent::TextDelta("answer".into()),
+                        AgentEvent::TurnComplete {
+                            usage: Default::default(),
+                            cost_usd: 0.0,
+                        },
+                    ])) as AgentEventStream)
+                },
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn rpc_fast_completion_keeps_request_identity_and_sends_end_after_events() {
+        let session = SessionRuntime::new(Agent::new(
+            ConnectionConfig {
+                backend: Arc::new(Immediate),
+                provider_id: None,
+                model: "test".into(),
+                fallback_context_window: 128_000,
+                instructions: None,
+            },
+            Arc::new(ToolRegistry::with_tools(Vec::new())),
+            AgentOptions::default(),
+        ));
+        let (input, mut client) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            serve_rpc(
+                &session,
+                Mode::Build,
+                input,
+                Output {
+                    bytes: Vec::new(),
+                    tx,
+                },
+            )
+            .await
+        });
+        for turn in 0..10 {
+            let id = format!("request-{turn}");
+            client
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id":id,"command":{"type":"prompt","text":"hello"}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut complete = false;
+            let mut answer = false;
+            loop {
+                let value = receive(&mut rx).await;
+                match value["type"].as_str() {
+                    Some("event") => {
+                        assert_eq!(value["request_id"], id);
+                        let payload: AgentEvent =
+                            serde_json::from_value(value["event"].clone()).unwrap();
+                        answer |= matches!(&payload,AgentEvent::TextDelta(text) if text.contains("answer"));
+                        complete |= matches!(payload, AgentEvent::TurnComplete { .. });
+                    }
+                    Some("end") => {
+                        assert_eq!(value["request_id"], id);
+                        assert!(complete && answer);
+                        break;
+                    }
+                    _ => {
+                        assert_eq!(value["id"], id);
+                        assert_eq!(value["ok"], true);
+                    }
+                }
+            }
+        }
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn rpc_rejects_oversized_input_before_parsing() {
         let bytes = vec![b'x'; 1024 * 1024 + 1];
