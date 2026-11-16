@@ -14,8 +14,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
+use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Role, ToolCall, TurnRequest, Usage,
+    AgentEvent, AgentEventStream, BackendError, ModelConnector, Role, ToolCall, Usage,
 };
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
@@ -49,8 +50,25 @@ const FOOTER: u16 = HEIGHT - 1;
 struct FakeBackend;
 
 #[async_trait::async_trait]
-impl AgentBackend for FakeBackend {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+impl ModelConnector for FakeBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "fake"
+    }
+}
+impl FakeBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
             asked(&request)
@@ -65,10 +83,6 @@ impl AgentBackend for FakeBackend {
         ];
         Ok(Box::pin(futures::stream::iter(events)))
     }
-
-    fn label(&self) -> &str {
-        "fake"
-    }
 }
 
 /// A backend that asks for a tool this session does not have, then answers.
@@ -82,8 +96,25 @@ struct ToolBackend {
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for ToolBackend {
-    async fn run_turn(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+impl ModelConnector for ToolBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "tool"
+    }
+}
+impl ToolBackend {
+    async fn respond(&self, _request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let round = self.round.fetch_add(1, Ordering::Relaxed);
         let events = if round == 0 {
             vec![
@@ -108,15 +139,12 @@ impl AgentBackend for ToolBackend {
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
-
-    fn label(&self) -> &str {
-        "tool"
-    }
 }
 
 struct Harness {
     tui: Tui,
     terminal: Terminal<TestBackend>,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 struct DelegatingBackend {
@@ -127,8 +155,25 @@ struct DelegatingBackend {
 struct InspectingBackend;
 
 #[async_trait::async_trait]
-impl AgentBackend for InspectingBackend {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+impl ModelConnector for InspectingBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "inspecting"
+    }
+}
+impl InspectingBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let answered = request
             .history
             .iter()
@@ -161,15 +206,28 @@ impl AgentBackend for InspectingBackend {
         });
         Ok(Box::pin(futures::stream::iter(events)))
     }
-
-    fn label(&self) -> &str {
-        "inspecting"
-    }
 }
 
 #[async_trait::async_trait]
-impl AgentBackend for DelegatingBackend {
-    async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+impl ModelConnector for DelegatingBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(solaris_agent::testing::client(
+            self.capabilities(),
+            move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            },
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "delegating"
+    }
+}
+impl DelegatingBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let child = asked(&request).starts_with("You are an isolated");
         let answered = request
             .history
@@ -220,9 +278,6 @@ impl AgentBackend for DelegatingBackend {
                 cost_usd: 0.0,
             },
         ])))
-    }
-    fn label(&self) -> &str {
-        "delegating"
     }
 }
 
@@ -434,12 +489,23 @@ impl Harness {
     }
 
     /// A harness driven by `backend` rather than the echoing fake.
-    fn with_backend(backend: Arc<dyn AgentBackend>) -> Self {
+    fn with_backend(backend: Arc<dyn ModelConnector>) -> Self {
         let (clipboard, _) = clipboard_for(None);
         Self::with_backend_and_clipboard(backend, clipboard)
     }
 
-    fn with_backend_and_clipboard(backend: Arc<dyn AgentBackend>, clipboard: Clipboard) -> Self {
+    fn with_backend_and_clipboard(backend: Arc<dyn ModelConnector>, clipboard: Clipboard) -> Self {
+        let runtime = if tokio::runtime::Handle::try_current().is_err() {
+            Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let guard = runtime.as_ref().map(|runtime| runtime.enter());
         let fallback = Arc::clone(&backend);
         let mut tui = Tui::new();
         let mut options = AppOptions::new(
@@ -474,12 +540,23 @@ impl Harness {
         tui.set_root(Box::new(App::new(options)));
 
         let terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
-        Self { tui, terminal }
+        drop(guard);
+        Self {
+            tui,
+            terminal,
+            runtime,
+        }
     }
 
     /// Draw one frame and return the visible text.
     fn draw(&mut self) -> String {
-        let Self { tui, terminal } = self;
+        if let Some(runtime) = &self.runtime {
+            runtime.block_on(async {
+                tokio::task::yield_now().await;
+            });
+            self.tui.tick();
+        }
+        let Self { tui, terminal, .. } = self;
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -490,11 +567,13 @@ impl Harness {
     }
 
     fn key(&mut self, code: KeyCode) {
+        let _guard = self.runtime.as_ref().map(|runtime| runtime.enter());
         self.tui
             .handle_key(KeyEvent::new(code, KeyModifiers::empty()));
     }
 
     fn ctrl(&mut self, c: char) {
+        let _guard = self.runtime.as_ref().map(|runtime| runtime.enter());
         self.tui
             .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
@@ -894,6 +973,11 @@ async fn the_model_command_needs_a_provider_then_lists_its_models() {
     harness.type_str("sk-live-1234");
     harness.key(KeyCode::Enter); // confirm the key
     harness.key(KeyCode::Enter); // take the model the wizard offers
+    // Connection replacement is accepted by the session actor asynchronously.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        harness.tui.tick();
+    }
 
     // Now the picker lists that provider's models, in the prompt region.
     harness.type_str("/model");
@@ -901,7 +985,10 @@ async fn the_model_command_needs_a_provider_then_lists_its_models() {
     assert!(harness.tui.overlay_queue().borrow().is_empty());
     let frame = harness.draw();
     assert!(frame.contains("Select a model:"), "{frame}");
-    assert!(frame.contains("claude-opus-4-1"), "{frame}");
+    assert!(
+        frame.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[1].0),
+        "{frame}"
+    );
 
     harness.key(KeyCode::Down);
     harness.key(KeyCode::Enter);
@@ -1169,13 +1256,17 @@ fn connecting_an_api_key_flows_into_the_model_picker() {
 
     let text = harness.draw();
     assert!(text.contains("Select a model:"), "{text}");
-    assert!(text.contains("claude-sonnet-4-5"), "{text}");
+    assert!(
+        text.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[0].0),
+        "{text}"
+    );
 
     harness.key(KeyCode::Enter); // pick the first model
     let text = harness.draw();
     assert!(!text.contains("Select a model:"), "{text}");
     assert!(
-        text.contains("anthropic") && text.contains("claude-sonnet-4-5"),
+        text.contains("anthropic")
+            && text.contains(&solaris_provider::ProviderConfig::default().models("anthropic")[0].0),
         "the footer should report the connection:\n{text}"
     );
 }

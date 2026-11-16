@@ -95,7 +95,7 @@ impl ExecutionEnvironment {
             if let Some(home) = std::env::var_os("USERPROFILE") {
                 command.env("HOME", home);
             }
-            command.creation_flags(0x0800_0000);
+            command.creation_flags(crate::process::CREATE_NO_WINDOW);
             command
         };
         Ok(command)
@@ -299,7 +299,7 @@ impl ExecutionEnvironment {
                 failure = Some("tool exceeded 60 seconds");
             }
             if failure.is_some() {
-                kill_tree(pid);
+                crate::process::kill_tree_blocking(pid);
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
@@ -332,21 +332,6 @@ fn one_path(mut bytes: Vec<u8>) -> io::Result<String> {
         bytes.pop();
     }
     String::from_utf8(bytes).map_err(io::Error::other)
-}
-
-fn kill_tree(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new(PathBuf::from(root).join("System32/taskkill.exe"))
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(0x0800_0000)
-            .output();
-    }
 }
 
 /// Convert native app paths for model-facing diagnostics and instructions.

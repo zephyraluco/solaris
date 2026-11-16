@@ -23,13 +23,3 @@ pub enum Wire {
     /// than assumed.
     OpenAiResponses,
 }
-
-impl Wire {
-    /// Whether this is one of the OpenAI protocols.
-    ///
-    /// They share a host, a key and a caching story, which is what makes some
-    /// request fields worth sending to both or to neither.
-    pub fn is_openai(self) -> bool {
-        matches!(self, Wire::OpenAiChat | Wire::OpenAiResponses)
-    }
-}

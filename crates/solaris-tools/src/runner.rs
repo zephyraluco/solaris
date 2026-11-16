@@ -48,22 +48,12 @@ impl CommandOutput {
 /// Runs an external program and collects what it printed.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
-    /// Run with turn cancellation; custom runners may override this method.
-    async fn run_with_context(
-        &self,
-        program: &str,
-        args: &[String],
-        ctx: &ToolContext,
-    ) -> Result<CommandOutput, String> {
-        self.run(program, args, &ctx.cwd).await
-    }
-
-    /// Run `program` with `args` in `cwd`.
+    /// Run with the working directory and cancellation token from this turn.
     async fn run(
         &self,
         program: &str,
         args: &[String],
-        cwd: &Path,
+        ctx: &ToolContext,
     ) -> Result<CommandOutput, String>;
 }
 
@@ -74,15 +64,6 @@ pub struct LocalRunner;
 #[async_trait]
 impl CommandRunner for LocalRunner {
     async fn run(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> Result<CommandOutput, String> {
-        run_local(program, args, cwd, &Cancel::new()).await
-    }
-
-    async fn run_with_context(
         &self,
         program: &str,
         args: &[String],
@@ -120,7 +101,7 @@ async fn run_local(
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    command.creation_flags(crate::process::CREATE_NO_WINDOW);
     let mut child = command
         .spawn()
         .map_err(|error| describe_spawn_failure("bash", &error))?;
@@ -160,7 +141,7 @@ async fn run_local(
         }
     }
     if exceeded || failure.is_some() {
-        crate::tools::shell::kill_tree(pid).await;
+        crate::process::kill_tree(pid).await;
         let _ = child.kill().await;
     }
     let status = loop {
@@ -169,12 +150,12 @@ async fn run_local(
             _ = ticker.tick(), if failure.is_none() => {
                 if cancel.is_cancelled() {
                     failure = Some("search cancelled".into());
-                    crate::tools::shell::kill_tree(pid).await;
+                    crate::process::kill_tree(pid).await;
                     let _ = child.kill().await;
                 }
             },
             _ = &mut deadline => {
-                crate::tools::shell::kill_tree(pid).await;
+                crate::process::kill_tree(pid).await;
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 return Err("search exceeded 60 seconds".into());
@@ -233,7 +214,7 @@ pub(crate) mod tests {
             &self,
             _program: &str,
             _args: &[String],
-            _cwd: &Path,
+            _ctx: &ToolContext,
         ) -> Result<CommandOutput, String> {
             Ok(self.0.clone())
         }
@@ -251,7 +232,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_missing_program_explains_itself() {
         let error = LocalRunner
-            .run("solaris-a-program-that-does-not-exist", &[], Path::new("."))
+            .run(
+                "solaris-a-program-that-does-not-exist",
+                &[],
+                &ToolContext::new(".", std::env::temp_dir()),
+            )
             .await
             .expect_err("nothing is installed under that name");
         assert!(error.contains("PATH"), "{error}");
@@ -268,7 +253,7 @@ pub(crate) mod tests {
                     "-c".into(),
                     "head -c 300000 /dev/zero >&2; head -c 300000 /dev/zero".into(),
                 ],
-                Path::new("."),
+                &ToolContext::new(".", std::env::temp_dir()),
             ),
         )
         .await
@@ -277,7 +262,11 @@ pub(crate) mod tests {
         assert_eq!(result.stdout.len(), 300000);
         assert_eq!(result.stderr.len(), 300000);
         let result = LocalRunner
-            .run("bash", &["-c".into(), "yes data".into()], Path::new("."))
+            .run(
+                "bash",
+                &["-c".into(), "yes data".into()],
+                &ToolContext::new(".", std::env::temp_dir()),
+            )
             .await
             .expect("bounded capture");
         assert!(result.stdout.len() < 2 * 1024 * 1024 + 100);
@@ -306,11 +295,10 @@ pub(crate) mod tests {
         };
         let cancel = ctx.cancel.clone();
         let command = command.to_owned();
-        let work = tokio::spawn(async move {
-            LocalRunner
-                .run_with_context("bash", &["-c".into(), command], &ctx)
-                .await
-        });
+        let work =
+            tokio::spawn(
+                async move { LocalRunner.run("bash", &["-c".into(), command], &ctx).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cancel.cancel();
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), work)

@@ -25,6 +25,7 @@ mod filesystem;
 mod mutation_queue;
 mod output;
 mod path_utils;
+mod process;
 mod registry;
 mod runner;
 mod tool;
@@ -45,3 +46,5 @@ pub use solaris_types::{Artifact, ToolMetadata, ToolStatus, TruncationInfo};
 mod image;
 pub use image::{MAX_IMAGE_BYTES, read_image};
 pub use solaris_types::InlineImage;
+
+pub use solaris_types::{ToolCall, ToolResult, ToolSpec};

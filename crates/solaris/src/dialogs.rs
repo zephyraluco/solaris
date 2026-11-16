@@ -11,7 +11,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_tui::component::{Component, KeyResult, MouseResult};
-use solaris_tui::components::markdown::{MarkdownStyle, render_markdown};
 use solaris_tui::components::select_list::{SelectItem, SelectList, SelectListTheme};
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{display_width, rect_contains, truncate_to_width, wrap_text};
@@ -759,10 +758,16 @@ pub fn stats_lines(
         row("cache write", usage.cache_write_tokens.to_string()),
         row(
             "cost",
-            if price_known == Some(false) {
+            if let Some(totals) = session.billing {
+                if totals.cost_complete {
+                    format!("${:.4}", totals.cost_usd)
+                } else {
+                    format!("${:.4} (partial; total unknown)", totals.cost_usd)
+                }
+            } else if price_known == Some(false) {
                 "unknown (pricing unavailable)".to_string()
             } else {
-                format!("${:.4}", session.total_cost())
+                "unknown (no settled request)".to_string()
             },
         ),
         row("context window", context_window.to_string()),
@@ -783,7 +788,7 @@ pub fn stats_lines(
             label,
         )),
         Line::from(Span::styled(
-            "  Costs use the bundled list-price snapshot, so a bill may differ.",
+            "  Costs come from SDK responses; your final bill may differ.",
             label,
         )),
     ];
@@ -796,11 +801,6 @@ pub fn stats_lines(
     }
 
     lines
-}
-
-/// Render markdown into dialog lines (used by future text dialogs).
-pub fn markdown_lines(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    render_markdown(text, width, &MarkdownStyle::from_theme(theme))
 }
 
 #[cfg(test)]
@@ -1238,7 +1238,10 @@ mod tests {
         let theme = Theme::dark();
         let mut session = crate::state::SessionState::new();
         session.turns.push(crate::state::Turn {
-            usage: solaris_agent::Usage::estimate(400, 400),
+            usage: solaris_agent::Usage {
+                estimated: true,
+                ..solaris_agent::Usage::new(100, 100)
+            },
             ..Default::default()
         });
 

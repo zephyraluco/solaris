@@ -84,19 +84,10 @@ impl Tool for WriteTool {
 
         let bytes = content.len();
 
-        let lock_path = absolute.clone();
-        let lock_path =
-            match tokio::task::spawn_blocking(move || crate::filesystem::canonicalize(&lock_path))
-                .await
-                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
-            {
-                Ok(path) => path,
-                Err(error) => {
-                    return ToolOutput::error(format!("could not resolve {path}: {error}"));
-                }
-            };
-        #[cfg(windows)]
-        let lock_path = std::path::PathBuf::from(lock_path.to_string_lossy().to_lowercase());
+        let lock_path = match crate::mutation_queue::lock_path(&absolute).await {
+            Ok(path) => path,
+            Err(error) => return ToolOutput::error(format!("could not resolve {path}: {error}")),
+        };
 
         self.queue
             .with_lock(&lock_path, || async {

@@ -6,7 +6,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solaris_agent::{AgentEvent, AgentEventStream, Mode, RuntimeCommand, SessionRuntime};
+use solaris_agent::{AgentEvent, Mode, RuntimeCommand, RuntimeEventStream, SessionRuntime};
 use tokio::io::AsyncRead;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
@@ -16,18 +16,19 @@ pub async fn print_turn(
     mode: Mode,
     json_output: bool,
 ) -> Result<bool> {
-    let mut stream = session.dispatch(RuntimeCommand::Prompt {
-        text: prompt.into(),
-        mode,
-    });
-    let mut sequence = 0u64;
+    let mut stream = session
+        .execute(RuntimeCommand::Prompt {
+            text: prompt.into(),
+            mode,
+        })
+        .await
+        .map_err(anyhow::Error::msg)?;
     let mut succeeded = false;
     while let Some(event) = stream.next().await {
-        sequence += 1;
         if json_output {
-            println!("{}", event_envelope(session, sequence, &event));
+            println!("{}", event_envelope(&event));
         } else {
-            match &event {
+            match &event.event {
                 AgentEvent::TextDelta(text) => {
                     print!("{text}");
                     std::io::stdout().flush()?;
@@ -36,7 +37,7 @@ pub async fn print_turn(
                 _ => {}
             }
         }
-        match event {
+        match event.event {
             AgentEvent::TurnComplete { .. } => succeeded = true,
             AgentEvent::Error(_) => succeeded = false,
             _ => {}
@@ -48,8 +49,10 @@ pub async fn print_turn(
     Ok(succeeded)
 }
 
-fn event_envelope(session: &SessionRuntime, sequence: u64, event: &AgentEvent) -> Value {
-    json!({"version":1,"sequence":sequence,"session_id":session.journal().as_ref().map(|j| j.id().to_string()),"event":event})
+fn event_envelope(event: &solaris_agent::RuntimeEvent) -> Value {
+    let mut envelope = serde_json::to_value(event).expect("runtime event serializes");
+    envelope["version"] = json!(1);
+    envelope
 }
 
 #[derive(Deserialize)]
@@ -75,11 +78,23 @@ pub async fn serve_rpc(
     mut output: impl Write,
 ) -> Result<()> {
     let mut lines = FramedRead::new(input, LinesCodec::new_with_max_length(1024 * 1024));
-    let mut active: Option<AgentEventStream> = None;
+    let mut active: Option<RuntimeEventStream> = None;
     let mut request_id: Option<String> = None;
-    let mut sequence = 0u64;
+    let mut request_task = None;
+    let mut events = session.subscribe();
+    session.activate().map_err(anyhow::Error::msg)?;
     loop {
         tokio::select! {
+            biased;
+            event = events.recv() => {
+                let event = event.map_err(anyhow::Error::msg)?;
+                let mut envelope = event_envelope(&event);
+                envelope["type"] = json!("event");
+                envelope["request_id"] = if event.task_id == request_task {
+                    json!(request_id)
+                } else { Value::Null };
+                send(&mut output, &envelope)?;
+            }
             line = lines.next() => {
                 let Some(line) = line else {
                     session.cancel_handle().cancel();
@@ -94,35 +109,49 @@ pub async fn serve_rpc(
                     }
                 };
                 let mut command = request.command;
+                if command["type"]=="jobs" {
+                    send(&mut output,&json!({"version":1,"type":"response","id":request.id,"ok":true,"jobs":session.jobs().list(&session.snapshot().session_id)}))?;
+                    continue;
+                }
+                if command["type"]=="send_job" {
+                    let result=match (command["id"].as_str(),command["text"].as_str()) {
+                        (Some(id),Some(text))=>session.jobs().send(&session.snapshot().session_id,id,text),
+                        _=>Err("send_job requires id and text".into()),
+                    };
+                    send(&mut output,&json!({"version":1,"type":"response","id":request.id,"ok":result.is_ok(),"error":result.err()}))?;
+                    continue;
+                }
+                if command["type"]=="cancel_job" {command["type"]="cancel_task".into();}
                 if command["type"] == "prompt" && command.get("mode").is_none() {
                     command["mode"] = serde_json::to_value(default_mode)?;
                 }
-                let result = serde_json::from_value::<RuntimeCommand>(command)
-                    .map_err(|error| error.to_string())
-                    .and_then(|command| {
-                        if matches!(command, RuntimeCommand::Prompt { .. }) {
-                            if active.is_some() { return Err("a prompt is already running".into()); }
-                            active = Some(session.dispatch(command));
-                            request_id = Some(request.id.clone());
-                        } else {
-                            drop(session.dispatch(command));
+                let result = match serde_json::from_value::<RuntimeCommand>(command) {
+                    Err(error) => Err(error.to_string()),
+                    Ok(command) if matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact) && active.is_some() => Err("a prompt is already running".into()),
+                    Ok(command) => {
+                        let streaming = matches!(command, RuntimeCommand::Prompt { .. } | RuntimeCommand::Compact);
+                        match session.execute(command).await {
+                            Ok(stream) => {
+                                if streaming {
+                                    active = Some(stream);
+                                    request_id = Some(request.id.clone());
+                                    request_task = session.snapshot().task_id;
+                                }
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
                         }
-                        Ok(())
-                    });
+                    }
+                };
                 send(&mut output, &json!({"version":1,"type":"response","id":request.id,"ok":result.is_ok(),"error":result.err()}))?;
             }
             event = async { match active.as_mut() {
                 Some(stream) => stream.next().await,
                 None => std::future::pending().await,
             }} => {
-                if let Some(event) = event {
-                    sequence += 1;
-                    let mut envelope = event_envelope(session, sequence, &event);
-                    envelope["type"] = json!("event");
-                    envelope["request_id"] = json!(request_id);
-                    send(&mut output, &envelope)?;
-                } else {
+                if event.is_none() {
                     active = None;
+                    request_task = None;
                     send(&mut output, &json!({"version":1,"type":"end","request_id":request_id.take()}))?;
                 }
             }
@@ -133,23 +162,38 @@ pub async fn serve_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solaris_agent::AgentEventStream;
+    use solaris_agent::testing::TurnRequest;
     use solaris_agent::{
-        Agent, AgentBackend, AgentBackendConfig, AgentOptions, BackendError, ToolRegistry,
-        TurnRequest,
+        Agent, AgentOptions, BackendError, ConnectionConfig, ModelConnector, ToolRegistry,
     };
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
     struct Waiting;
     #[async_trait::async_trait]
-    impl AgentBackend for Waiting {
-        async fn run_turn(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    impl ModelConnector for Waiting {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+            Ok(solaris_agent::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
+        }
+    }
+    impl Waiting {
+        async fn respond(&self, _: TurnRequest) -> Result<AgentEventStream, BackendError> {
             std::future::pending().await
         }
     }
+
     fn session() -> SessionRuntime {
         SessionRuntime::new(Agent::new(
-            AgentBackendConfig {
+            ConnectionConfig {
                 backend: Arc::new(Waiting),
                 provider_id: None,
                 model: "test".into(),
@@ -230,6 +274,47 @@ mod tests {
             .expect("EOF exits")
             .expect("join")
             .expect("RPC");
+    }
+    #[tokio::test]
+    async fn rpc_publishes_autonomous_input_events_without_a_prompt_request() {
+        let session = SessionRuntime::new(Agent::new(
+            ConnectionConfig {
+                backend: Arc::new(Waiting),
+                provider_id: None,
+                model: "test".into(),
+                fallback_context_window: 128_000,
+                instructions: None,
+            },
+            Arc::new(ToolRegistry::with_tools(vec![])),
+            AgentOptions::default(),
+        ));
+        let (input, mut client) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            serve_rpc(
+                &session,
+                Mode::Build,
+                input,
+                Output {
+                    bytes: Vec::new(),
+                    tx,
+                },
+            )
+            .await
+        });
+        client
+            .write_all(
+                b"{\"id\":\"queued\",\"command\":{\"type\":\"queue\",\"text\":\"follow up\"}}\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(receive(&mut rx).await["ok"], true);
+        let event = receive(&mut rx).await;
+        assert_eq!(event["type"], "event");
+        assert!(event["request_id"].is_null());
+        assert!(event["sequence"].is_number());
+        drop(client);
+        server.await.unwrap().unwrap();
     }
     #[tokio::test]
     async fn rpc_rejects_oversized_input_before_parsing() {

@@ -21,7 +21,7 @@ use solaris_tui::components::{
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{truncate_to_width, wrap_text};
 
-use crate::state::{SessionState, SteeringNote, ToolStep, Turn};
+use crate::state::{SessionState, SteeringNote, ToolStep, Turn, TurnPart};
 
 /// Spinner glyphs shared with the reusable TUI activity indicators.
 pub use solaris_tui::components::loader::SPINNER;
@@ -269,37 +269,48 @@ fn build_with_headers(
         headers.parts.resize(out.len(), part + 1);
         push_compaction(&mut out, turn, theme);
         headers.parts.resize(out.len(), part + 2);
-        let steps_start = out.len();
-        push_steps(
-            &mut out,
-            turn.into(),
-            width,
-            theme,
-            spinner_frame,
-            index,
-            headers,
-        );
-        headers.parts.resize(out.len(), part + 3);
-        let steps_end = out.len();
-        let mut section = part + 4;
-        for row in steps_start..steps_end {
-            if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
-                section = part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
-                headers.parts[row] = section;
-                section += 1;
-            } else {
-                headers.parts[row] = section;
+        if turn.parts.is_empty() {
+            let steps_start = out.len();
+            push_steps(
+                &mut out,
+                turn.into(),
+                width,
+                theme,
+                spinner_frame,
+                index,
+                headers,
+            );
+            headers.parts.resize(out.len(), part + 3);
+            let steps_end = out.len();
+            let mut section = part + 4;
+            for row in steps_start..steps_end {
+                if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
+                    section =
+                        part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
+                    headers.parts[row] = section;
+                    section += 1;
+                } else {
+                    headers.parts[row] = section;
+                }
             }
-        }
-        let thinking_start = out.len();
-        push_thinking(&mut out, turn, width, theme);
-        headers.parts.resize(out.len(), part + 5);
-        if out.len() > thinking_start {
-            headers.parts[thinking_start] = part + 6;
-        }
-        if !turn.reply.trim().is_empty() {
-            out.push(Line::default());
-            out.extend(render_markdown(&turn.reply, width as u16, &markdown));
+            let thinking_start = out.len();
+            push_thinking(
+                &mut out,
+                &turn.thinking,
+                turn.thinking_expanded,
+                width,
+                theme,
+            );
+            headers.parts.resize(out.len(), part + 5);
+            if out.len() > thinking_start {
+                headers.parts[thinking_start] = part + 6;
+            }
+            if !turn.reply.trim().is_empty() {
+                out.push(Line::default());
+                out.extend(render_markdown(&turn.reply, width as u16, &markdown));
+            }
+        } else {
+            push_ordered(&mut out, turn, width, theme, spinner_frame, index, headers);
         }
 
         headers.parts.resize(out.len(), part + 7);
@@ -319,6 +330,93 @@ fn build_with_headers(
     out
 }
 
+// Only adjacent tool references are grouped. A text, thinking or steering
+// fragment is a real boundary, even when another tool arrives later.
+fn push_ordered(
+    out: &mut Vec<Line<'static>>,
+    turn: &Turn,
+    width: usize,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+    turn_index: usize,
+    headers: &mut TranscriptHeaders,
+) {
+    let base = ((turn_index as u64) + 1) << 32;
+    let markdown = MarkdownStyle::from_theme(theme);
+    let mut index = 0;
+    while index < turn.parts.len() {
+        let start = out.len();
+        let section = base + 0x1000_0000 + (index as u64) * 2;
+        match &turn.parts[index] {
+            TurnPart::Text(range) => {
+                if let Some(text) = turn
+                    .reply
+                    .get(range.clone())
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    out.push(Line::default());
+                    out.extend(render_markdown(text, width as u16, &markdown));
+                }
+            }
+            TurnPart::Thinking(range) => {
+                if let Some(text) = turn.thinking.get(range.clone()) {
+                    push_thinking(out, text, turn.thinking_expanded, width, theme);
+                }
+            }
+            TurnPart::Steering(note) => {
+                if let Some(note) = turn.steering.get(*note) {
+                    push_steering(out, &note.text, width, theme);
+                }
+            }
+            TurnPart::Tool(first) => {
+                let mut end = *first + 1;
+                while let Some(TurnPart::Tool(next)) = turn.parts.get(index + 1) {
+                    if *next != end {
+                        break;
+                    }
+                    end += 1;
+                    index += 1;
+                }
+                if let Some(steps) = turn.steps.get(*first..end) {
+                    push_steps(
+                        out,
+                        ToolTranscript {
+                            offset: *first,
+                            steps,
+                            steering: &[],
+                            complete: turn.complete,
+                        },
+                        width,
+                        theme,
+                        spinner_frame,
+                        turn_index,
+                        headers,
+                    );
+                }
+            }
+        }
+        headers.parts.resize(out.len(), section);
+        // Keep headers separate from copied body text, with global step IDs.
+        if matches!(turn.parts[index], TurnPart::Tool(_)) {
+            let mut current = section;
+            for row in start..out.len() {
+                if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
+                    current =
+                        base + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
+                    headers.parts[row] = current;
+                    current += 1;
+                } else {
+                    headers.parts[row] = current;
+                }
+            }
+        }
+        if matches!(turn.parts[index], TurnPart::Thinking(_)) && out.len() > start {
+            headers.parts[start] = section + 1;
+        }
+        index += 1;
+    }
+}
+
 fn push_prompt(out: &mut Vec<Line<'static>>, prompt: &str, width: usize, theme: &Theme) {
     let wrap = width.saturating_sub(2).max(4);
     let style = Style::default().fg(theme.user).add_modifier(Modifier::BOLD);
@@ -331,24 +429,30 @@ fn push_prompt(out: &mut Vec<Line<'static>>, prompt: &str, width: usize, theme: 
     }
 }
 
-fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme: &Theme) {
-    if turn.thinking.trim().is_empty() {
+fn push_thinking(
+    out: &mut Vec<Line<'static>>,
+    thinking: &str,
+    expanded: bool,
+    width: usize,
+    theme: &Theme,
+) {
+    if thinking.trim().is_empty() {
         return;
     }
 
     let dim = Style::default().fg(theme.dim);
     let italic = dim.add_modifier(Modifier::ITALIC);
-    let marker = if turn.thinking_expanded { "▾" } else { "▸" };
+    let marker = if expanded { "▾" } else { "▸" };
 
     out.push(Line::from(vec![
         Span::styled(format!("{marker} thinking "), dim),
-        Span::styled(summarize(&turn.thinking), italic),
+        Span::styled(summarize(thinking), italic),
         Span::styled("  ctrl+o", Style::default().fg(theme.border)),
     ]));
 
-    if turn.thinking_expanded {
+    if expanded {
         let wrap = width.saturating_sub(2).max(4);
-        for segment in wrap_text(&turn.thinking, wrap) {
+        for segment in wrap_text(thinking, wrap) {
             out.push(Line::from(vec![
                 Span::styled("  ", dim),
                 Span::styled(segment, italic),
@@ -360,6 +464,7 @@ fn push_thinking(out: &mut Vec<Line<'static>>, turn: &Turn, width: usize, theme:
 /// Consecutive ordinary calls share a disclosure; shell commands own one and
 /// child agents link to a terminal. Steering notes stay outside these groups.
 struct ToolTranscript<'a> {
+    offset: usize,
     steps: &'a [ToolStep],
     steering: &'a [SteeringNote],
     complete: bool,
@@ -368,6 +473,7 @@ struct ToolTranscript<'a> {
 impl<'a> From<&'a Turn> for ToolTranscript<'a> {
     fn from(turn: &'a Turn) -> Self {
         Self {
+            offset: 0,
             steps: &turn.steps,
             steering: &turn.steering,
             complete: turn.complete,
@@ -400,7 +506,7 @@ fn push_steps(
         if let Some((title, style, status)) = subagent_summary(step, turn.complete, theme) {
             let header = headers
                 .subagents
-                .entry((turn_index, step_index))
+                .entry((turn_index, turn.offset + step_index))
                 .or_insert_with(|| SubagentHeader {
                     row: out.len(),
                     summary: SubagentSummary::default(),
@@ -445,7 +551,7 @@ fn push_steps(
                 let target_step = step_index + header.path.first().copied().unwrap_or(0);
                 headers.tools.push(CollapsibleHeader {
                     row: out.len() + header.row,
-                    target: (turn_index, target_step),
+                    target: (turn_index, turn.offset + target_step),
                     marker_offset: header.marker_offset,
                     body_rows: if detail {
                         turn.steps[target_step]
@@ -681,6 +787,7 @@ pub fn subagent_layout(
     push_steps(
         &mut out,
         ToolTranscript {
+            offset: 0,
             steps: &child.steps,
             steering: &[],
             complete: !running,
@@ -853,6 +960,92 @@ mod tests {
         let mut session = SessionState::new();
         session.turns.push(turn);
         session
+    }
+
+    #[test]
+    fn interleaved_fragments_keep_arrival_order_and_global_tool_targets() {
+        let mut turn = Turn {
+            prompt: "investigate".into(),
+            thinking_expanded: true,
+            complete: true,
+            ..Default::default()
+        };
+        turn.push_thinking("FIRST_THOUGHT");
+        turn.push_text("**BEFORE_");
+        turn.push_text("TOOL**");
+        for (id, path, output) in [
+            ("first", "first.rs", "FIRST_RESULT"),
+            ("second", "second.rs", "SECOND_RESULT"),
+        ] {
+            let call = ToolCall::new(id, "read", serde_json::json!({"path":path}));
+            turn.push_tool(call.clone());
+            let step = turn.steps.last_mut().unwrap();
+            step.finish(ToolResult::ok(&call, output), 1);
+            step.disclosure.set_expanded(true);
+            step.detail_disclosure.set_expanded(true);
+            if id == "first" {
+                turn.push_text("BETWEEN_TOOLS");
+                turn.push_thinking("SECOND_THOUGHT");
+            }
+        }
+        turn.push_steering("STEER_HERE".into());
+        turn.push_text("FINAL_ANSWER");
+        let session = session_with(turn);
+        for width in [35, 100] {
+            let mut headers = TranscriptHeaders::default();
+            let lines = build_with_headers(
+                &session,
+                area(width, 80),
+                &Theme::dark(),
+                None,
+                &welcome(),
+                &mut headers,
+            );
+            let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            let mut previous = 0;
+            for token in [
+                "FIRST_THOUGHT",
+                "BEFORE_TOOL",
+                "first.rs",
+                "FIRST_RESULT",
+                "BETWEEN_TOOLS",
+                "SECOND_THOUGHT",
+                "second.rs",
+                "SECOND_RESULT",
+                "STEER_HERE",
+                "FINAL_ANSWER",
+            ] {
+                let position = text
+                    .find(token)
+                    .unwrap_or_else(|| panic!("missing {token}: {text}"));
+                assert!(
+                    position >= previous,
+                    "{token} moved before an earlier event: {text}"
+                );
+                previous = position;
+            }
+            let groups: Vec<_> = headers
+                .tools
+                .iter()
+                .filter(|header| !header.detail)
+                .map(|header| header.target)
+                .collect();
+            assert_eq!(
+                groups,
+                [(0, 0), (0, 1)],
+                "text must separate groups, and hit targets must keep global indices"
+            );
+            assert_eq!(headers.parts.len(), lines.len());
+            let thinking = lines
+                .iter()
+                .position(|line| line_text(line).starts_with("▾ thinking"))
+                .unwrap();
+            assert_ne!(
+                headers.parts[thinking],
+                headers.parts[thinking + 1],
+                "copying thinking text must exclude the disclosure header"
+            );
+        }
     }
 
     /// A welcome box that only carries a greeting, so assertions stay readable.

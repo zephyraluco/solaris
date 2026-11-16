@@ -9,6 +9,8 @@
 //! screen. While the transcript is empty the first rows are the welcome box,
 //! which scrolls away with the first turn.
 
+use futures::StreamExt;
+
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -22,8 +24,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
-    Agent, AgentBackend, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest,
-    Approver, Cancel, ChannelApprover, Mode, PromptContext, ResourcePaths, Skills, ToolCall,
+    Agent, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest, Approver, Cancel,
+    ChannelApprover, Mode, ModelConnector, PromptContext, ResourcePaths, Skills, ToolCall,
     ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
@@ -59,7 +61,7 @@ use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
 use crate::recent::{self, RecentActivity};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, SteeringNote, ToolStep, Turn};
+use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
 
 /// Program name shown in the welcome box title.
@@ -152,7 +154,7 @@ impl AppOptions {
     /// discovery is left off for the same reason: whatever backend it was handed
     /// is the only thing this app should talk to.
     pub fn new(
-        backend: Arc<dyn AgentBackend>,
+        backend: Arc<dyn ModelConnector>,
         config: Config,
         quit: QuitFlag,
         overlay_queue: OverlayQueue,
@@ -160,6 +162,8 @@ impl AppOptions {
     ) -> Self {
         Self {
             backend_factory: Arc::new(move |_, model| BackendChoice {
+                models: Arc::new(solaris_provider::UnavailableModels),
+                configuration: Default::default(),
                 backend: Arc::clone(&backend),
                 provider_id: None,
                 base_url: None,
@@ -242,23 +246,29 @@ fn with_tools(
     execution: &solaris_agent::ExecutionSettings,
     factory: &BackendFactory,
     auth: &AuthStore,
+    runtime: &solaris_agent::Runtime,
 ) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
     let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
-        .with_skills(skills.clone())
-        .with_prompt_context(prompt_context.clone())
         .with_approver(approver);
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
     let auth = auth.clone();
-    options.child_backend = Some(Arc::new(move |model| {
-        Ok(crate::agent_backend(factory(&auth, model)))
-    }));
-    let agent = Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
-        crate::agent_backend(choice),
-        registry,
-        options,
-    )));
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(move |model| Ok(crate::agent_backend(factory(&auth, model))));
+    let agent = Arc::new(
+        runtime
+            .open(
+                Agent::new(crate::agent_backend(choice), registry, options)
+                    .with_resources(solaris_agent::ResourceSnapshot {
+                        skills: skills.clone(),
+                        prompt: prompt_context.clone(),
+                        warnings: Vec::new(),
+                    })
+                    .with_child_backend(child_factory),
+            )
+            .expect("new unpersisted session can be registered"),
+    );
     let cancel = agent.cancel_handle();
     (agent, cancel)
 }
@@ -267,6 +277,12 @@ fn with_tools(
 pub struct App {
     /// The session every turn goes through, and the backend behind it.
     pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
+    runtime: Arc<solaris_agent::Runtime>,
+    runtime_events: tokio::sync::broadcast::Receiver<solaris_agent::RuntimeEvent>,
+    model_source: Arc<dyn solaris_provider::ModelSource>,
+    runtime_errors: UnboundedReceiver<String>,
+    runtime_pending: Arc<std::sync::atomic::AtomicUsize>,
+    runtime_error_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Resolves the backend again whenever the credentials or model change.
     backend_factory: BackendFactory,
     pub(crate) config: Config,
@@ -289,12 +305,12 @@ pub struct App {
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
     spinner_frame: u16,
-    frame: u64,
     last_transcript: Rect,
     /// Shared disclosure interaction; targets identify transcript records.
     collapsible_mouse: CollapsibleInteraction<(usize, usize, bool)>,
     /// Credentials collected by `/connect`.
     pub(crate) auth: AuthStore,
+    auth_base: AuthStore,
     /// Where credentials are saved after a change.
     auth_path: Option<PathBuf>,
     /// The companion shown in the welcome box and by `/buddy`.
@@ -323,6 +339,7 @@ pub struct App {
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
     discovered: Vec<String>,
+    provider_config: Arc<solaris_provider::ProviderConfig>,
     /// Answer from the background model-discovery task, while one is in flight.
     models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
     models_error: Option<String>,
@@ -358,15 +375,9 @@ pub struct App {
 }
 
 struct OAuthPending {
+    url_rx: Option<UnboundedReceiver<String>>,
     rx: oneshot::Receiver<Result<Credential, String>>,
     task: tokio::task::JoinHandle<()>,
-    action: OAuthAction,
-}
-
-enum OAuthAction {
-    Login,
-    Turn(String, String),
-    Models,
 }
 
 impl Drop for OAuthPending {
@@ -428,7 +439,10 @@ impl App {
             (Arc::new(AlwaysApprove), None)
         };
 
+        let runtime = Arc::new(solaris_agent::Runtime::default());
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
+        let provider_config = Arc::clone(&choice.configuration);
+        let model_source = Arc::clone(&choice.models);
         let (agent, tool_cancel) = with_tools(
             choice,
             Arc::clone(&registry),
@@ -440,6 +454,7 @@ impl App {
             &execution,
             &backend_factory,
             &auth,
+            &runtime,
         );
 
         if let Some(journal) = &journal {
@@ -456,8 +471,19 @@ impl App {
         editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
 
+        let (runtime_error_tx, runtime_errors) = unbounded_channel();
+        let runtime_events = agent.subscribe();
+        let _ = agent.activate();
+        let auth_base = auth.clone();
         let mut app = Self {
+            auth_base,
+            runtime,
+            runtime_events,
             agent,
+            model_source,
+            runtime_errors,
+            runtime_pending: Default::default(),
+            runtime_error_tx,
             backend_factory,
             config,
             theme,
@@ -476,7 +502,6 @@ impl App {
             dialog_rx,
             events_rx: None,
             spinner_frame: 0,
-            frame: 0,
             last_transcript: Rect::default(),
             collapsible_mouse: CollapsibleInteraction::default(),
             auth,
@@ -495,6 +520,7 @@ impl App {
             quit_press: None,
             inline: None,
             discovered: Vec::new(),
+            provider_config,
             models_rx: None,
             models_error: None,
             oauth: None,
@@ -536,11 +562,9 @@ impl App {
                 solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
                     "session interrupted; verify unfinished tool outcomes before retrying".into(),
                 )),
-                solaris_agent::SessionRecord::Context { messages } => {
+                solaris_agent::SessionRecord::Cleared => {
                     self.session.context = Default::default();
-                    if messages.is_empty() {
-                        self.session.turns.clear();
-                    }
+                    self.session.turns.clear();
                 }
                 _ => {}
             }
@@ -616,6 +640,10 @@ impl App {
             || self.compact_rx.is_some()
             || self.resource_rx.is_some()
             || self.oauth.is_some()
+            || self
+                .runtime_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
         {
             self.notifications
                 .warning("finish or cancel the active operation before changing sessions");
@@ -643,8 +671,11 @@ impl App {
                 .error("session not found in this directory");
             return;
         };
+        let loaded = if fork { None } else { self.runtime.session(id) };
         let journal = if fork {
             current.fork(&cwd, &self.config.model)
+        } else if let Some(journal) = loaded.as_ref().and_then(|session| session.journal()) {
+            Ok(journal)
         } else {
             current.store().resume(id)
         };
@@ -671,22 +702,34 @@ impl App {
             }
         }
         let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
-        let (agent, cancel) = with_tools(
-            choice,
-            Arc::clone(&self.registry),
-            &self.tools,
-            &self.skills,
-            &self.agent.prompt_context(),
-            &cwd,
-            Arc::clone(&self.approver),
-            &self.execution,
-            &self.backend_factory,
-            &auth,
-        );
-        if let Err(error) = agent.attach_journal(Arc::clone(&journal)) {
+        self.provider_config = Arc::clone(&choice.configuration);
+        self.model_source = Arc::clone(&choice.models);
+        let (agent, cancel) = if let Some(session) = loaded {
+            let cancel = session.cancel_handle();
+            (Arc::new(session), cancel)
+        } else {
+            with_tools(
+                choice,
+                Arc::clone(&self.registry),
+                &self.tools,
+                &self.skills,
+                &self.agent.prompt_context(),
+                &cwd,
+                Arc::clone(&self.approver),
+                &self.execution,
+                &self.backend_factory,
+                &auth,
+                &self.runtime,
+            )
+        };
+        if agent.journal().is_none()
+            && let Err(error) = agent.attach_journal(Arc::clone(&journal))
+        {
             self.notifications.error(error.to_string());
             return;
         }
+        self.runtime_events = agent.subscribe();
+        let _ = agent.activate();
         self.agent = agent;
         self.tool_cancel = cancel;
         self.config = config;
@@ -739,16 +782,16 @@ impl App {
     }
 
     /// The label of the backend answering turns right now.
-    pub fn backend_label(&self) -> &str {
-        self.agent.label()
+    pub fn backend_label(&self) -> String {
+        self.agent.snapshot().label
     }
 
     /// Provider the current session was resolved to, when one was.
     ///
     /// The model picker lists this provider's models, so it needs the id rather
     /// than the backend's display label.
-    fn provider_id(&self) -> Option<&str> {
-        self.agent.provider_id()
+    fn provider_id(&self) -> Option<String> {
+        self.agent.snapshot().provider_id
     }
 
     /// Resolve the backend again after the credentials or the model changed.
@@ -757,35 +800,15 @@ impl App {
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
         let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+        self.provider_config = Arc::clone(&choice.configuration);
         let source = choice.source;
-        let (agent, cancel) = with_tools(
-            choice,
-            Arc::clone(&self.registry),
-            &self.tools,
-            &self.skills,
-            &self.agent.prompt_context(),
-            &self.cwd,
-            Arc::clone(&self.approver),
-            &self.execution,
-            &self.backend_factory,
-            &self.auth,
-        );
-        if let Some(journal) = self.agent.journal() {
-            let _ = agent.attach_journal(journal);
-        }
-        self.agent = agent;
-        self.tool_cancel = cancel;
+        self.refresh_transport(choice);
         source
     }
 
     /// Whether an overlay is currently visible.
     pub fn overlay_open(&self) -> bool {
         self.overlay_flag.get()
-    }
-
-    /// Frames rendered so far.
-    pub fn frame_count(&self) -> u64 {
-        self.frame
     }
 
     // ------------------------------------------------------------------- input
@@ -1021,7 +1044,7 @@ impl App {
         self.config.model = name.to_string();
         // A model belongs to the provider that offers it, so it is remembered
         // beside that provider rather than in the settings file.
-        if let Some(provider) = self.provider_id().map(str::to_owned) {
+        if let Some(provider) = self.provider_id() {
             self.auth.activate(&provider);
         }
         self.auth.remember_model(name);
@@ -1083,10 +1106,31 @@ impl App {
     /// folded it in — that is when the turn's record gets the note, so a
     /// message that arrives just too late to be read by this turn is recorded
     /// against the turn that does read it rather than the one it was typed into.
+    fn runtime_command(&self, command: solaris_agent::RuntimeCommand) {
+        let submitted = match self.agent.submit(command) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                let _ = self.runtime_error_tx.send(error);
+                return;
+            }
+        };
+        let errors = self.runtime_error_tx.clone();
+        let pending = Arc::clone(&self.runtime_pending);
+        pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        tokio::spawn(async move {
+            let result = submitted.accepted().await;
+            if let Err(error) = result {
+                let _ = errors.send(error);
+            }
+            pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        });
+    }
+
     fn steer(&mut self, text: String) {
-        match self.agent.steering_handle().try_push(text.clone()) {
-            Ok(true) => {}
-            Ok(false) => return,
+        match self.agent.expand_input(&text) {
+            Ok(prepared) if !prepared.trim().is_empty() => self
+                .runtime_command(solaris_agent::RuntimeCommand::PreparedSteer { text: prepared }),
+            Ok(_) => return,
             Err(error) => {
                 self.notifications.error(error.to_string());
                 return;
@@ -1161,10 +1205,19 @@ impl App {
             "stats" => self.open_stats(),
             "subagents" => self.notifications.info(format!(
                 "Active tasks: {}",
-                self.agent.active_tasks().join(", ")
+                self.agent.snapshot().active_tasks.join(", ")
             )),
             "stop" => {
-                if self.agent.cancel_task(command.args.trim()) {
+                if self
+                    .agent
+                    .snapshot()
+                    .active_tasks
+                    .iter()
+                    .any(|id| id == command.args.trim())
+                {
+                    self.runtime_command(solaris_agent::RuntimeCommand::CancelTask {
+                        id: command.args.trim().into(),
+                    });
                     self.notifications.info("stopping child task");
                 } else {
                     self.notifications
@@ -1215,12 +1268,17 @@ impl App {
             self.start_turn(prompt.clone(), prompt);
             return;
         }
-        match self.agent.follow_up_handle().try_push(text) {
-            Ok(true) => self.notifications.info(format!(
-                "after this turn: {}",
-                crate::transcript::summarize(text)
-            )),
-            Ok(false) => {}
+        match self.agent.expand_input(text) {
+            Ok(prepared) if !prepared.trim().is_empty() => {
+                self.runtime_command(solaris_agent::RuntimeCommand::PreparedQueue {
+                    text: prepared,
+                });
+                self.notifications.info(format!(
+                    "after this turn: {}",
+                    crate::transcript::summarize(text)
+                ));
+            }
+            Ok(_) => {}
             Err(error) => self.notifications.error(error.to_string()),
         }
     }
@@ -1257,7 +1315,9 @@ impl App {
                     .collect::<Vec<_>>();
                 self.skills = snapshot.skills.clone();
                 self.editor.set_hints(commands::hints(&self.skills));
-                self.agent.replace_resources(snapshot);
+                self.runtime_command(solaris_agent::RuntimeCommand::ReplaceResources {
+                    resources: snapshot,
+                });
                 if diagnostics.is_empty() {
                     self.notifications.info(format!(
                         "reloaded {} skills and prompt instructions",
@@ -1291,14 +1351,28 @@ impl App {
         self.notifications.clear();
         self.notifications.info("compacting…".to_string());
 
+        let errors = self.runtime_error_tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(agent.compact().await);
+            let mut dropped = None;
+            match agent.execute(solaris_agent::RuntimeCommand::Compact).await {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        if let AgentEvent::Compacted { dropped: count } = event.event {
+                            dropped = Some(count);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = errors.send(error);
+                }
+            }
+            let _ = tx.send(dropped);
         });
     }
 
     /// Report what the manual compaction did.
     fn on_compacted(&mut self, dropped: Option<usize>) {
-        self.session.context = self.agent.context_usage(self.config.mode);
+        self.session.context = self.agent.snapshot().context(self.config.mode);
         match dropped {
             Some(dropped) => self.notifications.info(format!(
                 "summarized {dropped} messages; {} left in context",
@@ -1315,17 +1389,6 @@ impl App {
             self.notifications.warning(
                 "OpenAI authorization is in progress; wait before submitting another prompt",
             );
-            return;
-        }
-        if self.auth.active_provider() == Some("openai")
-            && let Some(credential) = self
-                .auth
-                .credential("openai")
-                .filter(|c| solaris_provider::oauth::needs_refresh(c))
-                .cloned()
-        {
-            self.refresh_openai_credential(credential, OAuthAction::Turn(submitted, prompt));
-            self.notifications.info("Refreshing OpenAI authorization…");
             return;
         }
         let prompt = match self.agent.expand_input(&prompt) {
@@ -1350,12 +1413,22 @@ impl App {
 
         let agent = Arc::clone(&self.agent);
         let mode = self.config.mode;
+        let submitted = agent.submit(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut stream =
-                agent.dispatch(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
+            let mut stream = match match submitted {
+                Ok(receipt) => receipt.accepted().await,
+                Err(error) => Err(error),
+            } {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = tx.send(AgentEvent::Error(error));
+                    return;
+                }
+            };
             while let Some(event) = stream.next().await {
-                if tx.send(event).is_err() {
+                let _ = event;
+                if tx.is_closed() {
                     break;
                 }
             }
@@ -1367,18 +1440,18 @@ impl App {
             AgentEvent::ContextUsageUpdated { context } => self.session.context = context,
             AgentEvent::ThinkingDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.thinking.push_str(&chunk);
+                    turn.push_thinking(&chunk);
                 }
             }
             AgentEvent::TextDelta(chunk) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.reply.push_str(&chunk);
+                    turn.push_text(&chunk);
                 }
             }
             AgentEvent::Status(text) => self.session.status = Some(text),
             AgentEvent::ToolCall(call) => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    turn.steps.push(ToolStep::pending(call));
+                    turn.push_tool(call);
                 }
             }
             AgentEvent::ToolResult {
@@ -1433,8 +1506,10 @@ impl App {
             AgentEvent::SubagentToolCall { task_id, call } => {
                 if let Some(child) = self
                     .session
-                    .active_turn_mut()
-                    .and_then(|turn| turn.subagent_mut(&task_id))
+                    .turns
+                    .iter_mut()
+                    .rev()
+                    .find_map(|turn| turn.subagent_mut(&task_id))
                     .and_then(|step| step.subagent.as_mut())
                 {
                     child.steps.push(ToolStep::pending(call));
@@ -1447,8 +1522,10 @@ impl App {
             } => {
                 if let Some(child) = self
                     .session
-                    .active_turn_mut()
-                    .and_then(|turn| turn.subagent_mut(&task_id))
+                    .turns
+                    .iter_mut()
+                    .rev()
+                    .find_map(|turn| turn.subagent_mut(&task_id))
                     .and_then(|step| step.subagent.as_mut())
                     && let Some(step) = child
                         .steps
@@ -1474,8 +1551,10 @@ impl App {
                 }
                 if let Some(step) = self
                     .session
-                    .active_turn_mut()
-                    .and_then(|turn| turn.subagent_mut(&task_id))
+                    .turns
+                    .iter_mut()
+                    .rev()
+                    .find_map(|turn| turn.subagent_mut(&task_id))
                 {
                     let result = if is_error {
                         solaris_agent::ToolResult::error(&step.call, output)
@@ -1518,8 +1597,7 @@ impl App {
             // than when it was typed, so it lands in the turn that read it.
             AgentEvent::Steered { text } => {
                 if let Some(turn) = self.session.active_turn_mut() {
-                    let after_steps = turn.steps.iter().filter(|step| step.is_done()).count();
-                    turn.steering.push(SteeringNote { text, after_steps });
+                    turn.push_steering(text);
                 }
             }
             // A queued prompt is now being run as a turn of its own. The turn it
@@ -1529,7 +1607,7 @@ impl App {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
                     if turn.reply.is_empty() {
-                        turn.reply = "_(superseded by the queued prompt)_".to_string();
+                        turn.push_text("_(superseded by the queued prompt)_");
                     }
                 }
                 self.session.turns.push(Turn {
@@ -1543,7 +1621,7 @@ impl App {
                 if let Some(turn) = self.session.active_turn_mut() {
                     turn.complete = true;
                     if turn.reply.trim().is_empty() {
-                        turn.reply = format!("**Error:** {message}");
+                        turn.push_text(&format!("**Error:** {message}"));
                     }
                 }
                 self.session.status = None;
@@ -1588,7 +1666,7 @@ impl App {
                 // clearing what is on screen must also forget what the model
                 // would be sent, or the next turn answers a conversation the
                 // user can no longer see.
-                self.agent.clear();
+                self.runtime_command(solaris_agent::RuntimeCommand::Clear);
                 self.notifications.info("transcript cleared");
             }
             DialogMessage::Confirm {
@@ -1666,9 +1744,10 @@ impl App {
     }
 
     fn open_stats(&mut self) {
-        self.session.billing = self.agent.usage_totals().or(self.session.billing);
-        self.session.context = self.agent.context_usage(self.config.mode);
-        let backend = self.agent.label().to_string();
+        let snapshot = self.agent.snapshot();
+        self.session.billing = snapshot.billing.or(self.session.billing);
+        self.session.context = snapshot.context(self.config.mode);
+        let backend = snapshot.label;
         let model = if self.config.model.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -1681,7 +1760,7 @@ impl App {
             &backend,
             self.config.mode,
             self.config.context_window,
-            self.agent.capabilities().price_known,
+            snapshot.capabilities.price_known,
         );
         let dialog = TextDialog::new(
             "Stats",
@@ -1803,46 +1882,31 @@ impl App {
             return;
         }
 
-        if self.uses_chatgpt() {
-            if self.oauth.is_some() {
-                return;
-            }
-            if let Some(credential) = self
-                .auth
-                .credential("openai")
-                .filter(|credential| solaris_provider::oauth::needs_refresh(credential))
-                .cloned()
-            {
-                self.refresh_openai_credential(credential, OAuthAction::Models);
-                return;
-            }
-        }
-
-        let agent = Arc::clone(&self.agent);
+        let models = Arc::clone(&self.model_source);
         let (tx, rx) = unbounded_channel();
         self.models_rx = Some(rx);
 
         tokio::spawn(async move {
-            let answer = agent.models().await.map_err(|error| error.to_string());
+            let answer = models.models().await.map_err(|error| error.to_string());
             let _ = tx.send(answer);
         });
     }
 
     fn refresh_transport(&mut self, choice: BackendChoice) {
+        self.model_source = Arc::clone(&choice.models);
         let factory = Arc::clone(&self.backend_factory);
         let auth = self.auth.clone();
-        self.agent = Arc::new(
-            self.agent
-                .with_refreshed_backend(crate::agent_backend(choice))
-                .with_child_backend(Arc::new(move |model| {
-                    Ok(crate::agent_backend(factory(&auth, model)))
-                })),
-        );
+        self.runtime_command(solaris_agent::RuntimeCommand::ReplaceConnection {
+            connection: crate::agent_backend(choice),
+            children: Some(Arc::new(move |model| {
+                Ok(crate::agent_backend(factory(&auth, model)))
+            })),
+        });
     }
 
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
-        let catalog_notice = self.agent.model_catalog_notice();
+        let catalog_notice = self.model_source.notice();
         match answer {
             Ok(models) if !models.is_empty() => {
                 // The provider's own list is the one that knows which models
@@ -1978,30 +2042,26 @@ impl App {
     /// context windows for the models we ship while leaving a gateway's own
     /// list intact. With nothing reported, the catalogue is the whole answer.
     fn model_choices(&self) -> Vec<SelectItem> {
-        let catalogue = self.provider_id().and_then(solaris_provider::provider_spec);
-
+        let catalogue = self
+            .provider_id()
+            .map(|id| self.provider_config.models(&id))
+            .unwrap_or_default();
         if self.discovered.is_empty() {
             if self.uses_chatgpt() {
                 return Vec::new();
             }
             return catalogue
-                .map(|spec| {
-                    spec.models
-                        .iter()
-                        .map(|model| {
-                            SelectItem::new(model.id, model.id).description(model.description)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                .into_iter()
+                .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
+                .collect();
         }
-
         self.discovered
             .iter()
             .map(|id| {
                 let description = catalogue
-                    .and_then(|provider| provider.models.iter().find(|model| model.id == id))
-                    .map_or("", |model| model.description);
+                    .iter()
+                    .find(|(model, _)| model == id)
+                    .map_or("", |(_, name)| name.as_str());
                 SelectItem::new(id.as_str(), id.as_str()).description(description)
             })
             .collect()
@@ -2070,79 +2130,59 @@ impl App {
             .unwrap_or_else(|| "Loading OpenAI account models…".into())
     }
 
-    fn refresh_openai_credential(&mut self, credential: Credential, action: OAuthAction) {
-        let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let result = solaris_provider::oauth::refresh(&credential)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = tx.send(result);
-        });
-        self.oauth = Some(OAuthPending { rx, task, action });
-    }
-
     fn begin_openai_login(&mut self) {
         self.oauth = None;
-        let login = match solaris_provider::oauth::Login::bind() {
-            Ok(login) => login,
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                self.close_inline();
-                return;
-            }
-        };
         if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
-            flow.enter_browser_auth(login.url().to_string());
+            flow.enter_browser_auth("Starting browser authorization…".into());
         }
+        let (url_tx, url_rx) = unbounded_channel();
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let result = login.complete().await.map_err(|e| e.to_string());
+            let result = solaris_provider::oauth::login(|url| {
+                let _ = url_tx.send(url);
+            })
+            .await
+            .map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
         self.oauth = Some(OAuthPending {
+            url_rx: Some(url_rx),
             rx,
             task,
-            action: OAuthAction::Login,
         });
     }
 
     fn poll_oauth(&mut self) -> bool {
+        let mut updated = false;
+        if let Some(urls) = self
+            .oauth
+            .as_mut()
+            .and_then(|pending| pending.url_rx.as_mut())
+        {
+            while let Ok(url) = urls.try_recv() {
+                if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
+                    flow.enter_browser_auth(url);
+                    updated = true;
+                }
+            }
+        }
         let result = match self.oauth.as_mut().map(|pending| pending.rx.try_recv()) {
             Some(Ok(result)) => result,
             Some(Err(oneshot::error::TryRecvError::Closed)) => {
                 Err("OpenAI authorization was interrupted".into())
             }
-            _ => return false,
+            _ => return updated,
         };
-        let mut pending = match self.oauth.take() {
-            Some(pending) => pending,
-            None => return false,
+        let Some(_pending) = self.oauth.take() else {
+            return false;
         };
-        let action = std::mem::replace(&mut pending.action, OAuthAction::Login);
         match result {
             Ok(credential) => {
-                if matches!(action, OAuthAction::Login) {
-                    self.finish_connect("openai".into(), "OpenAI".into(), Some(credential));
-                } else {
-                    self.auth.store("openai", credential);
-                    self.persist_auth();
-                    let choice =
-                        resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-                    self.refresh_transport(choice);
-                    match action {
-                        OAuthAction::Turn(submitted, prompt) => self.start_turn(submitted, prompt),
-                        OAuthAction::Models => self.refresh_models(),
-                        OAuthAction::Login => {}
-                    }
-                }
+                self.finish_connect("openai".into(), "OpenAI".into(), Some(credential))
             }
             Err(error) => {
-                if matches!(action, OAuthAction::Models) {
-                    self.on_models_discovered(Err(error));
-                } else {
-                    self.notifications.error(error);
-                    self.close_inline();
-                }
+                self.notifications.error(error);
+                self.close_inline();
             }
         }
         true
@@ -2158,11 +2198,7 @@ impl App {
     /// Drop the wizard.
     fn close_inline(&mut self) {
         // Credential refresh belongs to the pending request, not to the wizard.
-        if self
-            .oauth
-            .as_ref()
-            .is_some_and(|pending| matches!(pending.action, OAuthAction::Login))
-        {
+        if self.oauth.is_some() {
             self.oauth = None;
         }
         self.inline = None;
@@ -2342,16 +2378,11 @@ impl App {
         ) {
             Vec::new()
         } else {
-            solaris_provider::provider_spec(&provider_id)
-                .map(|spec| {
-                    spec.models
-                        .iter()
-                        .map(|model| {
-                            SelectItem::new(model.id, model.id).description(model.description)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            self.provider_config
+                .models(&provider_id)
+                .into_iter()
+                .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
+                .collect()
         };
         let pending = self.models_rx.is_some();
         let current = self.config.model.clone();
@@ -2374,8 +2405,11 @@ impl App {
             return;
         };
 
-        let written = self.auth.save(&path);
-
+        let written = self.auth.save_changes(&self.auth_base, &path);
+        if let Ok(saved) = &written {
+            self.auth = saved.clone();
+            self.auth_base = saved.clone();
+        }
         if let Err(error) = written {
             self.notifications
                 .warning(format!("could not save credentials: {error}"));
@@ -2680,17 +2714,19 @@ impl App {
 
         // The model slot disappears while no model is named, so the footer
         // never shows an empty gap between two separators.
-        let mut facts = vec![self.agent.label().to_string()];
+        let mut facts = vec![self.agent.snapshot().label];
         if !self.config.model.is_empty() {
             facts.push(self.config.model.clone());
         }
         facts.push(self.config.mode.label().to_string());
         facts.push(format!("{} tok", self.session.total_tokens()));
-        facts.push(if self.agent.capabilities().price_known == Some(false) {
-            "$?".into()
-        } else {
-            format!("${:.4}", self.session.total_cost())
-        });
+        facts.push(
+            if self.agent.snapshot().capabilities.price_known == Some(false) {
+                "$?".into()
+            } else {
+                format!("${:.4}", self.session.total_cost())
+            },
+        );
         let left = format!(" {} ", facts.join(" · "));
         buf.set_string(
             area.x,
@@ -2896,7 +2932,6 @@ impl Component for App {
         }
     }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
-        self.frame = self.frame.wrapping_add(1);
         if self.subagent_terminal.is_some() {
             self.render_subagent(buf, area);
         } else {
@@ -3016,10 +3051,14 @@ impl Component for App {
     }
 
     fn tick(&mut self) -> bool {
+        while let Ok(error) = self.runtime_errors.try_recv() {
+            self.notifications.error(error);
+        }
         let mut dirty = self.poll_oauth();
+        let snapshot = self.agent.snapshot();
         let context_window = u64::from(
-            self.agent
-                .capabilities()
+            snapshot
+                .capabilities
                 .context_window
                 .unwrap_or(DEFAULT_CONTEXT_WINDOW),
         );
@@ -3028,13 +3067,13 @@ impl Component for App {
             dirty = true;
         }
 
-        let context = self.agent.context_usage(self.config.mode);
+        let context = snapshot.context(self.config.mode);
         if self.session.context != context {
             self.session.context = context;
             dirty = true;
         }
 
-        if let Some(billing) = self.agent.usage_totals()
+        if let Some(billing) = snapshot.billing
             && self.session.billing != Some(billing)
         {
             self.session.billing = Some(billing);
@@ -3063,10 +3102,43 @@ impl Component for App {
             self.apply_event(event);
         }
 
+        loop {
+            match self.runtime_events.try_recv() {
+                Ok(event) => {
+                    if event.task_id.is_some()
+                        && self.session.active_turn().is_none()
+                        && matches!(
+                            event.event,
+                            AgentEvent::TextDelta(_)
+                                | AgentEvent::ThinkingDelta(_)
+                                | AgentEvent::ToolCall(_)
+                        )
+                    {
+                        self.session.turns.push(Turn {
+                            prompt: "Background task results".into(),
+                            ..Default::default()
+                        });
+                        self.session.bump();
+                    }
+                    self.apply_event(event.event);
+                    dirty = true;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.notifications.warning(
+                        "Session events were missed; reopen this session to reload its transcript.",
+                    );
+                    dirty = true;
+                }
+            }
+        }
         if terminal || disconnected {
             self.events_rx = None;
             // A stream that ends without a terminal event must still stop the spinner.
-            if let Some(turn) = self.session.active_turn_mut() {
+            if self.agent.snapshot().task_id.is_none()
+                && let Some(turn) = self.session.active_turn_mut()
+            {
                 turn.complete = true;
                 self.session.status = None;
                 self.session.bump();
@@ -3075,6 +3147,10 @@ impl Component for App {
         }
         if self.reload_pending
             && self.events_rx.is_none()
+            && self
+                .runtime_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
             && self.compact_rx.is_none()
             && self.resource_rx.is_none()
         {
@@ -3297,9 +3373,8 @@ mod tests {
     use super::*;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{
-        BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, TurnRequest, Usage,
-    };
+    use solaris_agent::testing::TurnRequest;
+    use solaris_agent::{BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -3336,7 +3411,12 @@ mod tests {
             .expect("complete");
         drop(second);
         let mut app = app();
-        app.agent.attach_journal(first).expect("attach");
+        drop(
+            app.agent
+                .execute(solaris_agent::RuntimeCommand::AttachJournal { journal: first })
+                .await
+                .expect("attach"),
+        );
         app.switch_session(&id, false);
         assert_eq!(app.agent.journal().expect("journal").id(), id);
         assert_eq!(app.session.turns[0].reply, "saved answer");
@@ -3379,8 +3459,31 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AgentBackend for FakeBackend {
-        async fn run_turn(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+    impl ModelConnector for FakeBackend {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+            Ok(solaris_agent::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
+        }
+
+        fn label(&self) -> &str {
+            "fake"
+        }
+    }
+    #[async_trait::async_trait]
+    impl solaris_provider::ModelSource for FakeBackend {
+        async fn models(&self) -> Result<Vec<String>, BackendError> {
+            self.models.clone().map_err(BackendError::new)
+        }
+    }
+    impl FakeBackend {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             let reply = format!(
                 "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
                 asked(&request)
@@ -3396,26 +3499,18 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
-
-        fn label(&self) -> &str {
-            "fake"
-        }
-
-        async fn models(&self) -> Result<Vec<String>, BackendError> {
-            self.models.clone().map_err(BackendError::new)
-        }
     }
 
     /// The fake, type-erased the way `AppOptions` wants it. It lists no models,
     /// which is what a backend with nothing to say looks like.
-    fn fake_backend() -> Arc<dyn AgentBackend> {
+    fn fake_backend() -> Arc<FakeBackend> {
         Arc::new(FakeBackend {
             models: Err("this backend cannot list models".to_string()),
         })
     }
 
     /// The same, reporting `models` when asked.
-    fn fake_backend_reporting(models: &[&str]) -> Arc<dyn AgentBackend> {
+    fn fake_backend_reporting(models: &[&str]) -> Arc<FakeBackend> {
         Arc::new(FakeBackend {
             models: Ok(models.iter().map(|id| (*id).to_string()).collect()),
         })
@@ -3428,8 +3523,10 @@ mod tests {
     fn fake_session(provider: &'static str) -> Arc<solaris_agent::SessionRuntime> {
         Arc::new(solaris_agent::SessionRuntime::new(Agent::new(
             crate::agent_backend(BackendChoice {
+                models: Arc::new(solaris_provider::UnavailableModels),
+                configuration: Default::default(),
                 backend: fake_backend(),
-                provider_id: Some(provider),
+                provider_id: Some(provider.into()),
                 base_url: None,
                 model: String::new(),
                 source: CredentialSource::None,
@@ -3454,11 +3551,18 @@ mod tests {
     }
 
     /// An app pinned to `backend` that is allowed to ask it for its models.
-    fn app_with_backend(backend: Arc<dyn AgentBackend>) -> App {
+    fn app_with_backend(backend: Arc<FakeBackend>) -> App {
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let models: Arc<dyn solaris_provider::ModelSource> = backend.clone();
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
+        let factory = options.backend_factory.clone();
+        options.backend_factory = Arc::new(move |auth, model| {
+            let mut choice = factory(auth, model);
+            choice.models = Arc::clone(&models);
+            choice
+        });
         options.discover_models = true;
         App::new(options)
     }
@@ -3475,8 +3579,10 @@ mod tests {
         let mut options = AppOptions::new(pinned, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
-            backend: Arc::clone(&resolved),
-            provider_id: Some(provider),
+            models: resolved.clone(),
+            configuration: Default::default(),
+            backend: resolved.clone(),
+            provider_id: Some(provider.into()),
             base_url: None,
             model: model.to_string(),
             source: CredentialSource::None,
@@ -3494,8 +3600,10 @@ mod tests {
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.discover_models = true;
         options.backend_factory = Arc::new(move |_, model| BackendChoice {
+            models: Arc::new(solaris_provider::UnavailableModels),
+            configuration: Default::default(),
             backend: fake_backend(),
-            provider_id: Some(provider),
+            provider_id: Some(provider.into()),
             base_url: None,
             model: model.to_string(),
             source: CredentialSource::None,
@@ -3962,7 +4070,10 @@ mod tests {
 
         app.submit("/model".to_string());
         let text = rendered_text(&mut app, 90, 24);
-        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert!(
+            text.contains(&app.provider_config.models("anthropic")[1].0),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -4001,7 +4112,7 @@ mod tests {
         let mut app = app_connected_to("anthropic");
         // Nothing was named, so the provider's first model was adopted.
         let current = app.model().to_string();
-        assert_eq!(current, "claude-sonnet-4-5");
+        assert_eq!(current, app.provider_config.models("anthropic")[0].0);
 
         app.submit("/model".to_string());
 
@@ -4013,7 +4124,10 @@ mod tests {
         assert!(text.contains("Select a model:"), "{text}");
         assert!(text.contains(current.as_str()), "{text}");
         // Exactly what the connected provider offers, and nothing else.
-        assert!(text.contains("claude-opus-4-1"), "{text}");
+        assert!(
+            text.contains(&app.provider_config.models("anthropic")[1].0),
+            "{text}"
+        );
         assert!(text.contains("claude-haiku-4-5"), "{text}");
 
         // The active model is the highlighted row, so Enter keeps it.
@@ -4038,15 +4152,15 @@ mod tests {
     #[test]
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
-        let names: Vec<&str> = solaris_provider::provider_spec("anthropic")
-            .expect("a known provider")
-            .models
-            .iter()
-            .map(|model| model.id)
+        let names: Vec<String> = app
+            .provider_config
+            .models("anthropic")
+            .into_iter()
+            .map(|(id, _)| id)
             .collect();
         let start = names
             .iter()
-            .position(|name| *name == app.model())
+            .position(|name| name == app.model())
             .expect("the active model is on the list");
 
         app.submit("/model".to_string());
@@ -4720,6 +4834,42 @@ mod tests {
     }
 
     #[test]
+    fn streamed_events_record_interleaved_display_order() {
+        use crate::state::TurnPart;
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        app.apply_event(AgentEvent::ThinkingDelta("先想".into()));
+        app.apply_event(AgentEvent::TextDelta("先".into()));
+        app.apply_event(AgentEvent::TextDelta("说明".into()));
+        let call = ToolCall::new("call", "read", serde_json::json!({"path":"file.rs"}));
+        app.apply_event(AgentEvent::ToolCall(call.clone()));
+        app.apply_event(AgentEvent::ToolResult {
+            result: solaris_agent::ToolResult::ok(&call, "data"),
+            duration_ms: 1,
+        });
+        app.apply_event(AgentEvent::Steered {
+            text: "再检查".into(),
+        });
+        app.apply_event(AgentEvent::ThinkingDelta("再想".into()));
+        app.apply_event(AgentEvent::TextDelta("结论".into()));
+        let turn = &app.session.turns[0];
+        assert_eq!(
+            turn.parts,
+            [
+                TurnPart::Thinking(0..6),
+                TurnPart::Text(0..9),
+                TurnPart::Tool(0),
+                TurnPart::Steering(0),
+                TurnPart::Thinking(6..12),
+                TurnPart::Text(9..15)
+            ]
+        );
+        assert_eq!(turn.reply, "先说明结论");
+        assert_eq!(turn.thinking, "先想再想");
+        assert_eq!(turn.steps[0].result.as_ref().unwrap().output, "data");
+    }
+
+    #[test]
     fn edit_events_accumulate_into_the_active_turn() {
         let mut app = app();
         app.session.turns.push(Turn::default());
@@ -4865,7 +5015,7 @@ mod tests {
         settle_discovery(&mut app).await;
         let text = rendered_text(&mut app, 100, 22);
         assert!(text.contains("Could not list OpenAI models"));
-        assert!(text.contains("this backend cannot list models"));
+        assert!(text.contains("model discovery is unavailable"));
         assert!(app.model_choices().is_empty());
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
         app.handle_key(key(KeyCode::Char('r')));
@@ -4900,7 +5050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_model_discovery_refreshes_expired_credentials_before_fetching_catalog() {
+    async fn chatgpt_discovery_delegates_refresh_to_its_provider() {
         let mut app = app_reporting_models_as("openai", &["account-current"]);
         let mut credential = chatgpt_credential();
         if let Credential::ChatGpt { expires_at, .. } = &mut credential {
@@ -4909,24 +5059,7 @@ mod tests {
         app.auth.store("openai", credential);
         app.auth.activate("openai");
         app.refresh_models();
-        assert!(app.models_rx.is_none());
-        assert!(matches!(
-            app.oauth.as_ref().map(|pending| &pending.action),
-            Some(OAuthAction::Models)
-        ));
-        // Replace the not-yet-polled network task with a deterministic refresh.
-        app.oauth = None;
-        let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = tx.send(Ok(chatgpt_credential()));
-        });
-        app.oauth = Some(OAuthPending {
-            rx,
-            task,
-            action: OAuthAction::Models,
-        });
-        tokio::task::yield_now().await;
-        assert!(app.poll_oauth());
+        assert!(app.oauth.is_none());
         assert!(app.models_rx.is_some());
         settle_discovery(&mut app).await;
         assert_eq!(app.discovered, vec!["account-current"]);
@@ -4943,9 +5076,9 @@ mod tests {
             let _ = tx.send(Ok(chatgpt_credential()));
         });
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
-            action: OAuthAction::Login,
         });
         tokio::task::yield_now().await;
         assert!(app.poll_oauth());
@@ -4965,22 +5098,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refreshed_credentials_resume_the_deferred_turn() {
+    async fn model_preparation_does_not_create_a_ui_refresh_workflow() {
         let mut app = app_connected_to_but_faked("openai");
-        let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = tx.send(Ok(chatgpt_credential()));
-        });
-        app.oauth = Some(OAuthPending {
-            rx,
-            task,
-            action: OAuthAction::Turn("hello".into(), "hello".into()),
-        });
-        tokio::task::yield_now().await;
-        assert!(app.poll_oauth());
-        assert_eq!(app.auth.credential("openai"), Some(&chatgpt_credential()));
-        assert_eq!(app.session.turns.last().unwrap().prompt, "hello");
+        app.start_turn("hello".into(), "hello".into());
         assert!(app.oauth.is_none());
+        settle_turn(&mut app).await;
+        assert_eq!(app.session.turns[0].prompt, "hello");
     }
 
     #[tokio::test]
@@ -4992,9 +5115,9 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(std::future::pending());
         app.oauth = Some(OAuthPending {
+            url_rx: None,
             rx,
             task,
-            action: OAuthAction::Login,
         });
         app.handle_key(key(KeyCode::Esc));
         assert!(app.oauth.is_none());
@@ -5070,7 +5193,7 @@ mod tests {
         connect_with_api_key(&mut app, "sk-test");
 
         assert_eq!(app.active_provider(), Some("anthropic"));
-        assert!(app.auth.is_connected("anthropic"));
+        assert!(app.auth.credential("anthropic").is_some());
         assert_eq!(
             app.auth
                 .credential("anthropic")
@@ -5081,7 +5204,7 @@ mod tests {
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
 
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), "claude-sonnet-4-5");
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
         assert!(!app.connect_open());
     }
 
@@ -5164,7 +5287,11 @@ mod tests {
 
         assert_eq!(app.active_provider(), Some("local"));
         assert!(app.auth.credential("local").is_none());
-        assert_eq!(app.connect_step(), Some(ConnectStep::Model));
+        assert_eq!(
+            app.connect_step(),
+            None,
+            "local models require endpoint discovery"
+        );
     }
 
     #[test]
@@ -5175,7 +5302,7 @@ mod tests {
 
         // Enter with an empty URL does not connect.
         app.handle_key(key(KeyCode::Enter));
-        assert!(!app.auth.is_connected("custom"));
+        assert!(app.auth.credential("custom").is_none());
         assert_eq!(app.connect_step(), Some(ConnectStep::CustomProvider));
 
         for ch in "https://example.test/v1".chars() {
@@ -5410,7 +5537,7 @@ mod tests {
         assert_eq!(app.backend_label(), "anthropic");
         let footer = footer_text(&mut app);
         assert!(footer.contains(" anthropic · "), "{footer:?}");
-        assert!(footer.contains("claude-sonnet-4-5"), "{footer:?}");
+        assert!(footer.contains(app.model()), "{footer:?}");
     }
 
     #[tokio::test]
@@ -5420,19 +5547,37 @@ mod tests {
         assert_eq!(app.model(), "");
 
         connect_with_api_key(&mut app, "sk-test");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            app.tick();
+        }
 
         // Connecting a provider replaces both the backend and the model: with
         // nothing named, the provider's own first model is adopted.
         assert_eq!(app.backend_label(), "anthropic");
-        assert_eq!(app.model(), "claude-sonnet-4-5");
-        assert_eq!(app.config.context_window, 200_000);
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
+        let expected = app
+            .provider_config
+            .resolve("anthropic", app.model())
+            .parameters
+            .capabilities()
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(app.config.context_window, u64::from(expected));
 
         // The wizard's model step can still change it.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), "claude-opus-4-1");
-        // An ID absent from the upstream snapshot uses conservative defaults.
-        assert_eq!(app.config.context_window, 128_000);
+        assert_eq!(app.model(), app.provider_config.models("anthropic")[1].0);
+        // The official catalog also supplies the selected model's limits.
+        let expected = app
+            .provider_config
+            .resolve("anthropic", app.model())
+            .parameters
+            .capabilities()
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(app.config.context_window, u64::from(expected));
     }
 
     #[tokio::test]
@@ -5543,9 +5688,12 @@ mod tests {
         // No concurrent turn, and the message is waiting for the loop that is
         // running to read it rather than being run as a turn of its own.
         assert_eq!(app.session.turns.len(), 1, "a concurrent turn was started");
+        settle_turn(&mut app).await;
         assert!(
-            app.agent.steering_handle().has_pending(),
-            "the message never reached the running turn"
+            app.session.turns[0]
+                .steering
+                .iter()
+                .any(|note| note.text == "second")
         );
         assert!(
             app.notifications
@@ -5669,7 +5817,13 @@ mod tests {
     async fn settle_resources(app: &mut App) {
         for _ in 0..1000 {
             app.tick();
-            if app.resource_rx.is_none() && !app.reload_pending {
+            if app.resource_rx.is_none()
+                && !app.reload_pending
+                && app
+                    .runtime_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5774,7 +5928,7 @@ mod tests {
                 .any(|hint| hint.name == "skill:manual"
                     && hint.description.contains("explicit only"))
         );
-        assert_eq!(skills.visible_len(), 0);
+        assert_eq!(skills.visible().count(), 0);
     }
 
     #[tokio::test]
@@ -5936,9 +6090,11 @@ mod tests {
 
         // No second turn yet, and no steering either: this is the queue for after.
         assert_eq!(app.session.turns.len(), 1);
-        assert!(app.agent.follow_up_handle().has_pending());
+        settle_turn(&mut app).await;
+        assert_eq!(app.session.turns.len(), 2);
+        assert_eq!(app.session.turns[1].prompt, "run the tests");
         assert!(
-            app.agent.steering_handle().is_empty(),
+            !app.agent.steering_pending(),
             "a queued prompt is not a correction"
         );
         assert!(
@@ -5956,7 +6112,7 @@ mod tests {
 
         assert_eq!(app.session.turns.len(), 1, "it started straight away");
         assert_eq!(app.session.turns[0].prompt, "do it now");
-        assert!(app.agent.follow_up_handle().is_empty());
+        assert!(!app.agent.follow_up_pending());
     }
 
     #[tokio::test]

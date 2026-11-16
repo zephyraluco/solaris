@@ -22,36 +22,10 @@ use crate::truncate::{Limits, format_size, tail};
 /// rather than late.
 const MAX_TIMEOUT_SECONDS: u64 = 2_147_483;
 
-/// Keeps a program spawned from a windowed parent from opening a console of its
-/// own, which flashes on screen for every command.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Which shell a tool runs commands with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShellConfig {
-    /// Name the model calls the tool by.
-    pub tool_name: &'static str,
-    /// One-line description handed to the model.
-    pub description: &'static str,
-    /// Programs that can run it, best first.
-    pub programs: &'static [&'static str],
-    /// Argument that makes the program run the string it is given.
-    pub command_flag: &'static str,
-}
-
-impl ShellConfig {
-    /// Bash on Unix and bundled Cygwin Bash on Windows.
-    pub const BASH: ShellConfig = ShellConfig {
-        tool_name: "bash",
-        description: "Run a shell command in the session directory with bash and return everything \
+const DESCRIPTION: &str = "Run a shell command in the session directory with bash and return everything \
                       it printed, stdout and stderr together. The output is truncated to the last \
                       2000 lines or 50KB; when that happens the full output is written to a file \
-                      whose path is reported. Commands that never finish need a `timeout`.",
-        programs: &["bash"],
-        command_flag: "-c",
-    };
-}
+                      whose path is reported. Commands that never finish need a `timeout`.";
 
 /// What one shell command produced.
 #[derive(Debug, Clone, Default)]
@@ -79,7 +53,6 @@ pub trait ShellRunner: Send + Sync {
     /// carries, killing it if it outlives `timeout`.
     async fn run(
         &self,
-        config: ShellConfig,
         command: &str,
         ctx: &ToolContext,
         timeout: Option<Duration>,
@@ -94,161 +67,150 @@ pub struct LocalShell;
 impl ShellRunner for LocalShell {
     async fn run(
         &self,
-        config: ShellConfig,
         command: &str,
         ctx: &ToolContext,
         timeout: Option<Duration>,
     ) -> Result<ShellOutcome, String> {
-        let mut last_missing = String::new();
+        let (builder, input) = crate::environment::ExecutionEnvironment
+            .invocation(command, &[], &[])
+            .map_err(|error| error.to_string())?;
+        let mut builder = Command::from(builder);
+        builder
+            .current_dir(&ctx.cwd)
+            .stdin(if input.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            // Both streams are piped and merged here instead. What the shell
+            // itself reports about the command only ever reaches its stderr,
+            // so a redirect written into the command cannot carry it.
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
-        for program in config.programs {
-            let (builder, input) = crate::environment::ExecutionEnvironment
-                .invocation(command, &[], &[])
-                .map_err(|error| error.to_string())?;
-            let mut builder = Command::from(builder);
-            builder
-                .current_dir(&ctx.cwd)
-                .stdin(if input.is_empty() {
-                    Stdio::null()
-                } else {
-                    Stdio::piped()
-                })
-                .stdout(Stdio::piped())
-                // Both streams are piped and merged here instead. What the shell
-                // itself reports about the command only ever reaches its stderr,
-                // so a redirect written into the command cannot carry it.
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+        #[cfg(windows)]
+        builder.creation_flags(crate::process::CREATE_NO_WINDOW);
 
-            #[cfg(windows)]
-            builder.creation_flags(CREATE_NO_WINDOW);
+        // A process group of its own is what lets a timeout or a cancel
+        // reach the grandchildren, not just the shell.
+        #[cfg(unix)]
+        builder.process_group(0);
 
-            // A process group of its own is what lets a timeout or a cancel
-            // reach the grandchildren, not just the shell.
-            #[cfg(unix)]
-            builder.process_group(0);
+        let mut child = match builder.spawn() {
+            Ok(child) => child,
+            Err(error) => return Err(describe_spawn_failure(crate::SHELL_TOOL, &error)),
+        };
 
-            let mut child = match builder.spawn() {
-                Ok(child) => child,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    last_missing = describe_spawn_failure(program, &error);
-                    continue;
-                }
-                Err(error) => return Err(format!("could not run {program}: {error}")),
-            };
+        // One reader per pipe, both feeding one channel, so what is reported
+        // keeps the order the bytes arrived in rather than every line of
+        // stdout followed by every line of stderr.
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(16);
+        let mut readers = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            readers.push(spawn_reader(pipe, chunk_tx.clone()));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            readers.push(spawn_reader(pipe, chunk_tx.clone()));
+        }
+        drop(chunk_tx);
 
-            // One reader per pipe, both feeding one channel, so what is reported
-            // keeps the order the bytes arrived in rather than every line of
-            // stdout followed by every line of stderr.
-            let (chunk_tx, mut chunk_rx) = mpsc::channel(16);
-            let mut readers = Vec::new();
-            if let Some(pipe) = child.stdout.take() {
-                readers.push(spawn_reader(pipe, chunk_tx.clone()));
-            }
-            if let Some(pipe) = child.stderr.take() {
-                readers.push(spawn_reader(pipe, chunk_tx.clone()));
-            }
-            drop(chunk_tx);
-
-            let mut buffer = crate::output::OutputAccumulator::new(&ctx.temp_dir);
-            let mut capture_error = None;
-            if let Some(mut stdin) = child.stdin.take() {
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(&input).await;
-                });
-            }
-            let pid = child.id();
-            let mut timed_out = false;
-            let mut cancelled = false;
-            let mut status = None;
-            let mut wait_error = None;
-            let mut pipes_open = true;
-
-            let deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-                match timeout {
-                    Some(duration) => Box::pin(tokio::time::sleep(duration)),
-                    None => Box::pin(futures::future::pending()),
-                };
-            tokio::pin!(deadline);
-
-            // A cancelled turn has to stop a runaway command, so the flag is
-            // polled rather than checked once.
-            let mut ticker = tokio::time::interval(Duration::from_millis(100));
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    chunk = chunk_rx.recv(), if pipes_open => match chunk {
-                        // Both pipes are closed, so no more output can arrive.
-                        None => pipes_open = false,
-                        Some(bytes) => if let Err(error) = buffer.append(&bytes).await {
-                            capture_error = Some(error);
-                            break;
-                        },
-                    },
-                    // Waiting on the process rather than on its pipes is what
-                    // keeps a descendant that inherited them from holding the
-                    // tool open: the command is over either way.
-                    waited = child.wait() => {
-                        match waited {
-                            Ok(exit) => status = Some(exit),
-                            Err(error) => wait_error = Some(error),
-                        }
-                        break;
-                    }
-                    _ = &mut deadline => {
-                        timed_out = true;
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        if ctx.is_cancelled() {
-                            cancelled = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if timed_out || cancelled || capture_error.is_some() {
-                kill_tree(pid).await;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            }
-
-            // Take what the readers already hold, then let them go: the last
-            // words of a command that has ended are worth having, but a pipe an
-            // escaped grandchild still holds must not keep the turn running.
-            if let Err(error) = collect_pending(&mut chunk_rx, &mut buffer).await {
-                capture_error = Some(error);
-            }
-            for reader in readers {
-                reader.abort();
-                let _ = reader.await;
-            }
-
-            if let Some(error) = wait_error {
-                // What the process is doing is unknown, so stop it rather than
-                // leave it running behind a failed call.
-                kill_tree(child.id()).await;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(format!("could not wait for {program}: {error}"));
-            }
-
-            if let Some(error) = capture_error {
-                return Err(error.to_string());
-            }
-            let (output, artifact) = buffer.finish().await.map_err(|error| error.to_string())?;
-            return Ok(ShellOutcome {
-                output: sanitize(&output),
-                artifact,
-                code: exit_code(status),
-                timed_out,
-                cancelled,
+        let mut buffer = crate::output::OutputAccumulator::new(&ctx.temp_dir);
+        let mut capture_error = None;
+        if let Some(mut stdin) = child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&input).await;
             });
         }
+        let pid = child.id();
+        let mut timed_out = false;
+        let mut cancelled = false;
+        let mut status = None;
+        let mut wait_error = None;
+        let mut pipes_open = true;
 
-        Err(last_missing)
+        let deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            match timeout {
+                Some(duration) => Box::pin(tokio::time::sleep(duration)),
+                None => Box::pin(futures::future::pending()),
+            };
+        tokio::pin!(deadline);
+
+        // A cancelled turn has to stop a runaway command, so the flag is
+        // polled rather than checked once.
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                chunk = chunk_rx.recv(), if pipes_open => match chunk {
+                    // Both pipes are closed, so no more output can arrive.
+                    None => pipes_open = false,
+                    Some(bytes) => if let Err(error) = buffer.append(&bytes).await {
+                        capture_error = Some(error);
+                        break;
+                    },
+                },
+                // Waiting on the process rather than on its pipes is what
+                // keeps a descendant that inherited them from holding the
+                // tool open: the command is over either way.
+                waited = child.wait() => {
+                    match waited {
+                        Ok(exit) => status = Some(exit),
+                        Err(error) => wait_error = Some(error),
+                    }
+                    break;
+                }
+                _ = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if ctx.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if timed_out || cancelled || capture_error.is_some() {
+            crate::process::kill_tree(pid).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+
+        // Take what the readers already hold, then let them go: the last
+        // words of a command that has ended are worth having, but a pipe an
+        // escaped grandchild still holds must not keep the turn running.
+        if let Err(error) = collect_pending(&mut chunk_rx, &mut buffer).await {
+            capture_error = Some(error);
+        }
+        for reader in readers {
+            reader.abort();
+            let _ = reader.await;
+        }
+
+        if let Some(error) = wait_error {
+            // What the process is doing is unknown, so stop it rather than
+            // leave it running behind a failed call.
+            crate::process::kill_tree(child.id()).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(format!("could not wait for bash: {error}"));
+        }
+
+        if let Some(error) = capture_error {
+            return Err(error.to_string());
+        }
+        let (output, artifact) = buffer.finish().await.map_err(|error| error.to_string())?;
+        Ok(ShellOutcome {
+            output: sanitize(&output),
+            artifact,
+            code: exit_code(status),
+            timed_out,
+            cancelled,
+        })
     }
 }
 
@@ -292,49 +254,6 @@ async fn collect_pending(
         .unwrap_or(Ok(()))
 }
 
-/// Kill a command and everything it started.
-///
-/// `child.kill()` reaches the shell itself; a command that spawned something
-/// would leave it running.
-pub(crate) async fn kill_tree(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-
-    #[cfg(windows)]
-    {
-        // `taskkill.exe` by full path out of System32: stopping a runaway
-        // command should not depend on what PATH happens to point at.
-        let taskkill = std::env::var_os("SystemRoot")
-            .map_or_else(
-                || std::path::PathBuf::from(r"C:\Windows"),
-                std::path::PathBuf::from,
-            )
-            .join("System32")
-            .join("taskkill.exe");
-        let _ = Command::new(taskkill)
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-
-    #[cfg(unix)]
-    {
-        // The command leads its own process group (see the spawn above), so the
-        // negated pid reaches every process it started.
-        // SAFETY: the pid belongs to a child this process started, and the
-        // outcome of the kill is deliberately ignored.
-        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-}
-
-/// The exit code to report, using the shell convention for a signalled process.
-///
-/// A process killed by a signal has no exit code of its own; `128 + signal` is
-/// what a shell reports, and it keeps a kill from reading as a success.
 fn exit_code(status: Option<std::process::ExitStatus>) -> Option<i32> {
     let status = status?;
     if let Some(code) = status.code() {
@@ -433,24 +352,17 @@ fn is_control(ch: char) -> bool {
 /// Runs commands with a shell.
 #[derive(Clone)]
 pub struct ShellTool {
-    config: ShellConfig,
     runner: Arc<dyn ShellRunner>,
     limits: Limits,
 }
 
 impl ShellTool {
-    /// A tool that runs commands with `config`'s shell.
-    pub fn new(config: ShellConfig, runner: Arc<dyn ShellRunner>) -> Self {
+    /// The `bash` tool, using the platform's execution environment.
+    pub fn bash(runner: Arc<dyn ShellRunner>) -> Self {
         Self {
-            config,
             runner,
             limits: Limits::default(),
         }
-    }
-
-    /// The `bash` tool.
-    pub fn bash(runner: Arc<dyn ShellRunner>) -> Self {
-        Self::new(ShellConfig::BASH, runner)
     }
 
     /// A tool with its own output budget.
@@ -463,7 +375,7 @@ impl ShellTool {
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
-        self.config.tool_name
+        crate::SHELL_TOOL
     }
 
     /// A command can change anything, and two of them racing over the same
@@ -473,7 +385,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        self.config.description
+        DESCRIPTION
     }
 
     fn guideline(&self) -> Option<&'static str> {
@@ -519,7 +431,7 @@ impl Tool for ShellTool {
             Err(error) => return error,
         };
 
-        let outcome = match self.runner.run(self.config, &command, ctx, timeout).await {
+        let outcome = match self.runner.run(&command, ctx, timeout).await {
             Ok(outcome) => outcome,
             Err(error) => return ToolOutput::error(error),
         };
@@ -537,7 +449,9 @@ impl Tool for ShellTool {
         if truncated || outcome.artifact.is_some() {
             let saved = match outcome.artifact {
                 Some(path) => Ok(path),
-                None => write_full_output(&outcome.output, ctx).await,
+                None => crate::output::save_output(&ctx.temp_dir, outcome.output.as_bytes())
+                    .await
+                    .map_err(|error| error.to_string()),
             };
             match saved {
                 Ok(path) => {
@@ -604,28 +518,6 @@ impl Tool for ShellTool {
     }
 }
 
-/// Save the whole output somewhere the model can read it in pieces.
-async fn write_full_output(output: &str, ctx: &ToolContext) -> Result<std::path::PathBuf, String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = ctx.temp_dir.join(format!(
-        "solaris-output-{}-{unique}.log",
-        std::process::id()
-    ));
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    tokio::fs::write(&path, output.as_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,7 +543,6 @@ mod tests {
     impl ShellRunner for StubShell {
         async fn run(
             &self,
-            _config: ShellConfig,
             command: &str,
             _ctx: &ToolContext,
             timeout: Option<Duration>,
@@ -811,7 +702,6 @@ mod tests {
         impl ShellRunner for Missing {
             async fn run(
                 &self,
-                _config: ShellConfig,
                 _command: &str,
                 _ctx: &ToolContext,
                 _timeout: Option<Duration>,
@@ -871,12 +761,7 @@ mod tests {
     async fn bash_reports_nonzero_exit_codes() {
         let dir = test_dir("bash-nonzero");
         let outcome = LocalShell
-            .run(
-                ShellConfig::BASH,
-                "exit 7",
-                &context(&dir),
-                Some(Duration::from_secs(10)),
-            )
+            .run("exit 7", &context(&dir), Some(Duration::from_secs(10)))
             .await
             .unwrap();
         assert_eq!(outcome.code, Some(7));

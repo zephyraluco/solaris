@@ -17,7 +17,7 @@
 
 ---
 
-solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and drives the official Rig Agent state machine over an injected backend and tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
+solaris is a terminal AI assistant written from scratch in Rust. It is a full-screen TUI chat client — a streaming transcript, markdown rendering, a real editor, overlays, themes — built on a small layered workspace: a backend crate that privately uses the official Rig SDK for three model protocols, a tools crate that runs local commands and files and knows nothing about models, a platform crate that knows the providers, an agent crate that owns conversations and uses the complete official Rig Agent executor and memory over the Rig model connection and an application-assembled tool registry, an MCP crate that returns connected tool adapters for the application to register, and a reusable terminal UI framework that the app is only one consumer of.
 
 The interface is complete, and a connected provider really is called. Connect a provider — or just export an API key — and every turn streams from the real model over SSE, with retries before the first token and per-turn token and cost accounting.
 
@@ -276,9 +276,9 @@ Three wire protocols cover the whole catalogue, and the *model* decides which on
 
 ### Environment variables
 
-Selecting **OpenAI** in `/connect` now goes directly to ChatGPT browser authorization instead of an API-key field. Press `c` to copy the complete URL, then sign in to OpenAI / ChatGPT and authorize in a browser on the same machine. The callback at `http://localhost:1455/auth/callback` advances the wizard to model selection. Esc cancels; login times out after five minutes. If port 1455 is occupied, close the program using it and retry. Your account must have the required Codex entitlement; this authorization does not grant a general-purpose OpenAI API key.
+Selecting **OpenAI** in `/connect` now goes directly to ChatGPT browser authorization instead of an API-key field. Press `c` to copy the complete URL, then sign in to OpenAI / ChatGPT and authorize in a browser on the same machine. The official SDK listens on local port 1455, or 1457 if it is occupied; the browser callback advances the wizard to model selection. Esc cancels; login times out after five minutes. If both callback ports are occupied, free one and retry. Your account must have the required Codex entitlement; this authorization does not grant a general-purpose OpenAI API key.
 
-The flow uses PKCE and a random state. Access, refresh and ID tokens, expiry and account ID are saved locally in `auth.json`. **Treat this as a secret file: do not commit or share it.** Writes use `0600` on Unix and the containing user directory's ACL on Windows. Tokens nearing expiry are refreshed and persisted before model discovery or a new turn. Account tokens only go to the fixed ChatGPT/Codex integration endpoint, ignoring `OPENAI_BASE_URL` and `OPENAI_API_KEY`; they are never forwarded to a custom gateway. The model picker only shows the account's remote Codex catalog, sorted by priority and respecting its visibility flags. There are no bundled fallback models. Loading, an empty catalog and request failures are shown explicitly; press `r` to retry, or reopen `/model` to refresh. The catalog protocol version is independent of Solaris's package version because OpenAI gates catalog entries by Codex client version.
+The official Rig authenticator handles PKCE, random state, the browser callback and token exchange. Access, refresh and ID tokens, expiry and account ID are saved locally in `auth.json`. **Treat this as a secret file: do not commit or share it.** Writes use `0600` on Unix and the containing user directory's ACL on Windows. Tokens nearing expiry are refreshed and persisted before model discovery or a new turn. Account tokens only go to the fixed ChatGPT/Codex integration endpoint, ignoring `OPENAI_BASE_URL` and `OPENAI_API_KEY`; they are never forwarded to a custom gateway. The model picker only shows the account's remote Codex catalog, sorted by priority and respecting its visibility flags. There are no bundled fallback models. Loading, an empty catalog and request failures are shown explicitly; press `r` to retry, or reopen `/model` to refresh. The catalog protocol version is independent of Solaris's package version because OpenAI gates catalog entries by Codex client version.
 
 Otherwise, keys found in the environment win over `auth.json`, and a key in the environment is enough on its own: `ANTHROPIC_API_KEY=… solaris` needs no `/connect` at all. Existing OpenAI API-key files and environment configuration remain compatible when no ChatGPT authorization is stored.
 
@@ -294,11 +294,11 @@ Otherwise, keys found in the environment win over `auth.json`, and a key in the 
 
 - **Streaming.** Text and thinking arrive as the model produces them; `Ctrl+C` mid-stream cancels the request by dropping the connection.
 - **Retries.** A `429`, a `5xx` or a dropped connection is retried up to three times with backoff, but only *before* the first token — after that a retry would duplicate text, so the failure is reported instead.
-- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from a built-in list-price snapshot, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers are size estimates and `/stats` marks them with `≈`.
+- **Tokens and cost.** `/stats` breaks a session down by input, output and cache read/write, and prices it. Prices come from the official model catalog, so treat them as an estimate rather than a bill; a model whose price is unknown is shown with unknown pricing. When a provider reports no usage at all, the numbers use Rig native-message estimates and `/stats` marks them with `≈`.
 - **Prompt caching.** solaris asks for it rather than hoping: an Anthropic `cache_control` breakpoint on the last message, and an OpenAI `prompt_cache_key` when the endpoint is OpenAI's own. That is what makes the cache rows in `/stats` move, and why a long conversation gets cheaper per turn as the unchanged prefix starts coming back as cache reads.
 - **Context.** `/stats` reports `session tokens` (everything the session has spent) and `context used` separately. Only the second says how full the window is: it is the last turn's reported usage plus a size estimate for anything submitted since, because summing a session's turns would grow without bound and say nothing about a per-request window.
 - **Thinking.** Extended-thinking blocks only appear when the upstream actually streams reasoning (`thinking_delta`, `reasoning_content`, `reasoning`); solaris does not send Anthropic's `thinking` parameter yet, because models that do not support it reject the whole request.
-- **Model names.** Already connected once, solaris asks the provider which models it offers (`GET /models`, the one list endpoint both wires answer) and offers those in `/model`, annotated with the description and price from the bundled catalogue where the model is known. The model is remembered beside the provider it was chosen for — in `auth.json`, where the active provider already lives — and a new session starts on it; when there is no such record, the first model offered is used, because an empty model name is not something a provider will accept. The theme and the mode are remembered as well, in `settings.json`. If the provider will not answer, the bundled catalogue is what the picker shows; if there is nothing there either, `/model` says so rather than sending an empty name and collecting a 400. A name you passed with `--model` or `/model <name>` is kept exactly as written, even when nothing lists it.
+- **Model names.** Already connected once, solaris asks the provider which models it offers (`GET /models`, the one list endpoint both wires answer) and offers those in `/model`, annotated with the name from the current official catalogue where the model is known. The model is remembered beside the provider it was chosen for — in `auth.json`, where the active provider already lives — and a new session starts on it; when there is no such record, the first model offered is used, because an empty model name is not something a provider will accept. The theme and the mode are remembered as well, in `settings.json`. If the provider will not answer, the current official catalogue and configured aliases are what the picker shows; if there is nothing there either, `/model` says so rather than sending an empty name and collecting a 400. A name you passed with `--model` or `/model <name>` is kept exactly as written, even when nothing lists it.
 - **Errors.** A rejected key, an unknown model, a rate limit or an empty account is reported with the provider's own wording plus what to do about it. The footer always shows the backend that is answering, so a session with no credential says `unconnected` rather than naming a provider it never calls.
 
 ---
@@ -314,11 +314,11 @@ The model can call `subagent` to delegate a self-contained task:
 - **`explore`** is read-only (read/search/list); **`general`** can implement a task in Build mode. Plan mode rejects `general`.
 - Children use the current provider/model and their own conversation. They inherit project instructions, skills, approval policy, working directory and explicit tool allowlists/exclusions, but do not see the parent's history. Put necessary context and constraints in `prompt`.
 - **Foreground (default):** omit `background` or set it to `false` to wait for the report before continuing. Successive calls are serial; independent calls in one round may run concurrently under the parallel-tool limit (default 4).
-- **Background:** set `"background":true` to immediately receive `{"task_id":"subagent-1","status":"started"}` and continue other work. Completion or failure is reported automatically and the final report is delivered between model rounds; do not poll. Foreground and background children share the active-child limit; excess tasks queue.
-- Background tasks belong to the current turn. When the parent has no other work, it waits for notifications and resumes to integrate the reports before ending the turn. Tasks do not survive the turn or process exit.
+- **Background:** set `"background":true` to immediately receive `{"task_id":"job-…","status":"running"}` and continue other work. Completion or failure is reported automatically and the final report is delivered between model rounds; do not poll. Foreground and background children share the runtime limit on active model requests and tool execution. Waiting for descendants holds no execution slot.
+- Background tasks belong to the application runtime and continue after the parent turn finishes. Completion wakes an idle parent session or arrives at its next safe request boundary. Process exit marks unfinished jobs interrupted; recovery never replays their tools automatically.
 - Children share the workspace and file-mutation locks, **not a filesystem sandbox**; assign disjoint files to concurrent implementation tasks.
-- Children cannot delegate recursively. Each is limited to 20 model requests (including compaction), five minutes and a 16 KiB returned report. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
-- Ctrl+C or abandoning the parent stream cancels child work too. Child token usage/cost is included in session totals, but child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
+- Delegation defaults to one level; configure `--subagent-depth` to change it. There is no fixed request/time budget. Optional `--steps` limits each run independently and reserves its final step for a text-only report. Returned reports are capped at 16 KiB. Child errors become tool errors the parent can handle; child thinking and intermediate output do not become the parent's reply.
+- Ctrl+C or abandoning the parent stream cancels foreground work. Background jobs continue until completion, explicit cancellation or application shutdown. Children keep independent usage/cost ledgers; child contexts do not fill the parent's context gauge. The transcript shows the `subagent` tool result and the status line reports child progress.
 - Each child defaults to one collapsed activity-summary row: a spinner while running, then `→` when finished. Click the title to expand its nested tool calls (`↓`), and click again to collapse. Foreground and background children use the same display; a background launch acknowledgement does not mark the child complete.
 - Disable delegation with `--exclude-tools subagent`. Library callers may also use `AgentOptions::with_subagents(false)`.
 
@@ -328,7 +328,7 @@ For example, launch a background investigation with:
 {"agent":"explore","prompt":"Find test coverage gaps. Report relevant paths and suggestions; do not change files.","background":true}
 ```
 
-Children have persistent session IDs when the parent is saved. Use the `subagent` tool’s `resume_id` to continue a child explicitly, or `model` to override its model under the current provider. Omitted or blank `model` inherits the parent model; omitted or blank `resume_id` starts a new child. Surrounding whitespace is trimmed, and invalid non-empty model IDs fail with a specific error. `/subagents` lists active/queued task IDs and `/stop <task-id>` cancels one. The five-minute child deadline includes time queued for an execution slot; parent policy and aggregate budgets still apply.
+Children have persistent session IDs when the parent is saved. Use the `subagent` tool’s `resume_id` to continue a child explicitly, or `model` to override its model under the current provider. Omitted or blank `model` inherits the parent model; omitted or blank `resume_id` starts a new child. Surrounding whitespace is trimmed, and invalid non-empty model IDs fail with a specific error. `/subagents` lists active/queued task IDs and `/stop <task-id>` cancels one. A running job ID may also be used as resume_id to enqueue additional instructions without starting a concurrent executor. Completed jobs require explicit continuation; inherited permission rules still apply.
 
 # Configuration
 
@@ -373,10 +373,17 @@ subagent sessions), or `solaris --resume <ID>` to restore one explicitly.
 The journal records the resolved provider and model on attachment and backend
 changes so subsequent resume restores that choice unless explicitly overridden.
 
-The journal retains prompts, tool calls/results, model context, compaction checkpoints and
-child activity. Interrupted tool calls are never automatically executed again: verify their
-side effects before retrying. The journal contains conversation and tool data; treat it as
-private. Credentials and authentication headers are not intentionally recorded.
+Official SDK memory stores model messages and compaction state under
+`sessions/memory/<SESSION_ID>`. The SQLite journal retains the transcript, tool
+intents, usage, child activity and executor metadata. SDK memory is the sole message
+store; legacy SQL contexts are not imported. Forks copy native messages, identities and
+compaction asides into independent memory. Rig normalizes tool pairing on restore,
+with explicit interruption feedback for missing results. Successful SDK tasks and explicit
+safe-boundary handoffs commit messages; failed or cancelled phases retain earlier
+committed context. Tool side effects and
+billed usage can still occur before failure. Verify side effects before retrying;
+interrupted tools are never automatically replayed. Treat both stores as private.
+Credentials and authentication headers are not intentionally recorded.
 
 ## Review and undo file changes
 
@@ -388,7 +395,7 @@ Shell commands and external side effects are not covered. Files above 16 MiB are
 rejected by the mutation tools. Backups live alongside session artifacts and contain
 private file data. Ephemeral runs keep their artifacts in the temporary directory.
 
-## Execution policy and budgets
+## Execution policy and steps
 
 `--policy trusted` retains the usual approval hook. `--policy ask` confirms
 mutating/unknown tools; `--policy read-only` refuses them even when a rule allows
@@ -400,11 +407,10 @@ text, not its actual side effects; these rules are not an OS sandbox.
 An explicit `ask` rule also prompts for read-only tools, including locally trusted
 MCP reads. With confirmation enabled, reads without a matching ask/deny rule remain automatic.
 
-`--max-requests` (default 100) and `--max-seconds` (default 1800) apply across a turn,
-its children and automatic compaction. `--max-cost <USD>` stops further work when
-observed model cost reaches the limit; it cannot guarantee a prepaid spending cap,
-and depends on available provider pricing. Child limits cannot reset the parent's
-request counter or deadline.
+`--steps <N>` optionally limits each run's model/tool steps independently. The last
+step removes all tools and requests a concise final report. There is no default
+request count, time or shared cost budget. `--subagent-depth <N>` controls delegation
+depth (default 1; 0 disables it). Cancellation and approval policy remain available.
 
 ## Headless automation
 
@@ -420,7 +426,7 @@ or persistence failures stop the request; model requests are not automatically r
 `--fork <SESSION_ID>` copies a saved conversation into a new session.
 `--export-session <SESSION_ID>` prints its journal as JSON; exports contain private
 conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
-execution budgets, tool policy, persistence and cancellation.
+run policy, jobs, queued inputs, persistence and cancellation.
 
 `solaris --rpc` provides the same session over stdin/stdout, without a network
 server. Send one JSON request per line; `id` is a string. For example:
@@ -437,6 +443,10 @@ An omitted prompt mode uses the CLI mode. Responses carry `type: "response"`,
 completion; inspect the events for turn success or failure. One prompt runs at a
 time; a second prompt is rejected while controls remain available. Requests are
 limited to 1 MiB per line. Closing stdin cancels the current turn and exits.
+`jobs` lists this session’s jobs; `send_job` takes `id` and `text`, and `cancel_job`
+takes `id`. Automatic background events have a null `request_id`. A persistence
+failure is reported with a null `sequence`; normal events have durable sequences
+when the session is saved.
 
 ## MCP servers
 
@@ -482,63 +492,71 @@ bounded independently.
 
 ## Model capabilities and offline model lists
 
-Model capabilities, context/input/output limits and pricing come from provider-scoped
-[models.dev](https://models.dev/experimental/v2.0/api.json) metadata. OpenRouter's own
-model catalog takes precedence for OpenRouter. A compact snapshot ships with Solaris;
-the bundled snapshot includes only OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
-Meta, Moonshot, Zhipu and MiniMax. Gateway metadata is available from
-runtime caches and refreshes. Startup loads validated local caches immediately, then refreshes public catalogs in
-the background (24-hour freshness, hourly retry). Downloads never receive provider
-credentials. Failed refreshes retain cached data or the bundled snapshot.
+Model capabilities, limits, encoding rules and reference prices come from the
+official Rig catalog. Solaris uses Rig's built-in data and explicit user overrides.
+The catalog updates when the Rig dependency is upgraded. Solaris does not download,
+cache or refresh external metadata and maintains no separate model snapshot or parser.
 
-Matching uses exact, case-sensitive provider/model IDs. Solaris's `opencode` provider
-maps to the upstream `opencode-go` catalog. When a provider has no catalog, an exact model ID shared by only one of these
-manufacturers inherits that manufacturer's parameters and estimated prices; user
-overrides still win. Ambiguous or unknown IDs retain unknown features and prices,
-a 128,000-token context window and an 8,192-token output limit. The default
-requested output is capped at 8,192 and the model's limits. Model-name prefixes do not
-imply capabilities, prices or request protocols.
+Models are resolved by provider and ID using Rig's lookup rules, including its
+dated-snapshot matching. `opencode` maps to `opencode-go`. Unknown gateways may
+match a unique model ID among OpenAI, Anthropic, Google, DeepSeek, xAI, Mistral,
+Meta, Moonshot, Zhipu and MiniMax. Ambiguous and unknown models retain unknown
+capabilities and prices; the application uses a 128,000-token fallback context
+budget and requests at most 8,192 output tokens, capped by known limits.
 
-`models.json` in the user configuration directory provides explicit, provider-scoped
-overrides. For example:
+`models.json` now uses named model selections and official catalog overrides.
+The previous array-based format is no longer accepted. For example:
 
 ```json
 {
-  "models": [{
-    "provider": "local",
-    "id": "my-model",
-    "capabilities": {
-      "tool_calling": "supported",
-      "image_input": "unsupported",
-      "structured_output": "unknown",
-      "context_window": 32768,
-      "max_output": 4096
+  "providers": {
+    "gateway": {
+      "protocol": "openai-chat",
+      "base_url": "https://example.com/v1",
+      "credential": "new-api"
     }
-  }]
+  },
+  "models": {
+    "fast": {
+      "provider": "gateway",
+      "request_id": "private-alias",
+      "metadata": "anthropic/claude-sonnet-4-5",
+      "output_tokens": 4096
+    }
+  },
+  "overrides": {
+    "anthropic": {
+      "models": {
+        "claude-sonnet-4-5": {
+          "limit": { "context": 200000, "output": 64000 }
+        }
+      }
+    }
+  }
 }
 ```
 
-Feature values are `supported`, `unsupported`, or `unknown`; unknown features are
-not inferred from model names. A model that explicitly lacks tool calling receives
-no tools. Strict schema sampling is enabled only for explicit support and compatible
-schemas. `--print-config` reports resolved capabilities. Optional `price` uses
-`input`, `output`, `cache_read`, and `cache_write` USD-per-million-token rates.
-Unknown prices display as unknown; `--max-cost` requires known pricing.
+Run `solaris --model fast` to select the named model and its provider. `request_id`
+is sent unchanged; `metadata` identifies the official model facts and never
+changes the endpoint or protocol. It may be omitted for ordinary model matching.
+Custom providers support `openai-chat`, `openai-responses`, and
+`anthropic-messages`; their names must not replace a built-in provider.
+`credential` references an API credential already stored in `auth.json` (the
+example uses `/connect`'s New API credential); omit it for a keyless endpoint.
+ChatGPT subscription tokens cannot be used by custom endpoints.
 
-An override may additionally set `request_id` (defaults to `id`), `output_tokens` (requested reply budget), and
-`catalog: {"provider": "anthropic", "id": "claude-sonnet-4-5"}` to map a gateway alias
-to catalog capabilities. This reference never imports another provider's price or
-protocol. `capabilities.max_input` limits the input budget separately from the total
-context window. Optional `price_tiers` entries contain `input_tokens_above` and the
-same four price fields; the highest matching threshold is used. Explicit zero prices
-mean free, while absent input/output prices remain unknown. ChatGPT account sessions
-never use API prices. `--print-config` includes resolved parameters and their sources.
-Updates apply at the next model request and reuse the HTTP connection pool.
+The `overrides` object follows Rig's strict catalog override format: vendor keys,
+`models`, and model rows with fields such as `limit`, `cost`, `tool_call`,
+`modalities` and `rig`. Use it for custom model facts as well as changes to known
+models. To migrate an old override, replace `capabilities` and `price` with the
+official row fields; replace `catalog` with the selection's `metadata` reference.
+Unknown fields and invalid references fail configuration loading.
 
-Maintainers can regenerate the bundled snapshot with
-`bash scripts/update-model-catalog.sh`. Both refresh and generation use the same
-Rust source adapters; unused upstream documentation and benchmarks are omitted.
-The snapshot is metadata, not a guarantee that an account can access every model.
+Prices are USD per million tokens. Rig attaches standard API list-price estimates to native response usage; Solaris reads only `usage.cost` and does not calculate a fallback charge.
+long-context tiers, service tiers and hosted-tool fees are not included. Gateway
+metadata inherited from a manufacturer is marked as a reference price. Unknown
+prices remain unknown, and ChatGPT account sessions do not use API prices.
+`--print-config` shows the resolved official facts. Each request fixes its facts and reuses the HTTP connection pool. Backend construction accepts a complete immutable model parameter snapshot; capabilities and reply budgets are derived from the same official facts.
 
 Successful remote model discovery is cached by endpoint with a content checksum.
 An offline fallback is visibly marked as cached; corrupt or endpoint-mismatched
@@ -546,7 +564,7 @@ cache entries are rejected. This cache stores model IDs, not credentials.
 
 ## Images
 
-For a model explicitly marked `image_input: "supported"` in `models.json`,
+For a model whose official catalog facts enable image input,
 `read` can return PNG, JPEG, GIF and WebP images as image content. Headless runs
 can use `--image <PATH>` with `--print` (up to eight images, 8 MiB each). Detection
 uses file signatures. Unknown/unsupported model capabilities fail locally.
@@ -594,10 +612,17 @@ prompt/tool estimation inputs. UI polling only reads nonblocking snapshots: it n
 builds prompts, reads files or starts a shell. Restoring messages uses the same
 projection as ordinary requests, without a separate recovery-validation task.
 
-Each completed model request records usage and estimated cost immediately, including
+Each completed model request records usage and the cost supplied by Rig immediately, including
 automatic and manual summary calls. Known charges survive later request failures or
-cancellation. Child usage is accounted separately from parent context occupancy. Old
-cumulative records are supported without double counting new per-request records.
+cancellation. Child usage is accounted separately from parent context occupancy. Only
+per-request records restore billing; cumulative UI events are not a second billing source.
 The default reply budget is reduced for small model windows, and compaction retention
 is bounded by the usable window. `ContextUsageUpdated` events expose occupancy while
 `TurnComplete.usage` remains cumulative for a successful task.
+
+Request accounting preserves the full SDK cost and its completeness flag. Unknown or
+partial costs remain incomplete in the ledger and core totals; a cost budget stops
+execution if a complete charge is unavailable. The current UI displays the known
+subtotal. No token-price fallback is used.
+
+Session execution now uses a single command-owning runtime with session-scoped event sequences and snapshots. Model discovery is a separate provider service. Persistent sessions use schema 6, with additive migration from schemas 4 and 5; other versions are rejected. Native memory writes have journal checkpoints, and request settlement is idempotent. See [the architecture](docs/ARCHITECTURE.md) for module boundaries.

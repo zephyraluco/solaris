@@ -13,6 +13,17 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::Mutex;
 
+/// Normalize aliases before acquiring a per-file lock on the async execution path.
+pub(crate) async fn lock_path(path: &Path) -> std::io::Result<PathBuf> {
+    let path = path.to_owned();
+    let path = tokio::task::spawn_blocking(move || crate::filesystem::canonicalize(&path))
+        .await
+        .map_err(std::io::Error::other)??;
+    #[cfg(windows)]
+    let path = PathBuf::from(path.to_string_lossy().to_lowercase());
+    Ok(path)
+}
+
 /// One lock per path.
 ///
 /// The table holds the locks weakly, so a path's lock lives exactly as long as

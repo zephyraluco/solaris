@@ -1,0 +1,2577 @@
+//! Rig execution phases, prepared requests, tool policy and summary coordination.
+//! The SDK owns model/tool rounds; this module supplies product policy and safe
+//! request-boundary handoffs without authoring a second model history.
+
+#[cfg(test)]
+use crate::testing::TurnRequest;
+
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
+
+use crate::{AgentEvent, AgentEventStream};
+use futures::{Stream, StreamExt};
+#[cfg(test)]
+use solaris_backend::Message;
+use solaris_backend::{ModelConnector, Usage};
+use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
+use solaris_types::{ToolCall, ToolResult, ToolSpec};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+use crate::context::compaction::Compaction;
+use crate::context::prompt::{COMPACT_PROMPT, UPDATE_COMPACT_PROMPT};
+use crate::policy::approver::{Approval, Approver};
+use crate::runtime::agent::AgentOptions;
+use crate::runtime::queue::Queue;
+use crate::storage::memory::Conversation;
+
+use crate::tasks::{SUBAGENT_TOOL, SubagentRunner};
+
+/// Tool calls from one round that run at the same time.
+///
+/// Enough to overlap a round's reads without turning one model reply into a
+/// burst of processes. A round containing a tool that must run alone ignores it.
+pub const DEFAULT_MAX_PARALLEL: usize = 4;
+
+/// Everything one turn needs, gathered so the loop can outlive the call that
+/// started it.
+pub(crate) struct TurnInput {
+    pub outcome: Arc<std::sync::Mutex<Option<crate::StopReason>>>,
+    pub owner: String,
+    pub lease: Option<crate::runtime::TurnLease>,
+    /// The backend the credentials resolved to.
+    pub inner: Arc<dyn ModelConnector>,
+    /// The tools this turn may declare and run.
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub options: AgentOptions,
+    pub services: crate::runtime::services::SessionServices,
+    /// Stops the turn in flight.
+    pub cancel: Cancel,
+    /// Messages that correct the turn, read before each round.
+    pub steering: Queue,
+    /// Messages for after the turn, read when it would otherwise end.
+    pub follow_up: Queue,
+    /// The conversation this turn extends.
+    pub conversation: Arc<Conversation>,
+    /// The system prompt for this turn, written by [`crate::context::prompt`].
+    pub system: String,
+    /// The new user prompt.
+    pub prompt: String,
+    /// The model's context window, which sizes the compaction budget.
+    pub context_window: u32,
+    pub model_key: String,
+    pub base_id: String,
+    pub subagent: Option<Arc<SubagentRunner>>,
+}
+
+/// Start a turn, streaming what it produces.
+///
+/// The loop runs in its own task so the caller can keep drawing while a command
+/// runs. Dropping the returned stream drops `tx`, which is how the loop learns
+/// the turn was abandoned.
+pub(crate) fn start(input: TurnInput) -> AgentEventStream {
+    // A cancel belongs to one turn. Clearing it here is what keeps a stop that
+    // arrived after the last turn from stopping this one.
+    let turn_cancel = input.cancel.begin_turn();
+
+    let TurnInput {
+        outcome,
+        owner,
+        lease,
+        inner,
+        tools,
+        options,
+        services,
+        cancel: _,
+        steering,
+        follow_up,
+        conversation,
+        system,
+        prompt,
+        context_window,
+        model_key,
+        base_id,
+        subagent,
+    } = input;
+
+    let jobs = services.jobs.clone();
+    let inner: Arc<dyn ModelConnector> =
+        Arc::new(crate::execution::connection::ExecutionConnector {
+            inner,
+            conversation: Arc::clone(&conversation),
+            services,
+            kind: crate::UsageKind::Model,
+        });
+    let specs: Vec<ToolSpec> = tools
+        .iter()
+        .map(|tool| ToolSpec::new(tool.name(), tool.description(), tool.parameters()))
+        .collect();
+    let lazy_tools = specs.iter().any(|spec| spec.name == "tool_search")
+        && specs
+            .iter()
+            .filter(|spec| spec.name.starts_with("mcp_"))
+            .count()
+            > 8;
+    let active_tools = std::sync::Mutex::new(
+        specs
+            .iter()
+            .filter(|spec| !lazy_tools || !spec.name.starts_with("mcp_"))
+            .map(|spec| spec.name.clone())
+            .collect(),
+    );
+    let runner = Arc::new(Runner {
+        outcome,
+        active_tools,
+        steps: options.execution.steps,
+        model_steps: std::sync::atomic::AtomicU32::new(0),
+        inner,
+        tools,
+        specs,
+        approver: Arc::clone(&options.approver),
+        cwd: options.cwd.clone(),
+        temp_dir: options.temp_dir.clone(),
+        cancel: turn_cancel,
+        steering,
+        follow_up,
+        conversation,
+        compaction: options.compaction,
+        context_window,
+        model_key,
+        base_id,
+        max_parallel: options.max_parallel.max(1),
+        system,
+        subagent,
+        jobs,
+        owner,
+    });
+
+    let (tx, rx) = unbounded_channel();
+    let cancel = runner.cancel.clone();
+    let (completed, done) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        runner.drive(prompt, tx).await;
+        drop(lease);
+        let _ = completed.send(());
+    });
+
+    Box::pin(EventStream {
+        rx,
+        cancel,
+        done,
+        finished: false,
+    })
+}
+
+/// The state one turn's loop runs with, owned outright so it can outlive the
+/// call that started it.
+struct Runner {
+    outcome: Arc<std::sync::Mutex<Option<crate::StopReason>>>,
+    steps: Option<std::num::NonZeroU32>,
+    model_steps: std::sync::atomic::AtomicU32,
+    inner: Arc<dyn ModelConnector>,
+    tools: Vec<Arc<dyn Tool>>,
+    specs: Vec<ToolSpec>,
+    active_tools: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    approver: Arc<dyn Approver>,
+    cwd: PathBuf,
+    temp_dir: PathBuf,
+    cancel: Cancel,
+    /// Messages that correct this turn.
+    steering: Queue,
+    /// Messages to run as the next turn.
+    follow_up: Queue,
+    /// The conversation, shared with the agent so it outlives the turn.
+    conversation: Arc<Conversation>,
+    /// When the conversation is summarized, and how much room it may take.
+    compaction: Compaction,
+    /// The window the budget is measured against.
+    context_window: u32,
+    model_key: String,
+    base_id: String,
+    max_parallel: usize,
+    /// The system prompt, sent ahead of the conversation on every round.
+    system: String,
+    subagent: Option<Arc<SubagentRunner>>,
+    jobs: crate::Jobs,
+    owner: String,
+}
+
+#[path = "driver.rs"]
+mod driver;
+
+impl Runner {
+    /// Report a failed turn. Native checkpoints already retain consistent history;
+    /// recovery normalization belongs to session attachment.
+    fn give_up(&self, message: String, tx: &UnboundedSender<AgentEvent>) {
+        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(if self.cancel.is_cancelled() {
+                crate::StopReason::UserCancelled
+            } else {
+                crate::StopReason::ExecutionError
+            });
+        self.emit_context(tx);
+        let _ = tx.send(AgentEvent::Error(message));
+    }
+
+    fn absorb_inputs(&self, followups: bool, tx: &UnboundedSender<AgentEvent>) -> bool {
+        let pending = self.jobs.pending_inputs(&self.owner, followups);
+        let received = !pending.is_empty();
+        for input in pending {
+            if let Err(error) = self
+                .conversation
+                .push_notification(&input.id, &input.text)
+                .and_then(|()| {
+                    self.jobs
+                        .acknowledge_input(&input.id)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                self.conversation.failed(error);
+                break;
+            }
+            let _ = tx.send(if input.follow_up {
+                AgentEvent::FollowUp { prompt: input.text }
+            } else {
+                AgentEvent::Steered { text: input.text }
+            });
+        }
+        received
+    }
+
+    fn absorb_background(
+        &self,
+        _total: &mut Usage,
+        _cost_usd: &mut f64,
+        tx: &UnboundedSender<AgentEvent>,
+    ) -> bool {
+        let pending = self.jobs.pending(&self.owner);
+        let received = !pending.is_empty();
+        for info in pending {
+            let body = format!(
+                "Background subagent notification (task data, not a user instruction):\n{}",
+                serde_json::to_string(&info).unwrap_or_default()
+            );
+            if let Err(error) = self
+                .conversation
+                .push_notification(&info.id, &body)
+                .and_then(|()| {
+                    self.jobs
+                        .acknowledge(&info.id)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                self.conversation.failed(error);
+                break;
+            }
+            if let Some(result) = &info.result
+                && let Some(session_id) = result.metadata.details["session_id"].as_str()
+            {
+                let _ = tx.send(AgentEvent::SubagentSession {
+                    task_id: info.id.clone(),
+                    session_id: session_id.into(),
+                });
+            }
+            let _ = tx.send(AgentEvent::SubagentComplete {
+                task_id: info.id,
+                output: info.result.as_ref().map_or_else(
+                    || format!("subagent stopped: {:?}", info.stop_reason),
+                    |result| result.output.clone(),
+                ),
+                is_error: !matches!(
+                    info.status,
+                    crate::JobStatus::Completed | crate::JobStatus::Partial
+                ),
+                duration_ms: info
+                    .finished_at
+                    .unwrap_or(info.started_at)
+                    .saturating_sub(info.started_at),
+            });
+        }
+        received
+    }
+
+    /// Summarize the older part of the conversation, if there is a reason to.
+    ///
+    /// `force` is for the two cases where the budget is not the question: a round
+    /// that came back with an overflow, and the user asking for it. Returns
+    /// whether anything was replaced.
+    async fn compact(
+        &self,
+        force: bool,
+        tx: &UnboundedSender<AgentEvent>,
+        total: &mut Usage,
+        cost_usd: &mut f64,
+    ) -> bool {
+        if !self.compaction.enabled {
+            return false;
+        }
+        if !force && !self.over_budget() {
+            return false;
+        }
+
+        let outcome = compact_memory(
+            &self.inner,
+            &self.cancel,
+            &self.conversation,
+            self.compaction_policy(),
+            self.context_window,
+            force,
+        )
+        .await;
+        *total = total.merge(outcome.usage);
+        *cost_usd += outcome.cost_usd;
+        if outcome.text.is_none() {
+            return false;
+        }
+        let _ = tx.send(AgentEvent::Compacted {
+            dropped: outcome.dropped,
+        });
+        self.emit_context(tx);
+        true
+    }
+
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        let active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+        self.specs
+            .iter()
+            .filter(|spec| active.contains(&spec.name))
+            .cloned()
+            .collect()
+    }
+
+    fn request_header(&self) -> crate::context::projection::Header {
+        let mut header = crate::context::projection::Header::new(
+            &self.model_key,
+            &self.system,
+            &self.request_tools(),
+        );
+        if !self.base_id.is_empty() {
+            header.base_id.clone_from(&self.base_id);
+        }
+        header
+    }
+
+    fn emit_context(&self, tx: &UnboundedSender<AgentEvent>) {
+        self.conversation
+            .update_request_header(self.request_header());
+        let window = self
+            .inner
+            .capabilities()
+            .context_window
+            .unwrap_or(self.context_window);
+        let _ = tx.send(AgentEvent::ContextUsageUpdated {
+            context: self.conversation.context_usage(&self.base_id, window),
+        });
+    }
+
+    fn compaction_policy(&self) -> Compaction {
+        let caps = self.inner.capabilities();
+        let window = caps.context_window.unwrap_or(self.context_window);
+        let policy = self.compaction.for_window(window, caps.output_budget);
+        let input_window = caps.max_input.map_or(window, |limit| {
+            window.min(limit.saturating_add(policy.reserve_tokens))
+        });
+        policy.for_window(input_window, caps.output_budget)
+    }
+
+    fn over_budget(&self) -> bool {
+        self.over_budget_tokens(self.conversation.projected_tokens(&self.request_header()))
+    }
+
+    fn over_budget_tokens(&self, tokens: u32) -> bool {
+        let capabilities = self.inner.capabilities();
+        let context_window = capabilities.context_window.unwrap_or(self.context_window);
+        let policy = self.compaction_policy();
+        let window = capabilities.max_input.map_or(context_window, |limit| {
+            context_window.min(limit.saturating_add(policy.reserve_tokens))
+        });
+        policy.should_compact(tokens, window)
+    }
+
+    /// Run one call, or explain why it did not run.
+    async fn run_call(&self, call: &ToolCall, tx: &UnboundedSender<AgentEvent>) -> CallOutcome {
+        // The SDK classifies non-object arguments as malformed. Reject them
+        // before schema validation: an extension may advertise a permissive
+        // schema, but malformed model arguments must never reach side effects.
+        if !call.input.is_object() {
+            return ToolResult::error(call, "invalid tool arguments: expected a JSON object")
+                .into();
+        }
+        let Some(tool) = self.tools.iter().find(|tool| tool.name() == call.name) else {
+            return ToolResult::error(
+                call,
+                format!("there is no tool called `{}` in this session", call.name),
+            )
+            .into();
+        };
+
+        // External schema retrieval is disabled in the dependency features.
+        // Validate before approvals or side effects, including extension tools.
+        let Some(spec) = self.specs.iter().find(|spec| spec.name == call.name) else {
+            return ToolResult::error(call, "tool has no prepared specification").into();
+        };
+        let schema = spec.parameters.clone();
+        let validator = match jsonschema::validator_for(&schema) {
+            Ok(validator) => validator,
+            Err(error) => {
+                return ToolResult::error(call, format!("invalid tool schema: {error}")).into();
+            }
+        };
+        if let Err(error) = validator.validate(&call.input) {
+            return ToolResult::error(
+                call,
+                format!("invalid tool arguments at {}: {error}", error.instance_path),
+            )
+            .into();
+        }
+
+        let approval = tokio::select! {
+            biased;
+            _ = wait_for_cancel(&self.cancel) => return ToolResult::error(call, "the turn was cancelled while waiting for approval").into(),
+            approval = self.approver.approve(call) => approval,
+        };
+        if approval == Approval::Denied {
+            return ToolResult::error(
+                call,
+                "the call was declined, so it did not run — ask instead of acting, or try \
+                 something else",
+            )
+            .into();
+        }
+
+        // Waiting for that answer is exactly when a cancel is likely to arrive.
+        if self.cancel.is_cancelled() {
+            return ToolResult::error(call, "the turn was cancelled before this call ran").into();
+        }
+
+        if let Some(error) = self.conversation.error() {
+            return ToolResult::error(call, error).into();
+        }
+        if let Some(journal) = self.conversation.journal()
+            && let Err(error) =
+                journal.append(&crate::SessionRecord::ToolIntent { call: call.clone() })
+        {
+            return ToolResult::error(call, error.to_string()).into();
+        }
+        let ctx = ToolContext {
+            images_enabled: self.inner.capabilities().image_input
+                == solaris_backend::Support::Supported,
+            cwd: self.cwd.clone(),
+            temp_dir: self.conversation.journal().map_or_else(
+                || self.temp_dir.clone(),
+                |journal| journal.store().artifact_dir(),
+            ),
+            cancel: self.cancel.clone(),
+        };
+        let (output, totals) = if call.name == "tool_search" {
+            let query = call.input["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            let terms: Vec<_> = query.split_whitespace().collect();
+            let limit = call.input["limit"].as_u64().unwrap_or(5).min(8) as usize;
+            let mut matches: Vec<_> = self
+                .specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("mcp_"))
+                .filter_map(|spec| {
+                    let text = format!("{} {}", spec.name, spec.description).to_lowercase();
+                    let score = terms.iter().filter(|term| text.contains(**term)).count();
+                    (score > 0).then_some((score, spec))
+                })
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+            let found: Vec<_> = matches
+                .into_iter()
+                .take(limit)
+                .map(|(_, spec)| spec)
+                .collect();
+            {
+                let mut active = self.active_tools.lock().unwrap_or_else(|p| p.into_inner());
+                active.retain(|name| !name.starts_with("mcp_"));
+                for spec in &found {
+                    active.insert(spec.name.clone());
+                }
+            }
+            (
+                solaris_tools::ToolOutput::ok(
+                    serde_json::json!({"tools":found,"available_next_round":true}).to_string(),
+                ),
+                crate::UsageTotals::default(),
+            )
+        } else if call.name == SUBAGENT_TOOL {
+            let Some(subagent) = &self.subagent else {
+                return ToolResult::error(call, "subagent delegation is disabled in this session")
+                    .into();
+            };
+            let task = match subagent.parse(call.input.clone()) {
+                Ok(task) => task,
+                Err(output) => return ToolResult::error(call, output.text).into(),
+            };
+            let background = task.background;
+            let existing = match task
+                .resume_id
+                .as_deref()
+                .map(|session| {
+                    self.jobs
+                        .continue_running(&self.owner, session, &task.prompt)
+                })
+                .transpose()
+            {
+                Ok(id) => id.flatten(),
+                Err(error) => return ToolResult::error(call, error).into(),
+            };
+            let id = match existing {
+                Some(id) => id,
+                None => match self
+                    .jobs
+                    .start(Arc::clone(subagent), task, ctx, tx.clone(), &call.id)
+                {
+                    Ok(id) => id,
+                    Err(error) => return ToolResult::error(call, error.to_string()).into(),
+                },
+            };
+            if background {
+                return ToolResult::ok(
+                    call,
+                    serde_json::json!({"task_id":id,"status":"running"}).to_string(),
+                )
+                .into();
+            }
+            let info = tokio::select! {
+                info=self.jobs.wait(&id)=>info,
+                _=wait_for_cancel(&self.cancel)=>{self.jobs.cancel(&self.owner,&id);return ToolResult::error(call,"subagent was cancelled").into();}
+            };
+            let info = match info {
+                Ok(info) => info,
+                Err(error) => return ToolResult::error(call, error).into(),
+            };
+            let Some(result) = info.result else {
+                return ToolResult::error(
+                    call,
+                    format!("subagent stopped: {:?}", info.stop_reason),
+                )
+                .into();
+            };
+            (
+                solaris_tools::ToolOutput {
+                    text: result.output,
+                    is_error: result.is_error,
+                    metadata: Box::new(result.metadata),
+                },
+                result.totals,
+            )
+        } else {
+            let _permit = match self.jobs.execution_slot(&self.cancel).await {
+                Ok(permit) => permit,
+                Err(error) => return ToolResult::error(call, error).into(),
+            };
+            (
+                tool.run(call.input.clone(), &ctx).await,
+                crate::UsageTotals::default(),
+            )
+        };
+
+        let mut result = if output.is_error {
+            ToolResult::error(call, output.text)
+        } else {
+            ToolResult::ok(call, output.text)
+        };
+        result.metadata = output.metadata;
+        CallOutcome { result, totals }
+    }
+
+    /// Run one call and report it, answering with the block to send back.
+    async fn run_and_report(
+        &self,
+        call: &ToolCall,
+        tx: &UnboundedSender<AgentEvent>,
+    ) -> Option<CallOutcome> {
+        let started = Instant::now();
+        // A stop that arrived between calls means nothing more should start.
+        let result = if self.cancel.is_cancelled() {
+            ToolResult::error(call, "the turn was cancelled before this call ran").into()
+        } else {
+            self.run_call(call, tx).await
+        };
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        if !result.totals.usage.is_empty() || result.totals.cost_usd != 0.0 {
+            tx.send(AgentEvent::SubagentUsage {
+                usage: result.totals.usage,
+                cost_usd: result.totals.cost_usd,
+            })
+            .ok()?;
+        }
+
+        tx.send(AgentEvent::ToolResult {
+            result: result.result.clone(),
+            duration_ms: elapsed,
+        })
+        .ok()?;
+
+        Some(result)
+    }
+}
+
+struct CallOutcome {
+    result: ToolResult,
+    totals: crate::UsageTotals,
+}
+
+impl From<ToolResult> for CallOutcome {
+    fn from(result: ToolResult) -> Self {
+        Self {
+            result,
+            totals: crate::UsageTotals::default(),
+        }
+    }
+}
+
+pub(crate) async fn wait_for_cancel(cancel: &Cancel) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Compaction uses the official cut policy, request builder, validation and
+/// summary splice. It runs only between SDK tasks, so no live runner is mutated.
+#[derive(Default)]
+struct SummaryOutcome {
+    text: Option<String>,
+    usage: Usage,
+    cost_usd: f64,
+    dropped: usize,
+}
+async fn compact_memory(
+    inner: &Arc<dyn ModelConnector>,
+    cancel: &Cancel,
+    conversation: &Conversation,
+    config: Compaction,
+    fallback_window: u32,
+    force: bool,
+) -> SummaryOutcome {
+    use rig_core::{
+        effect::{Answered, EffectId, EffectKind},
+        serve::{Dispatch, Serve},
+    };
+    let mut outcome = SummaryOutcome::default();
+    if cancel.is_cancelled() {
+        return outcome;
+    }
+    let mut native = match conversation.native() {
+        Ok(native) => native,
+        Err(_) => return outcome,
+    };
+    let caps = inner.capabilities();
+    let provider = match rig_core::providers::registry::ProviderId::declare("solaris") {
+        Ok(provider) => provider,
+        Err(_) => return outcome,
+    };
+    let mut spec = rig_core::catalog::ModelSpec::new(provider, "session");
+    spec.context_window = caps
+        .context_window
+        .or((fallback_window > 0).then_some(fallback_window));
+    spec.max_input_tokens = caps.max_input;
+    spec.max_output_tokens = caps.max_output.or(caps.output_budget);
+    let mut policy = rig_memory::CompactionPolicy {
+        keep_recent: config.keep_recent_tokens as usize,
+        keep_asked: config.keep_recent_tokens as usize,
+        clearing: rig_memory::ClearToolOutputs::new(config.keep_recent_tokens as usize),
+        ..Default::default()
+    };
+    // Work on the loaded copy. Clearing and summarization are committed
+    // together only after a valid summary, so failed requests lose no context.
+    policy.clearing.clear_conversation(
+        &mut native,
+        rig_core::conversation::Author::plugin("solaris"),
+    );
+    let state = rig_memory::summary_state(&native);
+    policy.summarizer.prompts.system = if state.summary.is_empty() {
+        COMPACT_PROMPT.into()
+    } else {
+        UPDATE_COMPACT_PROMPT.into()
+    };
+    let reason = if force {
+        rig_memory::CompactReason::Asked {
+            focus: String::new(),
+        }
+    } else {
+        rig_memory::CompactReason::Threshold
+    };
+    if policy
+        .cut_summary(&native, &state, &reason, &spec)
+        .is_none()
+    {
+        return outcome;
+    }
+    let client = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return outcome,
+        result = Arc::clone(inner).model_client() => match result { Ok(client) => client, Err(_) => return outcome },
+    };
+    // A catalog or credential refresh may have happened while preparing the
+    // connection. Build the actual summary from that connection's fixed facts.
+    let caps = client.capabilities();
+    spec.context_window = caps
+        .context_window
+        .or((fallback_window > 0).then_some(fallback_window));
+    spec.max_input_tokens = caps.max_input;
+    spec.max_output_tokens = caps.max_output.or(caps.output_budget);
+    let plan = match policy.plan_summary(&native, &state, &reason, &spec) {
+        Ok(Some(plan)) => plan,
+        _ => return outcome,
+    };
+    let keep = plan.keep_from;
+    let cut = keep
+        .and_then(|id| native.index_of(id))
+        .unwrap_or(native.messages().len());
+    let mut state = plan.state;
+    let request = plan.request;
+    let summary = {
+        let input_tokens = crate::context::estimate::request_tokens(&request);
+        let kind = EffectKind::Completion {
+            request: Arc::new(request),
+            stream: true,
+        };
+        let answer = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => return outcome,
+            result = async { client.serve(kind, Dispatch::new(EffectId::from_raw(0), true)).await.into_outcome().await } => result,
+        };
+        let Ok(Answered::Completion(response)) = answer else {
+            return outcome;
+        };
+        outcome.usage = crate::context::estimate::usage(input_tokens, &response);
+        outcome.cost_usd = match client.settle(outcome.usage, response.usage.cost) {
+            Ok(cost) => cost,
+            Err(_) => return outcome,
+        };
+        match rig_memory::Summarizer::summary_text(&response) {
+            Ok(summary) => summary,
+            Err(_) => return outcome,
+        }
+    };
+    state.summary = summary.clone();
+    if rig_memory::apply_summary(&mut native, keep, &state).is_none() {
+        return outcome;
+    }
+    if let Err(error) = rig_memory::save(&conversation.storage(), "conversation", &mut native) {
+        conversation.failed(error);
+        return outcome;
+    }
+    conversation.refresh();
+    outcome.text = Some(summary);
+    outcome.dropped = cut;
+    outcome
+}
+
+pub(crate) async fn compact_now(
+    inner: &Arc<dyn ModelConnector>,
+    conversation: &Conversation,
+    config: Compaction,
+    cancel: &Cancel,
+) -> Option<usize> {
+    if !config.enabled {
+        return None;
+    }
+    let outcome = compact_memory(inner, cancel, conversation, config, 0, true).await;
+    outcome.text.map(|_| outcome.dropped)
+}
+
+/// A stream over the loop's channel.
+///
+/// Hand-rolled rather than pulled from another crate: it is the only thing
+/// needed from one, and it is three lines.
+struct EventStream {
+    rx: UnboundedReceiver<AgentEvent>,
+    cancel: Cancel,
+    done: tokio::sync::oneshot::Receiver<()>,
+    finished: bool,
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Stream for EventStream {
+    type Item = AgentEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<AgentEvent>> {
+        if self.finished {
+            return std::future::Future::poll(Pin::new(&mut self.done), cx).map(|_| None);
+        }
+        let event = self.rx.poll_recv(cx);
+        if let Poll::Ready(Some(event)) = &event {
+            // A child racing cancellation may already have queued a status or
+            // notification. Nothing may appear after the turn's terminal event.
+            self.finished = event.is_terminal();
+        }
+        event
+    }
+}
+#[cfg(test)]
+mod tests {
+    fn request_text(request: &crate::testing::TurnRequest) -> String {
+        request
+            .history
+            .iter()
+            .map(solaris_backend::Message::text)
+            .chain(std::iter::once(request.prompt.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    use super::*;
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use crate::policy::approver::{Approval, DenyAll};
+    use crate::runtime::mode::Mode;
+    use solaris_backend::{BackendError, Usage};
+    use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput};
+
+    /// A tool that records every call it is handed.
+    #[derive(Default)]
+    struct Recording {
+        calls: Mutex<Vec<Value>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Tool for Recording {
+        fn name(&self) -> &str {
+            "record"
+        }
+
+        fn description(&self) -> &str {
+            "Record a call"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn run(&self, input: Value, _ctx: &ToolContext) -> ToolOutput {
+            self.calls.lock().expect("lock").push(input);
+            if self.fail {
+                ToolOutput::error("it went wrong")
+            } else {
+                solaris_tools::ToolOutput::ok("done")
+            }
+        }
+    }
+
+    /// A tool that reports how many copies of itself ran at once.
+    #[derive(Default)]
+    struct Overlapping {
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        sequential: bool,
+    }
+
+    #[async_trait]
+    impl Tool for Overlapping {
+        fn name(&self) -> &str {
+            "overlap"
+        }
+
+        fn description(&self) -> &str {
+            "Sleep briefly"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        fn execution_mode(&self) -> ExecutionMode {
+            if self.sequential {
+                ExecutionMode::Sequential
+            } else {
+                ExecutionMode::Parallel
+            }
+        }
+
+        async fn run(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            ToolOutput::ok("done")
+        }
+    }
+
+    /// A tool that cancels the turn it runs in, so a later call must not start.
+    #[derive(Default)]
+    struct Cancelling {
+        cancel: Mutex<Option<Cancel>>,
+        runs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Tool for Cancelling {
+        fn name(&self) -> &str {
+            "cancel-now"
+        }
+
+        fn description(&self) -> &str {
+            "Cancel the turn"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn run(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            // Only the first call cancels; the second turn runs unimpeded.
+            if let Some(cancel) = self.cancel.lock().expect("lock").take() {
+                cancel.cancel();
+            }
+            ToolOutput::ok("done")
+        }
+    }
+
+    /// A backend that plays a scripted list of rounds and records what it was
+    /// asked.
+    struct Scripted {
+        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
+        seen: Mutex<Vec<TurnRequest>>,
+    }
+
+    impl Scripted {
+        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                rounds: Mutex::new(rounds.into()),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<TurnRequest> {
+            self.seen.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelConnector for Scripted {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+            Ok(crate::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
+        }
+
+        fn label(&self) -> &str {
+            "scripted"
+        }
+    }
+    impl Scripted {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            self.seen.lock().expect("lock").push(request);
+            let events = self
+                .rounds
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn round(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let mut round = events;
+        round.push(AgentEvent::TurnComplete {
+            usage: Usage::new(10, 5),
+            cost_usd: 0.001,
+        });
+        round
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall::new(id, name, json!({ "note": id }))
+    }
+
+    /// An earlier conversation for a turn to continue.
+    ///
+    /// It carries no system message: the agent writes the system prompt itself,
+    /// and the conversation is held apart from it.
+    fn earlier() -> Vec<Message> {
+        vec![Message::user("earlier"), Message::assistant("noted")]
+    }
+
+    /// A turn to run: the backend behind the loop, the tools it may ask for, the
+    /// options, and the handles that reach it.
+    ///
+    /// The tools are handed in rather than selected, because choosing them from
+    /// a mode is [`crate::Agent`]'s job — the loop declares exactly what it is
+    /// given and can run exactly that.
+    struct Turn {
+        inner: Arc<dyn ModelConnector>,
+        tools: Vec<Arc<dyn Tool>>,
+        options: AgentOptions,
+        cancel: Cancel,
+        steering: Queue,
+        follow_up: Queue,
+        context_window: u32,
+        /// Shared with the loop, so a test can look at what the turn left behind
+        /// rather than only at what it streamed.
+        conversation: Arc<Conversation>,
+    }
+
+    impl Turn {
+        /// A turn over one tool, with the default options.
+        ///
+        /// The context window is left at zero, which puts nothing over budget:
+        /// a test that is not about compaction therefore never pays for a
+        /// second model call.
+        fn of(inner: Arc<dyn ModelConnector>, tool: Arc<dyn Tool>) -> Self {
+            Self {
+                inner,
+                tools: vec![tool],
+                options: AgentOptions::default(),
+                cancel: Cancel::new(),
+                steering: Queue::new(),
+                follow_up: Queue::new(),
+                context_window: 0,
+                conversation: Arc::new(Conversation::new()),
+            }
+        }
+
+        fn options(mut self, options: AgentOptions) -> Self {
+            self.options = options;
+            self
+        }
+
+        /// The same turn, stopped by `cancel` — so a test can hold the handle
+        /// the loop is running with.
+        fn cancel(mut self, cancel: Cancel) -> Self {
+            self.cancel = cancel;
+            self
+        }
+
+        /// The same turn, reading messages from `steering`.
+        fn steering(mut self, steering: Queue) -> Self {
+            self.steering = steering;
+            self
+        }
+
+        /// The same turn, reading messages from `follow_up` when it would end.
+        fn follow_up(mut self, follow_up: Queue) -> Self {
+            self.follow_up = follow_up;
+            self
+        }
+
+        /// The same turn, sized against a context window of `tokens`.
+        fn context_window(mut self, tokens: u32) -> Self {
+            self.context_window = tokens;
+            self
+        }
+
+        /// The same turn, continuing `messages` rather than the default start.
+        fn history(self, messages: Vec<Message>) -> Self {
+            for message in messages {
+                self.conversation.push_fixture(message);
+            }
+            self
+        }
+
+        /// Run the turn and collect everything it produced.
+        async fn run(self, prompt: &str) -> Vec<AgentEvent> {
+            let mut stream = start(TurnInput {
+                outcome: Default::default(),
+                owner: crate::identity::new_id(),
+                lease: None,
+                inner: self.inner,
+                tools: self.tools,
+                options: self.options,
+                services: crate::runtime::services::SessionServices::default(),
+                cancel: self.cancel,
+                steering: self.steering,
+                follow_up: self.follow_up,
+                conversation: Arc::clone(&self.conversation),
+                system: crate::context::prompt::system_prompt(
+                    Mode::Build,
+                    &[],
+                    &crate::context::skills::Skills::empty(),
+                    None,
+                ),
+                prompt: prompt.to_string(),
+                context_window: self.context_window,
+                model_key: "test".into(),
+                base_id: String::new(),
+                subagent: None,
+            });
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            events
+        }
+    }
+
+    /// The text a turn produced.
+    fn text(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(chunk) => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The ids of the results a turn produced, in the order they were sent.
+    fn result_ids(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { result, .. } => Some(result.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The results the model was handed in the round after the first.
+    fn results_seen(inner: &Scripted) -> Vec<ToolResult> {
+        inner.requests()[1]
+            .history
+            .iter()
+            .flat_map(Message::tool_results)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_closes_the_stream_even_if_a_child_queues_a_late_notification() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(AgentEvent::Error("cancelled".into())).unwrap();
+        tx.send(AgentEvent::SubagentComplete {
+            task_id: "subagent-1".into(),
+            output: "late report".into(),
+            is_error: false,
+            duration_ms: 1,
+        })
+        .unwrap();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        completed.send(()).unwrap();
+        let stream = EventStream {
+            rx,
+            done,
+            cancel: Cancel::new(),
+            finished: false,
+        };
+        assert_eq!(
+            stream.collect::<Vec<_>>().await,
+            vec![AgentEvent::Error("cancelled".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_tool_call_ends_after_one_round() {
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
+        let tool = Arc::new(Recording::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        assert_eq!(text(&events), "hello");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        assert!(tool.calls.lock().expect("lock").is_empty());
+        assert_eq!(inner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_run_and_the_result_sent_back() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("all done".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        // The call ran with the arguments the model sent.
+        assert_eq!(
+            tool.calls.lock().expect("lock").clone(),
+            vec![json!({ "note": "call-1" })]
+        );
+
+        // The model saw the result, and the turn ended once it stopped asking.
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2);
+        let second = &seen[1];
+        assert_eq!(second.tools.len(), 1, "tools are declared on every round");
+        let results = results_seen(&inner);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output, "done");
+        assert!(!results[0].is_error);
+
+        // The prompt moved into the history, so the second round does not repeat it.
+        assert!(second.prompt.is_empty());
+        assert!(
+            second
+                .history
+                .iter()
+                .any(|message| message.text() == "do it")
+        );
+
+        // The caller saw the result, and one terminal event for the whole turn.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { result, .. } if result.output == "done"
+        )));
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+        assert_eq!(text(&events), "all done");
+    }
+
+    #[tokio::test]
+    async fn usage_and_cost_are_summed_across_rounds() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+        let Some(AgentEvent::TurnComplete { usage, cost_usd }) = events.last() else {
+            panic!("a completed turn: {events:?}");
+        };
+
+        assert_eq!(usage.total(), 30, "two rounds of 10 in and 5 out");
+        assert!((cost_usd - 0.002).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_is_reported_to_the_model_without_ending_the_turn() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta(
+                "I will try something else".to_string(),
+            )]),
+        ]);
+
+        let events = Turn::of(
+            inner.clone(),
+            Arc::new(Recording {
+                calls: Mutex::new(Vec::new()),
+                fail: true,
+            }),
+        )
+        .run("do it")
+        .await;
+
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert_eq!(results[0].output, "it went wrong");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_declined_call_becomes_an_error_result() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "record"))]),
+            round(vec![AgentEvent::TextDelta("understood".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+
+        let options = AgentOptions {
+            approver: Arc::new(DenyAll),
+            ..Default::default()
+        };
+        Turn::of(inner.clone(), tool.clone())
+            .options(options)
+            .run("do it")
+            .await;
+
+        assert!(
+            tool.calls.lock().expect("lock").is_empty(),
+            "a declined call does not run"
+        );
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("declined"),
+            "{}",
+            results[0].output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_for_a_tool_that_is_not_declared_is_refused() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("call-1", "teleport"))]),
+            round(vec![AgentEvent::TextDelta("sorry".to_string())]),
+        ]);
+
+        Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+
+        let results = results_seen(&inner);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("no tool called"),
+            "{}",
+            results[0].output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_asking_is_not_stopped_by_a_round_ceiling() {
+        // Well past the old 24-round cap: a long agentic turn has to be allowed
+        // to run to whatever end the model reaches. The last round asks for
+        // nothing, which is what ends the turn.
+        let mut rounds: Vec<Vec<AgentEvent>> = (0..40)
+            .map(|index| {
+                round(vec![AgentEvent::ToolCall(call(
+                    &format!("call-{index}"),
+                    "record",
+                ))])
+            })
+            .collect();
+        rounds.push(round(vec![AgentEvent::TextDelta("finally".to_string())]));
+        let inner = Scripted::new(rounds);
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "the turn ends because the model stopped asking: {events:?}"
+        );
+        assert_eq!(
+            inner.requests().len(),
+            41,
+            "forty rounds of calls plus the one that stopped asking"
+        );
+        assert_eq!(result_ids(&events).len(), 40, "every round's call ran");
+        assert_eq!(text(&events), "finally");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_a_model_that_would_otherwise_keep_asking() {
+        /// A backend that asks for another call forever, so only cancelling can
+        /// end the turn.
+        struct Endless;
+
+        #[async_trait]
+        impl ModelConnector for Endless {
+            async fn model_client(
+                self: std::sync::Arc<Self>,
+            ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+                Ok(crate::testing::client(
+                    self.capabilities(),
+                    move |request| {
+                        let fixture = std::sync::Arc::clone(&self);
+                        async move { fixture.respond(request).await }
+                    },
+                ))
+            }
+
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+        impl Endless {
+            async fn respond(
+                &self,
+                _request: TurnRequest,
+            ) -> Result<AgentEventStream, BackendError> {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    AgentEvent::ToolCall(ToolCall::new("call-1", "cancel-now", json!({}))),
+                    AgentEvent::TurnComplete {
+                        usage: Usage::new(1, 1),
+                        cost_usd: 0.0,
+                    },
+                ])))
+            }
+        }
+
+        let tool = Arc::new(Cancelling::default());
+        let cancel = Cancel::new();
+        *tool.cancel.lock().expect("lock") = Some(cancel.clone());
+
+        // The tool stops the turn on its first call, which is now the only
+        // thing standing between an asking-forever model and a runaway bill.
+        let events = Turn::of(Arc::new(Endless), tool.clone())
+            .cancel(cancel)
+            .run("do it")
+            .await;
+
+        assert_eq!(
+            tool.runs.load(Ordering::SeqCst),
+            1,
+            "no further round may start once the turn is stopped"
+        );
+        let Some(AgentEvent::Error(message)) = events.last() else {
+            panic!("a cancelled turn ends in an error: {events:?}");
+        };
+        assert!(message.contains("cancelled"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_error_from_the_backend_ends_the_turn() {
+        let inner = Scripted::new(vec![vec![AgentEvent::Error(
+            "the model exploded".to_string(),
+        )]]);
+
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+        assert_eq!(
+            events
+                .into_iter()
+                .filter(|event| !matches!(event, AgentEvent::ContextUsageUpdated { .. }))
+                .collect::<Vec<_>>(),
+            vec![AgentEvent::Error("the model exploded".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_completing_is_an_error() {
+        // No TurnComplete: the answer was cut short on the way.
+        let inner = Scripted::new(vec![vec![AgentEvent::TextDelta("half".to_string())]]);
+
+        let events = Turn::of(inner, Arc::new(Recording::default()))
+            .run("do it")
+            .await;
+
+        assert_eq!(text(&events), "half", "what arrived is still shown");
+        let Some(AgentEvent::Error(message)) = events.last() else {
+            panic!("a cut-short stream must not read as a finished turn: {events:?}");
+        };
+        assert!(message.contains("without completing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_never_run_a_tool_with_a_permissive_schema() {
+        struct Permissive(AtomicUsize);
+        #[async_trait]
+        impl Tool for Permissive {
+            fn name(&self) -> &str {
+                "permissive"
+            }
+            fn description(&self) -> &str {
+                "Any schema"
+            }
+            fn parameters(&self) -> Value {
+                json!({})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ToolOutput::ok("side effect")
+            }
+        }
+        let tool = Arc::new(Permissive(AtomicUsize::new(0)));
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(ToolCall::new(
+                "bad",
+                "permissive",
+                json!("incomplete"),
+            ))]),
+            round(vec![AgentEvent::TextDelta("corrected".into())]),
+        ]);
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+        assert_eq!(tool.0.load(Ordering::SeqCst), 0);
+        assert!(results_seen(&inner)[0].is_error);
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_message_has_its_calls_refused_instead_of_run() {
+        let inner = Scripted::new(vec![
+            round(vec![
+                AgentEvent::OutputTruncated,
+                AgentEvent::ToolCall(call("call-1", "record")),
+            ]),
+            round(vec![AgentEvent::TextDelta("asking again".to_string())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        assert!(
+            tool.calls.lock().expect("lock").is_empty(),
+            "a half-written call must not run"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::OutputTruncated))
+        );
+
+        assert_eq!(
+            inner.requests().len(),
+            2,
+            "SDK continues with explicit rejection feedback"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:?}"
+        );
+        let results = results_seen(&inner);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error && results[0].output.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_stream_stops_the_loop() {
+        /// A backend whose rounds all ask for another call, so the loop only
+        /// ends when nothing is listening.
+        ///
+        /// A pending timer models network latency and lets the caller abandon
+        /// the stream before an unlimited scripted model can finish another round.
+        struct Endless;
+
+        #[async_trait]
+        impl ModelConnector for Endless {
+            async fn model_client(
+                self: std::sync::Arc<Self>,
+            ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+                Ok(crate::testing::client(
+                    self.capabilities(),
+                    move |request| {
+                        let fixture = std::sync::Arc::clone(&self);
+                        async move { fixture.respond(request).await }
+                    },
+                ))
+            }
+
+            fn label(&self) -> &str {
+                "endless"
+            }
+        }
+        impl Endless {
+            async fn respond(
+                &self,
+                _request: TurnRequest,
+            ) -> Result<AgentEventStream, BackendError> {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                Ok(Box::pin(futures::stream::iter(vec![
+                    AgentEvent::ToolCall(ToolCall::new("call-1", "record", json!({}))),
+                    AgentEvent::TurnComplete {
+                        usage: Usage::new(1, 1),
+                        cost_usd: 0.0,
+                    },
+                ])))
+            }
+        }
+
+        let tool = Arc::new(Recording::default());
+        let mut stream = start(TurnInput {
+            outcome: Default::default(),
+            owner: crate::identity::new_id(),
+            lease: None,
+            inner: Arc::new(Endless),
+            tools: vec![tool.clone()],
+            options: AgentOptions::default(),
+            services: crate::runtime::services::SessionServices::default(),
+            cancel: Cancel::new(),
+            steering: Queue::new(),
+            follow_up: Queue::new(),
+            conversation: Arc::new(Conversation::new()),
+            system: crate::context::prompt::system_prompt(
+                Mode::Build,
+                &[],
+                &crate::context::skills::Skills::empty(),
+                None,
+            ),
+            prompt: "do it".to_string(),
+            context_window: 0,
+            model_key: "test".into(),
+            base_id: String::new(),
+            subagent: None,
+        });
+        // Read one round's worth, then walk away.
+        while let Some(event) = stream.next().await {
+            if matches!(event, AgentEvent::ToolResult { .. }) {
+                break;
+            }
+        }
+        drop(stream);
+
+        // The tool ran at least once; the loop stops rather than running away.
+        let ran = tool.calls.lock().expect("lock").len();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            tool.calls.lock().expect("lock").len(),
+            ran,
+            "an abandoned turn runs nothing more"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_in_one_round_run_together_and_keep_their_order() {
+        let calls: Vec<AgentEvent> = (0..4)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping::default());
+
+        let events = Turn::of(inner.clone(), tool.clone()).run("do it").await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            4,
+            "a round's independent calls should overlap"
+        );
+        // Results come back in the order the model asked for them, whatever
+        // order the calls happened to finish in.
+        assert_eq!(
+            result_ids(&events),
+            vec!["call-0", "call-1", "call-2", "call-3"]
+        );
+        let results = results_seen(&inner);
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|result| !result.is_error));
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_runs_the_round_one_call_at_a_time() {
+        let calls: Vec<AgentEvent> = (0..3)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping::default());
+
+        let options = AgentOptions {
+            max_parallel: 1,
+            ..Default::default()
+        };
+        Turn::of(inner, tool.clone())
+            .options(options)
+            .run("do it")
+            .await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            1,
+            "a cap of one must not overlap anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sequential_tool_settles_the_whole_round() {
+        let calls: Vec<AgentEvent> = (0..3)
+            .map(|index| AgentEvent::ToolCall(call(&format!("call-{index}"), "overlap")))
+            .collect();
+        let inner = Scripted::new(vec![
+            round(calls),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let tool = Arc::new(Overlapping {
+            sequential: true,
+            ..Default::default()
+        });
+
+        Turn::of(inner, tool.clone()).run("do it").await;
+
+        assert_eq!(
+            tool.peak.load(Ordering::SeqCst),
+            1,
+            "a tool that asked to run alone takes the round with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_the_round_and_does_not_leak_into_the_next_turn() {
+        let inner = Scripted::new(vec![
+            round(vec![
+                AgentEvent::ToolCall(call("call-1", "cancel-now")),
+                AgentEvent::ToolCall(call("call-2", "cancel-now")),
+            ]),
+            round(vec![AgentEvent::TextDelta("after".to_string())]),
+        ]);
+        let tool = Arc::new(Cancelling::default());
+        // The first call cancels the turn it runs in, through the same handle
+        // every turn of the session shares.
+        let cancel = Cancel::new();
+        *tool.cancel.lock().expect("lock") = Some(cancel.clone());
+
+        let cancelled = Turn::of(inner.clone(), tool.clone())
+            .cancel(cancel.clone())
+            .run("do it")
+            .await;
+
+        assert_eq!(
+            tool.runs.load(Ordering::SeqCst),
+            1,
+            "the second call must not run once the turn is cancelled"
+        );
+        let Some(AgentEvent::Error(message)) = cancelled.last() else {
+            panic!("a cancelled turn ends in an error: {cancelled:?}");
+        };
+        assert!(message.contains("cancelled"), "{message}");
+
+        // The next turn starts clean: the stop belonged to one turn only.
+        let next = Turn::of(inner, tool).cancel(cancel).run("do it").await;
+        assert!(
+            matches!(next.last(), Some(AgentEvent::TurnComplete { .. })),
+            "a fresh turn must not inherit the last turn's cancel: {next:?}"
+        );
+        assert_eq!(text(&next), "after");
+    }
+
+    #[tokio::test]
+    async fn the_options_are_rooted_somewhere_sensible() {
+        let options = AgentOptions::default();
+        assert!(options.cwd.is_absolute() || options.cwd == Path::new("."));
+        assert!(options.max_parallel >= 1);
+        assert_eq!(
+            options.approver.approve(&call("call-1", "record")).await,
+            Approval::Approved
+        );
+    }
+
+    // ------------------------------------------------------------- steering
+
+    /// A backend that steers a message in while it is answering, so the message
+    /// provably arrives mid-turn rather than before it started.
+    struct SteersOnFirstRound {
+        steering: Queue,
+        seen: Mutex<Vec<TurnRequest>>,
+        steered: AtomicUsize,
+    }
+
+    impl SteersOnFirstRound {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                steering: Queue::new(),
+                seen: Mutex::new(Vec::new()),
+                steered: AtomicUsize::new(0),
+            })
+        }
+
+        fn requests(&self) -> Vec<TurnRequest> {
+            self.seen.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelConnector for SteersOnFirstRound {
+        async fn model_client(
+            self: std::sync::Arc<Self>,
+        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+            Ok(crate::testing::client(
+                self.capabilities(),
+                move |request| {
+                    let fixture = std::sync::Arc::clone(&self);
+                    async move { fixture.respond(request).await }
+                },
+            ))
+        }
+
+        fn label(&self) -> &str {
+            "steering"
+        }
+    }
+    impl SteersOnFirstRound {
+        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+            self.seen.lock().expect("lock").push(request);
+            let events = if self.steered.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.steering.push("actually, use the other file");
+                vec![AgentEvent::TextDelta("first".to_string())]
+            } else {
+                vec![AgentEvent::TextDelta("second".to_string())]
+            };
+            Ok(Box::pin(futures::stream::iter(round(events))))
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_after_a_tool_hands_off_once_without_resetting_the_request_budget() {
+        struct SteeringTool {
+            queue: Queue,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Tool for SteeringTool {
+            fn name(&self) -> &str {
+                "record"
+            }
+            fn description(&self) -> &str {
+                "Record"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn run(&self, _: Value, _: &ToolContext) -> ToolOutput {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.queue.push("use the other file");
+                ToolOutput::ok("read result")
+            }
+        }
+        let queue = Queue::new();
+        let tool = Arc::new(SteeringTool {
+            queue: queue.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::ToolCall(call("c1", "record"))]),
+            round(vec![AgentEvent::TextDelta("corrected".into())]),
+        ]);
+        let options = AgentOptions::default();
+        let turn = Turn::of(inner.clone(), tool.clone())
+            .options(options)
+            .steering(queue);
+        let conversation = turn.conversation.clone();
+        let events = turn.run("inspect file").await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:?}"
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.requests().len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_)))
+        );
+        let history = conversation.native().unwrap();
+        rig_core::conversation::pairing::validate(history.messages()).unwrap();
+        let text = serde_json::to_string(history.messages()).unwrap();
+        assert_eq!(text.matches("inspect file").count(), 1);
+        assert_eq!(text.matches("use the other file").count(), 1);
+        assert!(text.find("read result").unwrap() < text.find("use the other file").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_message_steered_in_mid_turn_keeps_the_turn_going() {
+        let inner = SteersOnFirstRound::new();
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .steering(inner.steering.clone())
+            .history(earlier())
+            .run("do it")
+            .await;
+
+        // The first round asked for nothing, so without the steered message the
+        // turn would have ended there.
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2, "the steered message earned another round");
+
+        // It reaches the model as an ordinary user message, after the prompt and
+        // after whatever came before that — including the model's own words, which
+        // belong in the conversation as much as the user's do.
+        let history: Vec<String> = seen[1].history.iter().map(|m| m.text()).collect();
+        assert_eq!(
+            history,
+            [
+                // The system prompt the agent wrote leads every request.
+                seen[1].history[0].text(),
+                "earlier".to_string(),
+                "noted".to_string(),
+                "do it".to_string(),
+                "first".to_string(),
+                "actually, use the other file".to_string(),
+            ],
+            "{history:?}"
+        );
+
+        // And the turn still finishes normally.
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+        assert_eq!(text(&events), "firstsecond");
+
+        // The caller is told the message was read, so it can write it into the
+        // turn's own record rather than guess when it arrived.
+        let steered: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Steered { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered, ["actually, use the other file"]);
+    }
+
+    #[tokio::test]
+    async fn what_a_turn_said_stays_in_the_conversation() {
+        // The agent owns the conversation, so a turn's own record of itself is
+        // what the next turn reads rather than something reconstructed from a
+        // transcript.
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "the parser is in src/parser.rs".to_string(),
+        )])]);
+        let turn = Turn::of(inner, Arc::new(Recording::default()));
+        let conversation = Arc::clone(&turn.conversation);
+
+        turn.run("where is the parser").await;
+
+        let text: Vec<String> = conversation.snapshot().iter().map(Message::text).collect();
+        assert_eq!(
+            text,
+            [
+                "where is the parser".to_string(),
+                "the parser is in src/parser.rs".to_string()
+            ],
+            "{text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_said_nothing_adds_nothing_but_the_prompt() {
+        // Some wires reject a blank text block, so an answer of nothing must not
+        // become a message of nothing.
+        let inner = Scripted::new(vec![round(vec![])]);
+        let turn = Turn::of(inner, Arc::new(Recording::default()));
+        let conversation = Arc::clone(&turn.conversation);
+
+        turn.run("do it").await;
+
+        assert_eq!(conversation.len(), 1, "just the prompt");
+        assert_eq!(conversation.snapshot()[0].text(), "do it");
+    }
+
+    #[tokio::test]
+    async fn nothing_steered_leaves_the_turn_exactly_as_it_was() {
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
+        let steering = Queue::new();
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .steering(steering)
+            .run("do it")
+            .await;
+
+        assert_eq!(inner.requests().len(), 1, "no extra round");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------ compaction
+
+    /// A marker unique to the note that stands in for summarized messages.
+    ///
+    /// Shared by the tests that look for it and the one that must not find it,
+    /// so a change to the wording cannot make one of them pass for the wrong
+    /// reason.
+    const SUMMARY_MARKER: &str = "The conversation before this point was compacted";
+
+    /// A conversation long enough to outgrow a small budget.
+    ///
+    /// Each message is a real user turn, so the test exercises the same
+    /// native SDK token estimate the loop uses rather than a fixture tuned to it.
+    fn long_history(turns: usize) -> Vec<Message> {
+        (0..turns)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("question {index}: please change the parser")),
+                    Message::assistant(format!("answer {index}: I changed the parser")),
+                ]
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_conversation_is_summarized_before_the_model_reads_it() {
+        let inner = Scripted::new(vec![
+            // The summarizer answers first, because compaction runs before the
+            // round it is there to protect.
+            round(vec![AgentEvent::TextDelta("we added a flag".to_string())]),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let options = AgentOptions {
+            compaction: Compaction {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 60,
+            },
+            ..Default::default()
+        };
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(200)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2, "official summary request, then the SDK task");
+
+        // The summary call is a plain question: it declares no tools.
+        assert!(seen[0].tools.is_empty());
+        assert!(
+            seen[0].history[0]
+                .text()
+                .contains("a conversation to summarize"),
+            "the summarizer is told what it is for: {}",
+            seen[0].history[0].text()
+        );
+
+        // The round that follows reads the summary where the messages were.
+        let round = &seen[1];
+        assert!(
+            round.history[0].text().contains("You are solaris"),
+            "the system prompt still leads: {}",
+            round.history[0].text()
+        );
+        let note = round
+            .history
+            .iter()
+            .find(|message| message.text().contains(SUMMARY_MARKER))
+            .expect("the summary is in the conversation");
+        assert!(
+            note.text().contains("we added a flag"),
+            "carrying what the summarizer wrote: {}",
+            note.text()
+        );
+
+        // The newest messages were kept verbatim rather than summarized.
+        assert!(
+            round
+                .history
+                .iter()
+                .any(|message| message.text().contains("question 11")),
+            "the retained tail survives: {:#?}",
+            round.history.iter().map(Message::text).collect::<Vec<_>>()
+        );
+        assert!(
+            !round
+                .history
+                .iter()
+                .any(|message| message.text().contains("question 0:")),
+            "the oldest messages are gone"
+        );
+
+        // And the caller is told, rather than left to wonder why the model
+        // remembers less.
+        let dropped = events.iter().find_map(|event| match event {
+            AgentEvent::Compacted { dropped } => Some(*dropped),
+            _ => None,
+        });
+        assert!(
+            dropped.is_some(),
+            "the turn reports it compacted: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_inside_its_budget_is_left_alone() {
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .context_window(1_000_000)
+            .run("do it")
+            .await;
+
+        assert_eq!(inner.requests().len(), 1, "nothing had to be summarized");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_compaction_off_sends_what_it_has() {
+        let inner = Scripted::new(vec![round(vec![AgentEvent::TextDelta(
+            "hello".to_string(),
+        )])]);
+        let options = AgentOptions {
+            compaction: Compaction::OFF,
+            ..Default::default()
+        };
+
+        Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(1)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+
+        assert_eq!(inner.requests().len(), 1, "off means off");
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_keeps_the_conversation_rather_than_losing_it() {
+        let inner = Scripted::new(vec![
+            // The summarizer fails.
+            vec![AgentEvent::Error("the model exploded".to_string())],
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let options = AgentOptions {
+            compaction: Compaction {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 60,
+            },
+            ..Default::default()
+        };
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(200)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+
+        // The turn went ahead with everything it had, and never claimed to have
+        // compacted something it had not.
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !seen[1]
+                .history
+                .iter()
+                .any(|message| message.text().contains(SUMMARY_MARKER)),
+            "nothing was replaced"
+        );
+        assert!(
+            seen[1]
+                .history
+                .iter()
+                .any(|message| message.text().contains("question 0:")),
+            "the whole conversation is still there"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted { .. })),
+            "nor reported as replaced: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_summary_still_stands_on_the_next_turn() {
+        // The point of the agent owning the conversation: a summary that only
+        // existed for one turn would be paid for again by the next one.
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("we added a flag".to_string())]),
+            round(vec![AgentEvent::TextDelta("first".to_string())]),
+        ]);
+        let options = AgentOptions {
+            compaction: Compaction {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 60,
+            },
+            ..Default::default()
+        };
+
+        let turn = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(200)
+            .history(long_history(12));
+        let conversation = Arc::clone(&turn.conversation);
+
+        turn.run("do it").await;
+
+        // The messages the summary replaced are gone from what the model will be
+        // sent, and the summary is what stands in their place.
+        let left = conversation.snapshot();
+        let text: Vec<String> = left.iter().map(Message::text).collect();
+        assert!(
+            text.iter().any(|t| t.contains(SUMMARY_MARKER)),
+            "the summary is still there: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|t| t.contains("question 0:")),
+            "and the messages it replaced are not: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_runs_as_another_turn_in_the_same_loop() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta("first".to_string())]),
+            round(vec![AgentEvent::TextDelta("second".to_string())]),
+        ]);
+        let follow_up = Queue::new();
+        follow_up.push("then run the tests");
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .follow_up(follow_up.clone())
+            .run("do it")
+            .await;
+
+        // The turn answered, and rather than finishing it took the queued prompt
+        // as a turn of its own.
+        assert_eq!(inner.requests().len(), 2, "a second turn was not run");
+        assert_eq!(text(&events), "firstsecond");
+        assert!(follow_up.is_empty(), "the queue is drained when it is read");
+
+        let announced: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::FollowUp { prompt } => Some(prompt.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            ["then run the tests"],
+            "the caller is told a new turn is starting, so it can attribute it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_summary_is_updated_rather_than_written_again() {
+        let inner = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta(
+                "## Goal\ncarried forward".to_string(),
+            )]),
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let options = AgentOptions {
+            compaction: Compaction {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 30,
+            },
+            ..Default::default()
+        };
+
+        // Seed the official summary state, then extend the native conversation.
+        let turn = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(200);
+        let conversation = Arc::clone(&turn.conversation);
+        let mut native = conversation.native().expect("native conversation");
+        native.extend([rig_core::message::Message::user("original task")]);
+        let state = rig_memory::SummaryState {
+            summary: "## Goal\nwhat came before".into(),
+            ..Default::default()
+        };
+        rig_memory::apply_summary(&mut native, None, &state).expect("initial summary");
+        native.extend(
+            long_history(12)
+                .iter()
+                .map(rig_core::message::Message::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("native history"),
+        );
+        rig_memory::save(&conversation.storage(), "conversation", &mut native)
+            .expect("save summary state");
+        let events = turn.run("do it").await;
+        assert_eq!(
+            rig_memory::summary_state(&conversation.native().expect("saved conversation")).summary,
+            "## Goal\ncarried forward",
+            "the updated summary must remain in official memory",
+        );
+
+        let seen = inner.requests();
+        assert_eq!(seen.len(), 2, "a summary call, then the round");
+        assert!(
+            seen[0].history[0].text().contains("Update it"),
+            "the summarizer is told to update rather than write: {}",
+            seen[0].history[0].text()
+        );
+        assert!(
+            request_text(&seen[0]).contains("what came before"),
+            "and is handed the summary it is updating: {}",
+            request_text(&seen[0])
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_overflow_preserves_saved_history_and_ends_the_sdk_task() {
+        let inner = Scripted::new(vec![
+            // The round the provider refuses.
+            vec![AgentEvent::Error(
+                "prompt is too long: 213462 tokens > 200000 maximum".to_string(),
+            )],
+            // The summary.
+            round(vec![AgentEvent::TextDelta(
+                "## Goal\na summary".to_string(),
+            )]),
+            // The same round, asked again.
+            round(vec![AgentEvent::TextDelta("done".to_string())]),
+        ]);
+        let options = AgentOptions {
+            compaction: Compaction {
+                enabled: true,
+                reserve_tokens: 0,
+                keep_recent_tokens: 30,
+            },
+            ..Default::default()
+        };
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(1_000_000)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(message)) if message.contains("too long"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted { .. }))
+        );
+        assert_eq!(
+            inner.requests().len(),
+            1,
+            "SDK failures do not silently restart tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflow_with_compaction_off_is_reported_rather_than_retried() {
+        let inner = Scripted::new(vec![vec![AgentEvent::Error(
+            "prompt is too long: 213462 tokens > 200000 maximum".to_string(),
+        )]]);
+        let options = AgentOptions {
+            compaction: Compaction::OFF,
+            ..Default::default()
+        };
+
+        let events = Turn::of(inner.clone(), Arc::new(Recording::default()))
+            .options(options)
+            .context_window(1_000_000)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+
+        assert_eq!(inner.requests().len(), 1, "nothing to recover with");
+        let Some(AgentEvent::Error(message)) = events.last() else {
+            panic!("the overflow is the answer when nothing can be done: {events:?}");
+        };
+        assert!(message.contains("too long"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_happens_between_tool_rounds_without_replaying_calls() {
+        let inner = Scripted::new(vec![
+            vec![
+                AgentEvent::ToolCall(call("call-1", "record")),
+                AgentEvent::TurnComplete {
+                    usage: Usage::new(190_000, 100),
+                    cost_usd: 0.0,
+                },
+            ],
+            round(vec![AgentEvent::TextDelta("history summary".into())]),
+            round(vec![AgentEvent::TextDelta("finished task".into())]),
+        ]);
+        let tool = Arc::new(Recording::default());
+        let events = Turn::of(inner.clone(), tool.clone())
+            .options(AgentOptions {
+                compaction: Compaction {
+                    enabled: true,
+                    reserve_tokens: 16_384,
+                    keep_recent_tokens: 30,
+                },
+                ..Default::default()
+            })
+            .context_window(200_000)
+            .history(long_history(12))
+            .run("do it")
+            .await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
+            "{events:?}"
+        );
+        let result = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolResult { .. }))
+            .unwrap();
+        let compacted = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Compacted { .. }))
+            .unwrap();
+        let answer = events.iter().position(|event| matches!(event, AgentEvent::TextDelta(text) if text.contains("finished task"))).unwrap();
+        assert!(result < compacted && compacted < answer);
+        assert_eq!(tool.calls.lock().unwrap().len(), 1);
+        let requests = inner.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].tools.is_empty());
+        assert!(request_text(&requests[2]).contains("history summary"));
+        let history: Vec<_> = requests[2]
+            .history
+            .iter()
+            .map(rig_core::message::Message::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rig_core::conversation::pairing::validate(&history).unwrap();
+    }
+
+    #[tokio::test]
+    async fn official_output_clearing_and_summary_are_saved_atomically() {
+        for success in [true, false] {
+            let old = call("old", "record");
+            let recent = call("recent", "record");
+            let original = vec![
+                Message::user("keep task constraints"),
+                Message::tool_use(old.clone()),
+                Message::tool_result(ToolResult::ok(
+                    &old,
+                    format!("OLD_OUTPUT_MARKER{}", "x".repeat(20000)),
+                )),
+                Message::tool_use(recent.clone()),
+                Message::tool_result(ToolResult::ok(&recent, "RECENT_OUTPUT_MARKER")),
+                Message::user("next action"),
+            ];
+            let conversation = Conversation::new();
+            conversation.replace_with(original.clone());
+            let scripted = if success {
+                round(vec![AgentEvent::TextDelta("useful summary".into())])
+            } else {
+                vec![AgentEvent::Error("summary unavailable".into())]
+            };
+            let model = Scripted::new(vec![scripted]);
+            let inner: Arc<dyn ModelConnector> = model.clone();
+            let outcome = compact_memory(
+                &inner,
+                &Cancel::new(),
+                &conversation,
+                Compaction {
+                    enabled: true,
+                    reserve_tokens: 16384,
+                    keep_recent_tokens: 1000,
+                },
+                128000,
+                true,
+            )
+            .await;
+            assert_eq!(outcome.text.is_some(), success);
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1);
+            let input = request_text(&requests[0]);
+            assert!(input.contains(rig_memory::ClearToolOutputs::PLACEHOLDER));
+            assert!(input.contains("RECENT_OUTPUT_MARKER"));
+            assert!(!input.contains("OLD_OUTPUT_MARKER"));
+            if !success {
+                assert_eq!(conversation.snapshot(), original);
+            }
+            let native = conversation.native().unwrap();
+            rig_core::conversation::pairing::validate(native.messages()).unwrap();
+        }
+    }
+
+    fn split_task_history() -> Vec<Message> {
+        vec![
+            Message::user("old history"),
+            Message::assistant("old answer"),
+            Message::user("current target: parser.rs; preserve flags"),
+            Message::tool_use(call("first", "record")),
+            Message::tool_result(ToolResult::ok(&call("first", "record"), "first result")),
+            Message::tool_use(call("last", "record")),
+            Message::tool_result(ToolResult::ok(&call("last", "record"), "x".repeat(4000))),
+        ]
+    }
+
+    #[tokio::test]
+    async fn official_compaction_summarizes_task_constraints_and_keeps_a_paired_tool_tail() {
+        let scripted = Scripted::new(vec![
+            round(vec![AgentEvent::TextDelta(
+                "history summary: preserve parser flags".into(),
+            )]),
+            round(vec![AgentEvent::TextDelta("preserve parser flags".into())]),
+        ]);
+        let inner: Arc<dyn ModelConnector> = scripted.clone();
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            Some(5)
+        );
+        let seen = scripted.requests();
+        assert_eq!(seen.len(), 1);
+        assert!(request_text(&seen[0]).contains("current target: parser.rs"));
+        assert!(request_text(&seen[0]).contains("preserve flags"));
+        let kept = conversation.snapshot();
+        assert!(kept[0].text().contains("history summary"));
+        assert!(
+            rig_core::conversation::pairing::validate(conversation.native().unwrap().messages())
+                .is_ok()
+        );
+        assert_eq!(
+            kept[1].tool_calls().next().expect("retained call").id,
+            "last"
+        );
+        assert_eq!(
+            kept[2].tool_results().next().expect("retained result").id,
+            "last"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_official_summary_does_not_change_saved_context() {
+        let inner: Arc<dyn ModelConnector> =
+            Scripted::new(vec![vec![AgentEvent::Error("summary failed".into())]]);
+        let conversation = Conversation::new();
+        conversation.replace_with(split_task_history());
+        let before = conversation.snapshot();
+        let policy = Compaction {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+        };
+        assert_eq!(
+            compact_now(&inner, &conversation, policy, &Cancel::new()).await,
+            None
+        );
+        assert_eq!(conversation.snapshot(), before);
+    }
+}
+
+pub(crate) mod connection;
+pub(crate) mod tool_search;
+
+pub(crate) mod content;

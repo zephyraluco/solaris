@@ -1,92 +1,90 @@
-//! The agent session: the model, the tools it may ask for, and the loop between
-//! them.
+//! Session runtime and policy over the official Rig executor and memory.
 //!
-//! A model can only ask; something has to act, and something has to carry the
-//! answer back and ask again. That is this crate. It sits above the backend and tool layers
-//! it composes; the application supplies resolved backend metadata and tools:
-//!
-//! - [`Agent`] wraps a resolved backend ([`solaris_backend`]) in the multi-round
-//!   loop, declaring the tools ([`solaris_tools`]) a turn's [`Mode`] offers and
-//!   running what comes back.
-//! - [`Mode`] is what a session is doing — building, or only looking — which
-//!   decides the default tool set and nothing else.
-//! - [`Approver`] is the hook that can refuse a call before it runs.
-//!
-//! For callers running sessions, the execution vocabulary comes from
-//! here too: the messages and events a turn is made of, the tool calls and
-//! results, and the usage a turn is billed for are re-exported from
-//! [`solaris_backend`], and the tools and their registry from [`solaris_tools`].
+//! [`SessionRuntime`] serializes commands and publishes sequenced events and
+//! snapshots. [`Agent`] constructs the execution state supplied to that runtime;
+//! model connections and tools are injected by the application. Provider selection
+//! and authentication never enter this crate. SDK message history has one owner:
+//! native memory. Product events and request settlements live in the journal.
 
-mod agent;
-mod approver;
-mod backend;
-mod background;
-mod billing;
-pub use billing::{UsageKind, UsageTotals};
-mod compaction;
-mod conversation;
-mod execution;
-mod input;
-mod mode;
-mod overflow;
-mod projection;
-mod prompt;
-mod queue;
-mod resources;
-mod session;
-mod skills;
-mod subagent;
+pub use storage::billing::{UsageKind, UsageTotals};
 
-pub use agent::{Agent, AgentOptions};
-pub use approver::{
+pub use context::compaction::Compaction;
+pub use context::resources::{PromptContext, PromptFile, ResourcePaths, ResourceSnapshot};
+pub use context::skills::{Skill, SkillRoot, SkillSource, SkillWarning, Skills};
+pub use execution::DEFAULT_MAX_PARALLEL;
+pub use policy::approver::{
     AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, DenyAll, FnApprover,
 };
-pub use backend::AgentBackendConfig;
-pub use compaction::Compaction;
-pub use input::{InputError, expand_input};
-pub use mode::{Mode, default_tool_names};
-pub use queue::Queue;
-pub use resources::{PromptContext, PromptFile, ResourcePaths, ResourceSnapshot};
-pub use session::DEFAULT_MAX_PARALLEL;
-pub use skills::{Skill, SkillRoot, SkillSource, SkillWarning, Skills};
-pub use subagent::{SUBAGENT_TOOL, agent_tool_registry};
+pub use runtime::agent::{Agent, AgentOptions};
+pub use runtime::connection::ConnectionConfig;
+pub use runtime::input::{InputError, expand_input};
+pub use runtime::mode::{Mode, default_tool_names};
+pub use runtime::queue::Queue;
+pub use tasks::{SUBAGENT_TOOL, agent_tool_registry};
 
 // The conversation: what a turn is written in and what it streams back.
-pub use solaris_backend::{
-    AgentBackend, AgentEvent, AgentEventStream, BackendError, Content, ContextUsage, Message,
-    Price, Role, ToolCall, ToolResult, ToolSpec, TurnRequest, Usage, tokens_for_characters,
-};
+pub use solaris_backend::{BackendError, ContextUsage, ModelClient, ModelConnector, Usage};
+pub use solaris_types::{ToolCall, ToolResult, ToolSpec};
 // The tools, as the application sees them: what to hold, and what to hand in.
 pub use solaris_tools::{
     BUILTIN_TOOLS, Cancel, CommandOutput, CommandRunner, LocalRunner, SHELL_TOOL, Tool,
     ToolContext, ToolOutput, ToolRegistry, ToolSelection,
 };
 
-mod store;
-pub use store::{SessionInfo, SessionJournal, SessionRecord, SessionStore, StoreError};
+pub use storage::{SessionInfo, SessionJournal, SessionRecord, SessionStore, StoreError};
 
-mod runtime;
-
-mod budget;
-mod policy;
-pub use budget::{BudgetLimits, ExecutionBudget};
 pub use policy::{PermissionEffect, PermissionRule, PolicyApprover, PolicyProfile};
 
 /// Per-session execution settings; children inherit these ceilings.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionSettings {
     #[serde(default)]
     pub profile: PolicyProfile,
     #[serde(default)]
     pub rules: Vec<PermissionRule>,
+    /// Optional logical model-step limit; the final step is a text-only report.
     #[serde(default)]
-    pub budget: BudgetLimits,
+    pub steps: Option<std::num::NonZeroU32>,
+    #[serde(default = "default_subagent_depth")]
+    pub subagent_depth: u32,
 }
 
-pub use runtime::{RuntimeCommand, SessionRuntime};
+fn default_subagent_depth() -> u32 {
+    1
+}
+impl Default for ExecutionSettings {
+    fn default() -> Self {
+        Self {
+            profile: Default::default(),
+            rules: Vec::new(),
+            steps: None,
+            subagent_depth: 1,
+        }
+    }
+}
+
+pub use runtime::jobs::{JobInfo, JobResult, JobStatus, Jobs, StopReason};
+pub use runtime::{
+    CommandReceipt, ModeContexts, Runtime, RuntimeCommand, RuntimeEvent, RuntimeEventStream,
+    RuntimeSnapshot, SessionRuntime,
+};
 
 pub type ChildBackendFactory =
-    std::sync::Arc<dyn Fn(&str) -> Result<AgentBackendConfig, String> + Send + Sync>;
-pub use subagent::TaskControls;
+    std::sync::Arc<dyn Fn(&str) -> Result<ConnectionConfig, String> + Send + Sync>;
 
-mod tool_search;
+pub use runtime::event::AgentEvent;
+pub type AgentEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = AgentEvent> + Send>>;
+#[cfg(feature = "test-utils")]
+pub mod testing;
+
+mod context;
+mod execution;
+mod policy;
+mod runtime;
+mod storage;
+mod tasks;
+
+mod identity;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use solaris_backend::{Content, Message, Role};

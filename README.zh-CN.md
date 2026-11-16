@@ -17,7 +17,7 @@
 
 ---
 
-solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个内部使用官方 Rig SDK 处理三种模型协议的后端 crate，一个只会跑本地命令与文件的工具 crate，一个认识各种 provider 的平台 crate，一个持有对话、接收后端和工具注册表并驱动官方 Rig Agent 状态机的 agent crate，一个返回已连接工具适配器、由应用注册的 MCP crate，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
+solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 TUI 聊天客户端 —— 流式对话记录、Markdown 渲染、一个好用的编辑器、浮层与主题 —— 并建立在一个小而分层的工作区之上：一个内部使用官方 Rig SDK 处理三种模型协议的后端 crate，一个只会跑本地命令与文件的工具 crate，一个认识各种 provider 的平台 crate，一个持有对话、接收后端和工具注册表并使用官方 Rig Agent 完整执行器与 memory的 agent crate，一个返回已连接工具适配器、由应用注册的 MCP crate，以及一个可复用的终端 UI 框架（本应用只是它的其中一个使用者）。
 
 界面是完整的，接上 provider 之后真的会去调用它。接一个 provider（或者干脆只导出一个 API key），每一轮都会通过 SSE 从真实模型流式取回：首个 token 之前会重试，每一轮都会结算 token 与费用。
 
@@ -36,7 +36,7 @@ solaris 是一个用 Rust 从零写起的终端 AI 助手。它是一个全屏 T
 > - 技能（skills）：任何一处在常规目录下的 `SKILL.md` 都会按名字与描述告知模型，而它的完整说明只在任务真的需要时才载入 —— 或者你用 `/skill:<name>` 直接点名
 > - 提示词系统：身份、模式、实际工作目录、工具指南、技能清单、项目规则与用户/项目追加说明；`/reload` 可重新加载文件中的说明
 > - 中途 steering：流式期间输入的消息加入正在跑的那一轮；`/queue` 则把一条排到它之后
-> - 上下文压缩：对话接近模型窗口上限时，较早的消息摘要成一份结构化检查点（再次压缩时是「更新」而不是重写）；窗口真的被撑满时也会摘要后重试
+> - 上下文压缩：对话接近模型窗口上限时，较早的消息摘要成一份结构化检查点（再次压缩时是「更新」而不是重写）；在 SDK 任务之间执行，失败不隐式重放
 > - 多行编辑器，支持按词移动、`/` 命令补全，以及命令面板
 > - 两套配色主题，运行时循环切换
 > - Build 与 Plan 两种模式，各有独立强调色与系统提示词
@@ -263,9 +263,9 @@ solaris 只把「这个技能存在」告诉模型 —— 名字、描述和文�
 
 ### 环境变量
 
-在 `/connect` 中选择 **OpenAI** 会直接显示浏览器授权网址，不再要求填写 API key。按 `c` 复制完整链接，在与 solaris 同一台机器的浏览器中登录 OpenAI / ChatGPT 并授权；浏览器回调到 `http://localhost:1455/auth/callback` 后，向导自动进入模型选择。按 Esc 取消，五分钟未完成则超时；1455 端口被占用时会提示错误，请先关闭占用它的程序再重试。账户必须具备 OpenAI 授予的 Codex 使用权限，ChatGPT 授权不等于取得通用 OpenAI API key。
+在 `/connect` 中选择 **OpenAI** 会直接显示浏览器授权网址，不再要求填写 API key。按 `c` 复制完整链接，在与 solaris 同一台机器的浏览器中登录 OpenAI / ChatGPT 并授权；官方 SDK 监听本机 1455 端口，被占用时尝试 1457；浏览器回调后，向导自动进入模型选择。按 Esc 取消，五分钟未完成则超时；两个回调端口都被占用时，请释放其中一个再重试。账户必须具备 OpenAI 授予的 Codex 使用权限，ChatGPT 授权不等于取得通用 OpenAI API key。
 
-授权使用 PKCE 和随机 state。访问令牌、刷新令牌、ID 令牌、过期时间和账户 ID 保存在本机 `auth.json`，**这是敏感文件，请勿提交或分享**（Unix 上写入权限为 `0600`；Windows 使用所在用户目录的 ACL）。获取模型清单或发送新一轮请求前会刷新临近过期的令牌并保存更新。账户令牌仅发给固定的 ChatGPT/Codex 集成端点，忽略 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`，不会被转发到自定义网关。模型选择只展示账户的远程 Codex 清单，按服务端优先级排序并遵守可见性标记，不再提供内置兜底模型。加载中、空清单和请求失败均会明确提示；按 `r` 重试，或重新打开 `/model` 刷新。清单使用的 Codex 协议版本独立于 Solaris 自身版本，因为 OpenAI 会按 Codex 客户端版本筛选模型。
+PKCE、随机 state、浏览器回调和令牌交换由官方 Rig Authenticator 处理。访问令牌、刷新令牌、ID 令牌、过期时间和账户 ID 保存在本机 `auth.json`，**这是敏感文件，请勿提交或分享**（Unix 上写入权限为 `0600`；Windows 使用所在用户目录的 ACL）。获取模型清单或发送新一轮请求前会刷新临近过期的令牌并保存更新。账户令牌仅发给固定的 ChatGPT/Codex 集成端点，忽略 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`，不会被转发到自定义网关。模型选择只展示账户的远程 Codex 清单，按服务端优先级排序并遵守可见性标记，不再提供内置兜底模型。加载中、空清单和请求失败均会明确提示；按 `r` 重试，或重新打开 `/model` 刷新。清单使用的 Codex 协议版本独立于 Solaris 自身版本，因为 OpenAI 会按 Codex 客户端版本筛选模型。
 
 其他情况下，环境里的 key 优先于 `auth.json`，而且只靠它就能跑：`ANTHROPIC_API_KEY=… solaris` 完全不需要 `/connect`。未保存 ChatGPT 授权时仍兼容既有 OpenAI API key 文件及环境变量配置。
 
@@ -281,7 +281,7 @@ solaris 只把「这个技能存在」告诉模型 —— 名字、描述和文�
 
 - **流式**。文本与思考随模型产出即时到达；流式过程中 `Ctrl+C` 会通过断开连接来取消本次请求。
 - **重试**。`429`、`5xx` 或连接中断会退避重试最多三次，但**只在第一个 token 之前** —— 之后重试会重复输出，所以改为直接报告失败。
-- **token 与费用**。`/stats` 会按输入、输出、缓存读 / 缓存写分类结算一个会话并计价。价格来自内置的牌价快照，请当作估算而非账单；目录里没有的模型按 0 计费。若服务端完全没有报告用量，这些数字是按字符估算的，`/stats` 会用 `≈` 标出。
+- **token 与费用**。`/stats` 会按输入、输出、缓存读 / 缓存写分类结算一个会话并计价。费用只读取 Rig 响应的 `usage.cost`，作为标准 API 单价参考而非账单；未知费用保持未知。若服务端完全没有报告用量，这些数字由 Rig 原生消息计数器估算，`/stats` 会用 `≈` 标出。
 - **prompt 缓存**。solaris 是**主动请求**缓存的：Anthropic 走 `cache_control` 断点（打在最后一条消息上），OpenAI 只在端点是 OpenAI 自家时发 `prompt_cache_key`。`/stats` 里那两行缓存数字之所以会有值就是因为这个；也是长对话每轮越来越便宜的原因 —— 不变的前缀会以缓存读的价格回来。
 - **上下文**。`/stats` 分别给出 `session tokens`（本会话累计花掉的）和 `context used`。只有后者说明窗口有多满：它等于最后一轮上报的用量，加上其后新提交内容的估算量。把整个会话的轮次相加会无限增长，对「单次请求的窗口」毫无意义。
 - **思考**。只有当上游真的推了推理内容（`thinking_delta`、`reasoning_content`、`reasoning`）时才会出现思考块；solaris 目前不下发 Anthropic 的 `thinking` 参数，因为不支持的模型会连带整个请求一起拒绝。
@@ -352,25 +352,33 @@ solaris 是从两个项目移植 / 借鉴设计的 Rust 实现，源码在相关
 
 ## 模型目录与参数覆盖
 
-模型能力、上下文及输入输出限制、价格默认来自 models.dev 的 Provider 目录，
-OpenRouter 使用自身目录优先补充。随包快照仅保留 OpenAI、Anthropic、Google、
-DeepSeek、xAI、Mistral、Meta、Moonshot、智谱和 MiniMax；
-网关参数由运行时缓存和刷新提供。启动读取有效缓存或快照，
-后台更新目录，失败继续使用已有数据。模型按 Provider 和 ID 精确匹配，
-不按名称前缀匹配。当 Provider 没有目录时，按模型 ID 精确匹配主流厂商；
-唯一匹配时继承官方参数和估算价格，用户配置优先。存在歧义时保留默认值。
+模型能力、限制、编码规则和参考价格统一来自 Rig 官方 Catalog。加载顺序为
+Rig 内置目录 → 用户显式覆盖。Solaris 不下载、缓存或后台刷新外部模型元数据，
+也不维护自己的快照、schema 或价格解析器。目录随 Rig 依赖升级更新。
 
-全局 `models.json` 保持现有格式，用户配置优先。新增可选字段：
+全局 `models.json` 改为三个对象：
 
-- `request_id`：实际请求名称，默认等于 `id`。
-- `catalog`：例如 `{"provider":"anthropic","id":"claude-sonnet-4-5"}`，为网关别名引用能力和限制；不会继承其他平台的价格或协议。
-- `output_tokens`：请求的输出预算，受模型输出和上下文限制约束，默认 8,192。
-- `capabilities.max_input`：模型的独立输入上限。
-- `price_tiers`：包含 `input_tokens_above` 和四项价格的长上下文阶梯费率。
+- `providers`：命名端点，包含 `protocol`、`base_url` 和可选的 `credential` 引用。
+- `models`：命名模型，包含 `provider`、`request_id`、可选的 `metadata` 和 `output_tokens`。
+- `overrides`：Rig 官方覆盖格式，以厂商、`models` 和模型行组织参数。
 
-价格单位为美元/百万 tokens。缺失价格保持未知，显式零价格表示免费；
-ChatGPT 账号授权不按 API 价格估算。`--print-config` 显示最终参数及来源。
-维护者使用 `bash scripts/update-model-catalog.sh` 更新随包快照。
+完整示例见 [英文配置说明](README.md#model-capabilities-and-offline-model-lists)。
+运行 `solaris --model fast` 可选择示例中的命名模型及其端点。
+`request_id` 原样发送给服务端，`metadata` 如 `anthropic/claude-sonnet-4-5`
+只绑定模型事实，不改变端点或协议。自定义端点支持 `openai-chat`、
+`openai-responses` 和 `anthropic-messages`；凭证引用 `auth.json` 已保存的 API 凭据，
+不允许转发 ChatGPT 账户令牌。
+
+不再兼容旧版 `models` 数组、`capabilities`、`price_tiers` 等配置。
+迁移时将别名改为命名模型，将 `catalog` 改为 `metadata`；模型能力和价格改用
+官方覆盖行中的 `tool_call`、`modalities`、`limit`、`cost` 和 `rig` 等字段。
+模型匹配采用官方规则；未知网关只对允许的主流厂商执行唯一 ID 匹配，歧义保留未知。
+未知上下文由应用采用 128,000 token 预算回退，默认回复预算最多 8,192 token。
+
+费用只读取 Rig 响应中的 `usage.cost`，Solaris 不按 token 再计算或回退估算。Rig 的费用为标准 API 单价参考值，不包含长上下文阶梯、服务等级及托管工具费用。
+网关继承厂商价格时标记为参考价；未知价格保持未知，账户订阅不使用 API 价格。
+每次请求固定一份官方模型事实，`--print-config` 显示解析结果。
+远程可用模型列表单独缓存，不与模型参数目录混合。
 
 ## 上下文投影与请求计费
 
@@ -384,7 +392,13 @@ usage，后续工具结果和用户消息只补充估算。缓存 token 在该�
 UI 只读取非阻塞快照，不重建提示词、不读文件、不启动 shell。
 会话恢复直接使用消息中的计量元数据，没有独立的恢复校验回写任务。
 
-每次模型请求完成即记录用量与估算费用，包含自动和手动摘要，因此后续失败或取消
+每次模型请求完成即记录用量与 Rig 返回的费用，包含自动和手动摘要，因此后续失败或取消
 不会丢失已确认的消耗。子 Agent 消耗不计入父上下文占用。小窗口模型使用缩减的
 默认输出预算和自适应压缩保留量。流式 `ContextUsageUpdated` 表示上下文占用，
 成功任务的 `TurnComplete.usage` 保持累计语义。
+
+SDK memory 是唯一消息存储，不导入旧 SQL 上下文。分叉复制原生消息、身份和压缩旁注，后续修改相互独立。恢复时由 Rig 修复工具配对，并为缺失结果标注中断及核查副作用提示。
+
+账本和核心累计值保留 SDK 费用完整性；缺失或部分费用不会变成完整费用。启用费用预算时，无法取得完整费用会停止执行。当前 UI 仍显示已知费用小计，不按 token 回退计价。
+
+会话执行统一通过运行时命令，事件序号在持久恢复后继续增长；模型发现由独立 provider 服务提供。当前会话数据库为 schema 4，旧版明确拒绝打开，不自动迁移。原生 memory 写入有 journal 检查点，请求结算按标识去重。模块边界见[架构文档](docs/ARCHITECTURE.md)。
