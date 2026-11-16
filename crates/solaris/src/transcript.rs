@@ -156,6 +156,11 @@ impl TranscriptView {
                     .count()
             };
             let changed = full || first < keys.len() || first < self.turn_keys.len();
+            let changed_row = if full || first == 0 {
+                0
+            } else {
+                self.turn_ends[first - 1]
+            };
             if empty {
                 self.lines = build_with_headers(
                     session,
@@ -196,20 +201,24 @@ impl TranscriptView {
             }
             self.turn_keys = keys;
             if changed || empty {
-                self.document = Arc::new(TextDocument::new(
-                    self.lines
-                        .iter()
-                        .enumerate()
-                        .map(|(row, line)| DocumentRow {
-                            part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
-                            text: line
-                                .spans
-                                .iter()
-                                .map(|span| span.content.as_ref())
-                                .collect(),
-                        })
-                        .collect(),
-                ));
+                self.document = Arc::new(
+                    self.document.with_suffix(
+                        changed_row,
+                        self.lines
+                            .iter()
+                            .enumerate()
+                            .skip(changed_row)
+                            .map(|(row, line)| DocumentRow {
+                                part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
+                                text: line
+                                    .spans
+                                    .iter()
+                                    .map(|span| span.content.as_ref())
+                                    .collect(),
+                            })
+                            .collect(),
+                    ),
+                );
             }
             self.cache_width = area.width;
             self.cache_height = area.height;
