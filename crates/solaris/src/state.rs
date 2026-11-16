@@ -126,6 +126,8 @@ pub enum TurnPart {
 /// One prompt/response exchange.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Turn {
+    /// Revision of content/layout, independent of accounting and animation.
+    pub layout_revision: u64,
     /// Display order; text ranges coalesce only across adjacent deltas.
     pub parts: Vec<TurnPart>,
     /// The user's prompt.
@@ -154,6 +156,7 @@ pub struct Turn {
 
 impl Turn {
     pub fn push_text(&mut self, chunk: &str) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
         if chunk.is_empty() {
             return;
         }
@@ -170,6 +173,7 @@ impl Turn {
     }
 
     pub fn push_thinking(&mut self, chunk: &str) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
         if chunk.is_empty() {
             return;
         }
@@ -198,6 +202,14 @@ impl Turn {
 
     /// Locate child activity by its runtime ID, even after its launch returned.
     pub fn subagent_mut(&mut self, task_id: &str) -> Option<&mut ToolStep> {
+        let found = self.steps.iter().any(|step| {
+            step.subagent
+                .as_ref()
+                .is_some_and(|child| child.task_id.as_deref() == Some(task_id))
+        });
+        if found {
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+        }
         self.steps.iter_mut().rev().find(|step| {
             step.subagent
                 .as_ref()
@@ -249,7 +261,13 @@ impl SessionState {
 
     /// Mutable access to the turn being streamed.
     pub fn active_turn_mut(&mut self) -> Option<&mut Turn> {
-        self.turns.last_mut().filter(|turn| !turn.complete)
+        self.turns
+            .last_mut()
+            .filter(|turn| !turn.complete)
+            .map(|turn| {
+                turn.layout_revision = turn.layout_revision.wrapping_add(1);
+                turn
+            })
     }
 
     /// Whether a response is currently streaming.

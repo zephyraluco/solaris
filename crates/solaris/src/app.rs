@@ -1060,6 +1060,7 @@ impl App {
         let expand = !self.session.turns.iter().any(|turn| turn.thinking_expanded);
         for turn in &mut self.session.turns {
             turn.thinking_expanded = expand;
+            turn.layout_revision = turn.layout_revision.wrapping_add(1);
         }
         self.session.bump();
     }
@@ -1472,7 +1473,7 @@ impl App {
                 }
             }
             AgentEvent::SubagentUsage { usage, cost_usd } => {
-                if let Some(turn) = self.session.active_turn_mut() {
+                if let Some(turn) = self.session.turns.last_mut().filter(|turn| !turn.complete) {
                     turn.subagent_tokens = turn.subagent_tokens.saturating_add(usage.total());
                     // Preserve already consumed child usage even if the parent
                     // fails. A successful TurnComplete replaces this with totals.
