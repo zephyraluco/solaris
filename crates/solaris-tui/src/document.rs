@@ -49,13 +49,12 @@ struct PartIndex {
 }
 impl PartIndex {
     fn new(rows: Vec<Arc<DocumentRow>>) -> Self {
-        let mut counts = HashMap::<u64, usize>::new();
+        let mut count = 0usize;
         let mut positions = HashMap::new();
         let mut whitespace_positions = HashMap::new();
         let mut glyphs = Vec::with_capacity(rows.len());
         for (row, line) in rows.iter().enumerate() {
             let mut column = 0u16;
-            let count = counts.entry(line.part).or_default();
             let mut cells = Vec::new();
             let mut whitespace = 0u16;
             for grapheme in line.text.graphemes(true) {
@@ -65,7 +64,7 @@ impl PartIndex {
                     cells.push(Glyph {
                         anchor: TextAnchor {
                             part: line.part,
-                            grapheme: *count,
+                            grapheme: count,
                             whitespace,
                         },
                         column,
@@ -75,16 +74,16 @@ impl PartIndex {
                     whitespace = 0;
                     let anchor = TextAnchor {
                         part: line.part,
-                        grapheme: *count,
+                        grapheme: count,
                         whitespace: 0,
                     };
-                    positions.insert(*count, (row, column, width));
+                    positions.insert(count, (row, column, width));
                     cells.push(Glyph {
                         anchor,
                         column,
                         width,
                     });
-                    *count += 1;
+                    count += 1;
                 }
                 column = column.saturating_add(width);
             }
@@ -136,12 +135,9 @@ impl TextDocument {
                 let index = match old {
                     Some(old)
                         if old.index.rows.len() == global_rows.len()
-                            && old
-                                .index
-                                .rows
-                                .iter()
-                                .zip(&global_rows)
-                                .all(|(old, row)| Arc::ptr_eq(old, &rows[*row])) =>
+                            && old.index.rows.iter().zip(&global_rows).all(|(old, row)| {
+                                Arc::ptr_eq(old, &rows[*row]) || old.text == rows[*row].text
+                            }) =>
                     {
                         old.index.clone()
                     }

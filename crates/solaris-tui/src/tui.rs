@@ -13,7 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -118,21 +118,18 @@ impl Tui {
             }
 
             if event::poll(self.poll_interval)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        self.handle_key(key);
-                        dirty = true;
+                let started = Instant::now();
+                for _ in 0..64 {
+                    let overlays = self.overlays.len();
+                    dirty |= self.handle_terminal_event(event::read()?);
+                    if self.quit.get()
+                        || overlays != self.overlays.len()
+                        || !self.queue.borrow().is_empty()
+                        || started.elapsed() >= Duration::from_millis(2)
+                        || !event::poll(Duration::ZERO)?
+                    {
+                        break;
                     }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
-                        dirty = true;
-                    }
-                    Event::Paste(text) => {
-                        self.handle_paste(&text);
-                        dirty = true;
-                    }
-                    Event::Resize(_, _) => dirty = true,
-                    _ => {}
                 }
             }
 
@@ -146,6 +143,25 @@ impl Tui {
         }
 
         Ok(())
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.handle_key(key);
+                true
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                true
+            }
+            Event::Paste(text) => {
+                self.handle_paste(&text);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
+        }
     }
 
     fn draw<W: io::Write>(

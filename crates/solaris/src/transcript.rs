@@ -1,12 +1,11 @@
 //! Builds the styled transcript lines from session state.
 //!
-//! The transcript is rebuilt only when the session revision, terminal size,
-//! theme, or spinner frame changes, so scrolling and idle frames are free —
-//! except while it is empty, when the welcome box's animated companion needs a
-//! fresh frame every tick.
+//! Completed turns retain their layouts. Streaming updates rebuild the changed
+//! suffix and reuse prior Markdown fragments and immutable selection indexes.
+//! Activity decorations update independently; scrolling reuses the layout.
 
 use solaris_tui::document::{DocumentRow, TextDocument};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crossterm::event::MouseEvent;
@@ -41,8 +40,18 @@ struct SubagentHeader {
     summary: SubagentSummary,
 }
 
+struct MarkdownBlock {
+    source: String,
+    width: u16,
+    theme: String,
+    lines: Vec<Line<'static>>,
+}
+
 #[derive(Default)]
 struct TranscriptHeaders {
+    markdown: HashMap<u64, MarkdownBlock>,
+    #[cfg(test)]
+    markdown_builds: usize,
     parts: Vec<u64>,
     spinners: Vec<usize>,
     tools: Vec<CollapsibleHeader>,
@@ -156,6 +165,15 @@ impl TranscriptView {
                     .take_while(|(a, b)| a == b)
                     .count()
             };
+            if full {
+                self.headers.markdown.clear();
+            }
+            self.headers.markdown.retain(|part, _| {
+                session
+                    .turns
+                    .get(((part >> 32) as usize).saturating_sub(1))
+                    .is_some_and(|turn| !turn.complete)
+            });
             let changed = full || first < keys.len() || first < self.turn_keys.len();
             let changed_row = if full || first == 0 {
                 0
@@ -451,7 +469,6 @@ fn push_ordered(
     headers: &mut TranscriptHeaders,
 ) {
     let base = ((turn_index as u64) + 1) << 32;
-    let markdown = MarkdownStyle::from_theme(theme);
     let mut index = 0;
     while index < turn.parts.len() {
         let start = out.len();
@@ -464,7 +481,42 @@ fn push_ordered(
                     .filter(|text| !text.trim().is_empty())
                 {
                     out.push(Line::default());
-                    out.extend(render_markdown(text, width as u16, &markdown));
+                    if turn.complete {
+                        out.extend(render_markdown(
+                            text,
+                            width as u16,
+                            &MarkdownStyle::from_theme(theme),
+                        ));
+                    } else {
+                        let cached =
+                            headers
+                                .markdown
+                                .entry(section)
+                                .or_insert_with(|| MarkdownBlock {
+                                    source: String::new(),
+                                    width: 0,
+                                    theme: String::new(),
+                                    lines: Vec::new(),
+                                });
+                        if cached.source != text
+                            || cached.width != width as u16
+                            || cached.theme != theme.name
+                        {
+                            cached.lines = render_markdown(
+                                text,
+                                width as u16,
+                                &MarkdownStyle::from_theme(theme),
+                            );
+                            cached.source = text.to_owned();
+                            cached.width = width as u16;
+                            cached.theme = theme.name.clone();
+                            #[cfg(test)]
+                            {
+                                headers.markdown_builds += 1;
+                            }
+                        }
+                        out.extend_from_slice(&cached.lines);
+                    }
                 }
             }
             TurnPart::Thinking(range) => {
@@ -1102,6 +1154,27 @@ mod tests {
         view.lines(&session, area, &Theme::dark(), Some(1), &welcome());
         assert_eq!(view.layout_builds, 32);
         assert!(Arc::ptr_eq(&document, &view.document()));
+    }
+
+    #[test]
+    fn streaming_preserves_earlier_markdown_fragments_in_the_same_turn() {
+        let mut session = SessionState::new();
+        let mut turn = Turn::default();
+        turn.push_text("**first**");
+        turn.push_tool(solaris_agent::ToolCall::new(
+            "read",
+            "read",
+            serde_json::json!({"path":"file"}),
+        ));
+        turn.push_text("second");
+        session.turns.push(turn);
+        let mut view = TranscriptView::new();
+        view.lines(&session, area(80, 24), &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.headers.markdown_builds, 2);
+        session.active_turn_mut().unwrap().push_text(" appended");
+        session.bump();
+        view.lines(&session, area(80, 24), &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.headers.markdown_builds, 3);
     }
 
     #[test]

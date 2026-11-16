@@ -348,6 +348,14 @@ fn receiver(rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> AgentEventS
 }
 fn refresh(core: &Core, task_id: Option<u64>, mode: crate::Mode) {
     let view = core.view.read().unwrap_or_else(|p| p.into_inner());
+    // Compute services before taking the UI snapshot lock: Jobs may be waiting
+    // for persistence, but drawing must still be able to read the previous view.
+    let contexts = ModeContexts {
+        build: view.context_usage(crate::Mode::Build),
+        plan: view.context_usage(crate::Mode::Plan),
+    };
+    let tasks = view.active_tasks();
+    let billing = view.usage_totals();
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
     if let Some(journal) = view.journal() {
         if snapshot.session_id != journal.id() {
@@ -366,13 +374,10 @@ fn refresh(core: &Core, task_id: Option<u64>, mode: crate::Mode) {
     snapshot.label = view.label().into();
     snapshot.provider_id = view.provider_id().map(str::to_owned);
     snapshot.capabilities = view.capabilities();
-    snapshot.contexts = ModeContexts {
-        build: view.context_usage(crate::Mode::Build),
-        plan: view.context_usage(crate::Mode::Plan),
-    };
-    snapshot.active_tasks = view.active_tasks();
+    snapshot.contexts = contexts;
+    snapshot.active_tasks = tasks;
     snapshot.stop_reason = view.stop_reason();
-    if let Some(billing) = view.usage_totals() {
+    if let Some(billing) = billing {
         snapshot.billing = Some(billing);
     }
 }

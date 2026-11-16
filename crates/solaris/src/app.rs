@@ -275,6 +275,8 @@ fn with_tools(
 
 /// The solaris application root component.
 pub struct App {
+    io: crate::background_io::BackgroundIo,
+    input_generation: u64,
     /// The session every turn goes through, and the backend behind it.
     pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
     runtime: Arc<solaris_agent::Runtime>,
@@ -304,6 +306,7 @@ pub struct App {
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     events_rx: Option<UnboundedReceiver<AgentEvent>>,
+    pending_stream_end: bool,
     spinner_frame: u16,
     last_transcript: Rect,
     /// Shared disclosure interaction; targets identify transcript records.
@@ -476,6 +479,8 @@ impl App {
         let _ = agent.activate();
         let auth_base = auth.clone();
         let mut app = Self {
+            io: Default::default(),
+            input_generation: 0,
             auth_base,
             runtime,
             runtime_events,
@@ -501,6 +506,7 @@ impl App {
             dialog_tx,
             dialog_rx,
             events_rx: None,
+            pending_stream_end: false,
             spinner_frame: 0,
             last_transcript: Rect::default(),
             collapsible_mouse: CollapsibleInteraction::default(),
@@ -886,6 +892,72 @@ impl App {
         self.session.follow_end = false;
     }
 
+    fn poll_io(&mut self, wait: bool) -> bool {
+        use crate::background_io::Completion;
+        let events = self.io.drain(wait);
+        let dirty = !events.is_empty();
+        for event in events {
+            match event {
+                Completion::Saved {
+                    label,
+                    result: Err(error),
+                } => self
+                    .notifications
+                    .warning(format!("could not save {label}: {error}")),
+                Completion::Saved { .. } => {}
+                Completion::Auth { submitted, result } => match result {
+                    Ok(saved) if self.auth == submitted => {
+                        self.auth_base = saved.clone();
+                        self.auth = saved;
+                    }
+                    Ok(_) => {}
+                    Err(error) => self
+                        .notifications
+                        .warning(format!("could not save credentials: {error}")),
+                },
+                Completion::Copied {
+                    success,
+                    failure,
+                    ok,
+                } => {
+                    if ok {
+                        self.notifications.info(success)
+                    } else {
+                        self.notifications.warning(failure)
+                    }
+                }
+                Completion::Pasted { generation, text } => {
+                    if generation != self.input_generation {
+                        self.notifications
+                            .warning("paste destination changed; paste again");
+                    } else if let Some(text) = text {
+                        self.insert_pasted(&text);
+                    } else {
+                        self.notifications.warning("clipboard is empty");
+                    }
+                }
+            }
+        }
+        dirty
+    }
+
+    fn copy_text(&mut self, text: &str, success: String, failure: &str) {
+        if self.clipboard.background {
+            let text = text.to_owned();
+            let failure = failure.to_owned();
+            self.io
+                .submit(move || crate::background_io::Completion::Copied {
+                    ok: crate::clipboard::system_write(&text),
+                    success,
+                    failure,
+                });
+        } else if (self.clipboard.write)(text) {
+            self.notifications.info(success);
+        } else {
+            self.notifications.warning(failure);
+        }
+    }
+
     /// Copy the current selection to the system clipboard, saying so either way.
     fn copy_selection(&mut self, text: &str) {
         let characters = text.chars().count();
@@ -893,16 +965,12 @@ impl App {
             return;
         }
 
-        if (self.clipboard.write)(text) {
-            // One cell is an ordinary case now, so the count has to read
-            // correctly for it too.
-            let plural = if characters == 1 { "" } else { "s" };
-            self.notifications
-                .info(format!("copied {characters} character{plural}"));
-        } else {
-            self.notifications
-                .warning("could not reach the system clipboard");
-        }
+        let plural = if characters == 1 { "" } else { "s" };
+        self.copy_text(
+            text,
+            format!("copied {characters} character{plural}"),
+            "could not reach the system clipboard",
+        );
     }
 
     /// Put the clipboard into whatever is taking text, saying so when there is
@@ -911,6 +979,15 @@ impl App {
     /// claurst reads the clipboard on the same key and warns about an empty
     /// one.
     fn paste_from_clipboard(&mut self) {
+        if self.clipboard.background {
+            let generation = self.input_generation;
+            self.io
+                .submit(move || crate::background_io::Completion::Pasted {
+                    generation,
+                    text: crate::clipboard::system_read(),
+                });
+            return;
+        }
         match (self.clipboard.read)() {
             Some(text) if !text.is_empty() => self.insert_pasted(&text),
             _ => self.notifications.warning("clipboard is empty"),
@@ -1410,6 +1487,7 @@ impl App {
         self.spinner_frame = 0;
 
         let (tx, rx) = unbounded_channel();
+        self.pending_stream_end = false;
         self.events_rx = Some(rx);
 
         let agent = Arc::clone(&self.agent);
@@ -2198,6 +2276,7 @@ impl App {
 
     /// Drop the wizard.
     fn close_inline(&mut self) {
+        self.input_generation = self.input_generation.wrapping_add(1);
         // Credential refresh belongs to the pending request, not to the wizard.
         if self.oauth.is_some() {
             self.oauth = None;
@@ -2223,12 +2302,11 @@ impl App {
             ConnectOutcome::ProviderPicked { id, name } => self.begin_provider_setup(&id, &name),
             ConnectOutcome::Submit(submit) => self.apply_connect_submit(submit),
             ConnectOutcome::CopyBrowserUrl(url) => {
-                if (self.clipboard.write)(&url) {
-                    self.notifications.info("OpenAI authorization URL copied");
-                } else {
-                    self.notifications
-                        .warning("Could not copy URL; open the displayed URL manually");
-                }
+                self.copy_text(
+                    &url,
+                    "OpenAI authorization URL copied".into(),
+                    "Could not copy URL; open the displayed URL manually",
+                );
             }
             ConnectOutcome::RetryModels => {
                 self.refresh_models();
@@ -2406,15 +2484,14 @@ impl App {
             return;
         };
 
-        let written = self.auth.save_changes(&self.auth_base, &path);
-        if let Ok(saved) = &written {
-            self.auth = saved.clone();
-            self.auth_base = saved.clone();
-        }
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save credentials: {error}"));
-        }
+        let submitted = self.auth.clone();
+        let base = self.auth_base.clone();
+        self.io.submit(move || {
+            let result = submitted
+                .save_changes(&base, &path)
+                .map_err(|error| error.to_string());
+            crate::background_io::Completion::Auth { submitted, result }
+        });
     }
 
     /// Record a submitted prompt and persist the history, best-effort.
@@ -2428,16 +2505,12 @@ impl App {
             return;
         };
 
-        let written = self
-            .recent
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save recent activity: {error}"));
-        }
+        let json = self.recent.to_json().map_err(|error| error.to_string());
+        self.io
+            .submit(move || crate::background_io::Completion::Saved {
+                label: "recent activity",
+                result: json.and_then(|json| write_json(&path, &json)),
+            });
     }
 
     /// Remember the theme and the mode, best-effort.
@@ -2454,16 +2527,15 @@ impl App {
         self.preferences.theme = Some(self.config.theme.clone());
         self.preferences.mode = Some(self.config.mode);
 
-        let written = self
+        let json = self
             .preferences
             .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save preferences: {error}"));
-        }
+            .map_err(|error| error.to_string());
+        self.io
+            .submit(move || crate::background_io::Completion::Saved {
+                label: "preferences",
+                result: json.and_then(|json| write_json(&path, &json)),
+            });
     }
 
     /// Best-effort persistence of the companion's name.
@@ -2475,15 +2547,12 @@ impl App {
             return;
         };
 
-        let written = soul
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save the companion: {error}"));
-        }
+        let json = soul.to_json().map_err(|error| error.to_string());
+        self.io
+            .submit(move || crate::background_io::Completion::Saved {
+                label: "the companion",
+                result: json.and_then(|json| write_json(&path, &json)),
+            });
     }
 
     /// Everything the welcome box shows, rebuilt per frame so the companion can
@@ -2966,6 +3035,9 @@ impl Component for App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        if !(key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+            self.input_generation = self.input_generation.wrapping_add(1);
+        }
         if self.subagent_terminal.is_some() {
             if self.keybindings.matches("quit", &key) {
                 self.copy_selection_if_any();
@@ -3009,6 +3081,7 @@ impl Component for App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
+        self.input_generation = self.input_generation.wrapping_add(1);
         if self.subagent_terminal.is_some() {
             if self.handle_collapsible_mouse(event) {
                 return MouseResult::Handled;
@@ -3069,6 +3142,7 @@ impl Component for App {
     }
 
     fn handle_paste(&mut self, text: &str) -> KeyResult {
+        self.input_generation = self.input_generation.wrapping_add(1);
         if self.subagent_terminal.is_some() {
             return KeyResult::Handled;
         }
@@ -3077,10 +3151,11 @@ impl Component for App {
     }
 
     fn tick(&mut self) -> bool {
-        while let Ok(error) = self.runtime_errors.try_recv() {
+        let event_started = std::time::Instant::now();
+        for error in std::iter::from_fn(|| self.runtime_errors.try_recv().ok()).take(32) {
             self.notifications.error(error);
         }
-        let mut dirty = self.poll_oauth();
+        let mut dirty = self.poll_io(false) | self.poll_oauth();
         let snapshot = self.agent.snapshot();
         let context_window = u64::from(
             snapshot
@@ -3110,7 +3185,10 @@ impl Component for App {
         let mut events = Vec::new();
         let mut disconnected = false;
         if let Some(rx) = self.events_rx.as_mut() {
-            loop {
+            for _ in 0..128 {
+                if event_started.elapsed() >= Duration::from_millis(3) {
+                    break;
+                }
                 match rx.try_recv() {
                     Ok(event) => events.push(event),
                     Err(TryRecvError::Empty) => break,
@@ -3123,32 +3201,18 @@ impl Component for App {
         }
 
         let terminal = events.iter().any(AgentEvent::is_terminal);
-        for event in events {
+        for event in coalesce_events(events) {
             dirty = true;
             self.apply_event(event);
         }
 
-        loop {
+        let mut runtime_events = Vec::new();
+        for _ in 0..128 {
+            if event_started.elapsed() >= Duration::from_millis(3) {
+                break;
+            }
             match self.runtime_events.try_recv() {
-                Ok(event) => {
-                    if event.task_id.is_some()
-                        && self.session.active_turn().is_none()
-                        && matches!(
-                            event.event,
-                            AgentEvent::TextDelta(_)
-                                | AgentEvent::ThinkingDelta(_)
-                                | AgentEvent::ToolCall(_)
-                        )
-                    {
-                        self.session.turns.push(Turn {
-                            prompt: "Background task results".into(),
-                            ..Default::default()
-                        });
-                        self.session.bump();
-                    }
-                    self.apply_event(event.event);
-                    dirty = true;
-                }
+                Ok(event) => runtime_events.push(event),
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
@@ -3159,8 +3223,45 @@ impl Component for App {
                 }
             }
         }
+        let mut run_events = Vec::new();
+        let mut task_id = None;
+        for event in runtime_events {
+            if task_id != event.task_id {
+                for pending in coalesce_events(std::mem::take(&mut run_events)) {
+                    self.apply_event(pending);
+                }
+                task_id = event.task_id;
+            }
+            if event.task_id.is_some()
+                && self.session.active_turn().is_none()
+                && matches!(
+                    event.event,
+                    AgentEvent::TextDelta(_)
+                        | AgentEvent::ThinkingDelta(_)
+                        | AgentEvent::ToolCall(_)
+                )
+            {
+                self.session.turns.push(Turn {
+                    prompt: "Background task results".into(),
+                    ..Default::default()
+                });
+                self.session.bump();
+            }
+            run_events.push(event.event);
+            dirty = true;
+        }
+        for pending in coalesce_events(run_events) {
+            self.apply_event(pending);
+        }
         if terminal || disconnected {
             self.events_rx = None;
+            self.pending_stream_end = true;
+            dirty = true;
+        }
+        // The producer can finish before a bounded UI batch reaches its final
+        // event. Do not close its turn while transcript events remain queued.
+        if self.pending_stream_end && self.runtime_events.is_empty() {
+            self.pending_stream_end = false;
             // A stream that ends without a terminal event must still stop the spinner.
             if self.agent.snapshot().task_id.is_none()
                 && let Some(turn) = self.session.active_turn_mut()
@@ -3287,6 +3388,20 @@ impl Component for App {
 
         dirty
     }
+}
+
+fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+    let mut merged = Vec::with_capacity(events.len());
+    for event in events {
+        match (merged.last_mut(), event) {
+            (Some(AgentEvent::TextDelta(previous)), AgentEvent::TextDelta(next))
+            | (Some(AgentEvent::ThinkingDelta(previous)), AgentEvent::ThinkingDelta(next)) => {
+                previous.push_str(&next)
+            }
+            (_, event) => merged.push(event),
+        }
+    }
+    merged
 }
 
 /// The arguments of a call, as the confirmation prompt shows them.
@@ -3683,6 +3798,93 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_fragments_merge_without_crossing_tool_or_thinking_boundaries() {
+        let call = ToolCall::new("call", "read", serde_json::json!({"path":"file"}));
+        let events = coalesce_events(vec![
+            AgentEvent::TextDelta("a".into()),
+            AgentEvent::TextDelta("b".into()),
+            AgentEvent::ToolCall(call),
+            AgentEvent::TextDelta("c".into()),
+            AgentEvent::ThinkingDelta("d".into()),
+            AgentEvent::ThinkingDelta("e".into()),
+        ]);
+        assert!(
+            matches!(&events[..], [AgentEvent::TextDelta(ab),AgentEvent::ToolCall(_),AgentEvent::TextDelta(c),AgentEvent::ThinkingDelta(de)] if ab=="ab" && c=="c" && de=="de")
+        );
+    }
+
+    #[test]
+    fn late_clipboard_result_cannot_paste_into_a_changed_destination() {
+        let mut app = app();
+        let generation = app.input_generation;
+        app.io
+            .submit(move || crate::background_io::Completion::Pasted {
+                generation,
+                text: Some("secret".into()),
+            });
+        app.handle_key(key(KeyCode::Char('x')));
+        app.poll_io(true);
+        assert!(!rendered_text(&mut app, 80, 24).contains("secret"));
+        assert!(rendered_text(&mut app, 80, 24).contains("paste destination changed"));
+    }
+
+    #[tokio::test]
+    async fn producer_eof_waits_for_the_bounded_transcript_backlog() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        let (output, rx) = unbounded_channel();
+        drop(output);
+        app.events_rx = Some(rx);
+        let (events, rx) = tokio::sync::broadcast::channel(512);
+        app.runtime_events = rx;
+        for sequence in 0..200 {
+            events
+                .send(solaris_agent::RuntimeEvent {
+                    session_id: "session".into(),
+                    sequence: Some(sequence),
+                    task_id: Some(1),
+                    event: AgentEvent::TextDelta("x".into()),
+                })
+                .unwrap();
+        }
+        events
+            .send(solaris_agent::RuntimeEvent {
+                session_id: "session".into(),
+                sequence: Some(200),
+                task_id: Some(1),
+                event: AgentEvent::TurnComplete {
+                    usage: Default::default(),
+                    cost_usd: 0.0,
+                },
+            })
+            .unwrap();
+        app.tick();
+        assert!(!app.session.turns[0].complete);
+        for _ in 0..10 {
+            app.tick();
+        }
+        assert_eq!(app.session.turns.len(), 1);
+        assert_eq!(app.session.turns[0].reply.len(), 200);
+        assert!(app.session.turns[0].complete);
+    }
+
+    #[tokio::test]
+    async fn a_large_event_backlog_is_not_drained_in_one_tick() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        let (tx, rx) = unbounded_channel();
+        app.events_rx = Some(rx);
+        for _ in 0..1000 {
+            tx.send(AgentEvent::TextDelta("x".into())).unwrap();
+        }
+        app.tick();
+        assert!(app.events_rx.as_ref().unwrap().len() >= 872);
+        assert!(app.session.turns[0].reply.len() <= 128);
+        // Input remains actionable before processing the remaining events.
+        app.handle_key(key(KeyCode::Char('a')));
+    }
+
+    #[test]
     fn the_theme_the_mode_and_the_model_are_all_remembered() {
         let dir = std::env::temp_dir().join(format!("solaris-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a temp dir");
@@ -3697,12 +3899,14 @@ mod tests {
         app.set_theme("light");
 
         // Theme and mode are session preferences…
+        app.poll_io(true);
         let text = std::fs::read_to_string(&settings_path).expect("settings were written");
         let stored = Preferences::from_json(&text).expect("decodes");
         assert_eq!(stored.theme.as_deref(), Some("light"));
         assert_eq!(stored.mode, Some(Mode::Plan));
 
         // …while the model is remembered beside the provider that offers it.
+        app.poll_io(true);
         let text = std::fs::read_to_string(&auth_path).expect("credentials were written");
         let auth = AuthStore::from_json(&text).expect("decodes");
         assert_eq!(auth.active_provider(), Some("opencode"));
@@ -3921,6 +4125,7 @@ mod tests {
         assert_eq!(app.recent.len(), 1);
         assert_eq!(app.recent.entries()[0].label, "fix the parser");
 
+        app.poll_io(true);
         let saved = std::fs::read_to_string(&path).expect("recent file");
         let reloaded = RecentActivity::from_json(&saved).expect("valid json");
         assert_eq!(reloaded.entries()[0].label, "fix the parser");
@@ -3967,6 +4172,7 @@ mod tests {
         assert_eq!(app.buddy.display_name(), "Pip");
         assert_eq!(app.buddy.bones.species.as_str(), species);
 
+        app.poll_io(true);
         let saved = std::fs::read_to_string(&path).expect("companion file");
         let soul = Soul::from_json(&saved).expect("valid json");
         assert_eq!(soul.name, "Pip");
@@ -5435,6 +5641,7 @@ mod tests {
 
         let mut app = app_with_real_backends(auth);
         app.clipboard = Clipboard {
+            background: false,
             write: Rc::new(|_| true),
             read: Rc::new(|| Some("sk-pasted".to_string())),
         };
@@ -5533,6 +5740,7 @@ mod tests {
         let mut app = app_with_auth_path(path.clone());
         connect_with_api_key(&mut app, "sk-on-disk");
 
+        app.poll_io(true);
         let text = std::fs::read_to_string(&path).expect("credentials file");
         let store = AuthStore::from_json(&text).expect("valid json");
         assert_eq!(
@@ -6217,6 +6425,7 @@ mod tests {
         let pasted = reads.map(str::to_string);
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.clipboard = Clipboard {
+            background: false,
             write: Rc::new(move |text: &str| {
                 log.borrow_mut().push(text.to_string());
                 succeeds
@@ -6239,6 +6448,7 @@ mod tests {
         let reader = Rc::clone(&cell);
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.clipboard = Clipboard {
+            background: false,
             write: Rc::new(move |text: &str| {
                 *writer.borrow_mut() = text.to_string();
                 true

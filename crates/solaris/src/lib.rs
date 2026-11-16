@@ -18,6 +18,7 @@
 //! and all the app ever learns is the label the backend reports.
 
 pub mod app;
+mod background_io;
 pub mod buddy;
 pub mod clipboard;
 pub mod commands;

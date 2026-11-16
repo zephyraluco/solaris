@@ -15,6 +15,8 @@ pub type ClipboardReader = Rc<dyn Fn() -> Option<String>>;
 
 /// The clipboard as the application sees it.
 pub struct Clipboard {
+    /// System operations run on the application I/O worker; injected callbacks are immediate.
+    pub background: bool,
     /// Writes text, reporting whether it landed.
     pub write: ClipboardWriter,
     /// Reads text, or `None` when there is nothing to read.
@@ -22,38 +24,40 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    /// The platform clipboard, through `arboard`.
+    /// The worker retains its native clipboard connection between operations.
     pub fn system() -> Self {
-        let handle: Rc<RefCell<Option<arboard::Clipboard>>> = Rc::new(RefCell::new(None));
-
-        let writer = Rc::clone(&handle);
-        let write = Rc::new(move |text: &str| {
-            with(&writer, |clipboard| clipboard.set_text(text.to_string()))
-                .is_some_and(|written| written.is_ok())
-        });
-
-        let reader = Rc::clone(&handle);
-        let read = Rc::new(move || {
-            with(&reader, |clipboard| clipboard.get_text())
-                .and_then(Result::ok)
-                .filter(|text| !text.is_empty())
-        });
-
-        Self { write, read }
+        Self {
+            background: true,
+            write: Rc::new(system_write),
+            read: Rc::new(system_read),
+        }
     }
 }
 
-/// Run `use_it` against the platform clipboard, opening it on first use.
-///
-/// The handle is kept open because some platforms tie a clipboard connection to
-/// the process that opened it.
-fn with<T>(
-    handle: &Rc<RefCell<Option<arboard::Clipboard>>>,
-    use_it: impl FnOnce(&mut arboard::Clipboard) -> T,
-) -> Option<T> {
-    let mut handle = handle.borrow_mut();
-    if handle.is_none() {
-        *handle = arboard::Clipboard::new().ok();
-    }
-    handle.as_mut().map(use_it)
+thread_local! {
+    static SYSTEM: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+pub(crate) fn system_read() -> Option<String> {
+    SYSTEM.with(|handle| {
+        let mut handle = handle.borrow_mut();
+        if handle.is_none() {
+            *handle = arboard::Clipboard::new().ok();
+        }
+        handle
+            .as_mut()?
+            .get_text()
+            .ok()
+            .filter(|text| !text.is_empty())
+    })
+}
+pub(crate) fn system_write(text: &str) -> bool {
+    SYSTEM.with(|handle| {
+        let mut handle = handle.borrow_mut();
+        if handle.is_none() {
+            *handle = arboard::Clipboard::new().ok();
+        }
+        handle
+            .as_mut()
+            .is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+    })
 }

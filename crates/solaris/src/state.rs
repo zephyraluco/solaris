@@ -261,13 +261,12 @@ impl SessionState {
 
     /// Mutable access to the turn being streamed.
     pub fn active_turn_mut(&mut self) -> Option<&mut Turn> {
-        self.turns
-            .last_mut()
-            .filter(|turn| !turn.complete)
-            .map(|turn| {
-                turn.layout_revision = turn.layout_revision.wrapping_add(1);
-                turn
-            })
+        let turn = self.turns.last_mut()?;
+        if turn.complete {
+            return None;
+        }
+        turn.layout_revision = turn.layout_revision.wrapping_add(1);
+        Some(turn)
     }
 
     /// Whether a response is currently streaming.
