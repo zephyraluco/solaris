@@ -2659,6 +2659,9 @@ impl App {
                     } else {
                         self.session.follow_end = false;
                     }
+                    if let Some(view) = &mut self.subagent_terminal {
+                        view.layout_key = None;
+                    }
                     self.session.bump();
                 }
                 true
@@ -2754,6 +2757,8 @@ struct SubagentTerminal {
     scroll: usize,
     follow_end: bool,
     headers: Vec<crate::transcript::CollapsibleHeader>,
+    layout: Option<crate::transcript::SubagentTranscript>,
+    layout_key: Option<(crate::transcript::TurnKey, u16, String)>,
 }
 
 impl App {
@@ -2882,15 +2887,35 @@ impl App {
             area.height.saturating_sub(2),
         );
         self.last_transcript = content;
-        let layout = crate::transcript::subagent_layout(
-            step,
-            turn.complete,
+        let key = (
+            crate::transcript::TurnKey::from(turn),
             area.width,
-            &self.theme,
-            Some(self.spinner_frame),
+            self.theme.name.clone(),
         );
-        view.headers = layout.headers;
-        let lines = layout.lines;
+        if view.layout_key.as_ref() != Some(&key) {
+            let layout = crate::transcript::subagent_layout(
+                step,
+                turn.complete,
+                area.width,
+                &self.theme,
+                Some(self.spinner_frame),
+            );
+            view.headers = layout.headers.clone();
+            view.layout = Some(layout);
+            view.layout_key = Some(key);
+        }
+        let lines = &mut view.layout.as_mut().expect("child layout prepared").lines;
+        if let Some(line) = lines.last_mut()
+            && line.to_string().ends_with(" working…")
+        {
+            *line = Line::styled(
+                format!(
+                    "{} working…",
+                    SPINNER[self.spinner_frame as usize % SPINNER.len()]
+                ),
+                Style::default().fg(self.theme.accent),
+            );
+        }
         let max_scroll = lines.len().saturating_sub(usize::from(content.height));
         if view.follow_end {
             view.scroll = max_scroll;
@@ -3243,8 +3268,9 @@ impl Component for App {
             dirty = true;
         }
         if self.session.is_streaming() {
-            self.spinner_frame = self.spinner_frame.wrapping_add(1);
-            if self.spinner_frame.is_multiple_of(6) {
+            let frame = (self.buddy_started.elapsed().as_millis() / 100) as u16;
+            if frame != self.spinner_frame {
+                self.spinner_frame = frame;
                 dirty = true;
             }
         }

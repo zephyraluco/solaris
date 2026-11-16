@@ -44,12 +44,13 @@ struct SubagentHeader {
 #[derive(Default)]
 struct TranscriptHeaders {
     parts: Vec<u64>,
+    spinners: Vec<usize>,
     tools: Vec<CollapsibleHeader>,
     subagents: BTreeMap<(usize, usize), SubagentHeader>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct TurnKey {
+pub(crate) struct TurnKey {
     revision: u64,
     lengths: (usize, usize, usize, usize, usize),
     complete: bool,
@@ -180,7 +181,14 @@ impl TranscriptView {
                 self.lines.truncate(row);
                 self.headers.parts.truncate(row);
                 self.headers.tools.retain(|header| header.row < row);
-                self.headers.subagents.retain(|&(turn, _), _| turn < first);
+                self.headers.spinners.retain(|spinner| *spinner < row);
+                self.headers.subagents.retain(|&(turn, step), _| {
+                    session
+                        .turns
+                        .get(turn)
+                        .and_then(|turn| turn.steps.get(step))
+                        .is_some_and(|step| step.subagent.is_some())
+                });
                 self.turn_ends.truncate(first);
                 for (index, turn) in session.turns.iter().enumerate().skip(first) {
                     push_turn(
@@ -231,11 +239,8 @@ impl TranscriptView {
 
         if self.cache_spinner != spinner_key || stale {
             let glyph = SPINNER[usize::from(spinner_key) % SPINNER.len()];
-            for (row, line) in self.lines.iter_mut().enumerate() {
-                if self.headers.parts.get(row) == Some(&u64::MAX)
-                    && line.spans.len() == 2
-                    && line.spans[1].content == "generating…"
-                {
+            for row in &self.headers.spinners {
+                if let Some(line) = self.lines.get_mut(*row) {
                     line.spans[0].content = format!("{glyph} ").into();
                 }
             }
@@ -336,6 +341,7 @@ fn build_with_headers(
     headers: &mut TranscriptHeaders,
 ) -> Vec<Line<'static>> {
     headers.parts.clear();
+    headers.spinners.clear();
     headers.tools.clear();
     headers.subagents.retain(|&(turn, step), _| {
         session
@@ -423,6 +429,7 @@ fn push_turn(
             .map(|frame| SPINNER[frame as usize % SPINNER.len()])
             .unwrap_or(SPINNER[0]);
         out.push(Line::default());
+        headers.spinners.push(out.len());
         out.push(Line::from(vec![
             Span::styled(format!("{glyph} "), Style::default().fg(theme.accent)),
             Span::styled("generating…", Style::default().fg(theme.muted)),
@@ -1946,6 +1953,24 @@ mod tests {
                 "{lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn child_animation_reuses_layout_and_selection_index() {
+        let mut view = TranscriptView::new();
+        let session = session_with(Turn {
+            steps: vec![subagent_step(false, false)],
+            ..Default::default()
+        });
+        view.lines(&session, area(80, 20), &Theme::dark(), Some(0), &welcome());
+        let document = view.document();
+        let builds = view.layout_builds;
+        let row = view.headers.subagents[&(0, 0)].row;
+        let before = view.lines[row].to_string();
+        view.lines(&session, area(80, 20), &Theme::dark(), Some(1), &welcome());
+        assert_ne!(before, view.lines[row].to_string());
+        assert_eq!(builds, view.layout_builds);
+        assert!(Arc::ptr_eq(&document, &view.document()));
     }
 
     #[test]
