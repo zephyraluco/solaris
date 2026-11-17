@@ -68,6 +68,10 @@ pub enum SessionRecord {
     Event {
         event: AgentEvent,
     },
+    /// Product event with durable session/run identity and sequence.
+    RuntimeEvent {
+        envelope: crate::RuntimeEvent,
+    },
     Cleared,
     ToolIntent {
         call: solaris_types::ToolCall,
@@ -117,6 +121,7 @@ impl SessionStore {
             "CREATE UNIQUE INDEX IF NOT EXISTS request_settlements
             ON records(session_id, json_extract(data,'$.request_id'))
             WHERE json_extract(data,'$.type')='usage';
+            CREATE INDEX IF NOT EXISTS runtime_event_sequences ON records(session_id,json_extract(data,'$.envelope.sequence')) WHERE json_extract(data,'$.type')='runtime_event';
             CREATE TABLE IF NOT EXISTS memory_checkpoints (
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
                 log TEXT NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL,
@@ -325,24 +330,70 @@ impl SessionJournal {
             |row| row.get(0),
         )?)
     }
+    #[cfg(test)]
     pub(crate) fn publish_event(&self, event: &AgentEvent) -> Result<u64, StoreError> {
+        self.publish_runtime_event(None, event, None)
+    }
+    pub(crate) fn publish_runtime_event(
+        &self,
+        task_id: Option<u64>,
+        event: &AgentEvent,
+        prompt: Option<String>,
+    ) -> Result<u64, StoreError> {
         let mut connection = self.store.lock()?;
         let tx = connection.transaction()?;
-        let record = serde_json::to_string(&SessionRecord::Event {
-            event: event.clone(),
-        })?;
-        tx.execute(
-            "INSERT INTO records(session_id,data) VALUES(?1,?2)",
-            params![self.id, record],
-        )?;
         let status = match event {
             AgentEvent::TurnComplete { .. } => Some("idle"),
             AgentEvent::Error(_) => Some("error"),
             _ => None,
         };
-        let sequence=tx.query_row("UPDATE sessions SET event_sequence=event_sequence+1, updated_at=unixepoch(),status=coalesce(?2,status) WHERE id=?1 RETURNING event_sequence",params![self.id,status],|row|row.get(0))?;
+        let sequence=tx.query_row("UPDATE sessions SET event_sequence=event_sequence+1, updated_at=unixepoch(),status=coalesce(?2,status) WHERE id=?1 RETURNING event_sequence",params![self.id,status],|row|row.get::<_,u64>(0))?;
+        let record = SessionRecord::RuntimeEvent {
+            envelope: crate::RuntimeEvent {
+                session_id: self.id.clone(),
+                sequence: Some(sequence),
+                task_id,
+                prompt,
+                event: event.clone(),
+            },
+        };
+        tx.execute(
+            "INSERT INTO records(session_id,data) VALUES(?1,?2)",
+            params![self.id, serde_json::to_string(&record)?],
+        )?;
         tx.commit()?;
         Ok(sequence)
+    }
+    /// Read display records and their event waterline under the same database lock.
+    pub fn history(&self) -> Result<(Vec<SessionRecord>, u64), StoreError> {
+        let mut connection = self.store.lock()?;
+        let tx = connection.transaction()?;
+        let sequence = tx.query_row(
+            "SELECT event_sequence FROM sessions WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        let records = {
+            let mut query =
+                tx.prepare("SELECT data FROM records WHERE session_id=?1 ORDER BY seq")?;
+            query
+                .query_map([&self.id], |row| row.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<Result<Vec<_>, StoreError>>()?
+        };
+        tx.commit()?;
+        Ok((records, sequence))
+    }
+    pub(crate) fn events_after(&self, after: u64) -> Result<Vec<crate::RuntimeEvent>, StoreError> {
+        let connection = self.store.lock()?;
+        let mut query=connection.prepare("SELECT data FROM records WHERE session_id=?1 AND json_extract(data,'$.type')='runtime_event' AND json_extract(data,'$.envelope.sequence')>?2 ORDER BY json_extract(data,'$.envelope.sequence') LIMIT 1024")?;
+        query
+            .query_map(params![self.id, after], |row| row.get::<_, String>(0))?
+            .map(|row| match serde_json::from_str::<SessionRecord>(&row?)? {
+                SessionRecord::RuntimeEvent { envelope } => Ok(envelope),
+                _ => unreachable!(),
+            })
+            .collect()
     }
     pub(crate) fn begin_checkpoint(
         &self,
@@ -400,7 +451,8 @@ impl SessionJournal {
         {
             let mut connection = self.store.lock()?;
             let transaction = connection.transaction()?;
-            transaction.execute("INSERT INTO records(session_id,data) SELECT ?1,data FROM records WHERE session_id=?2 ORDER BY seq", params![child.id, self.id])?;
+            transaction.execute("INSERT INTO records(session_id,data) SELECT ?1,CASE WHEN json_extract(data,'$.type')='runtime_event' THEN json_set(data,'$.envelope.session_id',?1) ELSE data END FROM records WHERE session_id=?2 ORDER BY seq", params![child.id, self.id])?;
+            transaction.execute("UPDATE sessions SET event_sequence=(SELECT event_sequence FROM sessions WHERE id=?2) WHERE id=?1",params![child.id,self.id])?;
             transaction.commit()?;
         }
         // Fork the native conversation, retaining message identity and summary

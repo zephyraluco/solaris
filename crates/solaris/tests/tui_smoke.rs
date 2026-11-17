@@ -467,6 +467,7 @@ fn clipboard_for(paste: Option<&str>) -> (Clipboard, Rc<RefCell<Vec<String>>>) {
     let pasted = paste.map(str::to_string);
 
     let clipboard = Clipboard {
+        background: false,
         write: Rc::new(move |text: &str| {
             log.borrow_mut().push(text.to_string());
             true

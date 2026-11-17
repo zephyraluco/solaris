@@ -2,12 +2,12 @@
 //!
 //! Layer map, mirroring opencode's organization:
 //! - [`app`] — the root component (the app opens straight into the session)
-//! - [`state`] — session, notifications, and dialog messages (the "contexts")
+//! - [`presentation`] — replayable session display state; [`state`] adds local viewport state
 //! - [`dialogs`] — dialogs as components, resolved through one overlay path
 //! - [`connect`] — the inline `/connect` wizard that takes over the prompt area
 //! - [`commands`] / [`keymap`] — the slash-command table with the views over it,
 //!   and the global bindings
-//! - [`transcript`] — turn views rendered into styled lines
+//! - [`ui`] — layouts, dialogs and cached transcript rendering
 //! - [`clipboard`] — the platform clipboard, behind an injectable pair
 //! - [`config`] — the saved preferences
 //! - [`buddy`] / [`tips`] / [`recent`] — the companion, what it says, and what
@@ -18,18 +18,21 @@
 //! and all the app ever learns is the label the backend reports.
 
 pub mod app;
+pub mod application;
 pub mod buddy;
-pub mod clipboard;
+pub mod desktop;
+pub use desktop::clipboard;
 pub mod commands;
 pub mod config;
 pub mod connect;
-pub mod dialogs;
+pub mod ui;
+pub use ui::{dialogs, transcript};
 pub mod keymap;
 pub mod model;
+pub mod presentation;
 pub mod recent;
 pub mod state;
 pub mod tips;
-pub mod transcript;
 
 // `Inline` is an implementation detail of `App`, so it stays off the crate's
 // surface.

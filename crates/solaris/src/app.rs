@@ -24,9 +24,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_agent::{
-    Agent, AgentEvent, AgentOptions, AlwaysApprove, Approval, ApprovalRequest, Approver, Cancel,
-    ChannelApprover, Mode, ModelConnector, PromptContext, ResourcePaths, Skills, ToolCall,
-    ToolRegistry, ToolSelection,
+    AgentEvent, AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, Mode,
+    ModelConnector, PromptContext, ResourcePaths, Skills, ToolCall, ToolRegistry, ToolSelection,
 };
 use solaris_provider::{
     AuthKind, AuthStore, BackendChoice, Credential, CredentialSource, DEFAULT_CONTEXT_WINDOW,
@@ -61,8 +60,16 @@ use crate::inline::{Inline, InlineOutcome};
 use crate::keymap;
 use crate::model::{ModelOutcome, ModelPicker};
 use crate::recent::{self, RecentActivity};
-use crate::state::{NoticeKind, NotificationQueue, SessionState, ToolStep, Turn};
+#[cfg(test)]
+use crate::state::ToolStep;
+use crate::state::{NoticeKind, NotificationQueue, SessionState, Turn};
 use crate::transcript::{SPINNER, TranscriptView};
+#[cfg(test)]
+use solaris_agent::{Agent, AgentOptions};
+
+#[path = "ui/session.rs"]
+mod session_view;
+use session_view::SubagentTerminal;
 
 /// Program name shown in the welcome box title.
 const APP_NAME: &str = "solaris";
@@ -79,7 +86,7 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 /// A closure rather than a fixed backend, because `/connect` and `/model` both
 /// change the answer mid-session — and because it is the seam that lets the app
 /// stay ignorant of which provider, if any, is behind it.
-pub type BackendFactory = Arc<dyn Fn(&AuthStore, &str) -> BackendChoice + Send + Sync>;
+pub use crate::application::connection::BackendFactory;
 
 /// Everything [`App::new`] needs to start.
 pub struct AppOptions {
@@ -200,91 +207,17 @@ impl AppOptions {
     }
 }
 
-/// Resolve the backend for the current credentials, adopting the model that
-/// will really be asked for.
-///
-/// Adopting matters as soon as a provider is connected: with no model named
-/// yet, the resolution layer asks for the first model that provider offers, and
-/// the app takes that on so the footer and `/stats` report what is really being
-/// asked for. The context window follows the model, because the footer gauge is
-/// only honest if it measures against the window the model really has.
-/// The backend the current credentials call for, and why it was chosen.
-fn resolve_backend(
-    factory: &BackendFactory,
-    auth: &AuthStore,
-    config: &mut Config,
-) -> BackendChoice {
-    let choice = factory(auth, &config.model);
-    if choice.provider_id.is_some() {
-        config.model = choice.model.clone();
-    }
-    config.context_window = u64::from(
-        choice
-            .backend
-            .capabilities()
-            .context_window
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
-    );
-    choice
-}
-
-/// Wrap a resolved backend in the agent session.
-///
-/// Every backend goes through it — including the one that refuses turns when
-/// nothing is connected — because the session is transparent until the model
-/// asks for a tool: with none declared it is exactly one model call, forwarded
-/// unchanged. The returned handle stops whichever turn the session is running.
-#[expect(clippy::too_many_arguments, reason = "application assembly boundary")]
-fn with_tools(
-    choice: BackendChoice,
-    registry: Arc<ToolRegistry>,
-    selection: &ToolSelection,
-    skills: &Skills,
-    prompt_context: &PromptContext,
-    cwd: &Path,
-    approver: Arc<dyn Approver>,
-    execution: &solaris_agent::ExecutionSettings,
-    factory: &BackendFactory,
-    auth: &AuthStore,
-    runtime: &solaris_agent::Runtime,
-) -> (Arc<solaris_agent::SessionRuntime>, Cancel) {
-    let mut options = AgentOptions::in_directory(cwd)
-        .with_selection(selection.clone())
-        .with_approver(approver);
-    options.execution = execution.clone();
-    let factory = Arc::clone(factory);
-    let auth = auth.clone();
-    let child_factory: solaris_agent::ChildBackendFactory =
-        Arc::new(move |model| Ok(crate::agent_backend(factory(&auth, model))));
-    let agent = Arc::new(
-        runtime
-            .open(
-                Agent::new(crate::agent_backend(choice), registry, options)
-                    .with_resources(solaris_agent::ResourceSnapshot {
-                        skills: skills.clone(),
-                        prompt: prompt_context.clone(),
-                        warnings: Vec::new(),
-                    })
-                    .with_child_backend(child_factory),
-            )
-            .expect("new unpersisted session can be registered"),
-    );
-    let cancel = agent.cancel_handle();
-    (agent, cancel)
-}
+use crate::assembly::{resolve_backend, with_tools};
 
 /// The solaris application root component.
 pub struct App {
+    connection: crate::application::connection::ConnectionController,
+    resources: crate::application::resources::ResourceController,
+    sessions: crate::application::session::SessionController,
+    io: crate::desktop::DesktopIo,
+    input_generation: u64,
     /// The session every turn goes through, and the backend behind it.
-    pub(crate) agent: Arc<solaris_agent::SessionRuntime>,
-    runtime: Arc<solaris_agent::Runtime>,
-    runtime_events: tokio::sync::broadcast::Receiver<solaris_agent::RuntimeEvent>,
-    model_source: Arc<dyn solaris_provider::ModelSource>,
-    runtime_errors: UnboundedReceiver<String>,
-    runtime_pending: Arc<std::sync::atomic::AtomicUsize>,
-    runtime_error_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Resolves the backend again whenever the credentials or model change.
-    backend_factory: BackendFactory,
     pub(crate) config: Config,
     pub(crate) theme: Theme,
     pub(crate) session: SessionState,
@@ -303,16 +236,12 @@ pub struct App {
     clipboard: Clipboard,
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
-    events_rx: Option<UnboundedReceiver<AgentEvent>>,
     spinner_frame: u16,
     last_transcript: Rect,
     /// Shared disclosure interaction; targets identify transcript records.
     collapsible_mouse: CollapsibleInteraction<(usize, usize, bool)>,
     /// Credentials collected by `/connect`.
-    pub(crate) auth: AuthStore,
-    auth_base: AuthStore,
     /// Where credentials are saved after a change.
-    auth_path: Option<PathBuf>,
     /// The companion shown in the welcome box and by `/buddy`.
     pub(crate) buddy: Companion,
     /// Where the companion's name is saved once it has one.
@@ -338,23 +267,13 @@ pub struct App {
     /// Models the active provider reported, once it has reported any. Empty
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
-    discovered: Vec<String>,
-    provider_config: Arc<solaris_provider::ProviderConfig>,
     /// Answer from the background model-discovery task, while one is in flight.
-    models_rx: Option<UnboundedReceiver<Result<Vec<String>, String>>>,
-    models_error: Option<String>,
-    oauth: Option<OAuthPending>,
     /// Answer from a `/compact` that is in flight.
     compact_rx: Option<UnboundedReceiver<Option<usize>>>,
-    resource_rx: Option<UnboundedReceiver<std::io::Result<solaris_agent::ResourceSnapshot>>>,
     /// Whether asking the provider for its models is allowed at all.
-    discover_models: bool,
     /// Which tools a turn declares, on top of what the mode offers by default.
     tools: ToolSelection,
     /// The skills this session may draw on, found before the app was built.
-    skills: Skills,
-    resource_paths: Option<ResourcePaths>,
-    reload_pending: bool,
     /// Every built-in tool this platform has.
     ///
     /// Built once, so `edit` and `write` keep serialising against the same
@@ -366,24 +285,11 @@ pub struct App {
     approver: Arc<dyn Approver>,
     execution: solaris_agent::ExecutionSettings,
     /// Stops the turn in flight, tools included.
-    tool_cancel: Cancel,
     /// Calls waiting for the user's answer; `None` when the session approves
     /// everything without asking.
     approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
     /// Answers the loop is still waiting for, oldest first.
     pending_approvals: VecDeque<oneshot::Sender<Approval>>,
-}
-
-struct OAuthPending {
-    url_rx: Option<UnboundedReceiver<String>>,
-    rx: oneshot::Receiver<Result<Credential, String>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for OAuthPending {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 impl App {
@@ -443,7 +349,7 @@ impl App {
         let choice = resolve_backend(&backend_factory, &auth, &mut config);
         let provider_config = Arc::clone(&choice.configuration);
         let model_source = Arc::clone(&choice.models);
-        let (agent, tool_cancel) = with_tools(
+        let agent = with_tools(
             choice,
             Arc::clone(&registry),
             &tools,
@@ -455,7 +361,8 @@ impl App {
             &backend_factory,
             &auth,
             &runtime,
-        );
+        )
+        .expect("fresh application runtime can register its first session");
 
         if let Some(journal) = &journal {
             // Attach errors are retained by the agent and prevent tool execution.
@@ -471,20 +378,24 @@ impl App {
         editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
 
-        let (runtime_error_tx, runtime_errors) = unbounded_channel();
-        let runtime_events = agent.subscribe();
-        let _ = agent.activate();
-        let auth_base = auth.clone();
-        let mut app = Self {
-            auth_base,
-            runtime,
-            runtime_events,
-            agent,
-            model_source,
-            runtime_errors,
-            runtime_pending: Default::default(),
-            runtime_error_tx,
+        let sessions = crate::application::session::SessionController::new(agent, runtime);
+        let _ = sessions.agent.activate();
+        let connection = crate::application::connection::ConnectionController::new(
             backend_factory,
+            auth,
+            auth_path,
+            model_source,
+            provider_config,
+            discover_models,
+        );
+        let resources =
+            crate::application::resources::ResourceController::new(skills, resource_paths);
+        let mut app = Self {
+            connection,
+            resources,
+            sessions,
+            io: Default::default(),
+            input_generation: 0,
             config,
             theme,
             session: SessionState::new(),
@@ -500,12 +411,9 @@ impl App {
             clipboard,
             dialog_tx,
             dialog_rx,
-            events_rx: None,
             spinner_frame: 0,
             last_transcript: Rect::default(),
             collapsible_mouse: CollapsibleInteraction::default(),
-            auth,
-            auth_path,
             buddy,
             buddy_path,
             version,
@@ -519,75 +427,60 @@ impl App {
             buddy_started: Instant::now(),
             quit_press: None,
             inline: None,
-            discovered: Vec::new(),
-            provider_config,
-            models_rx: None,
-            models_error: None,
-            oauth: None,
             compact_rx: None,
-            resource_rx: None,
-            discover_models,
             tools,
-            skills,
-            resource_paths,
-            reload_pending: false,
             registry,
             cwd,
             approver,
             execution,
-            tool_cancel,
             approval_rx,
             pending_approvals: VecDeque::new(),
         };
 
         if let Some(journal) = journal {
-            match journal.store().records(journal.id()) {
-                Ok(records) => app.restore_records(records),
-                Err(error) => app.notifications.error(error.to_string()),
-            }
+            app.sessions.navigation.history(journal);
         }
         app.refresh_models();
         app
     }
 
     fn restore_records(&mut self, records: Vec<solaris_agent::SessionRecord>) {
+        let id = self.sessions.agent.snapshot().session_id;
+        let (projection, effects) =
+            crate::presentation::session::SessionProjection::restore(id, records);
         self.session = SessionState::new();
-        for record in records {
-            match record {
-                solaris_agent::SessionRecord::Prompt { text } => self.session.turns.push(Turn {
-                    prompt: text,
-                    ..Default::default()
-                }),
-                solaris_agent::SessionRecord::Event { event } => self.apply_event(event),
-                solaris_agent::SessionRecord::Interrupted => self.apply_event(AgentEvent::Error(
-                    "session interrupted; verify unfinished tool outcomes before retrying".into(),
-                )),
-                solaris_agent::SessionRecord::Cleared => {
-                    self.session.context = Default::default();
-                    self.session.turns.clear();
-                }
-                _ => {}
-            }
-        }
-        self.session.bump();
+        self.session.projection = projection;
+        self.apply_effects(effects);
         self.transcript.invalidate();
     }
 
+    fn recover_projection(&mut self) {
+        if let Some(journal) = self.sessions.agent.journal() {
+            self.sessions.navigation.history(journal);
+        } else {
+            self.notifications.error(
+                "temporary session history expired; cancel active work and use /clear to restart",
+            );
+        }
+    }
+
     fn open_sessions(&mut self, tree: bool) {
-        let Some(journal) = self.agent.journal() else {
+        let Some(journal) = self.sessions.agent.journal() else {
             self.notifications
                 .warning("session navigation is unavailable in ephemeral mode");
             return;
         };
-        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        let sessions = match journal.store().list(&cwd) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                return;
-            }
-        };
-        let current = journal.id();
+        self.sessions
+            .navigation
+            .list(journal, self.cwd.clone(), tree);
+    }
+
+    fn show_sessions(
+        &mut self,
+        sessions: Vec<solaris_agent::SessionInfo>,
+        current: String,
+        tree: bool,
+    ) {
         let items = sessions
             .into_iter()
             .map(|session| {
@@ -636,11 +529,12 @@ impl App {
     }
 
     fn switch_session(&mut self, id: &str, fork: bool) {
-        if self.events_rx.is_some()
+        if self.sessions.busy()
             || self.compact_rx.is_some()
-            || self.resource_rx.is_some()
-            || self.oauth.is_some()
+            || self.resources.resource_rx.is_some()
+            || self.connection.oauth.is_some()
             || self
+                .sessions
                 .runtime_pending
                 .load(std::sync::atomic::Ordering::Acquire)
                 > 0
@@ -649,7 +543,7 @@ impl App {
                 .warning("finish or cancel the active operation before changing sessions");
             return;
         }
-        let Some(current) = self.agent.journal() else {
+        let Some(current) = self.sessions.agent.journal() else {
             self.notifications
                 .warning("resume requires a saved session");
             return;
@@ -658,97 +552,78 @@ impl App {
             self.notifications.info("this session is already open");
             return;
         }
-        let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        let info = match current.store().list(&cwd) {
-            Ok(sessions) => sessions.into_iter().find(|session| session.id == id),
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                return;
+        self.sessions
+            .navigation
+            .open(crate::application::navigation::OpenSession {
+                current,
+                id: id.to_owned(),
+                fork,
+                cwd: self.cwd.clone(),
+                runtime: self.sessions.runtime.clone(),
+                config: self.config.clone(),
+                auth: self.connection.auth.clone(),
+                factory: self.connection.backend_factory.clone(),
+                registry: self.registry.clone(),
+                tools: self.tools.clone(),
+                skills: self.resources.skills.clone(),
+                prompt: self.sessions.agent.prompt_context(),
+                approver: self.approver.clone(),
+                execution: self.execution.clone(),
+            });
+    }
+
+    fn poll_navigation(&mut self) -> bool {
+        use crate::application::navigation::NavigationResult;
+        let Some(result) = self.sessions.navigation.poll() else {
+            return false;
+        };
+        match result {
+            Err(error) => self.notifications.error(error),
+            Ok(NavigationResult::List {
+                items,
+                current,
+                tree,
+            }) => self.show_sessions(items, current, tree),
+            Ok(NavigationResult::History { records, sequence }) => {
+                self.restore_records(records);
+                self.session.sequence = sequence;
+                self.sessions.runtime_events =
+                    crate::application::session::SessionFeed::new(&self.sessions.agent, sequence);
             }
-        };
-        let Some(info) = info else {
-            self.notifications
-                .error("session not found in this directory");
-            return;
-        };
-        let loaded = if fork { None } else { self.runtime.session(id) };
-        let journal = if fork {
-            current.fork(&cwd, &self.config.model)
-        } else if let Some(journal) = loaded.as_ref().and_then(|session| session.journal()) {
-            Ok(journal)
-        } else {
-            current.store().resume(id)
-        };
-        let journal = match journal {
-            Ok(journal) => journal,
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                return;
-            }
-        };
-        let records = match journal.store().records(journal.id()) {
-            Ok(records) => records,
-            Err(error) => {
-                self.notifications.error(error.to_string());
-                return;
-            }
-        };
-        let mut config = self.config.clone();
-        let mut auth = self.auth.clone();
-        if !fork {
-            config.model = info.model;
-            if let Some(provider) = info.provider {
-                auth.activate(provider);
-            }
-        }
-        let choice = resolve_backend(&self.backend_factory, &auth, &mut config);
-        self.provider_config = Arc::clone(&choice.configuration);
-        self.model_source = Arc::clone(&choice.models);
-        let (agent, cancel) = if let Some(session) = loaded {
-            let cancel = session.cancel_handle();
-            (Arc::new(session), cancel)
-        } else {
-            with_tools(
+            Ok(NavigationResult::Open {
+                session,
+                records,
+                sequence,
+                config,
+                auth,
                 choice,
-                Arc::clone(&self.registry),
-                &self.tools,
-                &self.skills,
-                &self.agent.prompt_context(),
-                &cwd,
-                Arc::clone(&self.approver),
-                &self.execution,
-                &self.backend_factory,
-                &auth,
-                &self.runtime,
-            )
-        };
-        if agent.journal().is_none()
-            && let Err(error) = agent.attach_journal(Arc::clone(&journal))
-        {
-            self.notifications.error(error.to_string());
-            return;
+                fork,
+            }) => {
+                self.connection.provider_config = choice.configuration;
+                self.connection.model_source = choice.models;
+                self.sessions.bind(session.clone(), sequence);
+                let _ = session.activate();
+                self.config = config;
+                self.connection.auth = auth;
+                self.subagent_terminal = None;
+                self.selection.borrow_mut().clear();
+                self.notifications.clear();
+                self.restore_records(records);
+                self.session.sequence = sequence;
+                self.refresh_models();
+                self.notifications.info(format!(
+                    "{} session {}",
+                    if fork { "forked" } else { "resumed" },
+                    session.snapshot().session_id
+                ));
+            }
         }
-        self.runtime_events = agent.subscribe();
-        let _ = agent.activate();
-        self.agent = agent;
-        self.tool_cancel = cancel;
-        self.config = config;
-        self.auth = auth;
-        self.subagent_terminal = None;
-        self.selection.borrow_mut().clear();
-        self.notifications.clear();
-        self.restore_records(records);
-        self.refresh_models();
-        self.notifications.info(format!(
-            "{} session {}",
-            if fork { "forked" } else { "resumed" },
-            journal.id()
-        ));
+        true
     }
 
     /// The active provider, once one has been connected.
     pub fn active_provider(&self) -> Option<&str> {
-        self.auth.active_provider()
+        self.connection.auth.active_provider()
     }
 
     /// Whether the `/connect` wizard is on screen.
@@ -778,12 +653,12 @@ impl App {
 
     /// The skills this session may draw on.
     pub fn skills(&self) -> &Skills {
-        &self.skills
+        &self.resources.skills
     }
 
     /// The label of the backend answering turns right now.
     pub fn backend_label(&self) -> String {
-        self.agent.snapshot().label
+        self.sessions.agent.snapshot().label
     }
 
     /// Provider the current session was resolved to, when one was.
@@ -791,7 +666,7 @@ impl App {
     /// The model picker lists this provider's models, so it needs the id rather
     /// than the backend's display label.
     fn provider_id(&self) -> Option<String> {
-        self.agent.snapshot().provider_id
+        self.sessions.agent.snapshot().provider_id
     }
 
     /// Resolve the backend again after the credentials or the model changed.
@@ -799,8 +674,12 @@ impl App {
     /// Returns where the credential came from, so a caller can explain a choice
     /// that did not land where the user pointed.
     fn rebuild_backend(&mut self) -> CredentialSource {
-        let choice = resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
-        self.provider_config = Arc::clone(&choice.configuration);
+        let choice = resolve_backend(
+            &self.connection.backend_factory,
+            &self.connection.auth,
+            &mut self.config,
+        );
+        self.connection.provider_config = Arc::clone(&choice.configuration);
         let source = choice.source;
         self.refresh_transport(choice);
         source
@@ -886,6 +765,72 @@ impl App {
         self.session.follow_end = false;
     }
 
+    fn poll_io(&mut self, wait: bool) -> bool {
+        use crate::desktop::Completion;
+        let events = self.io.drain(wait);
+        let dirty = !events.is_empty();
+        for event in events {
+            match event {
+                Completion::Saved {
+                    label,
+                    result: Err(error),
+                } => self
+                    .notifications
+                    .warning(format!("could not save {label}: {error}")),
+                Completion::Saved { .. } => {}
+                Completion::Auth { submitted, result } => match result {
+                    Ok(saved) if self.connection.auth == submitted => {
+                        self.connection.auth_base = saved.clone();
+                        self.connection.auth = saved;
+                    }
+                    Ok(_) => {}
+                    Err(error) => self
+                        .notifications
+                        .warning(format!("could not save credentials: {error}")),
+                },
+                Completion::Copied {
+                    success,
+                    failure,
+                    ok,
+                } => {
+                    if ok {
+                        self.notifications.info(success)
+                    } else {
+                        self.notifications.warning(failure)
+                    }
+                }
+                Completion::Pasted { generation, text } => {
+                    if generation != self.input_generation {
+                        self.notifications
+                            .warning("paste destination changed; paste again");
+                    } else if let Some(text) = text {
+                        self.insert_pasted(&text);
+                    } else {
+                        self.notifications.warning("clipboard is empty");
+                    }
+                }
+            }
+        }
+        dirty
+    }
+
+    fn copy_text(&mut self, text: &str, success: String, failure: &str) {
+        if self.clipboard.background {
+            let text = text.to_owned();
+            let failure = failure.to_owned();
+            self.io
+                .submit_clipboard(move || crate::desktop::Completion::Copied {
+                    ok: crate::clipboard::system_write(&text),
+                    success,
+                    failure,
+                });
+        } else if (self.clipboard.write)(text) {
+            self.notifications.info(success);
+        } else {
+            self.notifications.warning(failure);
+        }
+    }
+
     /// Copy the current selection to the system clipboard, saying so either way.
     fn copy_selection(&mut self, text: &str) {
         let characters = text.chars().count();
@@ -893,16 +838,12 @@ impl App {
             return;
         }
 
-        if (self.clipboard.write)(text) {
-            // One cell is an ordinary case now, so the count has to read
-            // correctly for it too.
-            let plural = if characters == 1 { "" } else { "s" };
-            self.notifications
-                .info(format!("copied {characters} character{plural}"));
-        } else {
-            self.notifications
-                .warning("could not reach the system clipboard");
-        }
+        let plural = if characters == 1 { "" } else { "s" };
+        self.copy_text(
+            text,
+            format!("copied {characters} character{plural}"),
+            "could not reach the system clipboard",
+        );
     }
 
     /// Put the clipboard into whatever is taking text, saying so when there is
@@ -911,6 +852,15 @@ impl App {
     /// claurst reads the clipboard on the same key and warns about an empty
     /// one.
     fn paste_from_clipboard(&mut self) {
+        if self.clipboard.background {
+            let generation = self.input_generation;
+            self.io
+                .submit_clipboard(move || crate::desktop::Completion::Pasted {
+                    generation,
+                    text: crate::clipboard::system_read(),
+                });
+            return;
+        }
         match (self.clipboard.read)() {
             Some(text) if !text.is_empty() => self.insert_pasted(&text),
             _ => self.notifications.warning("clipboard is empty"),
@@ -998,11 +948,9 @@ impl App {
     /// send fails. Claude Code answers an interrupt by sending anything queued
     /// next, so the queue keeps running in order instead of stalling.
     fn cancel_turn(&mut self) {
-        // Stop the tool the loop is running as well. Dropping the receiver only
-        // ends the stream the UI draws from; a command already in flight would
-        // otherwise keep running for a model that is no longer listening.
-        self.tool_cancel.cancel();
-        self.events_rx = None;
+        // Cancellation is an execution command, independent of view subscriptions.
+        self.sessions
+            .dispatch(solaris_agent::RuntimeCommand::Cancel);
         if let Some(turn) = self.session.active_turn_mut() {
             turn.complete = true;
             self.session.status = None;
@@ -1045,9 +993,9 @@ impl App {
         // A model belongs to the provider that offers it, so it is remembered
         // beside that provider rather than in the settings file.
         if let Some(provider) = self.provider_id() {
-            self.auth.activate(&provider);
+            self.connection.auth.activate(&provider);
         }
-        self.auth.remember_model(name);
+        self.connection.auth.remember_model(name);
         self.persist_auth();
         // The model decides the payload, the price and the size of the context
         // window, so the backend is resolved again.
@@ -1060,6 +1008,7 @@ impl App {
         let expand = !self.session.turns.iter().any(|turn| turn.thinking_expanded);
         for turn in &mut self.session.turns {
             turn.thinking_expanded = expand;
+            turn.layout_revision = turn.layout_revision.wrapping_add(1);
         }
         self.session.bump();
     }
@@ -1107,27 +1056,11 @@ impl App {
     /// message that arrives just too late to be read by this turn is recorded
     /// against the turn that does read it rather than the one it was typed into.
     fn runtime_command(&self, command: solaris_agent::RuntimeCommand) {
-        let submitted = match self.agent.submit(command) {
-            Ok(submitted) => submitted,
-            Err(error) => {
-                let _ = self.runtime_error_tx.send(error);
-                return;
-            }
-        };
-        let errors = self.runtime_error_tx.clone();
-        let pending = Arc::clone(&self.runtime_pending);
-        pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        tokio::spawn(async move {
-            let result = submitted.accepted().await;
-            if let Err(error) = result {
-                let _ = errors.send(error);
-            }
-            pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        });
+        self.sessions.dispatch(command);
     }
 
     fn steer(&mut self, text: String) {
-        match self.agent.expand_input(&text) {
+        match self.sessions.agent.expand_input(&text) {
             Ok(prepared) if !prepared.trim().is_empty() => self
                 .runtime_command(solaris_agent::RuntimeCommand::PreparedSteer { text: prepared }),
             Ok(_) => return,
@@ -1190,7 +1123,7 @@ impl App {
                 }
             }
             "fork" => {
-                if let Some(journal) = self.agent.journal() {
+                if let Some(journal) = self.sessions.agent.journal() {
                     self.switch_session(journal.id(), true);
                 } else {
                     self.notifications.warning("fork requires a saved session");
@@ -1205,10 +1138,11 @@ impl App {
             "stats" => self.open_stats(),
             "subagents" => self.notifications.info(format!(
                 "Active tasks: {}",
-                self.agent.snapshot().active_tasks.join(", ")
+                self.sessions.agent.snapshot().active_tasks.join(", ")
             )),
             "stop" => {
                 if self
+                    .sessions
                     .agent
                     .snapshot()
                     .active_tasks
@@ -1268,7 +1202,7 @@ impl App {
             self.start_turn(prompt.clone(), prompt);
             return;
         }
-        match self.agent.expand_input(text) {
+        match self.sessions.agent.expand_input(text) {
             Ok(prepared) if !prepared.trim().is_empty() => {
                 self.runtime_command(solaris_agent::RuntimeCommand::PreparedQueue {
                     text: prepared,
@@ -1284,44 +1218,42 @@ impl App {
     }
 
     fn reload_resources(&mut self) {
-        if self.resource_paths.is_none() {
-            self.notifications
-                .warning("no resource locations configured for this session");
-            return;
+        match self
+            .resources
+            .reload(self.sessions.busy() || self.compact_rx.is_some())
+        {
+            crate::application::resources::Reload::Unavailable => self
+                .notifications
+                .warning("no resource locations configured for this session"),
+            crate::application::resources::Reload::Queued => self
+                .notifications
+                .info("resources will reload when the active turn finishes"),
+            crate::application::resources::Reload::Started => {}
         }
-        if self.events_rx.is_some() || self.compact_rx.is_some() || self.resource_rx.is_some() {
-            self.reload_pending = true;
-            self.notifications
-                .info("resources will reload when the active turn finishes".to_string());
-            return;
-        }
-        self.reload_pending = false;
-        let Some(paths) = self.resource_paths.clone() else {
-            return;
-        };
-        let (tx, rx) = unbounded_channel();
-        self.resource_rx = Some(rx);
-        tokio::task::spawn_blocking(move || {
-            let _ = tx.send(paths.load());
-        });
     }
 
     fn publish_resources(&mut self, result: std::io::Result<solaris_agent::ResourceSnapshot>) {
+        match result {
+            Ok(snapshot) => self
+                .resources
+                .publish(self.sessions.agent.clone(), snapshot),
+            Err(error) => self.adopt_resources(Err(error)),
+        }
+    }
+    fn adopt_resources(&mut self, result: std::io::Result<solaris_agent::ResourceSnapshot>) {
         match result {
             Ok(snapshot) => {
                 let warnings = snapshot.warnings.iter().chain(snapshot.skills.warnings());
                 let diagnostics = warnings
                     .map(|warning| format!("{} — {}", warning.path.display(), warning.message))
                     .collect::<Vec<_>>();
-                self.skills = snapshot.skills.clone();
-                self.editor.set_hints(commands::hints(&self.skills));
-                self.runtime_command(solaris_agent::RuntimeCommand::ReplaceResources {
-                    resources: snapshot,
-                });
+                self.resources.skills = snapshot.skills.clone();
+                self.editor
+                    .set_hints(commands::hints(&self.resources.skills));
                 if diagnostics.is_empty() {
                     self.notifications.info(format!(
                         "reloaded {} skills and prompt instructions",
-                        self.skills.len()
+                        self.resources.skills.len()
                     ));
                 } else {
                     self.notifications.warning(format!(
@@ -1345,13 +1277,13 @@ impl App {
             self.notifications.info("already compacting".to_string());
             return;
         }
-        let agent = Arc::clone(&self.agent);
+        let agent = Arc::clone(&self.sessions.agent);
         let (tx, rx) = unbounded_channel();
         self.compact_rx = Some(rx);
         self.notifications.clear();
         self.notifications.info("compacting…".to_string());
 
-        let errors = self.runtime_error_tx.clone();
+        let errors = self.sessions.runtime_error_tx.clone();
         tokio::spawn(async move {
             let mut dropped = None;
             match agent.execute(solaris_agent::RuntimeCommand::Compact).await {
@@ -1372,11 +1304,11 @@ impl App {
 
     /// Report what the manual compaction did.
     fn on_compacted(&mut self, dropped: Option<usize>) {
-        self.session.context = self.agent.snapshot().context(self.config.mode);
+        self.session.context = self.sessions.agent.snapshot().context(self.config.mode);
         match dropped {
             Some(dropped) => self.notifications.info(format!(
                 "summarized {dropped} messages; {} left in context",
-                self.agent.conversation_len()
+                self.sessions.agent.conversation_len()
             )),
             None => self
                 .notifications
@@ -1385,13 +1317,26 @@ impl App {
     }
 
     fn start_turn(&mut self, submitted: String, prompt: String) {
-        if self.oauth.is_some() {
+        if self.sessions.runtime_events.is_failed() {
+            self.editor.set_text(&submitted);
+            self.notifications
+                .error("cancel active work and use /clear to restart the event subscription");
+            return;
+        }
+        if self.sessions.navigation.is_pending() || self.sessions.agent.snapshot().task_id.is_some()
+        {
+            self.editor.set_text(&submitted);
+            self.notifications
+                .info("wait for the current session operation to finish");
+            return;
+        }
+        if self.connection.oauth.is_some() {
             self.notifications.warning(
                 "OpenAI authorization is in progress; wait before submitting another prompt",
             );
             return;
         }
-        let prompt = match self.agent.expand_input(&prompt) {
+        let prompt = match self.sessions.agent.expand_input(&prompt) {
             Ok(prompt) => prompt,
             Err(error) => {
                 self.notifications.error(error.to_string());
@@ -1408,227 +1353,38 @@ impl App {
         self.session.bump();
         self.spinner_frame = 0;
 
-        let (tx, rx) = unbounded_channel();
-        self.events_rx = Some(rx);
-
-        let agent = Arc::clone(&self.agent);
-        let mode = self.config.mode;
-        let submitted = agent.submit(solaris_agent::RuntimeCommand::Prompt { text: prompt, mode });
-        tokio::spawn(async move {
-            use futures::StreamExt;
-            let mut stream = match match submitted {
-                Ok(receipt) => receipt.accepted().await,
-                Err(error) => Err(error),
-            } {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let _ = tx.send(AgentEvent::Error(error));
-                    return;
-                }
-            };
-            while let Some(event) = stream.next().await {
-                let _ = event;
-                if tx.is_closed() {
-                    break;
-                }
-            }
-        });
+        self.sessions.dispatch_prompt(
+            solaris_agent::RuntimeCommand::Prompt {
+                text: prompt,
+                mode: self.config.mode,
+            },
+            self.session.turns.len() - 1,
+        );
     }
 
-    fn apply_event(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::ContextUsageUpdated { context } => self.session.context = context,
-            AgentEvent::ThinkingDelta(chunk) => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.push_thinking(&chunk);
-                }
-            }
-            AgentEvent::TextDelta(chunk) => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.push_text(&chunk);
-                }
-            }
-            AgentEvent::Status(text) => self.session.status = Some(text),
-            AgentEvent::ToolCall(call) => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.push_tool(call);
-                }
-            }
-            AgentEvent::ToolResult {
-                result,
-                duration_ms,
-            } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    // The newest call with this id that has not been answered
-                    // yet, since a model may call the same tool twice.
-                    let step = turn
-                        .steps
-                        .iter_mut()
-                        .rev()
-                        .find(|step| step.call.id == result.id && !step.is_done());
-                    if let Some(step) = step {
-                        step.finish(result, duration_ms);
-                    }
-                }
-            }
-            AgentEvent::SubagentUsage { usage, cost_usd } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.subagent_tokens = turn.subagent_tokens.saturating_add(usage.total());
-                    // Preserve already consumed child usage even if the parent
-                    // fails. A successful TurnComplete replaces this with totals.
-                    turn.usage = turn.usage.merge(usage);
-                    turn.cost_usd += cost_usd;
-                }
-            }
-            AgentEvent::SubagentSession {
-                task_id,
-                session_id,
-            } => {
-                if let Some(turn) = self.session.active_turn_mut()
-                    && let Some(step) = turn.subagent_mut(&task_id)
-                    && let Some(child) = &mut step.subagent
-                {
-                    child.session_id = Some(session_id);
-                }
-            }
-            AgentEvent::SubagentStarted { call_id, task_id } => {
-                if let Some(turn) = self.session.active_turn_mut()
-                    && let Some(child) = turn
-                        .steps
-                        .iter_mut()
-                        .rev()
-                        .find(|step| step.call.id == call_id)
-                        .and_then(|step| step.subagent.as_mut())
-                {
-                    child.task_id = Some(task_id);
-                }
-            }
-            AgentEvent::SubagentToolCall { task_id, call } => {
-                if let Some(child) = self
-                    .session
-                    .turns
-                    .iter_mut()
-                    .rev()
-                    .find_map(|turn| turn.subagent_mut(&task_id))
-                    .and_then(|step| step.subagent.as_mut())
-                {
-                    child.steps.push(ToolStep::pending(call));
-                }
-            }
-            AgentEvent::SubagentToolResult {
-                task_id,
-                result,
-                duration_ms,
-            } => {
-                if let Some(child) = self
-                    .session
-                    .turns
-                    .iter_mut()
-                    .rev()
-                    .find_map(|turn| turn.subagent_mut(&task_id))
-                    .and_then(|step| step.subagent.as_mut())
-                    && let Some(step) = child
-                        .steps
-                        .iter_mut()
-                        .rev()
-                        .find(|step| step.call.id == result.id && !step.is_done())
-                {
-                    step.finish(result, duration_ms);
-                }
-            }
-            AgentEvent::SubagentComplete {
-                task_id,
-                output,
-                is_error,
-                duration_ms,
-            } => {
-                let status = if is_error { "failed" } else { "complete" };
-                let notice = format!("background subagent {task_id}: {status}");
-                if is_error {
-                    self.notifications.warning(notice);
-                } else {
-                    self.notifications.info(notice);
-                }
-                if let Some(step) = self
-                    .session
-                    .turns
-                    .iter_mut()
-                    .rev()
-                    .find_map(|turn| turn.subagent_mut(&task_id))
-                {
-                    let result = if is_error {
-                        solaris_agent::ToolResult::error(&step.call, output)
-                    } else {
-                        solaris_agent::ToolResult::ok(&step.call, output)
-                    };
-                    if let Some(child) = &mut step.subagent {
-                        child.finish(result, duration_ms);
-                    }
-                }
-            }
-            AgentEvent::TurnComplete { usage, cost_usd } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.complete = true;
-                    turn.usage = usage;
-                    turn.cost_usd = cost_usd;
-                }
-                self.session.status = None;
-            }
-            // The model ran out of room, so anything it asked for in the same
-            // message was refused. Saying so explains why the next thing it does
-            // may look like a repetition.
-            AgentEvent::OutputTruncated => {
-                self.notifications
-                    .warning("the reply hit the output limit; its tool calls were refused");
-            }
-            // The conversation was summarized to make room. It is worth a
-            // banner because the model suddenly remembers less, and worth a line
-            // in the transcript because a session that forgot things should say
-            // so where it can be read back later.
-            AgentEvent::Compacted { dropped } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.compacted += dropped;
-                }
-                self.notifications.warning(format!(
-                    "summarized {dropped} earlier messages to make room in the context window"
-                ));
-            }
-            // A message the user steered in has been read. Recorded here rather
-            // than when it was typed, so it lands in the turn that read it.
-            AgentEvent::Steered { text } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.push_steering(text);
-                }
-            }
-            // A queued prompt is now being run as a turn of its own. The turn it
-            // arrived during is over, so it is closed and a new one opened with
-            // this prompt: everything that streams from here belongs to it.
-            AgentEvent::FollowUp { prompt } => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.complete = true;
-                    if turn.reply.is_empty() {
-                        turn.push_text("_(superseded by the queued prompt)_");
-                    }
-                }
-                self.session.turns.push(Turn {
-                    prompt,
-                    ..Default::default()
-                });
-                self.session.follow_end = true;
-                self.spinner_frame = 0;
-            }
-            AgentEvent::Error(message) => {
-                if let Some(turn) = self.session.active_turn_mut() {
-                    turn.complete = true;
-                    if turn.reply.trim().is_empty() {
-                        turn.push_text(&format!("**Error:** {message}"));
-                    }
-                }
-                self.session.status = None;
-                self.notifications.error(message);
+    fn apply_effects(&mut self, effects: crate::presentation::session::Effects) {
+        if effects.follow_end {
+            self.session.follow_end = true;
+            self.spinner_frame = 0;
+        }
+        for (level, text) in effects.notices {
+            match level {
+                NoticeKind::Info => self.notifications.info(text),
+                NoticeKind::Warning => self.notifications.warning(text),
+                NoticeKind::Error => self.notifications.error(text),
             }
         }
-        self.session.bump();
+    }
+    #[cfg(test)]
+    fn apply_event(&mut self, event: AgentEvent) {
+        let effects = self.session.projection.apply(event);
+        self.apply_effects(effects);
+    }
+    fn apply_runtime_event(&mut self, event: solaris_agent::RuntimeEvent) {
+        match self.session.projection.apply_runtime(event) {
+            Ok(effects) => self.apply_effects(effects),
+            Err(error) => self.notifications.error(error),
+        }
     }
 
     fn on_dialog_message(&mut self, message: DialogMessage) {
@@ -1656,19 +1412,9 @@ impl App {
                 action: ConfirmAction::ClearTranscript,
                 accepted: true,
             } => {
-                self.session.turns.clear();
-                self.session.scroll = 0;
-                self.session.follow_end = true;
-                self.session.bump();
-                // The highlight points at rows that no longer exist.
-                self.selection.borrow_mut().clear();
-                // The transcript and the conversation are not the same thing:
-                // clearing what is on screen must also forget what the model
-                // would be sent, or the next turn answers a conversation the
-                // user can no longer see.
-                self.runtime_command(solaris_agent::RuntimeCommand::Clear);
-                self.notifications.info("transcript cleared");
+                self.sessions.dispatch_clear();
             }
+
             DialogMessage::Confirm {
                 accepted: false, ..
             } => {}
@@ -1721,13 +1467,13 @@ impl App {
 
     /// Show the skills this session found, and where each one lives.
     fn open_skills(&mut self) {
-        if self.skills.is_empty() {
+        if self.resources.skills.is_empty() {
             self.notifications
                 .info("no skills found — a skill is a directory holding a SKILL.md".to_string());
             return;
         }
 
-        let lines = skills_lines(&self.skills, &self.theme);
+        let lines = skills_lines(&self.resources.skills, &self.theme);
         let dialog = TextDialog::new(
             "Skills",
             "↑↓ scroll · enter or esc closes",
@@ -1744,14 +1490,14 @@ impl App {
     }
 
     fn open_stats(&mut self) {
-        let snapshot = self.agent.snapshot();
+        let snapshot = self.sessions.agent.snapshot();
         self.session.billing = snapshot.billing.or(self.session.billing);
         self.session.context = snapshot.context(self.config.mode);
         let backend = snapshot.label;
-        let model = if self.config.model.is_empty() {
+        let model = if snapshot.model.is_empty() {
             "(none yet)".to_string()
         } else {
-            self.config.model.clone()
+            snapshot.model
         };
         let lines = stats_lines(
             &self.theme,
@@ -1759,7 +1505,12 @@ impl App {
             &model,
             &backend,
             self.config.mode,
-            self.config.context_window,
+            u64::from(
+                snapshot
+                    .capabilities
+                    .context_window
+                    .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            ),
             snapshot.capabilities.price_known,
         );
         let dialog = TextDialog::new(
@@ -1872,30 +1623,13 @@ impl App {
     /// other providers may still use their bundled catalog. Replacing the
     /// receiver prevents a stale answer from an earlier request being adopted.
     fn refresh_models(&mut self) {
-        self.models_error = None;
-        self.models_rx = None;
-        self.discovered.clear();
-        if !self.discover_models {
-            if self.uses_chatgpt() {
-                self.models_error = Some("Model discovery is disabled.".into());
-            }
-            return;
-        }
-
-        let models = Arc::clone(&self.model_source);
-        let (tx, rx) = unbounded_channel();
-        self.models_rx = Some(rx);
-
-        tokio::spawn(async move {
-            let answer = models.models().await.map_err(|error| error.to_string());
-            let _ = tx.send(answer);
-        });
+        self.connection.refresh_models();
     }
 
     fn refresh_transport(&mut self, choice: BackendChoice) {
-        self.model_source = Arc::clone(&choice.models);
-        let factory = Arc::clone(&self.backend_factory);
-        let auth = self.auth.clone();
+        self.connection.model_source = Arc::clone(&choice.models);
+        let factory = Arc::clone(&self.connection.backend_factory);
+        let auth = self.connection.auth.clone();
         self.runtime_command(solaris_agent::RuntimeCommand::ReplaceConnection {
             connection: crate::agent_backend(choice),
             children: Some(Arc::new(move |model| {
@@ -1906,7 +1640,7 @@ impl App {
 
     /// Adopt the model list the provider reported.
     fn on_models_discovered(&mut self, answer: Result<Vec<String>, String>) {
-        let catalog_notice = self.model_source.notice();
+        let catalog_notice = self.connection.model_source.notice();
         match answer {
             Ok(models) if !models.is_empty() => {
                 // The provider's own list is the one that knows which models
@@ -1914,20 +1648,23 @@ impl App {
                 // the first of them — the same substitution the catalogue gets.
                 let adopt = self.config.model.is_empty()
                     || (self.uses_chatgpt() && !models.contains(&self.config.model));
-                self.models_error = None;
-                self.discovered = models;
+                self.connection.models_error = None;
+                self.connection.discovered = models;
 
-                if adopt && let Some(first) = self.discovered.first().cloned() {
+                if adopt && let Some(first) = self.connection.discovered.first().cloned() {
                     self.config.model = first;
                     if self.uses_chatgpt() {
-                        let choice =
-                            resolve_backend(&self.backend_factory, &self.auth, &mut self.config);
+                        let choice = resolve_backend(
+                            &self.connection.backend_factory,
+                            &self.connection.auth,
+                            &mut self.config,
+                        );
                         self.refresh_transport(choice);
                     } else {
                         self.rebuild_backend();
                     }
                 }
-                let count = self.discovered.len();
+                let count = self.connection.discovered.len();
                 if self.connect_is_choosing_a_model() {
                     // The list is on screen; pointing at `/model` would only
                     // send the user somewhere they already are.
@@ -1940,8 +1677,8 @@ impl App {
             }
             Ok(_) => {
                 if self.uses_chatgpt() {
-                    self.discovered.clear();
-                    self.models_error = Some(
+                    self.connection.discovered.clear();
+                    self.connection.models_error = Some(
                         "OpenAI returned no visible models for this account. Press r to retry."
                             .into(),
                     );
@@ -1957,8 +1694,8 @@ impl App {
             }
             Err(message) => {
                 if self.uses_chatgpt() {
-                    self.discovered.clear();
-                    self.models_error = Some(format!(
+                    self.connection.discovered.clear();
+                    self.connection.models_error = Some(format!(
                         "Could not list OpenAI models: {message}. Press r to retry."
                     ));
                 }
@@ -2044,9 +1781,9 @@ impl App {
     fn model_choices(&self) -> Vec<SelectItem> {
         let catalogue = self
             .provider_id()
-            .map(|id| self.provider_config.models(&id))
+            .map(|id| self.connection.provider_config.models(&id))
             .unwrap_or_default();
-        if self.discovered.is_empty() {
+        if self.connection.discovered.is_empty() {
             if self.uses_chatgpt() {
                 return Vec::new();
             }
@@ -2055,7 +1792,8 @@ impl App {
                 .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
                 .collect();
         }
-        self.discovered
+        self.connection
+            .discovered
             .iter()
             .map(|id| {
                 let description = catalogue
@@ -2117,44 +1855,27 @@ impl App {
     // ----------------------------------------------------------------- connect
 
     fn uses_chatgpt(&self) -> bool {
-        self.auth.active_provider() == Some("openai")
-            && matches!(
-                self.auth.credential("openai"),
-                Some(Credential::ChatGpt { .. })
-            )
+        self.connection.uses_chatgpt()
     }
 
     fn model_discovery_status(&self) -> String {
-        self.models_error
+        self.connection
+            .models_error
             .clone()
             .unwrap_or_else(|| "Loading OpenAI account models…".into())
     }
 
     fn begin_openai_login(&mut self) {
-        self.oauth = None;
         if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
             flow.enter_browser_auth("Starting browser authorization…".into());
         }
-        let (url_tx, url_rx) = unbounded_channel();
-        let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let result = solaris_provider::oauth::login(|url| {
-                let _ = url_tx.send(url);
-            })
-            .await
-            .map_err(|error| error.to_string());
-            let _ = tx.send(result);
-        });
-        self.oauth = Some(OAuthPending {
-            url_rx: Some(url_rx),
-            rx,
-            task,
-        });
+        self.connection.begin_login();
     }
 
     fn poll_oauth(&mut self) -> bool {
         let mut updated = false;
         if let Some(urls) = self
+            .connection
             .oauth
             .as_mut()
             .and_then(|pending| pending.url_rx.as_mut())
@@ -2166,14 +1887,19 @@ impl App {
                 }
             }
         }
-        let result = match self.oauth.as_mut().map(|pending| pending.rx.try_recv()) {
+        let result = match self
+            .connection
+            .oauth
+            .as_mut()
+            .map(|pending| pending.rx.try_recv())
+        {
             Some(Ok(result)) => result,
             Some(Err(oneshot::error::TryRecvError::Closed)) => {
                 Err("OpenAI authorization was interrupted".into())
             }
             _ => return updated,
         };
-        let Some(_pending) = self.oauth.take() else {
+        let Some(_pending) = self.connection.oauth.take() else {
             return false;
         };
         match result {
@@ -2190,16 +1916,17 @@ impl App {
 
     /// Open the `/connect` wizard in the prompt region.
     fn open_connect(&mut self) {
-        self.oauth = None;
+        self.connection.oauth = None;
         self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
         self.notifications.clear();
     }
 
     /// Drop the wizard.
     fn close_inline(&mut self) {
+        self.input_generation = self.input_generation.wrapping_add(1);
         // Credential refresh belongs to the pending request, not to the wizard.
-        if self.oauth.is_some() {
-            self.oauth = None;
+        if self.connection.oauth.is_some() {
+            self.connection.oauth = None;
         }
         self.inline = None;
     }
@@ -2222,12 +1949,11 @@ impl App {
             ConnectOutcome::ProviderPicked { id, name } => self.begin_provider_setup(&id, &name),
             ConnectOutcome::Submit(submit) => self.apply_connect_submit(submit),
             ConnectOutcome::CopyBrowserUrl(url) => {
-                if (self.clipboard.write)(&url) {
-                    self.notifications.info("OpenAI authorization URL copied");
-                } else {
-                    self.notifications
-                        .warning("Could not copy URL; open the displayed URL manually");
-                }
+                self.copy_text(
+                    &url,
+                    "OpenAI authorization URL copied".into(),
+                    "Could not copy URL; open the displayed URL manually",
+                );
             }
             ConnectOutcome::RetryModels => {
                 self.refresh_models();
@@ -2259,7 +1985,7 @@ impl App {
     /// The secret already stored for an API-key provider, so `/connect` shows
     /// it (masked) instead of asking for it again.
     fn stored_api_key(&self, provider_id: &str) -> Option<String> {
-        match self.auth.credential(provider_id) {
+        match self.connection.auth.credential(provider_id) {
             Some(Credential::ApiKey { key }) => Some(key.clone()),
             _ => None,
         }
@@ -2267,7 +1993,7 @@ impl App {
 
     /// The gateway URL and key already stored for an endpoint provider.
     fn stored_endpoint(&self, provider_id: &str) -> (Option<String>, Option<String>) {
-        match self.auth.credential(provider_id) {
+        match self.connection.auth.credential(provider_id) {
             Some(Credential::Endpoint { base_url, api_key }) => {
                 (Some(base_url.clone()), Some(api_key.clone()))
             }
@@ -2345,9 +2071,9 @@ impl App {
         credential: Option<Credential>,
     ) {
         if let Some(credential) = credential {
-            self.auth.store(provider_id.clone(), credential);
+            self.connection.auth.store(provider_id.clone(), credential);
         }
-        self.auth.activate(provider_id.clone());
+        self.connection.auth.activate(provider_id.clone());
         self.persist_auth();
 
         // Connecting is what resolves a real client, so the backend is rebuilt
@@ -2373,18 +2099,19 @@ impl App {
         // step to take, so the wizard closes rather than parking the user on an
         // empty screen.
         let models: Vec<SelectItem> = if matches!(
-            self.auth.credential(&provider_id),
+            self.connection.auth.credential(&provider_id),
             Some(Credential::ChatGpt { .. })
         ) {
             Vec::new()
         } else {
-            self.provider_config
+            self.connection
+                .provider_config
                 .models(&provider_id)
                 .into_iter()
                 .map(|(id, name)| SelectItem::new(id.clone(), id).description(name))
                 .collect()
         };
-        let pending = self.models_rx.is_some();
+        let pending = self.connection.models_rx.is_some();
         let current = self.config.model.clone();
         let chatgpt = self.uses_chatgpt();
 
@@ -2401,19 +2128,18 @@ impl App {
 
     /// Best-effort persistence of the credential store.
     fn persist_auth(&mut self) {
-        let Some(path) = self.auth_path.clone() else {
+        let Some(path) = self.connection.auth_path.clone() else {
             return;
         };
 
-        let written = self.auth.save_changes(&self.auth_base, &path);
-        if let Ok(saved) = &written {
-            self.auth = saved.clone();
-            self.auth_base = saved.clone();
-        }
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save credentials: {error}"));
-        }
+        let submitted = self.connection.auth.clone();
+        let base = self.connection.auth_base.clone();
+        self.io.submit(move || {
+            let result = submitted
+                .save_changes(&base, &path)
+                .map_err(|error| error.to_string());
+            crate::desktop::Completion::Auth { submitted, result }
+        });
     }
 
     /// Record a submitted prompt and persist the history, best-effort.
@@ -2427,16 +2153,11 @@ impl App {
             return;
         };
 
-        let written = self
-            .recent
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save recent activity: {error}"));
-        }
+        let json = self.recent.to_json().map_err(|error| error.to_string());
+        self.io.submit(move || crate::desktop::Completion::Saved {
+            label: "recent activity",
+            result: json.and_then(|json| write_json(&path, &json)),
+        });
     }
 
     /// Remember the theme and the mode, best-effort.
@@ -2453,16 +2174,14 @@ impl App {
         self.preferences.theme = Some(self.config.theme.clone());
         self.preferences.mode = Some(self.config.mode);
 
-        let written = self
+        let json = self
             .preferences
             .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save preferences: {error}"));
-        }
+            .map_err(|error| error.to_string());
+        self.io.submit(move || crate::desktop::Completion::Saved {
+            label: "preferences",
+            result: json.and_then(|json| write_json(&path, &json)),
+        });
     }
 
     /// Best-effort persistence of the companion's name.
@@ -2474,15 +2193,11 @@ impl App {
             return;
         };
 
-        let written = soul
-            .to_json()
-            .map_err(|error| error.to_string())
-            .and_then(|json| write_json(&path, &json));
-
-        if let Err(error) = written {
-            self.notifications
-                .warning(format!("could not save the companion: {error}"));
-        }
+        let json = soul.to_json().map_err(|error| error.to_string());
+        self.io.submit(move || crate::desktop::Completion::Saved {
+            label: "the companion",
+            result: json.and_then(|json| write_json(&path, &json)),
+        });
     }
 
     /// Everything the welcome box shows, rebuilt per frame so the companion can
@@ -2505,423 +2220,14 @@ impl App {
     }
 
     // ------------------------------------------------------------------ render
-
-    /// Render the transcript, the prompt region, and the status footer.
-    fn render_session(&mut self, buf: &mut Buffer, area: Rect) {
-        if area.width < 12 || area.height < 4 {
-            self.last_transcript = Rect::default();
-            self.collapsible_mouse.cancel();
-            self.transcript.cancel_subagent_interaction();
-            return;
-        }
-
-        let max_editor = area.height.saturating_sub(2).max(3);
-        // The inline wizard takes over the prompt region, the way claurst's
-        // `/connect` does: it is not an overlay, it replaces the input line.
-        let prompt_height = match self.inline.as_mut() {
-            Some(flow) => flow.desired_height(area.width),
-            None => self.editor.desired_height(area.width).unwrap_or(3),
-        };
-        let prompt_height = prompt_height.clamp(3, max_editor);
-
-        let rows = layout::split(
-            area,
-            Axis::Vertical,
-            &[
-                Entry::auto().grow(1).min(1),
-                Entry::px(prompt_height),
-                Entry::px(1),
-            ],
-        );
-
-        self.render_transcript(buf, rows[0]);
-        match self.inline.as_mut() {
-            Some(flow) => flow.render(buf, rows[1]),
-            None => {
-                self.editor.set_focused(!self.overlay_open());
-                self.editor.render(buf, rows[1]);
-            }
-        }
-        self.render_footer(buf, rows[2]);
-    }
-
-    fn render_transcript(&mut self, buf: &mut Buffer, area: Rect) {
-        self.last_transcript = area;
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let spinner = self.session.is_streaming().then_some(self.spinner_frame);
-        let welcome = self.welcome_data();
-        let lines = self
-            .transcript
-            .lines(&self.session, area, &self.theme, spinner, &welcome);
-
-        let visible = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(visible);
-
-        if self.session.follow_end {
-            self.session.scroll = max_scroll;
-        }
-        self.session.scroll = self.session.scroll.min(max_scroll);
-        // Re-arm following once the view is back at the bottom.
-        if self.session.scroll >= max_scroll {
-            self.session.follow_end = true;
-        }
-
-        for (row, line) in lines
-            .iter()
-            .skip(self.session.scroll)
-            .take(visible)
-            .enumerate()
-        {
-            buf.set_line(area.x, area.y + row as u16, line, area.width);
-        }
-        self.selection.borrow_mut().set_document(
-            area,
-            self.session.scroll,
-            self.transcript.document(),
-        );
-    }
-
-    fn handle_collapsible_mouse(&mut self, event: MouseEvent) -> bool {
-        let over_transcript = rect_contains(self.last_transcript, event.column, event.row);
-        let scroll = self
-            .subagent_terminal
-            .as_ref()
-            .map_or(self.session.scroll, |view| view.scroll);
-        let row = scroll + usize::from(event.row.saturating_sub(self.last_transcript.y));
-        let header = over_transcript
-            .then(|| match &self.subagent_terminal {
-                Some(view) => view
-                    .headers
-                    .iter()
-                    .find(|header| header.row == row)
-                    .copied(),
-                None => self.transcript.collapsible_at(row),
-            })
-            .flatten();
-        let hit = header.map(|header| {
-            CollapsibleHit::new(
-                (header.target.0, header.target.1, header.detail),
-                Rect::new(
-                    self.last_transcript.x,
-                    event.row,
-                    self.last_transcript.width,
-                    1,
-                ),
-                header.marker_offset,
-            )
-        });
-        let selected = self.selection.borrow().is_active();
-        match self.collapsible_mouse.handle_mouse(event, hit, selected) {
-            CollapsibleAction::Ignored => false,
-            CollapsibleAction::Handled => true,
-            CollapsibleAction::Toggle((turn, step, detail)) => {
-                let tool = if let Some(view) = &self.subagent_terminal {
-                    self.session
-                        .turns
-                        .get_mut(view.target.0)
-                        .and_then(|turn| turn.steps.get_mut(view.target.1))
-                        .and_then(|step| step.subagent.as_mut())
-                        .and_then(|child| child.steps.get_mut(step))
-                } else {
-                    self.session
-                        .turns
-                        .get_mut(turn)
-                        .and_then(|turn| turn.steps.get_mut(step))
-                };
-                if let Some(step) = tool {
-                    let state = if detail {
-                        &mut step.detail_disclosure
-                    } else {
-                        &mut step.disclosure
-                    };
-                    if state.toggle() {
-                        // A title on the viewport's bottom row must reveal
-                        // its details, not expand entirely below the screen.
-                        let reveal = header
-                            .map_or(0, |header| header.body_rows)
-                            .min(usize::from(self.last_transcript.height.saturating_sub(1)));
-                        let end = usize::from(event.row - self.last_transcript.y) + 1 + reveal;
-                        let shift = end.saturating_sub(usize::from(self.last_transcript.height));
-                        if let Some(view) = &mut self.subagent_terminal {
-                            view.scroll = view.scroll.saturating_add(shift);
-                        } else {
-                            self.session.scroll = self.session.scroll.saturating_add(shift);
-                        }
-                    }
-                    // Keep the title in view instead of jumping to the tail
-                    // when expansion adds more content below the viewport.
-                    if let Some(view) = &mut self.subagent_terminal {
-                        view.follow_end = false;
-                    } else {
-                        self.session.follow_end = false;
-                    }
-                    self.session.bump();
-                }
-                true
-            }
-        }
-    }
-
-    fn render_footer(&mut self, buf: &mut Buffer, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let notice = self.notifications.current();
-        let (right, style) = if let Some((kind, text)) = notice {
-            let style = match kind {
-                NoticeKind::Error => Style::default()
-                    .fg(self.theme.error)
-                    .add_modifier(Modifier::BOLD),
-                NoticeKind::Warning => Style::default().fg(self.theme.warning),
-                NoticeKind::Info => Style::default().fg(self.theme.muted),
-            };
-            (format!("{} {} ", kind.marker(), text), style)
-        } else if self.session.is_streaming() {
-            let glyph = SPINNER[self.spinner_frame as usize % SPINNER.len()];
-            let status = self.session.status.as_deref().unwrap_or("working");
-            // Child activity is shown by its summary component.
-            if status.starts_with("subagent ") {
-                (String::new(), Style::default())
-            } else {
-                (
-                    format!("{glyph} {status} "),
-                    Style::default().fg(self.theme.accent),
-                )
-            }
-        } else {
-            (
-                format!("{} ", keymap::FOOTER_HINT),
-                Style::default().fg(self.theme.dim),
-            )
-        };
-
-        // The right slot wins the space it needs; the left one is truncated to
-        // whatever remains so the two never overlap. A notice is shown even
-        // when it is wider than the footer — truncated, because dropping it
-        // would hide the one message that says what just went wrong — while the
-        // standing hint and the spinner give way to the facts beside them.
-        let right_width = display_width(&right) as u16;
-        let show_right = notice.is_some() || right_width + 4 < area.width;
-        let left_budget = if show_right {
-            area.width.saturating_sub(right_width.min(area.width))
-        } else {
-            area.width
-        };
-
-        // The model slot disappears while no model is named, so the footer
-        // never shows an empty gap between two separators.
-        let mut facts = vec![self.agent.snapshot().label];
-        if !self.config.model.is_empty() {
-            facts.push(self.config.model.clone());
-        }
-        facts.push(self.config.mode.label().to_string());
-        facts.push(format!("{} tok", self.session.total_tokens()));
-        facts.push(
-            if self.agent.snapshot().capabilities.price_known == Some(false) {
-                "$?".into()
-            } else {
-                format!("${:.4}", self.session.total_cost())
-            },
-        );
-        let left = format!(" {} ", facts.join(" · "));
-        buf.set_string(
-            area.x,
-            area.y,
-            truncate_to_width(&left, left_budget as usize, "…"),
-            Style::default().fg(self.theme.muted),
-        );
-
-        if show_right {
-            let width = right_width.min(area.width);
-            buf.set_string(
-                area.x + area.width - width,
-                area.y,
-                truncate_to_width(&right, width as usize, "…"),
-                style,
-            );
-        }
-    }
-}
-
-#[derive(Default)]
-struct SubagentTerminal {
-    target: (usize, usize),
-    scroll: usize,
-    follow_end: bool,
-    headers: Vec<crate::transcript::CollapsibleHeader>,
-}
-
-impl App {
-    fn subagent_targets(&self) -> Vec<(usize, usize)> {
-        self.session
-            .turns
-            .iter()
-            .enumerate()
-            .flat_map(|(turn, state)| {
-                state
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(step, state)| state.subagent.as_ref().map(|_| (turn, step)))
-            })
-            .collect()
-    }
-
-    fn open_subagent(&mut self, target: (usize, usize)) {
-        self.subagent_terminal = Some(SubagentTerminal {
-            target,
-            follow_end: true,
-            ..Default::default()
-        });
-        self.collapsible_mouse.cancel();
-        self.transcript.cancel_subagent_interaction();
-        self.selection.borrow_mut().clear();
-    }
-
-    fn switch_subagent(&mut self, next: bool) {
-        let targets = self.subagent_targets();
-        if targets.is_empty() {
-            return;
-        }
-        let current = self
-            .subagent_terminal
-            .as_ref()
-            .and_then(|view| targets.iter().position(|target| *target == view.target));
-        let index = match current {
-            Some(index) if next => (index + 1) % targets.len(),
-            Some(index) => (index + targets.len() - 1) % targets.len(),
-            None if next => 0,
-            None => targets.len() - 1,
-        };
-        self.open_subagent(targets[index]);
-    }
-
-    fn scroll_subagent(&mut self, delta: i32) {
-        if let Some(view) = &mut self.subagent_terminal {
-            view.scroll = view.scroll.saturating_add_signed(delta as isize);
-            view.follow_end = false;
-        }
-    }
-
-    fn handle_subagent_key(&mut self, key: KeyEvent) -> KeyResult {
-        let page = i32::from(self.last_transcript.height.max(1));
-        match key.code {
-            KeyCode::Esc => {
-                self.subagent_terminal = None;
-                self.collapsible_mouse.cancel();
-                self.last_transcript = Rect::default();
-                self.selection.borrow_mut().clear();
-            }
-            KeyCode::Left => self.switch_subagent(false),
-            KeyCode::Right => self.switch_subagent(true),
-            KeyCode::Up => self.scroll_subagent(-1),
-            KeyCode::Down => self.scroll_subagent(1),
-            KeyCode::PageUp => self.scroll_subagent(-page),
-            KeyCode::PageDown => self.scroll_subagent(page),
-            KeyCode::Home => {
-                if let Some(view) = &mut self.subagent_terminal {
-                    view.scroll = 0;
-                    view.follow_end = false;
-                }
-            }
-            KeyCode::End => {
-                if let Some(view) = &mut self.subagent_terminal {
-                    view.follow_end = true;
-                }
-            }
-            _ => {}
-        }
-        KeyResult::Handled
-    }
-
-    fn render_subagent(&mut self, buf: &mut Buffer, area: Rect) {
-        let targets = self.subagent_targets();
-        let Some(view) = &mut self.subagent_terminal else {
-            return;
-        };
-        let Some(turn) = self.session.turns.get(view.target.0) else {
-            self.subagent_terminal = None;
-            return;
-        };
-        let Some(step) = turn.steps.get(view.target.1) else {
-            self.subagent_terminal = None;
-            return;
-        };
-        if area.is_empty() {
-            return;
-        }
-        let index = targets
-            .iter()
-            .position(|target| *target == view.target)
-            .unwrap_or(0)
-            + 1;
-        let name = step.call.input["agent"].as_str().unwrap_or("subagent");
-        let identity = step
-            .subagent
-            .as_ref()
-            .and_then(|child| child.task_id.as_deref())
-            .unwrap_or(&step.call.id);
-        let title = format!(" Subagent {index}/{} · {name} · {identity}", targets.len());
-        buf.set_string(
-            area.x,
-            area.y,
-            truncate_to_width(&title, usize::from(area.width), "…"),
-            Style::default()
-                .fg(self.theme.accent)
-                .add_modifier(Modifier::BOLD),
-        );
-        let content = Rect::new(
-            area.x,
-            area.y.saturating_add(1),
-            area.width,
-            area.height.saturating_sub(2),
-        );
-        self.last_transcript = content;
-        let layout = crate::transcript::subagent_layout(
-            step,
-            turn.complete,
-            area.width,
-            &self.theme,
-            Some(self.spinner_frame),
-        );
-        view.headers = layout.headers;
-        let lines = layout.lines;
-        let max_scroll = lines.len().saturating_sub(usize::from(content.height));
-        if view.follow_end {
-            view.scroll = max_scroll;
-        }
-        view.scroll = view.scroll.min(max_scroll);
-        if view.scroll == max_scroll {
-            view.follow_end = true;
-        }
-        for (row, line) in lines
-            .iter()
-            .skip(view.scroll)
-            .take(usize::from(content.height))
-            .enumerate()
-        {
-            buf.set_line(content.x, content.y + row as u16, line, content.width);
-        }
-        if area.height > 1 {
-            buf.set_string(
-                area.x,
-                area.bottom() - 1,
-                truncate_to_width(
-                    " Esc back · ←/→ switch agents · ↑/↓ scroll · PgUp/PgDn",
-                    usize::from(area.width),
-                    "…",
-                ),
-                Style::default().fg(self.theme.muted),
-            );
-        }
-    }
 }
 
 impl Component for App {
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.sessions.navigation.cancel();
+        self.sessions.runtime.shutdown();
+        self.io.shutdown().map_err(std::io::Error::other)
+    }
     fn cursor_position(&self) -> Option<(u16, u16)> {
         if self.overlay_open() || self.subagent_terminal.is_some() {
             return None;
@@ -2940,6 +2246,9 @@ impl Component for App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        if !(key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+            self.input_generation = self.input_generation.wrapping_add(1);
+        }
         if self.subagent_terminal.is_some() {
             if self.keybindings.matches("quit", &key) {
                 self.copy_selection_if_any();
@@ -2983,6 +2292,7 @@ impl Component for App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
+        self.input_generation = self.input_generation.wrapping_add(1);
         if self.subagent_terminal.is_some() {
             if self.handle_collapsible_mouse(event) {
                 return MouseResult::Handled;
@@ -3043,6 +2353,7 @@ impl Component for App {
     }
 
     fn handle_paste(&mut self, text: &str) -> KeyResult {
+        self.input_generation = self.input_generation.wrapping_add(1);
         if self.subagent_terminal.is_some() {
             return KeyResult::Handled;
         }
@@ -3051,11 +2362,56 @@ impl Component for App {
     }
 
     fn tick(&mut self) -> bool {
-        while let Ok(error) = self.runtime_errors.try_recv() {
+        let event_started = std::time::Instant::now();
+        let errors = std::iter::from_fn(|| self.sessions.runtime_errors.try_recv().ok())
+            .take(32)
+            .collect::<Vec<_>>();
+        for error in errors {
+            if !self.sessions.busy()
+                && let Some(turn) = self.session.active_turn_mut()
+            {
+                turn.complete = true;
+                turn.push_text(&format!("**Error:** {error}"));
+                self.session.bump();
+            }
             self.notifications.error(error);
         }
-        let mut dirty = self.poll_oauth();
-        let snapshot = self.agent.snapshot();
+        while let Some(outcome) = self.sessions.poll_outcome() {
+            if outcome.session_id != self.sessions.agent.snapshot().session_id {
+                continue;
+            }
+            use crate::application::session::CommandTarget;
+            match (outcome.target, outcome.result) {
+                (CommandTarget::Prompt(turn), Ok(snapshot)) => {
+                    if let Some(run) = snapshot.task_id {
+                        self.session.runs.insert(run, turn);
+                    }
+                }
+                (CommandTarget::Prompt(index), Err(error)) => {
+                    if let Some(turn) = self.session.turns.get_mut(index) {
+                        turn.complete = true;
+                        turn.push_text(&format!("**Error:** {error}"));
+                    }
+                    self.session.bump();
+                    self.notifications.error(error);
+                }
+                (CommandTarget::Clear, Ok(snapshot)) => {
+                    self.session = SessionState::new();
+                    self.session.session_id = snapshot.session_id;
+                    self.session.sequence = snapshot.sequence;
+                    self.sessions.runtime_events = crate::application::session::SessionFeed::new(
+                        &self.sessions.agent,
+                        snapshot.sequence,
+                    );
+                    self.transcript.invalidate();
+                    self.selection.borrow_mut().clear();
+                    self.notifications.info("transcript cleared");
+                }
+                (CommandTarget::Clear, Err(error)) => self.notifications.error(error),
+            }
+        }
+        let mut dirty = self.poll_navigation() | self.poll_io(false) | self.poll_oauth();
+        let snapshot = self.sessions.agent.snapshot();
         let context_window = u64::from(
             snapshot
                 .capabilities
@@ -3080,87 +2436,47 @@ impl Component for App {
             dirty = true;
         }
 
-        // Drain backend events without holding a borrow across the handler.
-        let mut events = Vec::new();
-        let mut disconnected = false;
-        if let Some(rx) = self.events_rx.as_mut() {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
+        for _ in 0..128 {
+            if event_started.elapsed() >= Duration::from_millis(3) {
+                break;
             }
-        }
-
-        let terminal = events.iter().any(AgentEvent::is_terminal);
-        for event in events {
-            dirty = true;
-            self.apply_event(event);
-        }
-
-        loop {
-            match self.runtime_events.try_recv() {
-                Ok(event) => {
-                    if event.task_id.is_some()
-                        && self.session.active_turn().is_none()
-                        && matches!(
-                            event.event,
-                            AgentEvent::TextDelta(_)
-                                | AgentEvent::ThinkingDelta(_)
-                                | AgentEvent::ToolCall(_)
-                        )
-                    {
-                        self.session.turns.push(Turn {
-                            prompt: "Background task results".into(),
-                            ..Default::default()
-                        });
-                        self.session.bump();
-                    }
-                    self.apply_event(event.event);
+            match self.sessions.runtime_events.try_recv() {
+                Ok(Ok(event)) => {
+                    self.apply_runtime_event(event);
                     dirty = true;
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                    self.notifications.warning(
-                        "Session events were missed; reopen this session to reload its transcript.",
-                    );
+                Ok(Err(error)) => {
+                    self.notifications.warning(error);
+                    self.recover_projection();
                     dirty = true;
+                    break;
                 }
+                Err(_) => break,
             }
         }
-        if terminal || disconnected {
-            self.events_rx = None;
-            // A stream that ends without a terminal event must still stop the spinner.
-            if self.agent.snapshot().task_id.is_none()
-                && let Some(turn) = self.session.active_turn_mut()
-            {
-                turn.complete = true;
-                self.session.status = None;
-                self.session.bump();
-            }
+        if let Some(result) = self.resources.poll_publication() {
+            self.adopt_resources(result);
             dirty = true;
         }
-        if self.reload_pending
-            && self.events_rx.is_none()
+        if self.resources.reload_pending
+            && !self.sessions.busy()
             && self
+                .sessions
                 .runtime_pending
                 .load(std::sync::atomic::Ordering::Acquire)
                 == 0
             && self.compact_rx.is_none()
-            && self.resource_rx.is_none()
+            && self.resources.resource_rx.is_none()
+            && !self.resources.publication_pending()
         {
             self.reload_resources();
             dirty = true;
         }
 
         // One loader runs at a time. A ready result waits for an idle publication boundary.
-        if self.events_rx.is_none() && self.compact_rx.is_none() {
+        if !self.sessions.busy() && self.compact_rx.is_none() {
             let result = self
+                .resources
                 .resource_rx
                 .as_mut()
                 .and_then(|rx| match rx.try_recv() {
@@ -3171,7 +2487,7 @@ impl Component for App {
                     Err(TryRecvError::Empty) => None,
                 });
             if let Some(result) = result {
-                self.resource_rx = None;
+                self.resources.resource_rx = None;
                 self.publish_resources(result);
                 dirty = true;
             }
@@ -3203,7 +2519,7 @@ impl Component for App {
         // Models the provider reported to the background discovery task.
         let mut discovered = Vec::new();
         let mut discovery_done = false;
-        if let Some(rx) = self.models_rx.as_mut() {
+        if let Some(rx) = self.connection.models_rx.as_mut() {
             loop {
                 match rx.try_recv() {
                     Ok(answer) => discovered.push(answer),
@@ -3216,7 +2532,7 @@ impl Component for App {
             }
         }
         if discovery_done {
-            self.models_rx = None;
+            self.connection.models_rx = None;
         }
         for answer in discovered {
             dirty = true;
@@ -3242,8 +2558,9 @@ impl Component for App {
             dirty = true;
         }
         if self.session.is_streaming() {
-            self.spinner_frame = self.spinner_frame.wrapping_add(1);
-            if self.spinner_frame.is_multiple_of(6) {
+            let frame = (self.buddy_started.elapsed().as_millis() / 100) as u16;
+            if frame != self.spinner_frame {
+                self.spinner_frame = frame;
                 dirty = true;
             }
         }
@@ -3371,6 +2688,7 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::connection::OAuthPending;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
     use solaris_agent::testing::TurnRequest;
@@ -3412,16 +2730,31 @@ mod tests {
         drop(second);
         let mut app = app();
         drop(
-            app.agent
+            app.sessions
+                .agent
                 .execute(solaris_agent::RuntimeCommand::AttachJournal { journal: first })
                 .await
                 .expect("attach"),
         );
         app.switch_session(&id, false);
-        assert_eq!(app.agent.journal().expect("journal").id(), id);
+        for _ in 0..1000 {
+            app.tick();
+            if !app.sessions.navigation.is_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(app.sessions.agent.journal().expect("journal").id(), id);
         assert_eq!(app.session.turns[0].reply, "saved answer");
         app.switch_session(&id, true);
-        let fork = app.agent.journal().expect("fork");
+        for _ in 0..1000 {
+            app.tick();
+            if !app.sessions.navigation.is_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let fork = app.sessions.agent.journal().expect("fork");
         assert_ne!(fork.id(), id);
         assert_eq!(app.session.turns[0].reply, "saved answer");
         assert!(
@@ -3615,7 +2948,7 @@ mod tests {
     async fn settle_discovery(app: &mut App) {
         for _ in 0..500 {
             app.tick();
-            if app.models_rx.is_none() {
+            if app.connection.models_rx.is_none() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -3656,6 +2989,82 @@ mod tests {
     }
 
     #[test]
+    fn late_clipboard_result_cannot_paste_into_a_changed_destination() {
+        let mut app = app();
+        let generation = app.input_generation;
+        app.io.submit(move || crate::desktop::Completion::Pasted {
+            generation,
+            text: Some("secret".into()),
+        });
+        app.handle_key(key(KeyCode::Char('x')));
+        app.poll_io(true);
+        assert!(!rendered_text(&mut app, 80, 24).contains("secret"));
+        assert!(rendered_text(&mut app, 80, 24).contains("paste destination changed"));
+    }
+
+    #[tokio::test]
+    async fn producer_eof_waits_for_the_bounded_transcript_backlog() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        let (events, rx) = tokio::sync::mpsc::channel(512);
+        app.sessions.runtime_events = crate::application::session::SessionFeed::from_receiver(rx);
+        for sequence in 1..=200 {
+            events
+                .try_send(Ok(solaris_agent::RuntimeEvent {
+                    prompt: None,
+                    session_id: "session".into(),
+                    sequence: Some(sequence),
+                    task_id: Some(1),
+                    event: AgentEvent::TextDelta("x".into()),
+                }))
+                .unwrap();
+        }
+        events
+            .try_send(Ok(solaris_agent::RuntimeEvent {
+                prompt: None,
+                session_id: "session".into(),
+                sequence: Some(201),
+                task_id: Some(1),
+                event: AgentEvent::TurnComplete {
+                    usage: Default::default(),
+                    cost_usd: 0.0,
+                },
+            }))
+            .unwrap();
+        drop(events);
+        app.tick();
+        assert!(!app.session.turns[0].complete);
+        for _ in 0..10 {
+            app.tick();
+        }
+        assert_eq!(app.session.turns.len(), 1);
+        assert_eq!(app.session.turns[0].reply.len(), 200);
+        assert!(app.session.turns[0].complete);
+    }
+
+    #[tokio::test]
+    async fn a_large_event_backlog_is_not_drained_in_one_tick() {
+        let mut app = app();
+        app.session.turns.push(Turn::default());
+        let (events, rx) = tokio::sync::mpsc::channel(1024);
+        app.sessions.runtime_events = crate::application::session::SessionFeed::from_receiver(rx);
+        for sequence in 1..=1000 {
+            events
+                .try_send(Ok(solaris_agent::RuntimeEvent {
+                    prompt: None,
+                    session_id: "session".into(),
+                    sequence: Some(sequence),
+                    task_id: Some(1),
+                    event: AgentEvent::TextDelta("x".into()),
+                }))
+                .unwrap();
+        }
+        app.tick();
+        assert!(app.session.turns[0].reply.len() <= 128);
+        app.handle_key(key(KeyCode::Char('a')));
+    }
+
+    #[test]
     fn the_theme_the_mode_and_the_model_are_all_remembered() {
         let dir = std::env::temp_dir().join(format!("solaris-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a temp dir");
@@ -3663,19 +3072,21 @@ mod tests {
         let auth_path = dir.join("auth.json");
 
         let mut app = app_with_settings_path(settings_path.clone());
-        app.auth_path = Some(auth_path.clone());
-        app.agent = fake_session("opencode");
+        app.connection.auth_path = Some(auth_path.clone());
+        app.sessions.agent = fake_session("opencode");
         app.set_model("minimax-m3");
         app.toggle_mode();
         app.set_theme("light");
 
         // Theme and mode are session preferences…
+        app.poll_io(true);
         let text = std::fs::read_to_string(&settings_path).expect("settings were written");
         let stored = Preferences::from_json(&text).expect("decodes");
         assert_eq!(stored.theme.as_deref(), Some("light"));
         assert_eq!(stored.mode, Some(Mode::Plan));
 
         // …while the model is remembered beside the provider that offers it.
+        app.poll_io(true);
         let text = std::fs::read_to_string(&auth_path).expect("credentials were written");
         let auth = AuthStore::from_json(&text).expect("decodes");
         assert_eq!(auth.active_provider(), Some("opencode"));
@@ -3894,6 +3305,7 @@ mod tests {
         assert_eq!(app.recent.len(), 1);
         assert_eq!(app.recent.entries()[0].label, "fix the parser");
 
+        app.poll_io(true);
         let saved = std::fs::read_to_string(&path).expect("recent file");
         let reloaded = RecentActivity::from_json(&saved).expect("valid json");
         assert_eq!(reloaded.entries()[0].label, "fix the parser");
@@ -3940,6 +3352,7 @@ mod tests {
         assert_eq!(app.buddy.display_name(), "Pip");
         assert_eq!(app.buddy.bones.species.as_str(), species);
 
+        app.poll_io(true);
         let saved = std::fs::read_to_string(&path).expect("companion file");
         let soul = Soul::from_json(&saved).expect("valid json");
         assert_eq!(soul.name, "Pip");
@@ -4071,7 +3484,7 @@ mod tests {
         app.submit("/model".to_string());
         let text = rendered_text(&mut app, 90, 24);
         assert!(
-            text.contains(&app.provider_config.models("anthropic")[1].0),
+            text.contains(&app.connection.provider_config.models("anthropic")[1].0),
             "{text}"
         );
     }
@@ -4112,7 +3525,10 @@ mod tests {
         let mut app = app_connected_to("anthropic");
         // Nothing was named, so the provider's first model was adopted.
         let current = app.model().to_string();
-        assert_eq!(current, app.provider_config.models("anthropic")[0].0);
+        assert_eq!(
+            current,
+            app.connection.provider_config.models("anthropic")[0].0
+        );
 
         app.submit("/model".to_string());
 
@@ -4125,7 +3541,7 @@ mod tests {
         assert!(text.contains(current.as_str()), "{text}");
         // Exactly what the connected provider offers, and nothing else.
         assert!(
-            text.contains(&app.provider_config.models("anthropic")[1].0),
+            text.contains(&app.connection.provider_config.models("anthropic")[1].0),
             "{text}"
         );
         assert!(text.contains("claude-haiku-4-5"), "{text}");
@@ -4153,6 +3569,7 @@ mod tests {
     fn the_inline_model_picker_switches_the_model() {
         let mut app = app_connected_to("anthropic");
         let names: Vec<String> = app
+            .connection
             .provider_config
             .models("anthropic")
             .into_iter()
@@ -4190,8 +3607,8 @@ mod tests {
         assert_eq!(app.theme_name(), "light");
     }
 
-    #[test]
-    fn confirm_message_clears_the_transcript() {
+    #[tokio::test]
+    async fn confirm_message_clears_the_transcript() {
         let mut app = app();
         app.session.turns.push(Turn {
             prompt: "hi".into(),
@@ -4203,7 +3620,59 @@ mod tests {
             action: ConfirmAction::ClearTranscript,
             accepted: true,
         });
+        for _ in 0..1000 {
+            app.tick();
+            if app.session.turns.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(app.session.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_temporary_feed_requires_clear_and_then_accepts_new_work() {
+        let mut app = app();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        app.sessions.runtime_events = crate::application::session::SessionFeed::from_receiver(rx);
+        tx.send(Err("history expired".into())).await.unwrap();
+        app.tick();
+        assert!(app.sessions.runtime_events.is_failed());
+        app.submit("not sent".into());
+        assert!(app.session.turns.is_empty());
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::ClearTranscript,
+            accepted: true,
+        });
+        for _ in 0..1000 {
+            app.tick();
+            if !app.sessions.runtime_events.is_failed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!app.sessions.runtime_events.is_failed());
+        app.submit("next".into());
+        settle_turn(&mut app).await;
+        assert!(app.session.turns[0].reply.contains("next"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_clear_preserves_the_displayed_history() {
+        let mut app = app();
+        app.session.turns.push(Turn {
+            prompt: "keep".into(),
+            reply: "answer".into(),
+            complete: true,
+            ..Default::default()
+        });
+        app.sessions.agent.shutdown();
+        app.on_dialog_message(DialogMessage::Confirm {
+            action: ConfirmAction::ClearTranscript,
+            accepted: true,
+        });
+        app.tick();
+        assert_eq!(app.session.turns[0].reply, "answer");
     }
 
     #[tokio::test]
@@ -5019,8 +4488,8 @@ mod tests {
         assert!(app.model_choices().is_empty());
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
         app.handle_key(key(KeyCode::Char('r')));
-        assert!(app.models_rx.is_some());
-        assert!(app.models_error.is_none());
+        assert!(app.connection.models_rx.is_some());
+        assert!(app.connection.models_error.is_none());
         assert!(rendered_text(&mut app, 100, 22).contains("Loading OpenAI account models"));
     }
 
@@ -5056,13 +4525,13 @@ mod tests {
         if let Credential::ChatGpt { expires_at, .. } = &mut credential {
             *expires_at = 0;
         }
-        app.auth.store("openai", credential);
-        app.auth.activate("openai");
+        app.connection.auth.store("openai", credential);
+        app.connection.auth.activate("openai");
         app.refresh_models();
-        assert!(app.oauth.is_none());
-        assert!(app.models_rx.is_some());
+        assert!(app.connection.oauth.is_none());
+        assert!(app.connection.models_rx.is_some());
         settle_discovery(&mut app).await;
-        assert_eq!(app.discovered, vec!["account-current"]);
+        assert_eq!(app.connection.discovered, vec!["account-current"]);
     }
 
     #[tokio::test]
@@ -5075,15 +4544,18 @@ mod tests {
         let task = tokio::spawn(async move {
             let _ = tx.send(Ok(chatgpt_credential()));
         });
-        app.oauth = Some(OAuthPending {
+        app.connection.oauth = Some(OAuthPending {
             url_rx: None,
             rx,
             task,
         });
         tokio::task::yield_now().await;
         assert!(app.poll_oauth());
-        assert_eq!(app.auth.active_provider(), Some("openai"));
-        assert_eq!(app.auth.credential("openai"), Some(&chatgpt_credential()));
+        assert_eq!(app.connection.auth.active_provider(), Some("openai"));
+        assert_eq!(
+            app.connection.auth.credential("openai"),
+            Some(&chatgpt_credential())
+        );
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
         assert!(app.model_choices().is_empty());
         assert!(rendered_text(&mut app, 80, 20).contains("Model discovery is disabled"));
@@ -5101,7 +4573,7 @@ mod tests {
     async fn model_preparation_does_not_create_a_ui_refresh_workflow() {
         let mut app = app_connected_to_but_faked("openai");
         app.start_turn("hello".into(), "hello".into());
-        assert!(app.oauth.is_none());
+        assert!(app.connection.oauth.is_none());
         settle_turn(&mut app).await;
         assert_eq!(app.session.turns[0].prompt, "hello");
     }
@@ -5114,15 +4586,15 @@ mod tests {
         app.inline = Some(Inline::Connect(flow));
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(std::future::pending());
-        app.oauth = Some(OAuthPending {
+        app.connection.oauth = Some(OAuthPending {
             url_rx: None,
             rx,
             task,
         });
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.oauth.is_none());
+        assert!(app.connection.oauth.is_none());
         assert!(tx.send(Ok(chatgpt_credential())).is_err());
-        assert!(app.auth.credential("openai").is_none());
+        assert!(app.connection.auth.credential("openai").is_none());
     }
 
     #[test]
@@ -5193,9 +4665,10 @@ mod tests {
         connect_with_api_key(&mut app, "sk-test");
 
         assert_eq!(app.active_provider(), Some("anthropic"));
-        assert!(app.auth.credential("anthropic").is_some());
+        assert!(app.connection.auth.credential("anthropic").is_some());
         assert_eq!(
-            app.auth
+            app.connection
+                .auth
                 .credential("anthropic")
                 .and_then(Credential::secret),
             Some("sk-test")
@@ -5204,7 +4677,10 @@ mod tests {
         assert_eq!(app.connect_step(), Some(ConnectStep::Model));
 
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
+        assert_eq!(
+            app.model(),
+            app.connection.provider_config.models("anthropic")[0].0
+        );
         assert!(!app.connect_open());
     }
 
@@ -5286,7 +4762,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('7')));
 
         assert_eq!(app.active_provider(), Some("local"));
-        assert!(app.auth.credential("local").is_none());
+        assert!(app.connection.auth.credential("local").is_none());
         assert_eq!(
             app.connect_step(),
             None,
@@ -5302,7 +4778,7 @@ mod tests {
 
         // Enter with an empty URL does not connect.
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.auth.credential("custom").is_none());
+        assert!(app.connection.auth.credential("custom").is_none());
         assert_eq!(app.connect_step(), Some(ConnectStep::CustomProvider));
 
         for ch in "https://example.test/v1".chars() {
@@ -5312,7 +4788,7 @@ mod tests {
 
         assert_eq!(app.active_provider(), Some("custom"));
         assert!(matches!(
-            app.auth.credential("custom"),
+            app.connection.auth.credential("custom"),
             Some(Credential::Endpoint { .. })
         ));
         // The custom provider has no model list, so the wizard closes.
@@ -5362,7 +4838,8 @@ mod tests {
         // Confirming the untouched field stores the same key back.
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
-            app.auth
+            app.connection
+                .auth
                 .credential("anthropic")
                 .and_then(Credential::secret),
             Some("sk-test")
@@ -5379,7 +4856,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(
-            app.auth
+            app.connection
+                .auth
                 .credential("anthropic")
                 .and_then(Credential::secret),
             Some("sk-pasted")
@@ -5408,6 +4886,7 @@ mod tests {
 
         let mut app = app_with_real_backends(auth);
         app.clipboard = Clipboard {
+            background: false,
             write: Rc::new(|_| true),
             read: Rc::new(|| Some("sk-pasted".to_string())),
         };
@@ -5418,7 +4897,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(
-            app.auth
+            app.connection
+                .auth
                 .credential("anthropic")
                 .and_then(Credential::secret),
             Some("sk-pasted"),
@@ -5436,7 +4916,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(
-            app.auth
+            app.connection
+                .auth
                 .credential("anthropic")
                 .and_then(Credential::secret),
             Some("sk-pasted")
@@ -5506,6 +4987,7 @@ mod tests {
         let mut app = app_with_auth_path(path.clone());
         connect_with_api_key(&mut app, "sk-on-disk");
 
+        app.poll_io(true);
         let text = std::fs::read_to_string(&path).expect("credentials file");
         let store = AuthStore::from_json(&text).expect("valid json");
         assert_eq!(
@@ -5555,8 +5037,12 @@ mod tests {
         // Connecting a provider replaces both the backend and the model: with
         // nothing named, the provider's own first model is adopted.
         assert_eq!(app.backend_label(), "anthropic");
-        assert_eq!(app.model(), app.provider_config.models("anthropic")[0].0);
+        assert_eq!(
+            app.model(),
+            app.connection.provider_config.models("anthropic")[0].0
+        );
         let expected = app
+            .connection
             .provider_config
             .resolve("anthropic", app.model())
             .parameters
@@ -5568,9 +5054,13 @@ mod tests {
         // The wizard's model step can still change it.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.model(), app.provider_config.models("anthropic")[1].0);
+        assert_eq!(
+            app.model(),
+            app.connection.provider_config.models("anthropic")[1].0
+        );
         // The official catalog also supplies the selected model's limits.
         let expected = app
+            .connection
             .provider_config
             .resolve("anthropic", app.model())
             .parameters
@@ -5817,9 +5307,11 @@ mod tests {
     async fn settle_resources(app: &mut App) {
         for _ in 0..1000 {
             app.tick();
-            if app.resource_rx.is_none()
-                && !app.reload_pending
+            if app.resources.resource_rx.is_none()
+                && !app.resources.publication_pending()
+                && !app.resources.reload_pending
                 && app
+                    .sessions
                     .runtime_pending
                     .load(std::sync::atomic::Ordering::Acquire)
                     == 0
@@ -5843,7 +5335,7 @@ mod tests {
             .to_path_buf();
         std::fs::create_dir_all(cwd.join(".git")).expect("repo marker");
         let mut app = app_with_skills(skills);
-        app.resource_paths = Some(ResourcePaths {
+        app.resources.resource_paths = Some(ResourcePaths {
             cwd: cwd.clone(),
             config_dir: None,
             home_dir: None,
@@ -5852,7 +5344,7 @@ mod tests {
         app.submit("first".to_string());
         app.submit("/queue /skill:pdf-tools extract report.pdf".to_string());
         app.submit("/reload".to_string());
-        assert!(app.reload_pending);
+        assert!(app.resources.reload_pending);
         std::fs::write(
             &path,
             "---\ndescription: Updated PDF work\n---\nNew instructions",
@@ -5861,13 +5353,17 @@ mod tests {
         std::fs::write(cwd.join("AGENTS.md"), "Reloaded project rules").expect("rules");
         settle_turn(&mut app).await;
         settle_resources(&mut app).await;
-        assert!(!app.reload_pending);
+        assert!(!app.resources.reload_pending);
         assert_eq!(
-            app.skills.get("pdf-tools").expect("skill").description(),
+            app.resources
+                .skills
+                .get("pdf-tools")
+                .expect("skill")
+                .description(),
             "Updated PDF work"
         );
         assert_eq!(
-            app.agent.prompt_context().project_rules[0].content,
+            app.sessions.agent.prompt_context().project_rules[0].content,
             "Reloaded project rules"
         );
         assert_eq!(app.session.turns.len(), 2);
@@ -5876,7 +5372,7 @@ mod tests {
             "already queued messages keep their expanded text"
         );
         assert!(
-            app.agent.conversation_len() >= 4,
+            app.sessions.agent.conversation_len() >= 4,
             "reload retains conversation"
         );
         app.submit("/skill:pdf-tools use new body".to_string());
@@ -5885,7 +5381,7 @@ mod tests {
         std::fs::remove_file(path).expect("remove skill");
         app.submit("/reload".to_string());
         settle_resources(&mut app).await;
-        assert!(app.skills.is_empty());
+        assert!(app.resources.skills.is_empty());
         assert_eq!(app.session.turns.len(), 3);
         std::fs::remove_dir_all(cwd).expect("cleanup");
     }
@@ -5895,7 +5391,7 @@ mod tests {
         let skills = skills_holding("failed-reload", "pdf-tools", "PDF work", "Body");
         let path = skills.get("pdf-tools").expect("skill").path().to_path_buf();
         let mut app = app_with_skills(skills);
-        app.resource_paths = Some(ResourcePaths {
+        app.resources.resource_paths = Some(ResourcePaths {
             cwd: path.join("missing"),
             config_dir: None,
             home_dir: None,
@@ -5903,7 +5399,7 @@ mod tests {
         });
         app.submit("/reload".to_string());
         settle_resources(&mut app).await;
-        assert!(app.skills.get("pdf-tools").is_some());
+        assert!(app.resources.skills.get("pdf-tools").is_some());
         assert!(
             app.notifications.current().is_some_and(
                 |(kind, text)| kind == NoticeKind::Error && text.contains("not reloaded")
@@ -6030,7 +5526,7 @@ mod tests {
         app.submit("/skills".to_string());
 
         assert_eq!(app.overlay_queue.borrow().len(), 1);
-        assert_eq!(app.skills().len(), 1);
+        assert_eq!(app.resources.skills.len(), 1);
     }
 
     #[tokio::test]
@@ -6094,7 +5590,7 @@ mod tests {
         assert_eq!(app.session.turns.len(), 2);
         assert_eq!(app.session.turns[1].prompt, "run the tests");
         assert!(
-            !app.agent.steering_pending(),
+            !app.sessions.agent.steering_pending(),
             "a queued prompt is not a correction"
         );
         assert!(
@@ -6112,7 +5608,7 @@ mod tests {
 
         assert_eq!(app.session.turns.len(), 1, "it started straight away");
         assert_eq!(app.session.turns[0].prompt, "do it now");
-        assert!(!app.agent.follow_up_pending());
+        assert!(!app.sessions.agent.follow_up_pending());
     }
 
     #[tokio::test]
@@ -6190,6 +5686,7 @@ mod tests {
         let pasted = reads.map(str::to_string);
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.clipboard = Clipboard {
+            background: false,
             write: Rc::new(move |text: &str| {
                 log.borrow_mut().push(text.to_string());
                 succeeds
@@ -6212,6 +5709,7 @@ mod tests {
         let reader = Rc::clone(&cell);
         let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
         options.clipboard = Clipboard {
+            background: false,
             write: Rc::new(move |text: &str| {
                 *writer.borrow_mut() = text.to_string();
                 true

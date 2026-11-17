@@ -24,6 +24,83 @@ pub fn agent_backend(choice: BackendChoice) -> ConnectionConfig {
     }
 }
 
+use crate::application::connection::BackendFactory;
+use crate::config::Config;
+use solaris_agent::{Agent, AgentOptions, Approver, PromptContext, Skills};
+use solaris_provider::AuthStore;
+use solaris_tools::{ToolRegistry, ToolSelection};
+use std::{path::Path, sync::Arc};
+
+/// Resolve the backend for the current credentials, adopting the model that
+/// will really be asked for.
+///
+/// Adopting matters as soon as a provider is connected: with no model named
+/// yet, the resolution layer asks for the first model that provider offers, and
+/// the app takes that on so the footer and `/stats` report what is really being
+/// asked for. The context window follows the model, because the footer gauge is
+/// only honest if it measures against the window the model really has.
+/// The backend the current credentials call for, and why it was chosen.
+pub(crate) fn resolve_backend(
+    factory: &BackendFactory,
+    auth: &AuthStore,
+    config: &mut Config,
+) -> BackendChoice {
+    let choice = factory(auth, &config.model);
+    if choice.provider_id.is_some() {
+        config.model = choice.model.clone();
+    }
+    config.context_window = u64::from(
+        choice
+            .backend
+            .capabilities()
+            .context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+    );
+    choice
+}
+
+/// Wrap a resolved backend in the agent session.
+///
+/// Every backend goes through it — including the one that refuses turns when
+/// nothing is connected — because the session is transparent until the model
+/// asks for a tool: with none declared it is exactly one model call, forwarded
+/// unchanged. The returned handle stops whichever turn the session is running.
+#[expect(clippy::too_many_arguments, reason = "application assembly boundary")]
+pub(crate) fn with_tools(
+    choice: BackendChoice,
+    registry: Arc<ToolRegistry>,
+    selection: &ToolSelection,
+    skills: &Skills,
+    prompt_context: &PromptContext,
+    cwd: &Path,
+    approver: Arc<dyn Approver>,
+    execution: &solaris_agent::ExecutionSettings,
+    factory: &BackendFactory,
+    auth: &AuthStore,
+    runtime: &solaris_agent::Runtime,
+) -> Result<Arc<solaris_agent::SessionRuntime>, solaris_agent::StoreError> {
+    let mut options = AgentOptions::in_directory(cwd)
+        .with_selection(selection.clone())
+        .with_approver(approver);
+    options.execution = execution.clone();
+    let factory = Arc::clone(factory);
+    let auth = auth.clone();
+    let child_factory: solaris_agent::ChildBackendFactory =
+        Arc::new(move |model| Ok(crate::agent_backend(factory(&auth, model))));
+    let agent = Arc::new(
+        runtime.open(
+            Agent::new(crate::agent_backend(choice), registry, options)
+                .with_resources(solaris_agent::ResourceSnapshot {
+                    skills: skills.clone(),
+                    prompt: prompt_context.clone(),
+                    warnings: Vec::new(),
+                })
+                .with_child_backend(child_factory),
+        )?,
+    );
+    Ok(agent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

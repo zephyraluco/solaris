@@ -13,7 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -105,6 +105,25 @@ impl Tui {
 
     /// Run until the quit flag is raised.
     pub fn run(&mut self, terminal: &mut PiTerminal) -> io::Result<()> {
+        let result = self.run_loop(terminal);
+        self.shutdown_components(result)
+    }
+    fn shutdown_components(&mut self, mut result: io::Result<()>) -> io::Result<()> {
+        for overlay in &mut self.overlays {
+            let cleanup = overlay.component.shutdown();
+            if result.is_ok() {
+                result = cleanup;
+            }
+        }
+        if let Some(root) = &mut self.root {
+            let cleanup = root.shutdown();
+            if result.is_ok() {
+                result = cleanup;
+            }
+        }
+        result
+    }
+    fn run_loop(&mut self, terminal: &mut PiTerminal) -> io::Result<()> {
         let mut force_first_frame = true;
 
         while !self.quit.get() {
@@ -118,21 +137,18 @@ impl Tui {
             }
 
             if event::poll(self.poll_interval)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        self.handle_key(key);
-                        dirty = true;
+                let started = Instant::now();
+                for _ in 0..64 {
+                    let overlays = self.overlays.len();
+                    dirty |= self.handle_terminal_event(event::read()?);
+                    if self.quit.get()
+                        || overlays != self.overlays.len()
+                        || !self.queue.borrow().is_empty()
+                        || started.elapsed() >= Duration::from_millis(2)
+                        || !event::poll(Duration::ZERO)?
+                    {
+                        break;
                     }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
-                        dirty = true;
-                    }
-                    Event::Paste(text) => {
-                        self.handle_paste(&text);
-                        dirty = true;
-                    }
-                    Event::Resize(_, _) => dirty = true,
-                    _ => {}
                 }
             }
 
@@ -146,6 +162,25 @@ impl Tui {
         }
 
         Ok(())
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.handle_key(key);
+                true
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                true
+            }
+            Event::Paste(text) => {
+                self.handle_paste(&text);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
+        }
     }
 
     fn draw<W: io::Write>(
@@ -305,6 +340,30 @@ mod tests {
         fn cursor_position(&self) -> Option<(u16, u16)> {
             self.0.borrow().cursor_position()
         }
+    }
+
+    #[test]
+    fn shutdown_runs_even_after_an_error_and_preserves_the_primary_failure() {
+        struct Probe(Rc<Cell<bool>>);
+        impl Component for Probe {
+            fn render(&mut self, _: &mut Buffer, _: Rect) {}
+            fn shutdown(&mut self) -> io::Result<()> {
+                self.0.set(true);
+                Err(io::Error::other("save failed"))
+            }
+        }
+        let called = Rc::new(Cell::new(false));
+        let mut tui = Tui::new();
+        tui.set_root(Box::new(Probe(called.clone())));
+        let error = tui
+            .shutdown_components(Err(io::Error::other("draw failed")))
+            .unwrap_err();
+        assert!(called.get());
+        assert_eq!(error.to_string(), "draw failed");
+        assert_eq!(
+            tui.shutdown_components(Ok(())).unwrap_err().to_string(),
+            "save failed"
+        );
     }
 
     #[test]

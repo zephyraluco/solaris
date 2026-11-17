@@ -1,12 +1,11 @@
 //! Builds the styled transcript lines from session state.
 //!
-//! The transcript is rebuilt only when the session revision, terminal size,
-//! theme, or spinner frame changes, so scrolling and idle frames are free —
-//! except while it is empty, when the welcome box's animated companion needs a
-//! fresh frame every tick.
+//! Completed turns retain their layouts. Streaming updates rebuild the changed
+//! suffix and reuse prior Markdown fragments and immutable selection indexes.
+//! Activity decorations update independently; scrolling reuses the layout.
 
 use solaris_tui::document::{DocumentRow, TextDocument};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crossterm::event::MouseEvent;
@@ -41,16 +40,68 @@ struct SubagentHeader {
     summary: SubagentSummary,
 }
 
+struct MarkdownBlock {
+    source: String,
+    width: u16,
+    theme: String,
+    lines: Vec<Line<'static>>,
+}
+
 #[derive(Default)]
 struct TranscriptHeaders {
+    markdown: HashMap<u64, MarkdownBlock>,
+    #[cfg(test)]
+    markdown_builds: usize,
     parts: Vec<u64>,
+    spinners: Vec<usize>,
     tools: Vec<CollapsibleHeader>,
     subagents: BTreeMap<(usize, usize), SubagentHeader>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TurnKey {
+    revision: u64,
+    lengths: (usize, usize, usize, usize, usize),
+    complete: bool,
+    thinking_expanded: bool,
+    compacted: usize,
+    disclosures: Vec<(bool, bool)>,
+}
+impl From<&Turn> for TurnKey {
+    fn from(turn: &Turn) -> Self {
+        Self {
+            revision: turn.layout_revision,
+            lengths: (
+                turn.prompt.len(),
+                turn.reply.len(),
+                turn.thinking.len(),
+                turn.parts.len(),
+                turn.steps.len(),
+            ),
+            complete: turn.complete,
+            thinking_expanded: turn.thinking_expanded,
+            compacted: turn.compacted,
+            disclosures: turn
+                .steps
+                .iter()
+                .map(|step| {
+                    (
+                        step.disclosure.is_expanded(),
+                        step.detail_disclosure.is_expanded(),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Cached transcript lines.
 #[derive(Default)]
 pub struct TranscriptView {
+    turn_keys: Vec<TurnKey>,
+    turn_ends: Vec<usize>,
+    #[cfg(test)]
+    layout_builds: usize,
     cache_width: u16,
     cache_height: u16,
     cache_version: u64,
@@ -90,28 +141,6 @@ impl TranscriptView {
     ) -> &[Line<'static>] {
         let spinner_key = spinner_frame.unwrap_or(u16::MAX);
         let empty = session.turns.is_empty();
-        let animation_only = self.initialized
-            && !empty
-            && self.cache_version == session.version
-            && self.cache_width == area.width
-            && self.cache_height == area.height
-            && self.cache_theme == theme.name
-            && self.cache_spinner != u16::MAX
-            && spinner_frame.is_some()
-            && self.headers.subagents.is_empty();
-        if animation_only {
-            let glyph = SPINNER[usize::from(spinner_key) % SPINNER.len()];
-            for (row, line) in self.lines.iter_mut().enumerate() {
-                if self.headers.parts.get(row) == Some(&u64::MAX)
-                    && line.spans.len() == 2
-                    && line.spans[1].content == "generating…"
-                {
-                    line.spans[0].content = format!("{glyph} ").into();
-                }
-            }
-            self.cache_spinner = spinner_key;
-            return &self.lines;
-        }
         let stale = !self.initialized
             || empty
             || self.cache_empty != empty
@@ -122,28 +151,101 @@ impl TranscriptView {
             || self.cache_spinner != spinner_key;
 
         if stale {
-            self.lines = build_with_headers(
-                session,
-                area,
-                theme,
-                spinner_frame,
-                welcome,
-                &mut self.headers,
-            );
-            self.document = Arc::new(TextDocument::new(
-                self.lines
-                    .iter()
-                    .enumerate()
-                    .map(|(row, line)| DocumentRow {
-                        part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
-                        text: line
-                            .spans
+            let full = !self.initialized
+                || self.cache_empty
+                || empty
+                || self.cache_width != area.width
+                || self.cache_theme != theme.name;
+            let keys: Vec<_> = session.turns.iter().map(TurnKey::from).collect();
+            let first = if full {
+                0
+            } else {
+                keys.iter()
+                    .zip(&self.turn_keys)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
+            if full {
+                self.headers.markdown.clear();
+            }
+            self.headers.markdown.retain(|part, _| {
+                session
+                    .turns
+                    .get(((part >> 32) as usize).saturating_sub(1))
+                    .is_some_and(|turn| !turn.complete)
+            });
+            let changed = full || first < keys.len() || first < self.turn_keys.len();
+            let changed_row = if full || first == 0 {
+                0
+            } else {
+                self.turn_ends[first - 1]
+            };
+            if empty {
+                self.lines = build_with_headers(
+                    session,
+                    area,
+                    theme,
+                    spinner_frame,
+                    welcome,
+                    &mut self.headers,
+                );
+                self.turn_ends.clear();
+            } else if changed {
+                let row = if first == 0 {
+                    0
+                } else {
+                    self.turn_ends[first - 1]
+                };
+                self.lines.truncate(row);
+                self.headers.parts.truncate(row);
+                self.headers.tools.retain(|header| header.row < row);
+                self.headers.spinners.retain(|spinner| *spinner < row);
+                self.headers.subagents.retain(|&(turn, step), _| {
+                    session
+                        .turns
+                        .get(turn)
+                        .and_then(|turn| turn.steps.get(step))
+                        .is_some_and(|step| step.subagent.is_some())
+                });
+                self.turn_ends.truncate(first);
+                for (index, turn) in session.turns.iter().enumerate().skip(first) {
+                    push_turn(
+                        &mut self.lines,
+                        turn,
+                        area.width.max(8) as usize,
+                        theme,
+                        spinner_frame,
+                        index,
+                        &mut self.headers,
+                    );
+                    self.turn_ends.push(self.lines.len());
+                    #[cfg(test)]
+                    {
+                        self.layout_builds += 1;
+                    }
+                }
+            }
+            self.turn_keys = keys;
+            if changed || empty {
+                self.document = Arc::new(
+                    self.document.with_suffix(
+                        changed_row,
+                        self.lines
                             .iter()
-                            .map(|span| span.content.as_ref())
+                            .enumerate()
+                            .skip(changed_row)
+                            .map(|(row, line)| DocumentRow {
+                                part: self.headers.parts.get(row).copied().unwrap_or(row as u64),
+                                text: line
+                                    .spans
+                                    .iter()
+                                    .map(|span| span.content.as_ref())
+                                    .collect(),
+                            })
                             .collect(),
-                    })
-                    .collect(),
-            ));
+                    ),
+                );
+            }
             self.cache_width = area.width;
             self.cache_height = area.height;
             self.cache_version = session.version;
@@ -151,6 +253,22 @@ impl TranscriptView {
             self.cache_spinner = spinner_key;
             self.cache_empty = empty;
             self.initialized = true;
+        }
+
+        if self.cache_spinner != spinner_key || stale {
+            let glyph = SPINNER[usize::from(spinner_key) % SPINNER.len()];
+            for row in &self.headers.spinners {
+                if let Some(line) = self.lines.get_mut(*row) {
+                    line.spans[0].content = format!("{glyph} ").into();
+                }
+            }
+            for header in self.headers.subagents.values_mut() {
+                header.summary.set_spinner_frame(spinner_frame.unwrap_or(0));
+                if let Some(line) = self.lines.get_mut(header.row) {
+                    *line = header.summary.line(area.width.max(8));
+                }
+            }
+            self.cache_spinner = spinner_key;
         }
 
         &self.lines
@@ -241,6 +359,7 @@ fn build_with_headers(
     headers: &mut TranscriptHeaders,
 ) -> Vec<Line<'static>> {
     headers.parts.clear();
+    headers.spinners.clear();
     headers.tools.clear();
     headers.subagents.retain(|&(turn, step), _| {
         session
@@ -250,7 +369,6 @@ fn build_with_headers(
             .is_some_and(|step| step.subagent.is_some())
     });
     let width = area.width.max(8) as usize;
-    let markdown = MarkdownStyle::from_theme(theme);
     let mut out: Vec<Line<'static>> = Vec::new();
 
     if session.turns.is_empty() {
@@ -260,74 +378,83 @@ fn build_with_headers(
     }
 
     for (index, turn) in session.turns.iter().enumerate() {
-        if index > 0 {
-            out.push(Line::default());
-        }
-        let part = ((index as u64) + 1) << 32;
-        headers.parts.resize(out.len(), part);
-        push_prompt(&mut out, &turn.prompt, width, theme);
-        headers.parts.resize(out.len(), part + 1);
-        push_compaction(&mut out, turn, theme);
-        headers.parts.resize(out.len(), part + 2);
-        if turn.parts.is_empty() {
-            let steps_start = out.len();
-            push_steps(
-                &mut out,
-                turn.into(),
-                width,
-                theme,
-                spinner_frame,
-                index,
-                headers,
-            );
-            headers.parts.resize(out.len(), part + 3);
-            let steps_end = out.len();
-            let mut section = part + 4;
-            for row in steps_start..steps_end {
-                if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
-                    section =
-                        part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
-                    headers.parts[row] = section;
-                    section += 1;
-                } else {
-                    headers.parts[row] = section;
-                }
-            }
-            let thinking_start = out.len();
-            push_thinking(
-                &mut out,
-                &turn.thinking,
-                turn.thinking_expanded,
-                width,
-                theme,
-            );
-            headers.parts.resize(out.len(), part + 5);
-            if out.len() > thinking_start {
-                headers.parts[thinking_start] = part + 6;
-            }
-            if !turn.reply.trim().is_empty() {
-                out.push(Line::default());
-                out.extend(render_markdown(&turn.reply, width as u16, &markdown));
-            }
-        } else {
-            push_ordered(&mut out, turn, width, theme, spinner_frame, index, headers);
-        }
-
-        headers.parts.resize(out.len(), part + 7);
-        if !turn.complete {
-            let glyph = spinner_frame
-                .map(|frame| SPINNER[frame as usize % SPINNER.len()])
-                .unwrap_or(SPINNER[0]);
-            out.push(Line::default());
-            out.push(Line::from(vec![
-                Span::styled(format!("{glyph} "), Style::default().fg(theme.accent)),
-                Span::styled("generating…", Style::default().fg(theme.muted)),
-            ]));
-        }
+        push_turn(&mut out, turn, width, theme, spinner_frame, index, headers);
     }
 
     headers.parts.resize(out.len(), u64::MAX);
     out
+}
+
+fn push_turn(
+    out: &mut Vec<Line<'static>>,
+    turn: &Turn,
+    width: usize,
+    theme: &Theme,
+    spinner_frame: Option<u16>,
+    index: usize,
+    headers: &mut TranscriptHeaders,
+) {
+    let markdown = MarkdownStyle::from_theme(theme);
+    if index > 0 {
+        out.push(Line::default());
+    }
+    let part = ((index as u64) + 1) << 32;
+    headers.parts.resize(out.len(), part);
+    push_prompt(out, &turn.prompt, width, theme);
+    headers.parts.resize(out.len(), part + 1);
+    push_compaction(out, turn, theme);
+    headers.parts.resize(out.len(), part + 2);
+    if turn.parts.is_empty() {
+        let steps_start = out.len();
+        push_steps(
+            out,
+            turn.into(),
+            width,
+            theme,
+            spinner_frame,
+            index,
+            headers,
+        );
+        headers.parts.resize(out.len(), part + 3);
+        let steps_end = out.len();
+        let mut section = part + 4;
+        for row in steps_start..steps_end {
+            if let Some(header) = headers.tools.iter().find(|header| header.row == row) {
+                section = part + 1024 + (header.target.1 as u64) * 8 + u64::from(header.detail) * 2;
+                headers.parts[row] = section;
+                section += 1;
+            } else {
+                headers.parts[row] = section;
+            }
+        }
+        let thinking_start = out.len();
+        push_thinking(out, &turn.thinking, turn.thinking_expanded, width, theme);
+        headers.parts.resize(out.len(), part + 5);
+        if out.len() > thinking_start {
+            headers.parts[thinking_start] = part + 6;
+        }
+        if !turn.reply.trim().is_empty() {
+            out.push(Line::default());
+            out.extend(render_markdown(&turn.reply, width as u16, &markdown));
+        }
+    } else {
+        push_ordered(out, turn, width, theme, spinner_frame, index, headers);
+    }
+
+    headers.parts.resize(out.len(), part + 7);
+    if !turn.complete {
+        let glyph = spinner_frame
+            .map(|frame| SPINNER[frame as usize % SPINNER.len()])
+            .unwrap_or(SPINNER[0]);
+        out.push(Line::default());
+        headers.spinners.push(out.len());
+        out.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(theme.accent)),
+            Span::styled("generating…", Style::default().fg(theme.muted)),
+        ]));
+    }
+
+    headers.parts.resize(out.len(), u64::MAX);
 }
 
 // Only adjacent tool references are grouped. A text, thinking or steering
@@ -342,7 +469,6 @@ fn push_ordered(
     headers: &mut TranscriptHeaders,
 ) {
     let base = ((turn_index as u64) + 1) << 32;
-    let markdown = MarkdownStyle::from_theme(theme);
     let mut index = 0;
     while index < turn.parts.len() {
         let start = out.len();
@@ -355,7 +481,42 @@ fn push_ordered(
                     .filter(|text| !text.trim().is_empty())
                 {
                     out.push(Line::default());
-                    out.extend(render_markdown(text, width as u16, &markdown));
+                    if turn.complete {
+                        out.extend(render_markdown(
+                            text,
+                            width as u16,
+                            &MarkdownStyle::from_theme(theme),
+                        ));
+                    } else {
+                        let cached =
+                            headers
+                                .markdown
+                                .entry(section)
+                                .or_insert_with(|| MarkdownBlock {
+                                    source: String::new(),
+                                    width: 0,
+                                    theme: String::new(),
+                                    lines: Vec::new(),
+                                });
+                        if cached.source != text
+                            || cached.width != width as u16
+                            || cached.theme != theme.name
+                        {
+                            cached.lines = render_markdown(
+                                text,
+                                width as u16,
+                                &MarkdownStyle::from_theme(theme),
+                            );
+                            cached.source = text.to_owned();
+                            cached.width = width as u16;
+                            cached.theme = theme.name.clone();
+                            #[cfg(test)]
+                            {
+                                headers.markdown_builds += 1;
+                            }
+                        }
+                        out.extend_from_slice(&cached.lines);
+                    }
                 }
             }
             TurnPart::Thinking(range) => {
@@ -960,6 +1121,60 @@ mod tests {
         let mut session = SessionState::new();
         session.turns.push(turn);
         session
+    }
+
+    #[test]
+    fn streaming_only_rebuilds_the_changed_turn_and_status_keeps_the_document() {
+        let mut session = SessionState::new();
+        for _ in 0..30 {
+            session.turns.push(Turn {
+                reply: "## History\n\nlarge body ".repeat(30),
+                complete: true,
+                ..Default::default()
+            });
+        }
+        session.turns.push(Turn {
+            reply: "stream".into(),
+            ..Default::default()
+        });
+        let mut view = TranscriptView::new();
+        let area = area(80, 24);
+        view.lines(&session, area, &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.layout_builds, 31);
+        session.active_turn_mut().unwrap().push_text(" appended");
+        session.bump();
+        view.lines(&session, area, &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.layout_builds, 32);
+        let document = view.document();
+        session.status = Some("working".into());
+        session.bump();
+        view.lines(&session, area, &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.layout_builds, 32);
+        assert!(Arc::ptr_eq(&document, &view.document()));
+        view.lines(&session, area, &Theme::dark(), Some(1), &welcome());
+        assert_eq!(view.layout_builds, 32);
+        assert!(Arc::ptr_eq(&document, &view.document()));
+    }
+
+    #[test]
+    fn streaming_preserves_earlier_markdown_fragments_in_the_same_turn() {
+        let mut session = SessionState::new();
+        let mut turn = Turn::default();
+        turn.push_text("**first**");
+        turn.push_tool(solaris_agent::ToolCall::new(
+            "read",
+            "read",
+            serde_json::json!({"path":"file"}),
+        ));
+        turn.push_text("second");
+        session.turns.push(turn);
+        let mut view = TranscriptView::new();
+        view.lines(&session, area(80, 24), &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.headers.markdown_builds, 2);
+        session.active_turn_mut().unwrap().push_text(" appended");
+        session.bump();
+        view.lines(&session, area(80, 24), &Theme::dark(), Some(0), &welcome());
+        assert_eq!(view.headers.markdown_builds, 3);
     }
 
     #[test]
@@ -1811,6 +2026,24 @@ mod tests {
                 "{lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn child_animation_reuses_layout_and_selection_index() {
+        let mut view = TranscriptView::new();
+        let session = session_with(Turn {
+            steps: vec![subagent_step(false, false)],
+            ..Default::default()
+        });
+        view.lines(&session, area(80, 20), &Theme::dark(), Some(0), &welcome());
+        let document = view.document();
+        let builds = view.layout_builds;
+        let row = view.headers.subagents[&(0, 0)].row;
+        let before = view.lines[row].to_string();
+        view.lines(&session, area(80, 20), &Theme::dark(), Some(1), &welcome());
+        assert_ne!(before, view.lines[row].to_string());
+        assert_eq!(builds, view.layout_builds);
+        assert!(Arc::ptr_eq(&document, &view.document()));
     }
 
     #[test]

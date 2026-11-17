@@ -33,6 +33,7 @@ impl ModelConnector for ExecutionConnector {
                 && let Some(tx) = &report.tx
             {
                 let _ = tx.send(crate::AgentEvent::SubagentUsage {
+                    task_id: report.task_id.clone(),
                     usage,
                     cost_usd: cost.map_or(0.0, |value| value.total),
                 });
