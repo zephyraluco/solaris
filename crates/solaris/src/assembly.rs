@@ -82,6 +82,7 @@ pub(crate) fn with_tools(
     let mut options = AgentOptions::in_directory(cwd)
         .with_selection(selection.clone())
         .with_approver(approver);
+    options.questions = Some(Default::default());
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
     let auth = auth.clone();

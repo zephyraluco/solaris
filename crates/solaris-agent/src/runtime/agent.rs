@@ -22,6 +22,8 @@ use crate::{ConnectionConfig, InputError, PromptContext, ResourceSnapshot, expan
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
 pub struct AgentOptions {
+    /// Interactive request channel; absent in noninteractive sessions and children.
+    pub questions: Option<crate::Questions>,
     /// How the mode's default tool set is edited.
     pub selection: ToolSelection,
     /// Who decides whether a call may run.
@@ -49,6 +51,7 @@ pub struct AgentOptions {
 impl Default for AgentOptions {
     fn default() -> Self {
         Self {
+            questions: None,
             selection: ToolSelection::none(),
             approver: Arc::new(AlwaysApprove),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -158,6 +161,13 @@ impl Agent {
         services: crate::runtime::services::SessionServices,
         mut resources: ResourceSnapshot,
     ) -> Self {
+        let registry = if options.questions.is_some() {
+            let mut registry = registry.as_ref().clone();
+            registry.add(Arc::new(crate::questions::QuestionTool));
+            Arc::new(registry)
+        } else {
+            registry
+        };
         let approver: Arc<dyn Approver> = Arc::new(crate::PolicyApprover {
             profile: options.execution.profile,
             read_only_tools: registry
@@ -299,6 +309,10 @@ impl Agent {
     }
     pub fn cancel_task(&self, id: &str) -> bool {
         self.services.jobs.cancel(&self.session_id(), id)
+    }
+
+    pub(crate) fn questions(&self) -> Option<crate::Questions> {
+        self.options.questions.clone()
     }
 
     /// A handle that stops a turn in flight: a running command is killed and no
@@ -534,6 +548,7 @@ impl Agent {
         }
         crate::runtime::mode::select_tools(&self.registry, mode, &self.options.selection)
             .into_iter()
+            .filter(|tool| tool.name() != "question" || self.options.questions.is_some())
             .filter(|tool| {
                 (self.options.subagents
                     && self.services.depth < self.options.execution.subagent_depth)

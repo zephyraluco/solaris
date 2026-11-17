@@ -499,6 +499,9 @@ fn main() -> Result<()> {
             prompt: resources.prompt,
             warnings: resources.warnings,
         };
+        if args.rpc {
+            options.questions = Some(Default::default());
+        }
         options.execution = execution;
         let factory = Arc::new(solaris_provider::refreshing_backend_factory(
             auth,

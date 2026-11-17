@@ -125,6 +125,10 @@ pub async fn serve_rpc(
                     }
                 };
                 let mut command = request.command;
+                if command["type"]=="pending_questions" {
+                    send(&mut output,&json!({"version":1,"type":"response","id":request.id,"ok":true,"questions":session.pending_questions()}))?;
+                    continue;
+                }
                 if command["type"]=="jobs" {
                     send(&mut output,&json!({"version":1,"type":"response","id":request.id,"ok":true,"jobs":session.jobs().list(&session.snapshot().session_id)}))?;
                     continue;
@@ -426,5 +430,112 @@ mod tests {
             .await
             .expect_err("bounded line");
         assert!(error.to_string().contains("max line length"));
+    }
+    struct Asking;
+    #[async_trait::async_trait]
+    impl ModelConnector for Asking {
+        async fn model_client(self: Arc<Self>) -> Result<solaris_agent::ModelClient, BackendError> {
+            Ok(solaris_agent::testing::client(
+                Default::default(),
+                |request| async move {
+                    let answered = request
+                        .history
+                        .iter()
+                        .flat_map(|m| m.tool_results())
+                        .any(|r| r.id == "ask");
+                    let event = if answered {
+                        AgentEvent::TextDelta("using SQLite".into())
+                    } else {
+                        AgentEvent::ToolCall(solaris_agent::ToolCall::new(
+                            "ask",
+                            "question",
+                            json!({"questions":[{"id":"storage","header":"Storage","question":"Choose storage","options":[{"id":"sqlite","label":"SQLite","description":"Local"}]}]}),
+                        ))
+                    };
+                    Ok(Box::pin(futures::stream::iter([
+                        event,
+                        AgentEvent::TurnComplete {
+                            usage: solaris_agent::Usage::new(1, 1),
+                            cost_usd: 0.0,
+                        },
+                    ])) as AgentEventStream)
+                },
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn rpc_lists_pending_questions_and_answers_while_prompt_is_running() {
+        let options = AgentOptions {
+            questions: Some(Default::default()),
+            ..AgentOptions::default().with_subagents(false)
+        };
+        let session = SessionRuntime::new(Agent::new(
+            ConnectionConfig {
+                backend: Arc::new(Asking),
+                model: "test".into(),
+                provider_id: None,
+                fallback_context_window: 128_000,
+                instructions: None,
+            },
+            Arc::new(ToolRegistry::with_tools(vec![])),
+            options,
+        ));
+        let (input, mut client) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            serve_rpc(&session, Mode::Build, input, Output { bytes: vec![], tx }).await
+        });
+        client
+            .write_all(b"{\"id\":\"run\",\"command\":{\"type\":\"prompt\",\"text\":\"ask\"}}\n")
+            .await
+            .unwrap();
+        let request = loop {
+            let value = receive(&mut rx).await;
+            if value["type"] == "event"
+                && let Ok(AgentEvent::QuestionRequested(q)) =
+                    serde_json::from_value(value["event"].clone())
+            {
+                assert_eq!(value["request_id"], "run");
+                break q;
+            }
+        };
+        client
+            .write_all(b"{\"id\":\"pending\",\"command\":{\"type\":\"pending_questions\"}}\n")
+            .await
+            .unwrap();
+        loop {
+            let value = receive(&mut rx).await;
+            if value["id"] == "pending" {
+                assert_eq!(value["questions"][0]["request_id"], request.request_id);
+                break;
+            }
+        }
+        let reply = json!({"id":"answer","command":{"type":"answer_question","request_id":request.request_id,"response":{"status":"answered","answers":[{"question_id":"storage","selected":["sqlite"],"custom":null}]}}});
+        client
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut accepted = false;
+        let mut text = false;
+        loop {
+            let value = receive(&mut rx).await;
+            if value["id"] == "answer" {
+                assert_eq!(value["ok"], true);
+                accepted = true;
+            }
+            if value["type"] == "event"
+                && let Ok(AgentEvent::TextDelta(answer)) =
+                    serde_json::from_value(value["event"].clone())
+            {
+                text |= answer.contains("SQLite");
+            }
+            if value["type"] == "end" {
+                assert_eq!(value["request_id"], "run");
+                break;
+            }
+        }
+        assert!(accepted && text);
+        drop(client);
+        server.await.unwrap().unwrap();
     }
 }

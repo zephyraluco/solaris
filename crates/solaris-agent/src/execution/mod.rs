@@ -124,6 +124,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     let runner = Arc::new(Runner {
         outcome,
         active_tools,
+        questions: options.questions.clone(),
         steps: options.execution.steps,
         model_steps: std::sync::atomic::AtomicU32::new(0),
         inner,
@@ -167,6 +168,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 /// The state one turn's loop runs with, owned outright so it can outlive the
 /// call that started it.
 struct Runner {
+    questions: Option<crate::Questions>,
     outcome: Arc<std::sync::Mutex<Option<crate::StopReason>>>,
     steps: Option<std::num::NonZeroU32>,
     model_steps: std::sync::atomic::AtomicU32,
@@ -465,7 +467,15 @@ impl Runner {
             ),
             cancel: self.cancel.clone(),
         };
-        let (output, totals) = if call.name == "tool_search" {
+        let (output, totals) = if call.name == "question" {
+            let Some(questions) = &self.questions else {
+                return ToolResult::error(call, "interactive questions are unavailable").into();
+            };
+            (
+                questions.ask(&self.owner, call, &self.cancel, tx).await,
+                crate::UsageTotals::default(),
+            )
+        } else if call.name == "tool_search" {
             let query = call.input["query"]
                 .as_str()
                 .unwrap_or_default()

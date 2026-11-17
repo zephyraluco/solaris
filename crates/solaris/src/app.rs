@@ -290,6 +290,7 @@ pub struct App {
     approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
     /// Answers the loop is still waiting for, oldest first.
     pending_approvals: VecDeque<oneshot::Sender<Approval>>,
+    question_dialog: Option<(String, String)>,
 }
 
 impl App {
@@ -435,6 +436,7 @@ impl App {
             execution,
             approval_rx,
             pending_approvals: VecDeque::new(),
+            question_dialog: None,
         };
 
         if let Some(journal) = journal {
@@ -1389,6 +1391,14 @@ impl App {
 
     fn on_dialog_message(&mut self, message: DialogMessage) {
         match message {
+            DialogMessage::Question {
+                session_id,
+                request_id,
+                response,
+            } => {
+                self.sessions
+                    .answer_question(&session_id, request_id, response);
+            }
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
             DialogMessage::Session(id) => self.switch_session(&id, false),
@@ -2363,10 +2373,12 @@ impl Component for App {
 
     fn tick(&mut self) -> bool {
         let event_started = std::time::Instant::now();
+        let mut dirty = false;
         let errors = std::iter::from_fn(|| self.sessions.runtime_errors.try_recv().ok())
             .take(32)
             .collect::<Vec<_>>();
         for error in errors {
+            dirty = true;
             if !self.sessions.busy()
                 && let Some(turn) = self.session.active_turn_mut()
             {
@@ -2377,6 +2389,7 @@ impl Component for App {
             self.notifications.error(error);
         }
         while let Some(outcome) = self.sessions.poll_outcome() {
+            dirty = true;
             if outcome.session_id != self.sessions.agent.snapshot().session_id {
                 continue;
             }
@@ -2408,9 +2421,20 @@ impl Component for App {
                     self.notifications.info("transcript cleared");
                 }
                 (CommandTarget::Clear, Err(error)) => self.notifications.error(error),
+                (CommandTarget::Question(id), Err(error)) => {
+                    if self
+                        .question_dialog
+                        .as_ref()
+                        .is_some_and(|(_, request)| request == &id)
+                    {
+                        self.question_dialog = None;
+                    }
+                    self.notifications.error(error);
+                }
+                (CommandTarget::Question(_), Ok(_)) => {}
             }
         }
-        let mut dirty = self.poll_navigation() | self.poll_io(false) | self.poll_oauth();
+        dirty |= self.poll_navigation() | self.poll_io(false) | self.poll_oauth();
         let snapshot = self.sessions.agent.snapshot();
         let context_window = u64::from(
             snapshot
@@ -2501,6 +2525,33 @@ impl Component for App {
         for message in messages {
             dirty = true;
             self.on_dialog_message(message);
+        }
+
+        if self.question_dialog.as_ref().is_some_and(|(session, id)| {
+            session != &self.sessions.agent.snapshot().session_id
+                || !self.sessions.agent.is_question_pending(id)
+        }) {
+            self.question_dialog = None;
+            dirty = true;
+        }
+        if self.question_dialog.is_none()
+            && !self.overlay_open()
+            && let Some(request) = self.sessions.agent.pending_questions().into_iter().next()
+        {
+            self.question_dialog = Some((request.session_id.clone(), request.request_id.clone()));
+            let dialog = crate::ui::question::QuestionDialog::new(
+                request,
+                Arc::clone(&self.sessions.agent),
+                &self.theme,
+                self.dialog_tx.clone(),
+            );
+            self.push_overlay(
+                Box::new(dialog),
+                OverlayOptions::centered()
+                    .width(SizeValue::Percent(80))
+                    .max_height(SizeValue::Percent(85)),
+            );
+            dirty = true;
         }
 
         // Calls the loop is waiting on: answer each one, asking the user where a

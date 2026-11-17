@@ -43,6 +43,11 @@ impl MouseResult {
 
 /// A retained UI element that renders into a rectangular region.
 pub trait Component {
+    /// Whether an externally settled overlay should be removed on the next tick.
+    fn is_finished(&self) -> bool {
+        false
+    }
+
     /// Explicit application exit hook, also called when the terminal loop fails.
     fn shutdown(&mut self) -> std::io::Result<()> {
         Ok(())

@@ -72,10 +72,11 @@ impl Drop for SessionFeed {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum CommandTarget {
     Prompt(usize),
     Clear,
+    Question(String),
 }
 pub struct CommandOutcome {
     pub session_id: String,
@@ -126,10 +127,35 @@ impl SessionController {
     pub fn dispatch_clear(&self) {
         self.send(RuntimeCommand::Clear, Some(CommandTarget::Clear));
     }
+    pub fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: String,
+        response: solaris_agent::QuestionResponse,
+    ) {
+        if let Some(session) = self.runtime.session(session_id) {
+            self.send_to(
+                &session,
+                RuntimeCommand::AnswerQuestion {
+                    request_id: request_id.clone(),
+                    response,
+                },
+                Some(CommandTarget::Question(request_id)),
+            );
+        }
+    }
     fn send(&self, command: RuntimeCommand, target: Option<CommandTarget>) {
-        let session_id = self.agent.snapshot().session_id;
+        self.send_to(&self.agent, command, target);
+    }
+    fn send_to(
+        &self,
+        session: &SessionRuntime,
+        command: RuntimeCommand,
+        target: Option<CommandTarget>,
+    ) {
+        let session_id = session.snapshot().session_id;
         let outcomes = self.outcome_tx.clone();
-        let receipt = match self.agent.dispatch(command) {
+        let receipt = match session.dispatch(command) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if let Some(target) = target {

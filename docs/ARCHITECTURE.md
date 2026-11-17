@@ -223,7 +223,28 @@ Windows 启动校验 `cygwin.rs::REQUIRED_FILES`，覆盖 Bash、Cygwin DLL、pr
 
 可运行 `cargo run -p solaris --release --example transcript_bench --locked` 比较全文重建、流式追加和动画更新的中位数与 P95。该基准是合成转录排版计时，不等于真实终端的输入延迟；窗口宽度和主题变化仍需重排历史，行目录维护也仍随历史行数增长。
 
-## 10. 验证与扩展
+
+## 10. 用户提问工具
+
+交互式 TUI 和 RPC 在应用组装时通过 `AgentOptions.questions` 启用 `question` 工具。普通 `--print` 不提供回答通道，因此不向模型声明该工具；子代理也不继承提问通道。工具在 Build 和 Plan 中可用，仍遵守工具选择和显式权限规则。
+
+`solaris-types::Question` 定义问题、稳定的问题/选项 ID、说明、单选/多选和自定义答案权限。`solaris-agent::Questions` 保存会话内的待回答请求及一次性唤醒通道；工具执行只等待 Future，不阻塞 UI，不在等待期间请求模型或占用工具进程执行槽。调用结果仍通过 Rig 的原工具调用返回，不新增用户消息或模型循环。
+
+`QuestionRequested` 与 `QuestionResolved` 通过带有会话、运行和序号的 `RuntimeEvent` 发布并进入现有 journal；工具结果保留结构化问题与答案以便转录展示。Runtime 的 `pending_questions()` 返回当前活请求，历史回放不恢复等待 Future。重启后不能回复旧请求，必须按正常会话恢复流程继续执行。
+
+TUI 轮询活请求并打开选项浮层：方向键移动、Enter 确认、Space 多选、Shift+Tab 返回上一题。自定义输入复用现有 Editor；输入中 Esc 返回选项，选项中 Esc 或点击浮层外部则提交 `dismissed`。Ctrl+C 取消整个任务。任务取消、会话关闭、工具 Future 被丢弃都会清理等待者；通过其他客户端回答后，浮层也会自动关闭。
+
+RPC 使用同一套 Runtime 命令：
+
+```json
+{"id":"list","command":{"type":"pending_questions"}}
+{"id":"answer","command":{"type":"answer_question","request_id":"<request-id>","response":{"status":"answered","answers":[{"question_id":"storage","selected":["sqlite"],"custom":null}]}}}
+{"id":"dismiss","command":{"type":"answer_question","request_id":"<request-id>","response":{"status":"dismissed"}}}
+```
+
+服务器校验问题归属、选项 ID、单选/多选数量、自定义输入权限以及问题完整性。无效答案不消耗请求，可修正后重试；重复、跨会话和取消后的答案会被拒绝。高亮首项仅表示键盘焦点，不构成用户回答。
+
+## 11. 验证与扩展
 
 ```bash
 cargo fmt --all -- --check

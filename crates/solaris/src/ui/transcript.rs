@@ -836,8 +836,40 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
     view
 }
 
+fn question_display_text(result: &solaris_agent::ToolResult) -> Option<String> {
+    let data = &result.metadata.details["question"];
+    let questions: Vec<solaris_agent::Question> =
+        serde_json::from_value(data["questions"].clone()).ok()?;
+    let response: solaris_agent::QuestionResponse =
+        serde_json::from_value(data["response"].clone()).ok()?;
+    Some(match response {
+        solaris_agent::QuestionResponse::Dismissed => "Question dismissed by the user.".into(),
+        solaris_agent::QuestionResponse::Answered { answers } => questions
+            .iter()
+            .map(|q| {
+                let answer = answers.iter().find(|a| a.question_id == q.id);
+                let mut labels = answer
+                    .into_iter()
+                    .flat_map(|a| a.selected.iter())
+                    .filter_map(|id| {
+                        q.options
+                            .iter()
+                            .find(|o| &o.id == id)
+                            .map(|o| o.label.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(custom) = answer.and_then(|a| a.custom.as_ref()) {
+                    labels.push(custom.clone());
+                }
+                format!("{} → {}", q.question, labels.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
+}
+
 fn tool_display_text(result: &solaris_agent::ToolResult) -> String {
-    let mut output = result.output.clone();
+    let mut output = question_display_text(result).unwrap_or_else(|| result.output.clone());
     if let Some(patch) = result.metadata.details["change"]["patch"].as_str() {
         output.push_str("\n\n");
         output.push_str(patch);
@@ -1012,6 +1044,7 @@ fn tool_counts(steps: &[ToolStep], running: bool) -> String {
 
 fn tool_step_title(step: &ToolStep) -> String {
     let label = match step.call.name.as_str() {
+        "question" => "Question",
         "read" => "Read",
         "grep" => "Grep",
         "find" => "Find",
@@ -1031,6 +1064,24 @@ fn tool_step_title(step: &ToolStep) -> String {
         .find_map(|key| input[*key].as_str())
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
+    if step.call.name == "question" {
+        detail = step
+            .result
+            .as_ref()
+            .and_then(question_display_text)
+            .unwrap_or_else(|| {
+                input["questions"]
+                    .as_array()
+                    .map(|questions| {
+                        questions
+                            .iter()
+                            .filter_map(|q| q["question"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_else(|| "Waiting for your answer".into())
+            });
+    }
     if step.call.name == "read" {
         let offset = input["offset"].as_u64();
         let limit = input["limit"].as_u64();

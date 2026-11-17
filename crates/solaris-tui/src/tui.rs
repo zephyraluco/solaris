@@ -306,6 +306,12 @@ impl Tui {
                 dirty = true;
             }
         }
+        let before = self.overlays.len();
+        self.overlays.retain(|entry| !entry.component.is_finished());
+        if self.overlays.len() != before {
+            self.overlay_flag.set(!self.overlays.is_empty());
+            dirty = true;
+        }
         dirty
     }
 }

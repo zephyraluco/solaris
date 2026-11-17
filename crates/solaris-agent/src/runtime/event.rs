@@ -8,6 +8,13 @@ use solaris_types::{ToolCall, ToolResult};
 /// A single incremental event produced while answering a turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// A live tool is waiting for a client answer.
+    QuestionRequested(solaris_types::QuestionRequest),
+    /// A question was answered or dismissed.
+    QuestionResolved {
+        request_id: String,
+        response: solaris_types::QuestionResponse,
+    },
     /// Extended-thinking token chunk.
     ThinkingDelta(String),
     /// Assistant visible text chunk.

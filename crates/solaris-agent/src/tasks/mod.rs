@@ -22,6 +22,7 @@ const MAX_RESULT_BYTES: usize = 16 * 1024;
 pub fn agent_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::builtin();
     registry.add(Arc::new(SubagentTool));
+    registry.add(Arc::new(crate::questions::QuestionTool));
     registry
 }
 
@@ -226,7 +227,7 @@ impl SubagentRunner {
         let tools =
             crate::runtime::mode::select_tools(&self.registry, mode, &self.options.selection)
                 .into_iter()
-                .filter(|tool| tool.name() != SUBAGENT_TOOL)
+                .filter(|tool| tool.name() != SUBAGENT_TOOL && tool.name() != "question")
                 .filter(|tool| mode != Mode::Plan || tool.is_read_only())
                 .collect();
         let registry = Arc::new(ToolRegistry::with_tools(tools));
@@ -255,6 +256,7 @@ impl SubagentRunner {
             .options
             .clone()
             .with_subagents(services.depth < self.options.execution.subagent_depth);
+        options.questions = None;
         options.cwd = ctx.cwd.clone();
         options.temp_dir = ctx.temp_dir.clone();
         // Preserve explicit additions/custom tools instead of reapplying the
