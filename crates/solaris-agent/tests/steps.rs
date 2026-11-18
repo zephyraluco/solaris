@@ -120,6 +120,3 @@ async fn unspecified_steps_do_not_impose_a_twenty_request_ceiling() {
 
 #[path = "support/mod.rs"]
 mod test_support;
-
-#[path = "../src/context/estimate.rs"]
-mod test_estimate;

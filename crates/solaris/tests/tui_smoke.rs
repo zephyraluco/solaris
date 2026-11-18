@@ -19,25 +19,6 @@ use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 use test_support::TurnRequest;
 
-/// The prompt a request asks about, wherever the loop put it.
-///
-/// The agent records the prompt in the conversation before it asks anything, so a
-/// round's own `prompt` is empty and the words are the last user message instead.
-fn asked(request: &TurnRequest) -> String {
-    if !request.prompt.trim().is_empty() {
-        return request.prompt.trim().to_string();
-    }
-    request
-        .history
-        .iter()
-        .rev()
-        .find(|message| {
-            matches!(message, rig_core::message::Message::User { .. }) && !message.text().is_empty()
-        })
-        .map(|message| message.text())
-        .unwrap_or_default()
-}
-
 const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
 /// Row of the transcript's last visible line (above the editor and footer).
@@ -68,7 +49,7 @@ impl FakeBackend {
     async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-            asked(&request)
+            request.last_user_text()
         );
         let events = vec![
             AgentEvent::ThinkingDelta("thinking ".to_string()),
@@ -216,7 +197,7 @@ impl ModelConnector for DelegatingBackend {
 }
 impl DelegatingBackend {
     async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        let child = asked(&request).starts_with("You are an isolated");
+        let child = request.last_user_text().starts_with("You are an isolated");
         let answered = request
             .history
             .iter()
@@ -1275,8 +1256,5 @@ fn the_second_provider_row_opens_its_api_key_step() {
 
 #[path = "../../solaris-agent/tests/support/mod.rs"]
 mod test_support;
-
-#[path = "../../solaris-agent/src/context/estimate.rs"]
-mod test_estimate;
 
 use test_support::messages::MessageFixture;

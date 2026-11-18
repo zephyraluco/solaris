@@ -125,7 +125,6 @@ impl AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TurnRequest;
 
     #[test]
     fn a_tool_exchange_does_not_end_the_turn() {
@@ -198,12 +197,5 @@ mod tests {
             "a follow-up leaves the turn it interrupted finished"
         );
         assert!(AgentEvent::Error("boom".to_string()).is_terminal());
-    }
-
-    #[test]
-    fn a_new_request_declares_no_tools() {
-        let request = TurnRequest::new(Vec::new(), "hi");
-        assert!(request.tools.is_empty());
-        assert_eq!(request.prompt, "hi");
     }
 }

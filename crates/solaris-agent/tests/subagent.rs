@@ -818,9 +818,6 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
 #[path = "support/mod.rs"]
 mod test_support;
 
-#[path = "../src/context/estimate.rs"]
-mod test_estimate;
-
 #[path = "support/memory.rs"]
 mod memory;
 

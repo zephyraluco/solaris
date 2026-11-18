@@ -268,7 +268,4 @@ async fn question_events_and_display_metadata_survive_replay_without_reopening_t
 #[path = "support/mod.rs"]
 mod test_support;
 
-#[path = "../src/context/estimate.rs"]
-mod test_estimate;
-
 use test_support::messages::MessageFixture;

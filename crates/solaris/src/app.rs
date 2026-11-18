@@ -2730,7 +2730,6 @@ mod tests {
     use super::*;
     use crate::application::connection::OAuthPending;
     use crate::test_support::TurnRequest;
-    use crate::test_support::messages::MessageFixture;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
     use solaris_agent::{BackendError, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
@@ -2807,27 +2806,6 @@ mod tests {
         );
     }
 
-    /// The prompt a request asks about, wherever the loop put it.
-    ///
-    /// The agent records the prompt in the conversation before it asks anything,
-    /// so a round's own `prompt` is empty and the words are the last user message
-    /// instead. The fake reads both so it answers the same way either way.
-    fn asked(request: &TurnRequest) -> String {
-        if !request.prompt.trim().is_empty() {
-            return request.prompt.trim().to_string();
-        }
-        request
-            .history
-            .iter()
-            .rev()
-            .find(|message| {
-                matches!(message, rig_core::message::Message::User { .. })
-                    && !message.text().is_empty()
-            })
-            .map(|message| message.text())
-            .unwrap_or_default()
-    }
-
     /// A backend that answers with a prompt-echoing markdown reply, so the app's
     /// own behaviour can be driven without a provider and without a network.
     struct FakeBackend {
@@ -2863,7 +2841,7 @@ mod tests {
         async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
             let reply = format!(
                 "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-                asked(&request)
+                request.last_user_text()
             );
             let events = vec![
                 AgentEvent::ThinkingDelta("thinking ".to_string()),

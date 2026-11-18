@@ -401,10 +401,6 @@ impl Agent {
     pub(crate) fn fail(&self, error: impl std::fmt::Display) {
         self.conversation.failed(error);
     }
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn is_idle(&self) -> bool {
-        !self.active.load(std::sync::atomic::Ordering::Acquire)
-    }
     pub fn conversation_len(&self) -> usize {
         self.conversation.len()
     }

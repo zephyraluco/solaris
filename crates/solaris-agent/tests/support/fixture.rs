@@ -55,7 +55,6 @@ impl Serve for Fixture {
                 .iter()
                 .map(|message| message.as_ref().clone())
                 .collect(),
-            prompt: String::new(),
             tools: request
                 .tools
                 .iter()

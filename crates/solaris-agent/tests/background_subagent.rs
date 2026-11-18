@@ -375,7 +375,4 @@ async fn running_child_accepts_a_followup_without_starting_a_second_job() {
 #[path = "support/mod.rs"]
 mod test_support;
 
-#[path = "../src/context/estimate.rs"]
-mod test_estimate;
-
 use test_support::messages::MessageFixture;

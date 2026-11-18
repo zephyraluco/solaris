@@ -532,8 +532,5 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
 #[path = "support/mod.rs"]
 mod test_support;
 
-#[path = "../src/context/estimate.rs"]
-mod test_estimate;
-
 #[path = "support/memory.rs"]
 mod memory;

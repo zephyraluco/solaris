@@ -837,7 +837,6 @@ mod tests {
             .history
             .iter()
             .map(rig_core::message::Message::text)
-            .chain(std::iter::once(request.prompt.clone()))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1191,7 +1190,6 @@ mod tests {
         assert!(!results[0].is_error);
 
         // The prompt moved into the history, so the second round does not repeat it.
-        assert!(second.prompt.is_empty());
         assert!(
             second
                 .history

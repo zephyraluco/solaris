@@ -529,8 +529,7 @@ mod tests {
     /// One turn, for driving a backend that must refuse it.
     fn request() -> TurnRequest {
         TurnRequest {
-            history: Vec::new(),
-            prompt: "hello".to_string(),
+            history: vec![rig_core::message::Message::user("hello")],
             tools: Vec::new(),
         }
     }
@@ -543,7 +542,7 @@ mod tests {
         assert_eq!(choice.provider_id.as_deref(), None);
         assert_eq!(choice.backend.label(), "unconnected");
 
-        let error = match crate::test_support::request(choice.backend, request()).await {
+        let error = match crate::native_request::request(choice.backend, request()).await {
             Ok(_) => panic!("an unconnected backend must not answer"),
             Err(error) => error,
         };
@@ -663,7 +662,7 @@ mod tests {
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
-        let error = match crate::test_support::request(choice.backend, request()).await {
+        let error = match crate::native_request::request(choice.backend, request()).await {
             Ok(_) => panic!("a model-less provider must not be asked"),
             Err(error) => error,
         };

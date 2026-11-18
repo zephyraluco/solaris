@@ -32,5 +32,5 @@ pub use discovery::{ModelSource, UnavailableModels};
 mod test_support;
 
 #[cfg(test)]
-#[path = "../../solaris-agent/src/context/estimate.rs"]
-mod test_estimate;
+#[path = "../../solaris-agent/tests/support/native_request.rs"]
+mod native_request;

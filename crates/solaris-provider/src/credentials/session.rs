@@ -314,7 +314,7 @@ mod tests {
         )
     }
     fn request() -> TurnRequest {
-        TurnRequest::new(Vec::new(), "prompt")
+        TurnRequest::new(vec![rig_core::message::Message::user("prompt")])
     }
 
     #[tokio::test]
@@ -367,8 +367,8 @@ mod tests {
         let parent = shared.choice("parent");
         let child = shared.choice("child");
         let (one, two) = tokio::join!(
-            crate::test_support::request(parent.backend, request()),
-            crate::test_support::request(child.backend, request())
+            crate::native_request::request(parent.backend, request()),
+            crate::native_request::request(child.backend, request())
         );
         drop(one.expect("parent request"));
         drop(two.expect("child request"));
@@ -407,7 +407,7 @@ mod tests {
         let (shared, calls) = setup(directory.path().join("auth.json"), refresh);
         let backend = shared.choice("model").backend;
         drop(
-            crate::test_support::request(Arc::clone(&backend), request())
+            crate::native_request::request(Arc::clone(&backend), request())
                 .await
                 .expect("first prompt"),
         );
@@ -419,7 +419,7 @@ mod tests {
         state.auth.store("openai", expired);
         drop(state);
         drop(
-            crate::test_support::request(Arc::clone(&backend), request())
+            crate::native_request::request(Arc::clone(&backend), request())
                 .await
                 .expect("second prompt"),
         );
@@ -437,7 +437,8 @@ mod tests {
         );
         shared.initial.save(&path).expect("original credentials");
         let before = std::fs::read(&path).expect("before");
-        let result = crate::test_support::request(shared.choice("model").backend, request()).await;
+        let result =
+            crate::native_request::request(shared.choice("model").backend, request()).await;
         assert!(matches!(result, Err(error) if error.to_string().contains("refresh rejected")));
         assert!(calls.lock().expect("calls").is_empty());
         assert_eq!(std::fs::read(path).expect("after"), before);
@@ -459,14 +460,14 @@ mod tests {
         );
         let backend = shared.choice("model").backend;
         assert!(
-            crate::test_support::request(Arc::clone(&backend), request())
+            crate::native_request::request(Arc::clone(&backend), request())
                 .await
                 .is_err()
         );
         assert!(calls.lock().expect("calls").is_empty());
         std::fs::remove_dir(&path).expect("restore storage");
         drop(
-            crate::test_support::request(Arc::clone(&backend), request())
+            crate::native_request::request(Arc::clone(&backend), request())
                 .await
                 .expect("retry saved token"),
         );
@@ -487,7 +488,7 @@ mod tests {
         owned.current.get_mut().auth = owned.initial.clone();
         owned.path = None;
         drop(
-            crate::test_support::request(shared.choice("model").backend, request())
+            crate::native_request::request(shared.choice("model").backend, request())
                 .await
                 .expect("valid request"),
         );

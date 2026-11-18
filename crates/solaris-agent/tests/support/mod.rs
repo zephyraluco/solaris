@@ -1,12 +1,9 @@
 #![allow(dead_code)]
-use crate::test_estimate as estimate;
 
-mod display;
 mod fixture;
 pub use fixture::client;
 use futures::StreamExt;
 use rig_core::message::Message;
-use rig_core::serve::Serve;
 use solaris_agent::ToolSpec;
 pub mod messages;
 use std::sync::Arc;
@@ -17,83 +14,34 @@ use std::sync::Arc;
 /// list is already settled.
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
-    /// Prior conversation, oldest first, excluding the new prompt.
+    /// Messages sent to the model, oldest first.
     pub history: Vec<Message>,
-    /// The new user prompt.
-    ///
-    /// Empty means the caller has already put the prompt in `history` — which
-    /// is what a tool round trip does — and the request bodies then append no
-    /// further user message.
-    pub prompt: String,
     /// Tools declared to the model for this request. Empty means none, and the
     /// request bodies then carry no `tools` field at all.
     pub tools: Vec<ToolSpec>,
 }
 
 impl TurnRequest {
+    /// The last nonempty user message sent to the model.
+    pub fn last_user_text(&self) -> String {
+        use messages::MessageFixture;
+
+        self.history
+            .iter()
+            .rev()
+            .filter(|message| matches!(message, Message::User { .. }))
+            .map(MessageFixture::text)
+            .find(|text| !text.is_empty())
+            .unwrap_or_default()
+    }
+
     /// A request that declares no tools.
-    pub fn new(history: Vec<Message>, prompt: impl Into<String>) -> Self {
+    pub fn new(history: Vec<Message>) -> Self {
         Self {
             history,
-            prompt: prompt.into(),
             tools: Vec::new(),
         }
     }
-}
-
-/// Execute a fixture request through the sole Rig connection interface.
-pub async fn request(
-    backend: Arc<dyn solaris_agent::ModelConnector>,
-    request: TurnRequest,
-) -> Result<solaris_agent::AgentEventStream, solaris_backend::BackendError> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let client = backend
-        .model_client()
-        .await?
-        .with_status_observer(move |text| {
-            let _ = tx.send(solaris_agent::AgentEvent::Status(text));
-        });
-    let mut messages = request.history;
-    if !request.prompt.is_empty() {
-        messages.push(rig_core::message::Message::user(request.prompt));
-    }
-    let mut native = rig_core::completion::CompletionRequest::from(messages);
-    for tool in request.tools {
-        native = native.tool(rig_core::completion::ToolDefinition::new(
-            rig_core::message::ToolName::new(tool.name)
-                .map_err(|e| solaris_backend::BackendError::new(e.to_string()))?,
-            tool.description,
-            tool.parameters,
-        ));
-    }
-    let request = native;
-    let input_tokens = estimate::request_tokens(&request);
-    let reply = client
-        .serve(
-            rig_core::effect::EffectKind::Completion {
-                request: Arc::new(request),
-                stream: true,
-            },
-            rig_core::serve::Dispatch::new(rig_core::effect::EffectId::from_raw(0), true),
-        )
-        .await;
-    let mut events = display::adapt(reply.into_stream(), rx, input_tokens);
-    let mut opening = Vec::new();
-    while let Some(event) = events.next().await {
-        match event {
-            solaris_agent::AgentEvent::Error(error) => {
-                return Err(solaris_backend::BackendError::new(error));
-            }
-            event @ solaris_agent::AgentEvent::Status(_) => opening.push(event),
-            event => {
-                opening.push(event);
-                return Ok(Box::pin(futures::stream::iter(opening).chain(events)));
-            }
-        }
-    }
-    Err(solaris_backend::BackendError::new(
-        "model stream ended without a complete response",
-    ))
 }
 
 /// Explicit native facts for unpriced HTTP test models.

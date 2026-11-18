@@ -93,8 +93,5 @@ pub use solaris_types::{
 };
 
 #[cfg(test)]
-use context::estimate as test_estimate;
-
-#[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;

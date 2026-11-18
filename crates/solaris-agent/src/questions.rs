@@ -20,6 +20,12 @@ struct Pending {
     reply: oneshot::Sender<QuestionResponse>,
     cancel: Cancel,
 }
+impl Pending {
+    fn is_available_to(&self, session: &str) -> bool {
+        self.request.session_id == session && !self.cancel.is_cancelled()
+    }
+}
+
 struct Registration {
     questions: Questions,
     id: String,
@@ -45,9 +51,7 @@ impl Questions {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(id)
-            .is_some_and(|entry| {
-                entry.request.session_id == session && !entry.cancel.is_cancelled()
-            })
+            .is_some_and(|entry| entry.is_available_to(session))
     }
 
     pub(crate) fn pending(&self, session: &str) -> Vec<QuestionRequest> {
@@ -55,7 +59,7 @@ impl Questions {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .filter(|entry| entry.request.session_id == session && !entry.cancel.is_cancelled())
+            .filter(|entry| entry.is_available_to(session))
             .map(|p| p.request.clone())
             .collect()
     }
@@ -67,7 +71,7 @@ impl Questions {
     ) -> Result<(), String> {
         let mut pending = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let entry = pending.get(id).ok_or("question is no longer pending")?;
-        if entry.request.session_id != session || entry.cancel.is_cancelled() {
+        if !entry.is_available_to(session) {
             return Err("question is no longer pending in this session".into());
         }
         validate_response(&entry.request.questions, &response)?;
