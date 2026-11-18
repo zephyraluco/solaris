@@ -1,10 +1,12 @@
-//! Test fixtures for Rig handlers and real native HTTP connections. Not built in production.
+#![allow(dead_code)]
+use crate::test_estimate as estimate;
+
 mod display;
 mod fixture;
-use crate::{Message, ToolSpec};
 pub use fixture::client;
 use futures::StreamExt;
 use rig_core::serve::Serve;
+use solaris_agent::{Message, ToolSpec};
 use std::sync::Arc;
 /// Input observed by scripted Rig test fixtures.
 ///
@@ -39,15 +41,15 @@ impl TurnRequest {
 
 /// Execute a fixture request through the sole Rig connection interface.
 pub async fn request(
-    backend: Arc<dyn crate::ModelConnector>,
+    backend: Arc<dyn solaris_agent::ModelConnector>,
     request: TurnRequest,
-) -> Result<crate::AgentEventStream, solaris_backend::BackendError> {
+) -> Result<solaris_agent::AgentEventStream, solaris_backend::BackendError> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let client = backend
         .model_client()
         .await?
         .with_status_observer(move |text| {
-            let _ = tx.send(crate::AgentEvent::Status(text));
+            let _ = tx.send(solaris_agent::AgentEvent::Status(text));
         });
     let mut messages = request
         .history
@@ -67,7 +69,7 @@ pub async fn request(
         ));
     }
     let request = native;
-    let input_tokens = crate::context::estimate::request_tokens(&request);
+    let input_tokens = estimate::request_tokens(&request);
     let reply = client
         .serve(
             rig_core::effect::EffectKind::Completion {
@@ -81,10 +83,10 @@ pub async fn request(
     let mut opening = Vec::new();
     while let Some(event) = events.next().await {
         match event {
-            crate::AgentEvent::Error(error) => {
+            solaris_agent::AgentEvent::Error(error) => {
                 return Err(solaris_backend::BackendError::new(error));
             }
-            event @ crate::AgentEvent::Status(_) => opening.push(event),
+            event @ solaris_agent::AgentEvent::Status(_) => opening.push(event),
             event => {
                 opening.push(event);
                 return Ok(Box::pin(futures::stream::iter(opening).chain(events)));
@@ -95,17 +97,6 @@ pub async fn request(
         "model stream ended without a complete response",
     ))
 }
-
-#[async_trait::async_trait]
-pub trait NativeRequest: crate::ModelConnector + Clone + Sized + 'static {
-    async fn complete(
-        &self,
-        input: TurnRequest,
-    ) -> Result<crate::AgentEventStream, solaris_backend::BackendError> {
-        request(Arc::new(self.clone()), input).await
-    }
-}
-impl NativeRequest for solaris_backend::Backend {}
 
 /// Explicit native facts for unpriced HTTP test models.
 pub fn parameters(id: &str, output_tokens: u32) -> solaris_backend::ModelParameters {
@@ -119,20 +110,81 @@ pub fn parameters(id: &str, output_tokens: u32) -> solaris_backend::ModelParamet
     solaris_backend::ModelParameters::new(spec, Some(output_tokens), true)
 }
 
-/// Direct executor access exists only in test fixtures, not the production API.
-pub trait AgentFixture {
-    fn run_fixture(&self, prompt: impl Into<String>, mode: crate::Mode) -> crate::AgentEventStream;
-    fn compact_fixture(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>>;
+pub async fn run_turn(
+    session: &solaris_agent::SessionRuntime,
+    text: &str,
+    mode: solaris_agent::Mode,
+) -> solaris_agent::AgentEventStream {
+    Box::pin(
+        session
+            .execute(solaris_agent::RuntimeCommand::Prompt {
+                text: text.into(),
+                mode,
+            })
+            .await
+            .unwrap()
+            .map(|event| event.event),
+    )
 }
-impl AgentFixture for crate::Agent {
-    fn run_fixture(&self, prompt: impl Into<String>, mode: crate::Mode) -> crate::AgentEventStream {
-        crate::runtime::journal_stream(self.run_turn(prompt, mode), self.journal())
+
+pub async fn compact(session: &solaris_agent::SessionRuntime) -> Option<usize> {
+    let mut stream = session
+        .execute(solaris_agent::RuntimeCommand::Compact)
+        .await
+        .unwrap();
+    let mut compacted = None;
+    while let Some(event) = stream.next().await {
+        if let solaris_agent::AgentEvent::Compacted { dropped } = event.event {
+            compacted = Some(dropped);
+        }
     }
-    fn compact_fixture(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>> {
-        Box::pin(self.compact())
+    compacted
+}
+
+use solaris_agent::{AgentEvent, AgentEventStream, BackendError, ModelConnector};
+use std::{collections::VecDeque, sync::Mutex};
+pub struct Scripted {
+    rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
+    seen: Mutex<Vec<TurnRequest>>,
+}
+
+impl Scripted {
+    pub fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
+        Arc::new(Self {
+            rounds: Mutex::new(rounds.into()),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn requests(&self) -> Vec<TurnRequest> {
+        self.seen.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelConnector for Scripted {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
+        Ok(client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
+    }
+
+    fn label(&self) -> &str {
+        "scripted"
+    }
+}
+impl Scripted {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        self.seen.lock().expect("lock").push(request);
+        let events = self
+            .rounds
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }

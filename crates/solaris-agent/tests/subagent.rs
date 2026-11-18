@@ -1,6 +1,5 @@
 //! Delegation through the public Agent API, with scripted model replies.
 
-use solaris_agent::testing::AgentFixture;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,12 +7,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
     Agent, AgentEvent, AgentEventStream, AgentOptions, Approval, BackendError, ConnectionConfig,
     FnApprover, Mode, ModelConnector, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
     ToolOutput, ToolRegistry, ToolSelection, Usage,
 };
+use test_support::TurnRequest;
 use tokio::sync::{Barrier, Notify};
 
 fn complete(text: &str) -> Vec<AgentEvent> {
@@ -84,13 +83,10 @@ impl ModelConnector for Model {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -187,7 +183,15 @@ impl Tool for RecordingTool {
     }
 }
 
-fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> Agent {
+fn agent(
+    model: Arc<Model>,
+    options: AgentOptions,
+    runs: &Arc<AtomicUsize>,
+) -> solaris_agent::SessionRuntime {
+    solaris_agent::SessionRuntime::new(build_agent(model, options, runs))
+}
+
+fn build_agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> Agent {
     let registry = ToolRegistry::with_tools(vec![
         Arc::new(RecordingTool {
             name: "read",
@@ -215,11 +219,13 @@ fn agent(model: Arc<Model>, options: AgentOptions, runs: &Arc<AtomicUsize>) -> A
     )
 }
 
-async fn run(agent: &Agent, mode: Mode) -> Vec<AgentEvent> {
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        agent.run_fixture("ROOT_PRIVATE_CONTEXT", mode).collect(),
-    )
+async fn run(agent: &solaris_agent::SessionRuntime, mode: Mode) -> Vec<AgentEvent> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        test_support::run_turn(agent, "ROOT_PRIVATE_CONTEXT", mode)
+            .await
+            .collect()
+            .await
+    })
     .await
     .expect("turn must finish")
 }
@@ -250,7 +256,9 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
         },
         ..Default::default()
     };
-    let agent = agent(Arc::clone(&model), AgentOptions::default(), &runs).with_resources(resources);
+    let agent = solaris_agent::SessionRuntime::new(
+        build_agent(Arc::clone(&model), AgentOptions::default(), &runs).with_resources(resources),
+    );
     let events = run(&agent, Mode::Build).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(result(&events).output, "child final report");
@@ -568,7 +576,7 @@ async fn cancellation_and_dropped_parent_stream_stop_pending_child_network_reque
             AgentOptions::default(),
             &Arc::new(AtomicUsize::new(0)),
         );
-        let mut stream = agent.run_fixture("ROOT_PRIVATE_CONTEXT", Mode::Build);
+        let mut stream = test_support::run_turn(&agent, "ROOT_PRIVATE_CONTEXT", Mode::Build).await;
         tokio::time::timeout(Duration::from_secs(1), model.started.notified())
             .await
             .unwrap();
@@ -601,7 +609,7 @@ async fn cancellation_and_dropped_parent_stream_stop_pending_child_network_reque
 fn delegation_can_be_disabled_or_excluded_by_tool_selection() {
     let model = Arc::new(Model::new("explore"));
     let runs = Arc::new(AtomicUsize::new(0));
-    let disabled = agent(
+    let disabled = build_agent(
         Arc::clone(&model),
         AgentOptions::default().with_subagents(false),
         &runs,
@@ -611,7 +619,7 @@ fn delegation_can_be_disabled_or_excluded_by_tool_selection() {
             .tool_names(Mode::Build)
             .contains(&"subagent".to_string())
     );
-    let excluded = agent(
+    let excluded = build_agent(
         model,
         AgentOptions::default().with_selection(ToolSelection {
             remove: vec!["subagent".into()],
@@ -661,8 +669,10 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
             instructions: Some("Child model instructions resolved by the caller".into()),
         })
     });
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
-        .with_child_backend(child_factory);
+    let parent = solaris_agent::SessionRuntime::new(
+        build_agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory),
+    );
     parent.attach_journal(journal).expect("attach");
     let events = run(&parent, Mode::Build).await;
     assert_eq!(factory_called.load(Ordering::SeqCst), 1);
@@ -697,7 +707,7 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
             .iter()
             .any(|message| message.text().starts_with("You are an isolated"))
     );
-    assert!(parent.active_tasks().is_empty());
+    assert!(parent.snapshot().active_tasks.is_empty());
 }
 
 #[tokio::test]
@@ -727,8 +737,10 @@ async fn blank_child_model_does_not_invoke_the_override_factory() {
     let options = AgentOptions::default();
     let child_factory: solaris_agent::ChildBackendFactory =
         Arc::new(|_| panic!("blank override must inherit parent backend"));
-    let parent = agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)))
-        .with_child_backend(child_factory);
+    let parent = solaris_agent::SessionRuntime::new(
+        build_agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory),
+    );
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -750,8 +762,10 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
             instructions: None,
         })
     });
-    let parent =
-        agent(model, options, &Arc::new(AtomicUsize::new(0))).with_child_backend(child_factory);
+    let parent = solaris_agent::SessionRuntime::new(
+        build_agent(model, options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory),
+    );
     let events = run(&parent, Mode::Build).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
@@ -768,8 +782,10 @@ async fn invalid_child_model_is_rejected_before_resolving_or_running_a_child() {
         let options = AgentOptions::default();
         let child_factory: solaris_agent::ChildBackendFactory =
             Arc::new(|_| panic!("invalid model must not reach the factory"));
-        let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
-            .with_child_backend(child_factory);
+        let parent = solaris_agent::SessionRuntime::new(
+            build_agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+                .with_child_backend(child_factory),
+        );
         let events = run(&parent, Mode::Build).await;
         let output = result(&events);
         assert!(output.is_error);
@@ -786,8 +802,10 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
     let options = AgentOptions::default();
     let child_factory: solaris_agent::ChildBackendFactory =
         Arc::new(|_| Err("requested child model is unavailable".into()));
-    let parent = agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
-        .with_child_backend(child_factory);
+    let parent = solaris_agent::SessionRuntime::new(
+        build_agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
+            .with_child_backend(child_factory),
+    );
     let events = run(&parent, Mode::Build).await;
     assert!(result(&events).is_error);
     assert!(
@@ -797,3 +815,9 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
     );
     assert!(!model.requests().iter().any(is_child));
 }
+
+#[path = "support/mod.rs"]
+mod test_support;
+
+#[path = "../src/context/estimate.rs"]
+mod test_estimate;

@@ -3,39 +3,9 @@ pub(crate) mod jobs;
 mod subscription;
 pub use subscription::RuntimeSubscription;
 
-#[cfg(any(test, feature = "test-utils"))]
-use crate::SessionRecord;
 use crate::{AgentEvent, AgentEventStream, SessionJournal};
 use futures::StreamExt;
 use std::sync::Arc;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn journal_stream(
-    stream: AgentEventStream,
-    journal: Option<Arc<SessionJournal>>,
-) -> AgentEventStream {
-    let Some(journal) = journal else {
-        return stream;
-    };
-    Box::pin(futures::stream::unfold(
-        (stream, journal, false),
-        |(mut stream, journal, failed)| async move {
-            if failed {
-                return None;
-            }
-            let event = stream.next().await?;
-            match journal.append(&SessionRecord::Event {
-                event: event.clone(),
-            }) {
-                Ok(()) => Some((event, (stream, journal, false))),
-                Err(error) => Some((
-                    AgentEvent::Error(format!("cannot persist session: {error}")),
-                    (stream, journal, true),
-                )),
-            }
-        },
-    ))
-}
 
 /// The executor owns the session until its task retires.
 pub(crate) struct TurnLease {
@@ -735,7 +705,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::ModelConnector for Connector {
         async fn model_client(self: Arc<Self>) -> Result<crate::ModelClient, crate::BackendError> {
-            Ok(crate::testing::client(
+            Ok(crate::test_support::client(
                 Default::default(),
                 |request| async move {
                     if request

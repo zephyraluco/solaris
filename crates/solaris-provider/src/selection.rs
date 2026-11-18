@@ -494,7 +494,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_agent::testing::TurnRequest;
+    use crate::test_support::TurnRequest;
 
     /// Options with a fixed environment, so tests never touch the process's
     /// variables or the network.
@@ -543,7 +543,7 @@ mod tests {
         assert_eq!(choice.provider_id.as_deref(), None);
         assert_eq!(choice.backend.label(), "unconnected");
 
-        let error = match solaris_agent::testing::request(choice.backend, request()).await {
+        let error = match crate::test_support::request(choice.backend, request()).await {
             Ok(_) => panic!("an unconnected backend must not answer"),
             Err(error) => error,
         };
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(choice.backend.label(), "new-api");
         assert_eq!(choice.base_url.as_deref(), Some("https://gateway.test/v1"));
 
-        let error = match solaris_agent::testing::request(choice.backend, request()).await {
+        let error = match crate::test_support::request(choice.backend, request()).await {
             Ok(_) => panic!("a model-less provider must not be asked"),
             Err(error) => error,
         };

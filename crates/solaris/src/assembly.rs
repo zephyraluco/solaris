@@ -49,13 +49,6 @@ pub(crate) fn resolve_backend(
     if choice.provider_id.is_some() {
         config.model = choice.model.clone();
     }
-    config.context_window = u64::from(
-        choice
-            .backend
-            .capabilities()
-            .context_window
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
-    );
     choice
 }
 
@@ -105,7 +98,7 @@ pub(crate) fn with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solaris_agent::testing::TurnRequest;
+    use crate::test_support::TurnRequest;
     use solaris_agent::{AgentEventStream, BackendError, ModelConnector};
     use solaris_provider::CredentialSource;
     use std::sync::Arc;
@@ -116,7 +109,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);

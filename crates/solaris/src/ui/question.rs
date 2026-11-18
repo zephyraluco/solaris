@@ -334,25 +334,22 @@ mod tests {
     #[async_trait::async_trait]
     impl ModelConnector for Model {
         async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
-            Ok(solaris_agent::testing::client(
-                Default::default(),
-                move |_| {
-                    let questions = self.0.clone();
-                    async move {
-                        Ok(Box::pin(futures::stream::iter([
-                            AgentEvent::ToolCall(ToolCall::new(
-                                "ask",
-                                "question",
-                                serde_json::json!({"questions":questions}),
-                            )),
-                            AgentEvent::TurnComplete {
-                                usage: Usage::new(1, 1),
-                                cost_usd: 0.0,
-                            },
-                        ])) as AgentEventStream)
-                    }
-                },
-            ))
+            Ok(crate::test_support::client(Default::default(), move |_| {
+                let questions = self.0.clone();
+                async move {
+                    Ok(Box::pin(futures::stream::iter([
+                        AgentEvent::ToolCall(ToolCall::new(
+                            "ask",
+                            "question",
+                            serde_json::json!({"questions":questions}),
+                        )),
+                        AgentEvent::TurnComplete {
+                            usage: Usage::new(1, 1),
+                            cost_usd: 0.0,
+                        },
+                    ])) as AgentEventStream)
+                }
+            }))
         }
     }
     fn question(multiple: bool) -> solaris_agent::Question {

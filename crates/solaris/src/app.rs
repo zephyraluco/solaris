@@ -2436,17 +2436,6 @@ impl Component for App {
         }
         dirty |= self.poll_navigation() | self.poll_io(false) | self.poll_oauth();
         let snapshot = self.sessions.agent.snapshot();
-        let context_window = u64::from(
-            snapshot
-                .capabilities
-                .context_window
-                .unwrap_or(DEFAULT_CONTEXT_WINDOW),
-        );
-        if self.config.context_window != context_window {
-            self.config.context_window = context_window;
-            dirty = true;
-        }
-
         let context = snapshot.context(self.config.mode);
         if self.session.context != context {
             self.session.context = context;
@@ -2740,9 +2729,9 @@ pub fn editor_styles(theme: &Theme) -> EditorStyles {
 mod tests {
     use super::*;
     use crate::application::connection::OAuthPending;
+    use crate::test_support::TurnRequest;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::testing::TurnRequest;
     use solaris_agent::{BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
@@ -2847,7 +2836,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -5100,7 +5089,14 @@ mod tests {
             .capabilities()
             .context_window
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        assert_eq!(app.config.context_window, u64::from(expected));
+        assert_eq!(
+            app.sessions
+                .agent
+                .snapshot()
+                .context(app.config.mode)
+                .window,
+            expected
+        );
 
         // The wizard's model step can still change it.
         app.handle_key(key(KeyCode::Down));
@@ -5109,6 +5105,10 @@ mod tests {
             app.model(),
             app.connection.provider_config.models("anthropic")[1].0
         );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            app.tick();
+        }
         // The official catalog also supplies the selected model's limits.
         let expected = app
             .connection
@@ -5118,7 +5118,14 @@ mod tests {
             .capabilities()
             .context_window
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        assert_eq!(app.config.context_window, u64::from(expected));
+        assert_eq!(
+            app.sessions
+                .agent
+                .snapshot()
+                .context(app.config.mode)
+                .window,
+            expected
+        );
     }
 
     #[tokio::test]
@@ -5129,7 +5136,14 @@ mod tests {
         // Nothing to connect: no model is named and no provider answers.
         assert_eq!(app.backend_label(), "unconnected");
         assert_eq!(app.model(), "");
-        assert_eq!(app.config.context_window, 128_000);
+        assert_eq!(
+            app.sessions
+                .agent
+                .snapshot()
+                .context(app.config.mode)
+                .window,
+            DEFAULT_CONTEXT_WINDOW
+        );
     }
 
     #[test]

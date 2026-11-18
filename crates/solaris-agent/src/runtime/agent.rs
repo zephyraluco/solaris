@@ -161,7 +161,7 @@ impl Agent {
         services: crate::runtime::services::SessionServices,
         mut resources: ResourceSnapshot,
     ) -> Self {
-        let registry = if options.questions.is_some() {
+        let registry = if options.questions.is_some() && registry.get("question").is_none() {
             let mut registry = registry.as_ref().clone();
             registry.add(Arc::new(crate::questions::QuestionTool));
             Arc::new(registry)
@@ -735,11 +735,10 @@ impl std::fmt::Debug for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::testing::TurnRequest;
+    use crate::test_support::TurnRequest;
     use crate::{AgentEvent, AgentEventStream};
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -925,54 +924,7 @@ mod tests {
 
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.
-    struct Scripted {
-        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
-        seen: Mutex<Vec<TurnRequest>>,
-    }
-
-    impl Scripted {
-        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
-            Arc::new(Self {
-                rounds: Mutex::new(rounds.into()),
-                seen: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<TurnRequest> {
-            self.seen.lock().expect("lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl ModelConnector for Scripted {
-        async fn model_client(
-            self: std::sync::Arc<Self>,
-        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
-                self.capabilities(),
-                move |request| {
-                    let fixture = std::sync::Arc::clone(&self);
-                    async move { fixture.respond(request).await }
-                },
-            ))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
-        }
-    }
-    impl Scripted {
-        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            self.seen.lock().expect("lock").push(request);
-            let events = self
-                .rounds
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
+    use crate::test_support::Scripted;
 
     /// A backend that lists one model, for the pass-through checks.
     struct Listed;
@@ -982,7 +934,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);

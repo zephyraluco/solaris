@@ -757,3 +757,11 @@ mod credential_loading_tests {
         assert_eq!(load_auth(None).unwrap().len(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "../../solaris-agent/src/context/estimate.rs"]
+mod test_estimate;

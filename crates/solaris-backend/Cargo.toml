@@ -34,6 +34,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+rig-memory = "0.46.0"
 solaris-agent = { workspace = true, features = ["test-utils"] }
 solaris-backend = { path = ".", features = ["test-utils"] }
 # Only the loopback tests need a listening socket.

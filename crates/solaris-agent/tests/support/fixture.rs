@@ -1,6 +1,5 @@
 //! Scripted test replies exposed as native Rig Serve handlers.
 use super::TurnRequest;
-use crate::{AgentEvent, AgentEventStream, BackendError, Message, ModelClient, ToolSpec};
 use futures::StreamExt;
 use rig_core::{
     completion::{CompletionResponse, FinishReason, Usage as NativeUsage},
@@ -10,6 +9,7 @@ use rig_core::{
     serve::{Dispatch, Reply, Serve},
     streaming::{Item, Part, PartKind, Relayed, StreamEvent},
 };
+use solaris_agent::{AgentEvent, AgentEventStream, BackendError, Message, ModelClient, ToolSpec};
 use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
 type Response = Pin<Box<dyn Future<Output = Result<AgentEventStream, BackendError>> + Send>>;
 struct Fixture {

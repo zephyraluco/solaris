@@ -15,7 +15,7 @@ struct Model {
 impl ModelConnector for Model {
     async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
         let requests = self.requests.clone();
-        Ok(testing::client(Default::default(), move |request| {
+        Ok(test_support::client(Default::default(), move |request| {
             let number = requests.fetch_add(1, Ordering::SeqCst);
             async move {
                 let events = if number == 0 {
@@ -264,3 +264,9 @@ async fn question_events_and_display_metadata_survive_replay_without_reopening_t
     assert!(requested && resolved && metadata);
     assert!(session.pending_questions().is_empty());
 }
+
+#[path = "support/mod.rs"]
+mod test_support;
+
+#[path = "../src/context/estimate.rs"]
+mod test_estimate;

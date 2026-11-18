@@ -296,21 +296,52 @@ impl Tool for McpTool {
             CallToolRequestParams::new(self.remote.clone())
                 .with_arguments(input.as_object().cloned().unwrap_or_default()),
         );
-        tokio::pin!(call);
-        let mut ticker = tokio::time::interval(Duration::from_millis(25));
-        let deadline = tokio::time::sleep(Duration::from_secs(120));
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                biased;
-                _ = ticker.tick() => if ctx.is_cancelled() { return ToolOutput::error("MCP call cancelled"); },
-                _ = &mut deadline => return ToolOutput::error("MCP call timed out after 120 seconds"),
-                result = &mut call => {
-                    let result = match result { Ok(result) => result, Err(_) => return ToolOutput::error("MCP call failed; inspect server configuration or reconnect") };
-                    return tool_output(result, ctx);
-                }
+        match await_request(
+            ctx,
+            call,
+            120,
+            "MCP call cancelled",
+            "MCP call timed out after 120 seconds",
+        )
+        .await
+        {
+            Ok(Ok(result)) => tool_output(result, ctx),
+            Ok(Err(_)) => {
+                ToolOutput::error("MCP call failed; inspect server configuration or reconnect")
             }
+            Err(error) => ToolOutput::error(error),
         }
+    }
+}
+
+const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 50 * 1024;
+
+async fn await_request<T>(
+    ctx: &ToolContext,
+    request: impl std::future::Future<Output = T>,
+    seconds: u64,
+    cancelled: &'static str,
+    timed_out: &'static str,
+) -> Result<T, &'static str> {
+    tokio::pin!(request);
+    let deadline = tokio::time::sleep(Duration::from_secs(seconds));
+    tokio::pin!(deadline);
+    let mut ticker = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            biased;
+            _ = ticker.tick() => if ctx.is_cancelled() { return Err(cancelled); },
+            _ = &mut deadline => return Err(timed_out),
+            result = &mut request => return Ok(result),
+        }
+    }
+}
+
+fn truncate_result(text: &mut String, notice: &str) {
+    if text.len() > MAX_TEXT_BYTES {
+        text.truncate(text.floor_char_boundary(MAX_TEXT_BYTES));
+        text.push_str(notice);
     }
 }
 
@@ -319,7 +350,7 @@ fn tool_output(result: rmcp::model::CallToolResult, ctx: &ToolContext) -> ToolOu
         Ok(value) => value,
         Err(_) => return ToolOutput::error("invalid MCP result"),
     };
-    if encoded.to_string().len() > 2 * 1024 * 1024 {
+    if encoded.to_string().len() > MAX_RESULT_BYTES {
         return ToolOutput::error("MCP result exceeds the 2 MiB result limit; narrow the request");
     }
     let mut text = String::new();
@@ -358,14 +389,7 @@ fn tool_output(result: rmcp::model::CallToolResult, ctx: &ToolContext) -> ToolOu
             text.push_str(&structured);
         }
     }
-    if text.len() > 50 * 1024 {
-        let mut end = 50 * 1024;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str("\n[MCP output truncated]");
-    }
+    truncate_result(&mut text, "\n[MCP output truncated]");
     let mut output = if result.is_error == Some(true) {
         ToolOutput::error(text)
     } else {
@@ -549,27 +573,30 @@ impl Tool for ProtocolTool {
         }
     }
     async fn run(&self, input: Value, ctx: &ToolContext) -> ToolOutput {
-        let request = self.request(input);
-        tokio::pin!(request);
-        let deadline = tokio::time::sleep(Duration::from_secs(30));
-        tokio::pin!(deadline);
-        let mut ticker = tokio::time::interval(Duration::from_millis(25));
-        loop {
-            tokio::select! {
-                biased;
-                _ = ticker.tick() => if ctx.is_cancelled() { return ToolOutput::error("MCP request cancelled"); },
-                _ = &mut deadline => return ToolOutput::error("MCP request timed out"),
-                result = &mut request => return match result {
-                    Ok(value) => {
-                        let text = value.to_string();
-                        if text.len() > 2 * 1024 * 1024 { return ToolOutput::error("MCP protocol result exceeds 2 MiB; narrow the request"); }
-                        let mut output = ToolOutput::ok(if text.len() > 50 * 1024 { let mut end = 50 * 1024; while !text.is_char_boundary(end) { end -= 1; } format!("{}\n[MCP result truncated; full structured result retained]", &text[..end]) } else { text });
-                        output.metadata.details = json!({"mcp":value}); output
-                    },
-                    Err(error) => ToolOutput::error(error),
-                }
-            }
+        let value = match await_request(
+            ctx,
+            self.request(input),
+            30,
+            "MCP request cancelled",
+            "MCP request timed out",
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return ToolOutput::error(error),
+            Err(error) => return ToolOutput::error(error),
+        };
+        let mut text = value.to_string();
+        if text.len() > MAX_RESULT_BYTES {
+            return ToolOutput::error("MCP protocol result exceeds 2 MiB; narrow the request");
         }
+        truncate_result(
+            &mut text,
+            "\n[MCP result truncated; full structured result retained]",
+        );
+        let mut output = ToolOutput::ok(text);
+        output.metadata.details = json!({"mcp": value});
+        output
     }
 }
 

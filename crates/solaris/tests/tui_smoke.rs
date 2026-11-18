@@ -14,12 +14,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
-use solaris_agent::testing::TurnRequest;
 use solaris_agent::{
     AgentEvent, AgentEventStream, BackendError, ModelConnector, Role, ToolCall, Usage,
 };
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
+use test_support::TurnRequest;
 
 /// The prompt a request asks about, wherever the loop put it.
 ///
@@ -54,13 +54,10 @@ impl ModelConnector for FakeBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -100,13 +97,10 @@ impl ModelConnector for ToolBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -159,13 +153,10 @@ impl ModelConnector for InspectingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -213,13 +204,10 @@ impl ModelConnector for DelegatingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -1284,3 +1272,9 @@ fn the_second_provider_row_opens_its_api_key_step() {
     assert!(text.contains("Connect OpenCode Go"), "{text}");
     assert!(text.contains("Paste your API key:"), "{text}");
 }
+
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+#[path = "../../solaris-agent/src/context/estimate.rs"]
+mod test_estimate;

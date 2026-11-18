@@ -134,7 +134,7 @@ mod tests {
                         env_keys: &[],
                     },
                     model: {
-                        let mut spec = crate::testing::parameters("fixture", 100)
+                        let mut spec = crate::test_support::parameters("fixture", 100)
                             .facts()
                             .spec()
                             .unwrap()

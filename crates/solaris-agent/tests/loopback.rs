@@ -7,7 +7,6 @@
 //! parsed tool call, the executed tool and the follow-up request are all
 //! exercised together. Nothing here reaches the network.
 
-use solaris_agent::testing::AgentFixture;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,7 +143,7 @@ fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_ag
 }
 
 fn backend(addr: SocketAddr) -> Backend {
-    backend_with_model(addr, solaris_agent::testing::parameters("test-model", 4096))
+    backend_with_model(addr, test_support::parameters("test-model", 4096))
 }
 
 fn backend_with_model(addr: SocketAddr, model: solaris_backend::ModelParameters) -> Backend {
@@ -176,7 +175,7 @@ fn registry() -> Arc<ToolRegistry> {
 ///
 /// A gateway answers no catalogue, so the tool is named outright rather than
 /// left to a mode's default set.
-fn agent(addr: SocketAddr, dir: &Path) -> Agent {
+fn agent(addr: SocketAddr, dir: &Path) -> solaris_agent::SessionRuntime {
     let choice = ConnectionConfig {
         backend: Arc::new(backend(addr)),
         provider_id: None,
@@ -188,18 +187,18 @@ fn agent(addr: SocketAddr, dir: &Path) -> Agent {
         only: vec!["read".to_string()],
         ..Default::default()
     };
-    Agent::new(
+    solaris_agent::SessionRuntime::new(Agent::new(
         choice,
         registry(),
         AgentOptions::in_directory(dir)
             .with_selection(selection)
             .with_approver(Arc::new(solaris_agent::AlwaysApprove)),
-    )
+    ))
 }
 
 /// Read a turn's stream to its end.
-async fn drain(agent: &Agent, prompt: &str) -> Vec<AgentEvent> {
-    let mut stream = agent.run_fixture(prompt, Mode::Build);
+async fn drain(agent: &solaris_agent::SessionRuntime, prompt: &str) -> Vec<AgentEvent> {
+    let mut stream = test_support::run_turn(agent, prompt, Mode::Build).await;
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -314,7 +313,7 @@ async fn native_connection_preserves_full_response_in_the_complete_executor() {
             label: "local".into(),
             env_keys: &[],
         },
-        model: solaris_agent::testing::parameters("native-model", 1234),
+        model: test_support::parameters("native-model", 1234),
 
         prompt_cache_key: None,
     })
@@ -469,6 +468,7 @@ async fn manual_native_compaction_obeys_cancellation_and_releases_the_connection
         registry(),
         options,
     );
+    let agent = solaris_agent::SessionRuntime::new(agent);
     agent.attach_journal(Arc::clone(&journal)).unwrap();
     let cancel = agent.cancel_handle();
     tokio::spawn(async move {
@@ -476,7 +476,7 @@ async fn manual_native_compaction_obeys_cancellation_and_releases_the_connection
         cancel.cancel();
     });
     assert_eq!(
-        tokio::time::timeout(PATIENCE, agent.compact_fixture())
+        tokio::time::timeout(PATIENCE, test_support::compact(&agent))
             .await
             .unwrap(),
         None
@@ -530,8 +530,9 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
         registry(),
         options,
     );
+    let agent = solaris_agent::SessionRuntime::new(agent);
     agent.attach_journal(Arc::clone(&journal)).unwrap();
-    assert_eq!(agent.compact_fixture().await, Some(2));
+    assert_eq!(test_support::compact(&agent).await, Some(2));
     let memory =
         rig_memory::DirStore::open(directory.path().join("memory").join(journal.id())).unwrap();
     let conversation = rig_memory::load(&memory, "conversation").unwrap();
@@ -547,3 +548,9 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
     assert_eq!(body["max_tokens"], 2048);
     assert!(body.get("tools").is_none());
 }
+
+#[path = "support/mod.rs"]
+mod test_support;
+
+#[path = "../src/context/estimate.rs"]
+mod test_estimate;

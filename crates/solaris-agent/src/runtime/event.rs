@@ -125,7 +125,7 @@ impl AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TurnRequest;
+    use crate::test_support::TurnRequest;
 
     #[test]
     fn a_tool_exchange_does_not_end_the_turn() {

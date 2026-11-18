@@ -54,3 +54,11 @@ pub use solaris_agent::Mode;
 
 mod assembly;
 pub use assembly::agent_backend;
+
+#[cfg(test)]
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "../../solaris-agent/src/context/estimate.rs"]
+mod test_estimate;

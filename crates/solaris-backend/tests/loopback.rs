@@ -7,15 +7,15 @@
 //! content length, chunked reads, teardown) is exercised too. Nothing here
 //! reaches the network.
 
-use solaris_agent::testing::NativeRequest;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
 use solaris_agent::AgentEvent;
-use solaris_agent::testing::TurnRequest;
 use solaris_backend::{Backend, Endpoint, TurnPlan};
 use solaris_backend::{Message, ModelConnector, Usage, Wire};
+use std::sync::Arc;
+use test_support::TurnRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -167,7 +167,11 @@ async fn structured_output_metadata_does_not_override_rigs_native_tool_schema_po
     input
         .tools
         .push(solaris_types::ToolSpec::new("read", "Read", schema.clone()));
-    let events: Vec<_> = model.complete(input).await.unwrap().collect().await;
+    let events: Vec<_> = test_support::request(Arc::new(model), input)
+        .await
+        .unwrap()
+        .collect()
+        .await;
     assert!(matches!(
         events.last(),
         Some(AgentEvent::TurnComplete { .. })
@@ -194,7 +198,11 @@ async fn chatgpt_profile_sends_account_header_and_supported_responses_fields() {
         "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")).await;
     let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-5-codex", 8192, None)
         .with_chatgpt("account-123".into(), u64::MAX);
-    let events: Vec<_> = backend.complete(turn()).await.unwrap().collect().await;
+    let events: Vec<_> = test_support::request(Arc::new(backend), turn())
+        .await
+        .unwrap()
+        .collect()
+        .await;
     assert!(events.iter().any(AgentEvent::is_terminal));
     let request = tokio::time::timeout(PATIENCE, seen).await.unwrap().unwrap();
     assert!(
@@ -219,7 +227,7 @@ async fn expired_chatgpt_credentials_are_refused_before_network_access() {
         None,
     )
     .with_chatgpt("account".into(), 0);
-    let error = match backend.complete(turn()).await {
+    let error = match test_support::request(Arc::new(backend), turn()).await {
         Ok(_) => panic!("expired credentials must not reach the network"),
         Err(error) => error,
     };
@@ -258,8 +266,7 @@ async fn a_streamed_reply_arrives_over_a_real_socket() {
                 data: [DONE]\n\n";
     let (addr, seen) = serve(response("200 OK", "text/event-stream", body)).await;
 
-    let events: Vec<AgentEvent> = backend(addr)
-        .complete(turn())
+    let events: Vec<AgentEvent> = test_support::request(Arc::new(backend(addr)), turn())
         .await
         .expect("the turn started")
         .collect()
@@ -323,12 +330,14 @@ async fn a_responses_turn_streams_over_a_real_socket() {
             .with_cache_read(0.125)
             .with_cache_write(0.00),
     );
-    let events: Vec<AgentEvent> = backend_with_parameters(
-        addr,
-        Wire::OpenAiResponses,
-        solaris_backend::ModelParameters::new(spec, Some(128_000), true),
+    let events: Vec<AgentEvent> = test_support::request(
+        Arc::new(backend_with_parameters(
+            addr,
+            Wire::OpenAiResponses,
+            solaris_backend::ModelParameters::new(spec, Some(128_000), true),
+        )),
+        turn(),
     )
-    .complete(turn())
     .await
     .expect("the turn started")
     .collect()
@@ -474,7 +483,7 @@ async fn a_rejected_key_is_reported_with_the_providers_words() {
     let (addr, _seen) = serve(response("401 Unauthorized", "application/json", body)).await;
 
     // `AgentEventStream` is not `Debug`, so this cannot use `expect_err`.
-    let error = match backend(addr).complete(turn()).await {
+    let error = match test_support::request(Arc::new(backend(addr)), turn()).await {
         Ok(_) => panic!("a 401 must not produce a stream"),
         Err(error) => error,
     };
@@ -519,8 +528,7 @@ async fn a_rate_limited_request_is_retried_before_it_streams() {
         let _ = socket.flush().await;
     });
 
-    let events: Vec<AgentEvent> = backend(addr)
-        .complete(turn())
+    let events: Vec<AgentEvent> = test_support::request(Arc::new(backend(addr)), turn())
         .await
         .expect("the retry succeeded")
         .collect()
@@ -545,7 +553,7 @@ async fn a_connection_that_answers_nothing_fails_before_it_streams() {
     // from `run_turn` rather than as a stream that ends in silence.
     let (addr, _seen) = serve(String::new()).await;
 
-    let error = match backend(addr).complete(turn()).await {
+    let error = match test_support::request(Arc::new(backend(addr)), turn()).await {
         Ok(_) => panic!("a closed connection is not a stream"),
         Err(error) => error,
     };
@@ -617,12 +625,14 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                     serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
                 ));
             }
-            let events: Vec<_> = backend_with(addr, wire, "vision", 1000, None)
-                .complete(input)
-                .await
-                .expect("start")
-                .collect()
-                .await;
+            let events: Vec<_> = test_support::request(
+                Arc::new(backend_with(addr, wire, "vision", 1000, None)),
+                input,
+            )
+            .await
+            .expect("start")
+            .collect()
+            .await;
             assert!(
                 matches!(events.last(), Some(AgentEvent::TurnComplete { usage, .. }) if usage.total() == 12),
                 "{wire:?}: {events:?}"
@@ -653,7 +663,9 @@ async fn dropping_a_model_stream_closes_the_pending_socket() {
         let mut byte = [0];
         socket.read(&mut byte).await.unwrap()
     });
-    let mut stream = backend(addr).complete(turn()).await.unwrap();
+    let mut stream = test_support::request(Arc::new(backend(addr)), turn())
+        .await
+        .unwrap();
     assert!(matches!(
         stream.next().await,
         Some(AgentEvent::TextDelta(_))
@@ -671,8 +683,7 @@ async fn dropping_a_model_stream_closes_the_pending_socket() {
 #[tokio::test]
 async fn a_truncated_stream_is_not_retried_after_visible_output_or_reported_as_success() {
     let (addr, _) = serve("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 999999\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".into()).await;
-    let events: Vec<_> = backend(addr)
-        .complete(turn())
+    let events: Vec<_> = test_support::request(Arc::new(backend(addr)), turn())
         .await
         .unwrap()
         .collect()
@@ -710,9 +721,12 @@ async fn rejected_stream_options_are_removed_once_without_changing_prompt() {
         }
         bodies
     });
-    let error = match tokio::time::timeout(PATIENCE, backend(addr).complete(turn()))
-        .await
-        .unwrap()
+    let error = match tokio::time::timeout(
+        PATIENCE,
+        test_support::request(Arc::new(backend(addr)), turn()),
+    )
+    .await
+    .unwrap()
     {
         Err(error) => error,
         Ok(_) => panic!("repeated rejection must stop"),
@@ -812,7 +826,7 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
             label: "custom".into(),
             env_keys: &[],
         },
-        model: solaris_agent::testing::parameters("test", 100),
+        model: test_support::parameters("test", 100),
 
         prompt_cache_key: None,
     })
@@ -830,3 +844,9 @@ async fn official_messages_listing_follows_every_page_under_the_gateway_root() {
         assert!(request.contains("x-opencode-session:"));
     }
 }
+
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+#[path = "../../solaris-agent/src/context/estimate.rs"]
+mod test_estimate;

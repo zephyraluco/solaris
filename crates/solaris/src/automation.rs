@@ -184,8 +184,8 @@ pub async fn serve_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TurnRequest;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::testing::TurnRequest;
     use solaris_agent::{
         Agent, AgentOptions, BackendError, ConnectionConfig, ModelConnector, ToolRegistry,
     };
@@ -198,7 +198,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(solaris_agent::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -342,18 +342,15 @@ mod tests {
     #[async_trait::async_trait]
     impl ModelConnector for Immediate {
         async fn model_client(self: Arc<Self>) -> Result<solaris_agent::ModelClient, BackendError> {
-            Ok(solaris_agent::testing::client(
-                Default::default(),
-                |_| async {
-                    Ok(Box::pin(futures::stream::iter([
-                        AgentEvent::TextDelta("answer".into()),
-                        AgentEvent::TurnComplete {
-                            usage: Default::default(),
-                            cost_usd: 0.0,
-                        },
-                    ])) as AgentEventStream)
-                },
-            ))
+            Ok(crate::test_support::client(Default::default(), |_| async {
+                Ok(Box::pin(futures::stream::iter([
+                    AgentEvent::TextDelta("answer".into()),
+                    AgentEvent::TurnComplete {
+                        usage: Default::default(),
+                        cost_usd: 0.0,
+                    },
+                ])) as AgentEventStream)
+            }))
         }
     }
     #[tokio::test]
@@ -435,7 +432,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ModelConnector for Asking {
         async fn model_client(self: Arc<Self>) -> Result<solaris_agent::ModelClient, BackendError> {
-            Ok(solaris_agent::testing::client(
+            Ok(crate::test_support::client(
                 Default::default(),
                 |request| async move {
                     let answered = request
