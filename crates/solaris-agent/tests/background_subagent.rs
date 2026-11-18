@@ -19,10 +19,10 @@ impl ModelConnector for Model {
         Ok(test_support::client(Default::default(), move |request| {
             let this = self.clone();
             async move {
-                let child = request
-                    .history
-                    .iter()
-                    .any(|m| m.role == Role::User && m.text().starts_with("You are an isolated"));
+                let child = request.history.iter().any(|m| {
+                    matches!(m, rig_core::message::Message::User { .. })
+                        && m.text().starts_with("You are an isolated")
+                });
                 let events = if child {
                     if request
                         .history
@@ -377,3 +377,5 @@ mod test_support;
 
 #[path = "../src/context/estimate.rs"]
 mod test_estimate;
+
+use test_support::messages::MessageFixture;

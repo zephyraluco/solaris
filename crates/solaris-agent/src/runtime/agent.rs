@@ -735,6 +735,7 @@ impl std::fmt::Debug for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::messages::MessageFixture;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1008,7 +1009,7 @@ mod tests {
         let original = agent(Scripted::new(Vec::new()));
         original
             .conversation
-            .push_fixture(solaris_backend::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
         let refreshed = original.with_refreshed_backend(choice(Scripted::new(Vec::new())));
         assert_eq!(refreshed.conversation_len(), 1);
         assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
@@ -1030,7 +1031,7 @@ mod tests {
         assert_eq!(first.model, "claude-sonnet-4-5");
         original
             .conversation
-            .push_fixture(crate::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
 
         let mut next = choice(Scripted::new(Vec::new()));
         next.provider_id = Some("openai".into());
@@ -1047,8 +1048,12 @@ mod tests {
         assert_eq!(saved.model, "next-model");
         let resumed = store.resume(&saved.id).expect("resume");
         assert_eq!(
-            resumed.context().expect("context")[0].text(),
-            "remember this"
+            rig_memory::load(&resumed.memory_store().unwrap(), "conversation")
+                .unwrap()
+                .messages()[0]
+                .rag_text()
+                .as_deref(),
+            Some("remember this")
         );
     }
 
@@ -1064,7 +1069,7 @@ mod tests {
         original.attach_journal(journal).expect("attach");
         original
             .conversation
-            .push_fixture(crate::Message::user("private history"));
+            .push(rig_core::message::Message::user("private history"));
         rusqlite::Connection::open(&database)
             .expect("connection")
             .execute_batch(
@@ -1088,7 +1093,7 @@ mod tests {
             .with_child_backend(Arc::new(|_| Err("expired credential".into())));
         original
             .conversation
-            .push_fixture(crate::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
         let refreshed = original
             .with_refreshed_backend(choice(Scripted::new(Vec::new())))
             .with_child_backend(Arc::new(|model| {
@@ -1166,10 +1171,10 @@ mod tests {
         let agent = agent(inner.clone());
         agent
             .conversation
-            .push_fixture(crate::Message::user("earlier notification one"));
+            .push(rig_core::message::Message::user("earlier notification one"));
         agent
             .conversation
-            .push_fixture(crate::Message::user("earlier notification two"));
+            .push(rig_core::message::Message::user("earlier notification two"));
         let before = agent.conversation.native().expect("saved history");
         agent
             .steering_handle()
@@ -1258,8 +1263,8 @@ mod tests {
             .expect("request")
             .history
             .iter()
-            .filter(|message| message.role == crate::Role::User)
-            .map(crate::Message::text)
+            .filter(|message| matches!(message, rig_core::message::Message::User { .. }))
+            .map(rig_core::message::Message::text)
             .collect();
         assert_eq!(user_text.len(), 3);
         for (text, request) in user_text.iter().zip(["initial", "steer", "follow"]) {
@@ -1608,13 +1613,13 @@ mod tests {
         agent.options.compaction.keep_recent_tokens = 1;
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::user("old context"));
+            .push(rig_core::message::Message::user("old context"));
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::assistant("old reply"));
+            .push(rig_core::message::Message::assistant("old reply"));
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::user("new question"));
+            .push(rig_core::message::Message::user("new question"));
         assert!(agent.compact().await.is_some());
         assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
         let context = agent.context_usage(Mode::Build);

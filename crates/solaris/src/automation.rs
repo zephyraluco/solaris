@@ -185,6 +185,7 @@ pub async fn serve_rpc(
 mod tests {
     use super::*;
     use crate::test_support::TurnRequest;
+    use crate::test_support::messages::MessageFixture;
     use solaris_agent::AgentEventStream;
     use solaris_agent::{
         Agent, AgentOptions, BackendError, ConnectionConfig, ModelConnector, ToolRegistry,

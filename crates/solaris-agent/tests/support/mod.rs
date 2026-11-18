@@ -5,8 +5,10 @@ mod display;
 mod fixture;
 pub use fixture::client;
 use futures::StreamExt;
+use rig_core::message::Message;
 use rig_core::serve::Serve;
-use solaris_agent::{Message, ToolSpec};
+use solaris_agent::ToolSpec;
+pub mod messages;
 use std::sync::Arc;
 /// Input observed by scripted Rig test fixtures.
 ///
@@ -51,11 +53,7 @@ pub async fn request(
         .with_status_observer(move |text| {
             let _ = tx.send(solaris_agent::AgentEvent::Status(text));
         });
-    let mut messages = request
-        .history
-        .iter()
-        .map(rig_core::message::Message::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut messages = request.history;
     if !request.prompt.is_empty() {
         messages.push(rig_core::message::Message::user(request.prompt));
     }

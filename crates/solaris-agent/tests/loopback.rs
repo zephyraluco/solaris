@@ -122,26 +122,6 @@ fn text_body(text: &str) -> String {
 }
 
 /// A backend pointed at `addr` speaking Chat Completions.
-fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_agent::Message>) {
-    let directory = journal
-        .store()
-        .artifact_dir()
-        .parent()
-        .unwrap()
-        .join("memory")
-        .join(journal.id());
-    let store = rig_memory::DirStore::open(directory).unwrap();
-    let mut native = rig_memory::load(&store, "conversation").unwrap();
-    native.extend(
-        messages
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap(),
-    );
-    rig_memory::save(&store, "conversation", &mut native).unwrap();
-}
-
 fn backend(addr: SocketAddr) -> Backend {
     backend_with_model(addr, test_support::parameters("test-model", 4096))
 }
@@ -366,9 +346,9 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
         matches!(events.last(), Some(AgentEvent::TurnComplete { .. })),
         "{events:?}"
     );
-    let saved = journal.context().unwrap();
+    let saved = memory::messages(&journal);
     assert_eq!(saved.len(), 2);
-    assert_eq!(saved[1].text(), "remembered");
+    assert_eq!(saved[1].final_answer().as_deref(), Some("remembered"));
     let records = store.records(journal.id()).unwrap();
     assert!(
         !records
@@ -386,7 +366,7 @@ async fn official_memory_is_the_only_message_store_and_failed_tasks_do_not_appen
     let events = drain(&agent, "unsaved failed task").await;
     assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
     assert_eq!(
-        journal.context().unwrap(),
+        memory::messages(&journal),
         saved,
         "SDK memory saves successful tasks only"
     );
@@ -450,11 +430,11 @@ async fn manual_native_compaction_obeys_cancellation_and_releases_the_connection
         solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
     let journal = store.create(directory.path(), "test-model", None).unwrap();
     let saved = vec![
-        solaris_backend::Message::user("earlier request"),
-        solaris_backend::Message::assistant("earlier answer"),
-        solaris_backend::Message::user("new request"),
+        rig_core::message::Message::user("earlier request"),
+        rig_core::message::Message::assistant("earlier answer"),
+        rig_core::message::Message::user("new request"),
     ];
-    seed_memory(&journal, saved.clone());
+    memory::seed(&journal, saved.clone());
     let mut options = AgentOptions::in_directory(directory.path());
     options.compaction.keep_recent_tokens = 1;
     let agent = Agent::new(
@@ -481,7 +461,7 @@ async fn manual_native_compaction_obeys_cancellation_and_releases_the_connection
             .unwrap(),
         None
     );
-    assert_eq!(journal.context().unwrap(), saved);
+    assert_eq!(memory::messages(&journal), saved);
     assert_eq!(
         tokio::time::timeout(PATIENCE, server)
             .await
@@ -498,12 +478,12 @@ async fn native_compaction_uses_sdk_limits_and_persists_the_sdk_summary_state() 
     let store =
         solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite")).unwrap();
     let journal = store.create(directory.path(), "test-model", None).unwrap();
-    seed_memory(
+    memory::seed(
         &journal,
         vec![
-            solaris_backend::Message::user("old request"),
-            solaris_backend::Message::assistant("old answer"),
-            solaris_backend::Message::user("new request"),
+            rig_core::message::Message::user("old request"),
+            rig_core::message::Message::assistant("old answer"),
+            rig_core::message::Message::user("new request"),
         ],
     );
     let spec = rig_core::catalog::ModelSpec::new(
@@ -554,3 +534,6 @@ mod test_support;
 
 #[path = "../src/context/estimate.rs"]
 mod test_estimate;
+
+#[path = "support/memory.rs"]
+mod memory;

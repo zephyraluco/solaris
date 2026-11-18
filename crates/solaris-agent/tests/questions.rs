@@ -270,3 +270,5 @@ mod test_support;
 
 #[path = "../src/context/estimate.rs"]
 mod test_estimate;
+
+use test_support::messages::MessageFixture;

@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::{AgentEvent, AgentEventStream};
 use futures::{Stream, StreamExt};
 #[cfg(test)]
-use solaris_backend::Message;
+use rig_core::message::Message;
 use solaris_backend::{ModelConnector, Usage};
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use solaris_types::{ToolCall, ToolResult, ToolSpec};
@@ -831,11 +831,12 @@ impl Stream for EventStream {
 }
 #[cfg(test)]
 mod tests {
+    use crate::test_support::messages::MessageFixture;
     fn request_text(request: &crate::test_support::TurnRequest) -> String {
         request
             .history
             .iter()
-            .map(solaris_backend::Message::text)
+            .map(rig_core::message::Message::text)
             .chain(std::iter::once(request.prompt.clone()))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1050,7 +1051,7 @@ mod tests {
         /// The same turn, continuing `messages` rather than the default start.
         fn history(self, messages: Vec<Message>) -> Self {
             for message in messages {
-                self.conversation.push_fixture(message);
+                self.conversation.push(message);
             }
             self
         }
@@ -1116,8 +1117,7 @@ mod tests {
         inner.requests()[1]
             .history
             .iter()
-            .flat_map(Message::tool_results)
-            .cloned()
+            .flat_map(MessageFixture::tool_results)
             .collect()
     }
 
@@ -2255,13 +2255,7 @@ mod tests {
             ..Default::default()
         };
         rig_memory::apply_summary(&mut native, None, &state).expect("initial summary");
-        native.extend(
-            long_history(12)
-                .iter()
-                .map(rig_core::message::Message::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .expect("native history"),
-        );
+        native.extend(long_history(12));
         rig_memory::save(&conversation.storage(), "conversation", &mut native)
             .expect("save summary state");
         let events = turn.run("do it").await;
@@ -2404,13 +2398,8 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests[1].tools.is_empty());
         assert!(request_text(&requests[2]).contains("history summary"));
-        let history: Vec<_> = requests[2]
-            .history
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<_, _>>()
-            .unwrap();
-        rig_core::conversation::pairing::validate(&history).unwrap();
+        let history = &requests[2].history;
+        rig_core::conversation::pairing::validate(history).unwrap();
     }
 
     #[tokio::test]
@@ -2421,12 +2410,15 @@ mod tests {
             let original = vec![
                 Message::user("keep task constraints"),
                 Message::tool_use(old.clone()),
-                Message::tool_result(ToolResult::ok(
+                crate::test_support::messages::tool_result(ToolResult::ok(
                     &old,
                     format!("OLD_OUTPUT_MARKER{}", "x".repeat(20000)),
                 )),
                 Message::tool_use(recent.clone()),
-                Message::tool_result(ToolResult::ok(&recent, "RECENT_OUTPUT_MARKER")),
+                crate::test_support::messages::tool_result(ToolResult::ok(
+                    &recent,
+                    "RECENT_OUTPUT_MARKER",
+                )),
                 Message::user("next action"),
             ];
             let conversation = Conversation::new();
@@ -2472,9 +2464,15 @@ mod tests {
             Message::assistant("old answer"),
             Message::user("current target: parser.rs; preserve flags"),
             Message::tool_use(call("first", "record")),
-            Message::tool_result(ToolResult::ok(&call("first", "record"), "first result")),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("first", "record"),
+                "first result",
+            )),
             Message::tool_use(call("last", "record")),
-            Message::tool_result(ToolResult::ok(&call("last", "record"), "x".repeat(4000))),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("last", "record"),
+                "x".repeat(4000),
+            )),
         ]
     }
 

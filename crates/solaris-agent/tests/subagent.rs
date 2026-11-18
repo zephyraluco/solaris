@@ -9,7 +9,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use solaris_agent::{
     Agent, AgentEvent, AgentEventStream, AgentOptions, Approval, BackendError, ConnectionConfig,
-    FnApprover, Mode, ModelConnector, PromptContext, PromptFile, Role, Tool, ToolCall, ToolContext,
+    FnApprover, Mode, ModelConnector, PromptContext, PromptFile, Tool, ToolCall, ToolContext,
     ToolOutput, ToolRegistry, ToolSelection, Usage,
 };
 use test_support::TurnRequest;
@@ -74,7 +74,8 @@ impl Model {
 
 fn is_child(request: &TurnRequest) -> bool {
     request.history.iter().any(|message| {
-        message.role == Role::User && message.text().starts_with("You are an isolated")
+        matches!(message, rig_core::message::Message::User { .. })
+            && message.text().starts_with("You are an isolated")
     })
 }
 
@@ -526,7 +527,7 @@ async fn independent_subagents_run_concurrently_and_keep_result_order() {
         .history
         .iter()
         .flat_map(|message| message.tool_results())
-        .map(|result| result.id.as_str())
+        .map(|result| result.id)
         .collect();
     assert_eq!(ids, vec!["one", "two"]);
 }
@@ -700,13 +701,11 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
     assert!(child.is_subagent);
     assert!(events.iter().any(|event| matches!(event, AgentEvent::SubagentSession { session_id, .. } if session_id == &child.id)));
     let restored = store.resume(&child.id).expect("child is no longer running");
-    assert!(
-        restored
-            .context()
-            .expect("context")
-            .iter()
-            .any(|message| message.text().starts_with("You are an isolated"))
-    );
+    assert!(memory::messages(&restored).iter().any(|message| {
+        message
+            .rag_text()
+            .is_some_and(|text| text.starts_with("You are an isolated"))
+    }));
     assert!(parent.snapshot().active_tasks.is_empty());
 }
 
@@ -821,3 +820,8 @@ mod test_support;
 
 #[path = "../src/context/estimate.rs"]
 mod test_estimate;
+
+#[path = "support/memory.rs"]
+mod memory;
+
+use test_support::messages::MessageFixture;

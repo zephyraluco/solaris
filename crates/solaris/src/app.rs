@@ -2730,9 +2730,10 @@ mod tests {
     use super::*;
     use crate::application::connection::OAuthPending;
     use crate::test_support::TurnRequest;
+    use crate::test_support::messages::MessageFixture;
     use crossterm::event::MouseButton;
     use solaris_agent::AgentEventStream;
-    use solaris_agent::{BackendError, Role, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
+    use solaris_agent::{BackendError, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
     use solaris_provider::BackendOptions;
     use std::cell::RefCell;
     use std::time::Duration;
@@ -2819,7 +2820,10 @@ mod tests {
             .history
             .iter()
             .rev()
-            .find(|message| message.role == Role::User && !message.text().is_empty())
+            .find(|message| {
+                matches!(message, rig_core::message::Message::User { .. })
+                    && !message.text().is_empty()
+            })
             .map(|message| message.text())
             .unwrap_or_default()
     }

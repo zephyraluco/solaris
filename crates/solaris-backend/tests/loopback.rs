@@ -11,9 +11,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rig_core::message::Message;
 use solaris_agent::AgentEvent;
 use solaris_backend::{Backend, Endpoint, TurnPlan};
-use solaris_backend::{Message, ModelConnector, Usage, Wire};
+use solaris_backend::{ModelConnector, Usage, Wire};
 use std::sync::Arc;
 use test_support::TurnRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -582,7 +583,8 @@ fn completion(wire: Wire) -> String {
 
 #[tokio::test]
 async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_metadata() {
-    use solaris_backend::{Content, InlineImage};
+    use rig_core::message::{ImageMediaType, UserContent};
+    use solaris_backend::InlineImage;
     use solaris_types::{ToolCall, ToolResult};
     for wire in [
         Wire::OpenAiChat,
@@ -603,17 +605,21 @@ async fn user_and_tool_images_reach_all_three_rig_protocols_without_journal_meta
                 let mut result = ToolResult::ok(&call, "image result");
                 result.metadata.images.push(image.clone());
                 result.metadata.details = serde_json::json!({"journal": "journal-only-marker"});
-                vec![Message::tool_use(call), Message::tool_result(result)]
+                vec![
+                    Message::tool_use(call),
+                    test_support::messages::tool_result(result),
+                ]
             } else {
-                vec![Message::with_content(
-                    solaris_backend::Role::User,
-                    vec![
-                        Content::text("inspect"),
-                        Content::Image {
-                            image: image.clone(),
-                        },
+                vec![Message::User {
+                    content: vec![
+                        UserContent::text("inspect"),
+                        UserContent::image_base64(
+                            image.data.clone(),
+                            Some(ImageMediaType::PNG),
+                            None,
+                        ),
                     ],
-                )]
+                }]
             };
             let (addr, seen) =
                 serve(response("200 OK", "text/event-stream", &completion(wire))).await;
@@ -850,3 +856,5 @@ mod test_support;
 
 #[path = "../../solaris-agent/src/context/estimate.rs"]
 mod test_estimate;
+
+use test_support::messages::MessageFixture;

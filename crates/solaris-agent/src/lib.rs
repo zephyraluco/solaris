@@ -86,9 +86,6 @@ mod tasks;
 
 mod identity;
 
-#[cfg(any(test, feature = "test-utils"))]
-pub use solaris_backend::{Content, Message, Role};
-
 mod questions;
 pub use questions::Questions;
 pub use solaris_types::{

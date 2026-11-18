@@ -24,9 +24,7 @@ use std::sync::{
 };
 
 #[cfg(test)]
-use solaris_backend::Message;
-#[cfg(test)]
-use solaris_backend::Role;
+use rig_core::message::Message;
 
 /// The messages a turn is built from and appends to.
 pub(crate) struct Conversation {
@@ -190,7 +188,7 @@ impl Conversation {
             Ok(conversation) => conversation
                 .messages()
                 .iter()
-                .map(|message| Message::from(message.as_ref()))
+                .map(|message| message.as_ref().clone())
                 .collect(),
             Err(error) => {
                 self.failed(error);
@@ -205,13 +203,6 @@ impl Conversation {
                 self.failed(error);
                 0
             }
-        }
-    }
-    #[cfg(test)]
-    pub(crate) fn push_fixture(&self, message: Message) {
-        match rig_core::message::Message::try_from(&message) {
-            Ok(message) => self.push(message),
-            Err(error) => self.failed(error),
         }
     }
     /// Stable native entry authors make outbox retries idempotent across a crash before acknowledgement.
@@ -249,19 +240,12 @@ impl Conversation {
     }
     #[cfg(test)]
     pub(crate) fn replace_with(&self, messages: Vec<Message>) {
-        match messages
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(messages) => self.replace_entries(
-                messages
-                    .into_iter()
-                    .map(rig_core::conversation::Entry::new)
-                    .collect(),
-            ),
-            Err(error) => self.failed(error),
-        }
+        self.replace_entries(
+            messages
+                .into_iter()
+                .map(rig_core::conversation::Entry::new)
+                .collect(),
+        );
     }
     fn replace_entries(&self, entries: Vec<rig_core::conversation::Entry>) {
         self.projections
@@ -512,6 +496,7 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::messages::MessageFixture;
     use serde_json::json;
 
     use solaris_types::{ToolCall, ToolResult};
@@ -528,7 +513,7 @@ mod tests {
     #[test]
     fn a_phase_checkpoint_refuses_a_concurrent_writer() {
         let conversation = Conversation::new();
-        conversation.push_fixture(Message::user("original"));
+        conversation.push(Message::user("original"));
         let mut base = conversation.native().unwrap();
         let mut checkpoint = base
             .messages()
@@ -536,7 +521,7 @@ mod tests {
             .map(|message| message.as_ref().clone())
             .collect::<Vec<_>>();
         checkpoint.push(rig_core::message::Message::assistant("completed phase"));
-        conversation.push_fixture(Message::user("concurrent input"));
+        conversation.push(Message::user("concurrent input"));
         assert!(conversation.commit_phase(&mut base, checkpoint).is_err());
         let messages = conversation.snapshot();
         assert_eq!(messages.len(), 2);
@@ -548,8 +533,8 @@ mod tests {
         let conversation = Conversation::new();
         assert!(conversation.snapshot().is_empty());
 
-        conversation.push_fixture(Message::user("hello"));
-        conversation.push_fixture(Message::assistant("hi"));
+        conversation.push(Message::user("hello"));
+        conversation.push(Message::assistant("hi"));
 
         assert_eq!(conversation.len(), 2);
         let snapshot = conversation.snapshot();
@@ -560,8 +545,8 @@ mod tests {
     #[test]
     fn clearing_forgets_everything() {
         let conversation = Conversation::new();
-        conversation.push_fixture(Message::user("hello"));
-        conversation.push_fixture(Message::assistant("hi"));
+        conversation.push(Message::user("hello"));
+        conversation.push(Message::assistant("hi"));
         conversation.clear();
 
         assert_eq!(conversation.len(), 0);
@@ -572,8 +557,8 @@ mod tests {
     #[test]
     fn unanswered_calls_get_explicit_interruption_results() {
         let conversation = Conversation::new();
-        conversation.push_fixture(Message::user("read it"));
-        conversation.push_fixture(Message::tool_use(call("call-1")));
+        conversation.push(Message::user("read it"));
+        conversation.push(Message::tool_use(call("call-1")));
 
         conversation.repair();
 
@@ -592,20 +577,16 @@ mod tests {
         vec![
             Message::user("old round"),
             Message::tool_use(call("reused")),
-            Message::tool_result(ToolResult::ok(&call("reused"), "old result")),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("reused"),
+                "old result",
+            )),
             Message::user("new round"),
-            Message::with_content(
-                Role::Assistant,
-                vec![
-                    solaris_backend::Content::ToolUse {
-                        call: call("reused"),
-                    },
-                    solaris_backend::Content::ToolUse {
-                        call: call("other"),
-                    },
-                ],
-            ),
-            Message::tool_result(ToolResult::ok(&call("other"), "current partial result")),
+            crate::test_support::messages::tool_uses([call("reused"), call("other")]),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("other"),
+                "current partial result",
+            )),
         ]
     }
 
@@ -625,7 +606,10 @@ mod tests {
             ids
         );
         assert_eq!(&after[..5], &before[..5]);
-        let results: Vec<_> = after.iter().flat_map(Message::tool_results).collect();
+        let results: Vec<_> = after
+            .iter()
+            .flat_map(MessageFixture::tool_results)
+            .collect();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].output, "old result");
         assert_eq!(results[1].output, "current partial result");
@@ -640,7 +624,7 @@ mod tests {
     fn a_reused_id_with_a_current_result_is_not_repaired() {
         let conversation = Conversation::new();
         let mut complete = interrupted_reused_id_history();
-        complete.push(Message::tool_result(ToolResult::ok(
+        complete.push(crate::test_support::messages::tool_result(ToolResult::ok(
             &call("reused"),
             "current result",
         )));
@@ -671,7 +655,13 @@ mod tests {
             .expect("attach");
         let repaired = conversation.snapshot();
         assert_eq!(&repaired[..5], &before[..5]);
-        assert_eq!(repaired.iter().flat_map(Message::tool_results).count(), 3);
+        assert_eq!(
+            repaired
+                .iter()
+                .flat_map(MessageFixture::tool_results)
+                .count(),
+            3
+        );
         assert!(
             repaired
                 .last()
@@ -699,13 +689,13 @@ mod tests {
     #[test]
     fn a_consistent_conversation_is_left_alone() {
         let conversation = Conversation::new();
-        conversation.push_fixture(Message::user("read it"));
-        conversation.push_fixture(Message::tool_use(call("call-1")));
-        conversation.push_fixture(Message::tool_result(ToolResult::ok(
+        conversation.push(Message::user("read it"));
+        conversation.push(Message::tool_use(call("call-1")));
+        conversation.push(crate::test_support::messages::tool_result(ToolResult::ok(
             &call("call-1"),
             "contents",
         )));
-        conversation.push_fixture(Message::assistant("it says hello"));
+        conversation.push(Message::assistant("it says hello"));
 
         conversation.repair();
 
@@ -722,10 +712,10 @@ mod tests {
     #[test]
     fn the_estimate_grows_with_what_is_in_it() {
         let conversation = Conversation::new();
-        conversation.push_fixture(Message::user("x".repeat(400)));
+        conversation.push(Message::user("x".repeat(400)));
         let small = tokens(&conversation);
 
-        conversation.push_fixture(Message::assistant("y".repeat(400)));
+        conversation.push(Message::assistant("y".repeat(400)));
         assert!(tokens(&conversation) > small);
     }
     #[test]
@@ -735,7 +725,7 @@ mod tests {
         conversation.set_headers(vec![initial.clone()]);
         conversation.publish_projection(&[], &initial, true);
         conversation.observe_usage(&initial, solaris_backend::Usage::new(9000, 100));
-        conversation.push_fixture(Message::assistant("previous response"));
+        conversation.push(Message::assistant("previous response"));
         for schema in [r#"{"type":"string"}"#, r#"{"type":"number"}"#, "null"] {
             let tools = if schema == "null" {
                 vec![]
@@ -759,7 +749,7 @@ mod tests {
                 true,
             );
             conversation.observe_usage(&header, solaris_backend::Usage::new(200, 20));
-            conversation.push_fixture(Message::assistant("new response"));
+            conversation.push(Message::assistant("new response"));
             let display = conversation.context_usage(&initial.base_id, 10000);
             assert_eq!(display.tokens, Some(220));
             assert!(!display.estimated);
@@ -811,7 +801,7 @@ mod tests {
         conversation.set_headers(vec![header.clone()]);
         conversation.publish_projection(&[], &header, true);
         conversation.observe_usage(&header, solaris_backend::Usage::new(100, 10));
-        conversation.push_fixture(Message::assistant("reply"));
+        conversation.push(Message::assistant("reply"));
         let lock = conversation.storage.write().unwrap();
         let reader = Arc::clone(&conversation);
         let (tx, rx) = std::sync::mpsc::channel();

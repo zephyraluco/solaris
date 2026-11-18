@@ -14,9 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
-use solaris_agent::{
-    AgentEvent, AgentEventStream, BackendError, ModelConnector, Role, ToolCall, Usage,
-};
+use solaris_agent::{AgentEvent, AgentEventStream, BackendError, ModelConnector, ToolCall, Usage};
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
 use test_support::TurnRequest;
@@ -33,7 +31,9 @@ fn asked(request: &TurnRequest) -> String {
         .history
         .iter()
         .rev()
-        .find(|message| message.role == Role::User && !message.text().is_empty())
+        .find(|message| {
+            matches!(message, rig_core::message::Message::User { .. }) && !message.text().is_empty()
+        })
         .map(|message| message.text())
         .unwrap_or_default()
 }
@@ -1278,3 +1278,5 @@ mod test_support;
 
 #[path = "../../solaris-agent/src/context/estimate.rs"]
 mod test_estimate;
+
+use test_support::messages::MessageFixture;

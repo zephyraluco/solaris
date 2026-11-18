@@ -701,6 +701,7 @@ pub enum RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::messages::MessageFixture;
     struct Connector;
     #[async_trait::async_trait]
     impl crate::ModelConnector for Connector {
