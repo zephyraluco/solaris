@@ -19,6 +19,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Result of an interaction with a dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogMessage {
+    Question {
+        session_id: String,
+        request_id: String,
+        response: solaris_agent::QuestionResponse,
+    },
     /// Dismissed without a choice.
     Cancelled,
     /// A theme was chosen.

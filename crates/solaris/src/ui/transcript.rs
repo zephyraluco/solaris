@@ -678,12 +678,9 @@ fn push_steps(
             header.summary.set_spinner_frame(spinner_frame.unwrap_or(0));
             out.push(header.summary.line(width as u16));
         } else {
-            let (view, body_rows) = if is_shell(step) {
-                let body_rows = step
-                    .result
-                    .as_ref()
-                    .map_or(1, |result| tool_display_text(result).lines().count().max(1));
-                (shell_view(step, turn.complete, theme), body_rows)
+            let (view, body_rows, detail_rows) = if is_shell(step) {
+                let (view, rows) = shell_view(step, turn.complete, theme);
+                (view, rows, Vec::new())
             } else {
                 let mut group_finished = finished + usize::from(step.is_done());
                 while end < turn.steps.len()
@@ -696,15 +693,9 @@ fn push_steps(
                     group_finished += usize::from(turn.steps[end].is_done());
                     end += 1;
                 }
-                (
-                    tool_group_view(
-                        &turn.steps[step_index..end],
-                        turn.complete,
-                        theme,
-                        spinner_frame,
-                    ),
-                    end - step_index,
-                )
+                let (view, detail_rows) =
+                    tool_group_view(&turn.steps[step_index..end], turn.complete, theme);
+                (view, end - step_index, detail_rows)
             };
             let layout = view.layout(width as u16);
             for header in layout.headers {
@@ -715,10 +706,7 @@ fn push_steps(
                     target: (turn_index, turn.offset + target_step),
                     marker_offset: header.marker_offset,
                     body_rows: if detail {
-                        turn.steps[target_step]
-                            .result
-                            .as_ref()
-                            .map_or(1, |result| tool_display_text(result).lines().count().max(1))
+                        detail_rows[target_step - step_index]
                     } else {
                         body_rows
                     },
@@ -752,8 +740,7 @@ fn tool_group_view(
     steps: &[ToolStep],
     turn_complete: bool,
     theme: &Theme,
-    _spinner_frame: Option<u16>,
-) -> Collapsible {
+) -> (Collapsible, Vec<usize>) {
     let pending = steps.iter().any(|step| !step.is_done());
     let running = pending && !turn_complete;
     let interrupted = pending && turn_complete;
@@ -763,10 +750,12 @@ fn tool_group_view(
     // The first call anchors the group, so appending calls or receiving results
     // cannot replace the user's disclosure state.
     let mut view = step_view(&steps[0], title, running, failed, theme);
+    let mut rows = Vec::new();
     if steps[0].disclosure.is_expanded() {
         let mut children = Vec::new();
         for step in steps {
-            let mut child = Collapsible::new(tool_step_title(step))
+            let question_summary = step.result.as_ref().and_then(question_display_text);
+            let mut child = Collapsible::new(tool_step_title(step, question_summary.as_deref()))
                 .with_state(step.detail_disclosure)
                 .styles(CollapsibleStyles::from_theme(theme))
                 .indentation(0, 2);
@@ -779,33 +768,33 @@ fn tool_group_view(
             });
             let output = match &step.result {
                 Some(result) if result.output.is_empty() => "No output.".to_string(),
-                Some(result) => tool_display_text(result),
+                Some(result) => tool_display_text_with_summary(result, question_summary),
                 None if running => "Running…".to_string(),
                 None => "No output.".to_string(),
             };
-            child.set_content(
-                output
-                    .lines()
-                    .map(|line| {
-                        Line::styled(
-                            single_line(line),
-                            Style::default().fg(if step.is_error() {
-                                theme.error
-                            } else {
-                                theme.dim
-                            }),
-                        )
-                    })
-                    .collect(),
-            );
+            let content: Vec<_> = output
+                .lines()
+                .map(|line| {
+                    Line::styled(
+                        single_line(line),
+                        Style::default().fg(if step.is_error() {
+                            theme.error
+                        } else {
+                            theme.dim
+                        }),
+                    )
+                })
+                .collect();
+            rows.push(content.len().max(1));
+            child.set_content(content);
             children.push(child);
         }
         view.set_children(children);
     }
-    view
+    (view, rows)
 }
 
-fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsible {
+fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> (Collapsible, usize) {
     let running = !step.is_done() && !turn_complete;
     let interrupted = !step.is_done() && turn_complete;
     let failed = !running && (interrupted || step.is_error());
@@ -818,13 +807,14 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
         title.push_str(&format!("  ·  {elapsed}ms"));
     }
     let mut view = step_view(step, title, running, failed, theme);
+    let output = match &step.result {
+        Some(result) if result.output.is_empty() => "No output.".to_string(),
+        Some(result) => tool_display_text(result),
+        None if running => "Running…".to_string(),
+        None => "No output.".to_string(),
+    };
+    let rows = output.lines().count().max(1);
     if step.disclosure.is_expanded() {
-        let output = match &step.result {
-            Some(result) if result.output.is_empty() => "No output.".to_string(),
-            Some(result) => tool_display_text(result),
-            None if running => "Running…".to_string(),
-            None => "No output.".to_string(),
-        };
         let style = Style::default().fg(if failed { theme.error } else { theme.muted });
         view.set_content(
             output
@@ -833,11 +823,50 @@ fn shell_view(step: &ToolStep, turn_complete: bool, theme: &Theme) -> Collapsibl
                 .collect(),
         );
     }
-    view
+    (view, rows)
+}
+
+fn question_display_text(result: &solaris_agent::ToolResult) -> Option<String> {
+    let data = &result.metadata.details["question"];
+    let questions: Vec<solaris_agent::Question> =
+        serde_json::from_value(data["questions"].clone()).ok()?;
+    let response: solaris_agent::QuestionResponse =
+        serde_json::from_value(data["response"].clone()).ok()?;
+    Some(match response {
+        solaris_agent::QuestionResponse::Dismissed => "Question dismissed by the user.".into(),
+        solaris_agent::QuestionResponse::Answered { answers } => questions
+            .iter()
+            .map(|q| {
+                let answer = answers.iter().find(|a| a.question_id == q.id);
+                let mut labels = answer
+                    .into_iter()
+                    .flat_map(|a| a.selected.iter())
+                    .filter_map(|id| {
+                        q.options
+                            .iter()
+                            .find(|o| &o.id == id)
+                            .map(|o| o.label.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(custom) = answer.and_then(|a| a.custom.as_ref()) {
+                    labels.push(custom.clone());
+                }
+                format!("{} → {}", q.question, labels.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
 }
 
 fn tool_display_text(result: &solaris_agent::ToolResult) -> String {
-    let mut output = result.output.clone();
+    tool_display_text_with_summary(result, question_display_text(result))
+}
+
+fn tool_display_text_with_summary(
+    result: &solaris_agent::ToolResult,
+    summary: Option<String>,
+) -> String {
+    let mut output = summary.unwrap_or_else(|| result.output.clone());
     if let Some(patch) = result.metadata.details["change"]["patch"].as_str() {
         output.push_str("\n\n");
         output.push_str(patch);
@@ -1010,8 +1039,9 @@ fn tool_counts(steps: &[ToolStep], running: bool) -> String {
         .join(", ")
 }
 
-fn tool_step_title(step: &ToolStep) -> String {
+fn tool_step_title(step: &ToolStep, question_summary: Option<&str>) -> String {
     let label = match step.call.name.as_str() {
+        "question" => "Question",
         "read" => "Read",
         "grep" => "Grep",
         "find" => "Find",
@@ -1031,6 +1061,20 @@ fn tool_step_title(step: &ToolStep) -> String {
         .find_map(|key| input[*key].as_str())
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
+    if step.call.name == "question" {
+        detail = question_summary.map(str::to_owned).unwrap_or_else(|| {
+            input["questions"]
+                .as_array()
+                .map(|questions| {
+                    questions
+                        .iter()
+                        .filter_map(|q| q["question"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_else(|| "Waiting for your answer".into())
+        });
+    }
     if step.call.name == "read" {
         let offset = input["offset"].as_u64();
         let limit = input["limit"].as_u64();
@@ -1472,7 +1516,7 @@ mod tests {
                 let call = ToolCall::new("search", "grep", serde_json::json!({"pattern":"needle"}));
                 let mut steps = vec![failed, ToolStep::pending(call.clone())];
 
-                let view = tool_group_view(&steps, false, &theme, Some(1));
+                let (view, _) = tool_group_view(&steps, false, &theme);
                 let lines = view.lines(90);
                 let glyph = if expanded { "↓" } else { "→" };
                 assert_eq!(
@@ -1487,7 +1531,7 @@ mod tests {
                 assert_eq!(view.state().is_expanded(), expanded);
 
                 steps[1].finish(ToolResult::ok(&call, "matches"), 2);
-                let view = tool_group_view(&steps, false, &theme, Some(1));
+                let (view, _) = tool_group_view(&steps, false, &theme);
                 let lines = view.lines(90);
                 let glyph = if expanded { "↓" } else { "→" };
                 assert_eq!(

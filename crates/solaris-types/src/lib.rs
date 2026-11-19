@@ -89,3 +89,6 @@ pub struct ContextUsage {
 
 mod tool;
 pub use tool::{ToolCall, ToolResult, ToolSpec};
+
+mod question;
+pub use question::{Question, QuestionAnswer, QuestionOption, QuestionRequest, QuestionResponse};

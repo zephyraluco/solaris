@@ -26,3 +26,11 @@ pub use config::{ModelSelection, Protocol, ProviderConfig, ProviderEndpoint, Res
 mod discovery;
 
 pub use discovery::{ModelSource, UnavailableModels};
+
+#[cfg(test)]
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "../../solaris-agent/tests/support/native_request.rs"]
+mod native_request;

@@ -14,29 +14,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
-use solaris_agent::testing::TurnRequest;
-use solaris_agent::{
-    AgentEvent, AgentEventStream, BackendError, ModelConnector, Role, ToolCall, Usage,
-};
+use solaris_agent::{AgentEvent, AgentEventStream, BackendError, ModelConnector, ToolCall, Usage};
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
-
-/// The prompt a request asks about, wherever the loop put it.
-///
-/// The agent records the prompt in the conversation before it asks anything, so a
-/// round's own `prompt` is empty and the words are the last user message instead.
-fn asked(request: &TurnRequest) -> String {
-    if !request.prompt.trim().is_empty() {
-        return request.prompt.trim().to_string();
-    }
-    request
-        .history
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::User && !message.text().is_empty())
-        .map(|message| message.text())
-        .unwrap_or_default()
-}
+use test_support::TurnRequest;
 
 const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
@@ -54,13 +35,10 @@ impl ModelConnector for FakeBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -71,7 +49,7 @@ impl FakeBackend {
     async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
         let reply = format!(
             "You said: {}\n\n## Reply\n\n- streamed chunk by chunk\n",
-            asked(&request)
+            request.last_user_text()
         );
         let events = vec![
             AgentEvent::ThinkingDelta("thinking ".to_string()),
@@ -100,13 +78,10 @@ impl ModelConnector for ToolBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -159,13 +134,10 @@ impl ModelConnector for InspectingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -213,13 +185,10 @@ impl ModelConnector for DelegatingBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(solaris_agent::testing::client(
-            self.capabilities(),
-            move |request| {
-                let fixture = std::sync::Arc::clone(&self);
-                async move { fixture.respond(request).await }
-            },
-        ))
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
     }
 
     fn label(&self) -> &str {
@@ -228,7 +197,7 @@ impl ModelConnector for DelegatingBackend {
 }
 impl DelegatingBackend {
     async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-        let child = asked(&request).starts_with("You are an isolated");
+        let child = request.last_user_text().starts_with("You are an isolated");
         let answered = request
             .history
             .iter()
@@ -1284,3 +1253,8 @@ fn the_second_provider_row_opens_its_api_key_step() {
     assert!(text.contains("Connect OpenCode Go"), "{text}");
     assert!(text.contains("Paste your API key:"), "{text}");
 }
+
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;
+
+use test_support::messages::MessageFixture;

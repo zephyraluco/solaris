@@ -3,7 +3,7 @@
 //! request-boundary handoffs without authoring a second model history.
 
 #[cfg(test)]
-use crate::testing::TurnRequest;
+use crate::test_support::TurnRequest;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::{AgentEvent, AgentEventStream};
 use futures::{Stream, StreamExt};
 #[cfg(test)]
-use solaris_backend::Message;
+use rig_core::message::Message;
 use solaris_backend::{ModelConnector, Usage};
 use solaris_tools::{Cancel, ExecutionMode, Tool, ToolContext};
 use solaris_types::{ToolCall, ToolResult, ToolSpec};
@@ -124,6 +124,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
     let runner = Arc::new(Runner {
         outcome,
         active_tools,
+        questions: options.questions.clone(),
         steps: options.execution.steps,
         model_steps: std::sync::atomic::AtomicU32::new(0),
         inner,
@@ -167,6 +168,7 @@ pub(crate) fn start(input: TurnInput) -> AgentEventStream {
 /// The state one turn's loop runs with, owned outright so it can outlive the
 /// call that started it.
 struct Runner {
+    questions: Option<crate::Questions>,
     outcome: Arc<std::sync::Mutex<Option<crate::StopReason>>>,
     steps: Option<std::num::NonZeroU32>,
     model_steps: std::sync::atomic::AtomicU32,
@@ -465,7 +467,15 @@ impl Runner {
             ),
             cancel: self.cancel.clone(),
         };
-        let (output, totals) = if call.name == "tool_search" {
+        let (output, totals) = if call.name == "question" {
+            let Some(questions) = &self.questions else {
+                return ToolResult::error(call, "interactive questions are unavailable").into();
+            };
+            (
+                questions.ask(&self.owner, call, &self.cancel, tx).await,
+                crate::UsageTotals::default(),
+            )
+        } else if call.name == "tool_search" {
             let query = call.input["query"]
                 .as_str()
                 .unwrap_or_default()
@@ -821,17 +831,16 @@ impl Stream for EventStream {
 }
 #[cfg(test)]
 mod tests {
-    fn request_text(request: &crate::testing::TurnRequest) -> String {
+    use crate::test_support::messages::MessageFixture;
+    fn request_text(request: &crate::test_support::TurnRequest) -> String {
         request
             .history
             .iter()
-            .map(solaris_backend::Message::text)
-            .chain(std::iter::once(request.prompt.clone()))
+            .map(rig_core::message::Message::text)
             .collect::<Vec<_>>()
             .join("\n")
     }
     use super::*;
-    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -947,54 +956,7 @@ mod tests {
 
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.
-    struct Scripted {
-        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
-        seen: Mutex<Vec<TurnRequest>>,
-    }
-
-    impl Scripted {
-        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
-            Arc::new(Self {
-                rounds: Mutex::new(rounds.into()),
-                seen: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<TurnRequest> {
-            self.seen.lock().expect("lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl ModelConnector for Scripted {
-        async fn model_client(
-            self: std::sync::Arc<Self>,
-        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
-                self.capabilities(),
-                move |request| {
-                    let fixture = std::sync::Arc::clone(&self);
-                    async move { fixture.respond(request).await }
-                },
-            ))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
-        }
-    }
-    impl Scripted {
-        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            self.seen.lock().expect("lock").push(request);
-            let events = self
-                .rounds
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
+    use crate::test_support::Scripted;
 
     fn round(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
         let mut round = events;
@@ -1088,7 +1050,7 @@ mod tests {
         /// The same turn, continuing `messages` rather than the default start.
         fn history(self, messages: Vec<Message>) -> Self {
             for message in messages {
-                self.conversation.push_fixture(message);
+                self.conversation.push(message);
             }
             self
         }
@@ -1154,8 +1116,7 @@ mod tests {
         inner.requests()[1]
             .history
             .iter()
-            .flat_map(Message::tool_results)
-            .cloned()
+            .flat_map(MessageFixture::tool_results)
             .collect()
     }
 
@@ -1229,7 +1190,6 @@ mod tests {
         assert!(!results[0].is_error);
 
         // The prompt moved into the history, so the second round does not repeat it.
-        assert!(second.prompt.is_empty());
         assert!(
             second
                 .history
@@ -1386,7 +1346,7 @@ mod tests {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(crate::testing::client(
+                Ok(crate::test_support::client(
                     self.capabilities(),
                     move |request| {
                         let fixture = std::sync::Arc::clone(&self);
@@ -1558,7 +1518,7 @@ mod tests {
             async fn model_client(
                 self: std::sync::Arc<Self>,
             ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-                Ok(crate::testing::client(
+                Ok(crate::test_support::client(
                     self.capabilities(),
                     move |request| {
                         let fixture = std::sync::Arc::clone(&self);
@@ -1788,7 +1748,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -2293,13 +2253,7 @@ mod tests {
             ..Default::default()
         };
         rig_memory::apply_summary(&mut native, None, &state).expect("initial summary");
-        native.extend(
-            long_history(12)
-                .iter()
-                .map(rig_core::message::Message::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .expect("native history"),
-        );
+        native.extend(long_history(12));
         rig_memory::save(&conversation.storage(), "conversation", &mut native)
             .expect("save summary state");
         let events = turn.run("do it").await;
@@ -2442,13 +2396,8 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests[1].tools.is_empty());
         assert!(request_text(&requests[2]).contains("history summary"));
-        let history: Vec<_> = requests[2]
-            .history
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<_, _>>()
-            .unwrap();
-        rig_core::conversation::pairing::validate(&history).unwrap();
+        let history = &requests[2].history;
+        rig_core::conversation::pairing::validate(history).unwrap();
     }
 
     #[tokio::test]
@@ -2459,12 +2408,15 @@ mod tests {
             let original = vec![
                 Message::user("keep task constraints"),
                 Message::tool_use(old.clone()),
-                Message::tool_result(ToolResult::ok(
+                crate::test_support::messages::tool_result(ToolResult::ok(
                     &old,
                     format!("OLD_OUTPUT_MARKER{}", "x".repeat(20000)),
                 )),
                 Message::tool_use(recent.clone()),
-                Message::tool_result(ToolResult::ok(&recent, "RECENT_OUTPUT_MARKER")),
+                crate::test_support::messages::tool_result(ToolResult::ok(
+                    &recent,
+                    "RECENT_OUTPUT_MARKER",
+                )),
                 Message::user("next action"),
             ];
             let conversation = Conversation::new();
@@ -2510,9 +2462,15 @@ mod tests {
             Message::assistant("old answer"),
             Message::user("current target: parser.rs; preserve flags"),
             Message::tool_use(call("first", "record")),
-            Message::tool_result(ToolResult::ok(&call("first", "record"), "first result")),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("first", "record"),
+                "first result",
+            )),
             Message::tool_use(call("last", "record")),
-            Message::tool_result(ToolResult::ok(&call("last", "record"), "x".repeat(4000))),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("last", "record"),
+                "x".repeat(4000),
+            )),
         ]
     }
 

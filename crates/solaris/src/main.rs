@@ -499,6 +499,9 @@ fn main() -> Result<()> {
             prompt: resources.prompt,
             warnings: resources.warnings,
         };
+        if args.rpc {
+            options.questions = Some(Default::default());
+        }
         options.execution = execution;
         let factory = Arc::new(solaris_provider::refreshing_backend_factory(
             auth,
@@ -754,3 +757,7 @@ mod credential_loading_tests {
         assert_eq!(load_auth(None).unwrap().len(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "../../solaris-agent/tests/support/mod.rs"]
+mod test_support;

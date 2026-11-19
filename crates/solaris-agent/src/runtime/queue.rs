@@ -84,7 +84,7 @@ impl Queue {
 
     /// Whether anything is waiting, without taking it.
     pub fn has_pending(&self) -> bool {
-        !self.lock().is_empty()
+        !self.is_empty()
     }
 
     /// How many messages are waiting.

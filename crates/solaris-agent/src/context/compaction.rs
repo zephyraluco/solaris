@@ -18,7 +18,7 @@
 //!   a whole file.
 
 #[cfg(test)]
-use solaris_backend::Message;
+use rig_core::message::Message;
 
 /// Tokens held back from the window for the reply itself.
 pub const DEFAULT_RESERVE_TOKENS: u32 = 16_384;
@@ -94,16 +94,6 @@ impl Compaction {
     /// Keep a legal message boundary; oversized tool results retain their call.
     #[cfg(test)]
     fn cut_point(self, messages: &[Message]) -> usize {
-        let native: Vec<_> = match messages
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<_, _>>()
-        {
-            Ok(messages) => messages,
-            Err(_) => {
-                return 0;
-            }
-        };
         let policy = rig_memory::CompactionPolicy {
             keep_recent: self.keep_recent_tokens as usize,
             keep_asked: self.keep_recent_tokens as usize,
@@ -111,7 +101,7 @@ impl Compaction {
         };
         policy
             .cut(
-                &native
+                &messages
                     .iter()
                     .cloned()
                     .map(std::sync::Arc::new)
@@ -129,8 +119,8 @@ impl Compaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::messages::MessageFixture;
     use serde_json::json;
-    use solaris_backend::Role;
 
     use solaris_types::{ToolCall, ToolResult};
 
@@ -203,7 +193,7 @@ mod tests {
         let messages = vec![
             Message::user("read it"),
             Message::tool_use(call("call-1")),
-            Message::tool_result(ToolResult::ok(&call("call-1"), "contents")),
+            crate::test_support::messages::tool_result(ToolResult::ok(&call("call-1"), "contents")),
         ];
 
         // Keep the preceding call and all results, even beyond the target budget.
@@ -241,18 +231,18 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 1,
         };
-        let calls = Message::with_content(
-            Role::Assistant,
-            vec![
-                solaris_backend::Content::ToolUse { call: call("one") },
-                solaris_backend::Content::ToolUse { call: call("two") },
-            ],
-        );
+        let calls = crate::test_support::messages::tool_uses([call("one"), call("two")]);
         let messages = vec![
             Message::user("task"),
             calls,
-            Message::tool_result(ToolResult::ok(&call("one"), "x".repeat(4000))),
-            Message::tool_result(ToolResult::ok(&call("two"), "y".repeat(4000))),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("one"),
+                "x".repeat(4000),
+            )),
+            crate::test_support::messages::tool_result(ToolResult::ok(
+                &call("two"),
+                "y".repeat(4000),
+            )),
         ];
         assert_eq!(policy.cut_point(&messages), 1);
         assert_eq!(messages[policy.cut_point(&messages)..].len(), 3);

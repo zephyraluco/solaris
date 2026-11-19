@@ -17,8 +17,6 @@ pub struct Config {
     pub theme: String,
     /// Active agent mode.
     pub mode: Mode,
-    /// Context window size in tokens, used by the footer gauge.
-    pub context_window: u64,
 }
 
 impl Default for Config {
@@ -27,7 +25,6 @@ impl Default for Config {
             model: String::new(),
             theme: "dark".to_string(),
             mode: Mode::default(),
-            context_window: 128_000,
         }
     }
 }

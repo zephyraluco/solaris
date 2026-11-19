@@ -11,12 +11,8 @@ pub use parameters::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, ModelParameters
 mod connection;
 mod discovery;
 pub use connection::ModelClient;
-#[cfg(any(test, feature = "test-utils"))]
-mod convert;
 mod error;
 mod http;
-#[cfg(any(test, feature = "test-utils"))]
-mod message;
 mod policy;
 mod request;
 mod transport;
@@ -26,12 +22,6 @@ mod wire;
 pub use client::{Backend, Endpoint, TurnPlan};
 pub use error::BackendError;
 pub use http::IDLE_TIMEOUT;
-#[cfg(any(test, feature = "test-utils"))]
-pub use message::{Content, Message, Role};
-#[cfg(any(test, feature = "test-utils"))]
-use solaris_types::ToolCall;
-#[cfg(any(test, feature = "test-utils"))]
-use solaris_types::ToolResult;
 pub use usage::Usage;
 pub use wire::Wire;
 

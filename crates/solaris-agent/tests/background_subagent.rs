@@ -16,13 +16,13 @@ struct Model {
 #[async_trait]
 impl ModelConnector for Model {
     async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
-        Ok(testing::client(Default::default(), move |request| {
+        Ok(test_support::client(Default::default(), move |request| {
             let this = self.clone();
             async move {
-                let child = request
-                    .history
-                    .iter()
-                    .any(|m| m.role == Role::User && m.text().starts_with("You are an isolated"));
+                let child = request.history.iter().any(|m| {
+                    matches!(m, rig_core::message::Message::User { .. })
+                        && m.text().starts_with("You are an isolated")
+                });
                 let events = if child {
                     if request
                         .history
@@ -78,34 +78,37 @@ struct Nested;
 #[async_trait]
 impl ModelConnector for Nested {
     async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
-        Ok(testing::client(Default::default(), |request| async move {
-            let delegated = request
-                .history
-                .iter()
-                .any(|message| message.tool_results().next().is_some());
-            let leaf = request
-                .history
-                .iter()
-                .any(|message| message.text().contains("level-two"));
-            let child = request
-                .history
-                .iter()
-                .any(|message| message.text().contains("level-one"));
-            let mut events = if leaf || delegated {
-                vec![AgentEvent::TextDelta("finished".into())]
-            } else {
-                vec![AgentEvent::ToolCall(ToolCall::new(
-                    "nested",
-                    "subagent",
-                    serde_json::json!({"agent":"explore","prompt":if child {"level-two"} else {"level-one"}}),
-                ))]
-            };
-            events.push(AgentEvent::TurnComplete {
-                usage: Usage::new(2, 1),
-                cost_usd: 0.0,
-            });
-            Ok(Box::pin(futures::stream::iter(events)) as AgentEventStream)
-        }))
+        Ok(test_support::client(
+            Default::default(),
+            |request| async move {
+                let delegated = request
+                    .history
+                    .iter()
+                    .any(|message| message.tool_results().next().is_some());
+                let leaf = request
+                    .history
+                    .iter()
+                    .any(|message| message.text().contains("level-two"));
+                let child = request
+                    .history
+                    .iter()
+                    .any(|message| message.text().contains("level-one"));
+                let mut events = if leaf || delegated {
+                    vec![AgentEvent::TextDelta("finished".into())]
+                } else {
+                    vec![AgentEvent::ToolCall(ToolCall::new(
+                        "nested",
+                        "subagent",
+                        serde_json::json!({"agent":"explore","prompt":if child {"level-two"} else {"level-one"}}),
+                    ))]
+                };
+                events.push(AgentEvent::TurnComplete {
+                    usage: Usage::new(2, 1),
+                    cost_usd: 0.0,
+                });
+                Ok(Box::pin(futures::stream::iter(events)) as AgentEventStream)
+            },
+        ))
     }
 }
 #[tokio::test]
@@ -368,3 +371,8 @@ async fn running_child_accepts_a_followup_without_starting_a_second_job() {
     assert!(model.observed_followup.load(Ordering::SeqCst));
     assert_eq!(runtime.jobs().list(&owner).len(), 1);
 }
+
+#[path = "support/mod.rs"]
+mod test_support;
+
+use test_support::messages::MessageFixture;

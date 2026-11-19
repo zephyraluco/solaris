@@ -4,26 +4,6 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-fn seed_memory(journal: &solaris_agent::SessionJournal, messages: Vec<solaris_agent::Message>) {
-    let directory = journal
-        .store()
-        .artifact_dir()
-        .parent()
-        .unwrap()
-        .join("memory")
-        .join(journal.id());
-    let store = rig_memory::DirStore::open(directory).unwrap();
-    let mut native = rig_memory::load(&store, "conversation").unwrap();
-    native.extend(
-        messages
-            .iter()
-            .map(rig_core::message::Message::try_from)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap(),
-    );
-    rig_memory::save(&store, "conversation", &mut native).unwrap();
-}
-
 fn message_contains(message: &serde_json::Value, expected: &str) -> bool {
     message["content"]
         .as_str()
@@ -168,9 +148,9 @@ fn json_run_can_be_resumed_and_exported_without_a_terminal() {
     let child = store
         .create_subagent(&cwd, "test-model", id)
         .expect("child");
-    seed_memory(
+    memory::seed(
         &child,
-        vec![solaris_agent::Message::user("isolated child history")],
+        vec![rig_core::message::Message::user("isolated child history")],
     );
     assert_eq!(store.list(&cwd).expect("sessions")[0].id, child.id());
     drop(child);
@@ -354,7 +334,8 @@ fn rpc_binary_accepts_commands_without_initializing_a_terminal() {
 
 #[test]
 fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
-    use solaris_agent::{Message, SessionRecord, SessionStore};
+    use rig_core::message::Message;
+    use solaris_agent::{SessionRecord, SessionStore};
     use solaris_provider::{AuthStore, Credential};
     let directory = tempfile::tempdir().expect("directory");
     let store =
@@ -370,7 +351,7 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             model: "test-model".into(),
         })
         .expect("source model");
-    seed_memory(&source, vec![Message::user("source private history")]);
+    memory::seed(&source, vec![Message::user("source private history")]);
     let source_id = source.id().to_owned();
     drop(source);
     let mut auth = AuthStore::new();
@@ -410,8 +391,8 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
         );
         let journal = store.resume(&fork.id).expect("fork released");
         assert_eq!(
-            journal.context().expect("fork context")[0].text(),
-            "source private history"
+            memory::messages(&journal)[0].rag_text().as_deref(),
+            Some("source private history")
         );
     }
     assert_eq!(
@@ -555,3 +536,6 @@ fn named_model_routes_to_custom_endpoint_with_original_request_alias() {
     assert!(printed.contains("backend: gateway"), "{printed}");
     assert!(printed.contains("anthropic/claude-sonnet-4-5"), "{printed}");
 }
+
+#[path = "../../solaris-agent/tests/support/memory.rs"]
+mod memory;

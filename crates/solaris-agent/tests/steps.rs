@@ -30,7 +30,7 @@ struct Model(Arc<AtomicUsize>);
 #[async_trait]
 impl ModelConnector for Model {
     async fn model_client(self: Arc<Self>) -> Result<ModelClient, BackendError> {
-        Ok(testing::client(Default::default(), move |request| {
+        Ok(test_support::client(Default::default(), move |request| {
             let count = self.0.fetch_add(1, Ordering::SeqCst);
             async move {
                 let mut events = Vec::new();
@@ -117,3 +117,6 @@ async fn unspecified_steps_do_not_impose_a_twenty_request_ceiling() {
             .any(|event| matches!(event.event, AgentEvent::Error(_)))
     );
 }
+
+#[path = "support/mod.rs"]
+mod test_support;

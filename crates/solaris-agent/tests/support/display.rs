@@ -7,7 +7,7 @@ use rig_core::message::AssistantContent;
 use rig_core::streaming::{Item, Relayed, StreamEvent, StreamEvents};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{AgentEvent, AgentEventStream, BackendError};
+use solaris_agent::{AgentEvent, AgentEventStream, BackendError};
 
 pub(crate) fn adapt(
     stream: StreamEvents,
@@ -95,7 +95,7 @@ impl Events {
                                 || call.function.arguments_value(),
                                 |invalid| serde_json::Value::String(invalid.clone()),
                             );
-                            Some(AgentEvent::ToolCall(crate::ToolCall::new(
+                            Some(AgentEvent::ToolCall(solaris_agent::ToolCall::new(
                                 call.id.wire().into_owned(),
                                 call.function.name.as_str(),
                                 arguments,
@@ -112,7 +112,7 @@ impl Events {
                     if let Some(error) = response.error.as_ref().or(response.aborted.as_ref()) {
                         return Some(AgentEvent::Error(error.clone()));
                     }
-                    let usage = crate::context::estimate::usage(self.input_tokens, &response);
+                    let usage = super::estimate::usage(self.input_tokens, &response);
                     let complete = AgentEvent::TurnComplete {
                         usage,
                         cost_usd: response.usage.cost.map_or(0.0, |cost| cost.total),
@@ -143,17 +143,4 @@ fn final_suffix(previous: &str, final_text: &str) -> Result<Option<String>, Back
         .strip_prefix(previous)
         .ok_or_else(|| BackendError::new("provider changed previously streamed text"))?;
     Ok((!suffix.is_empty()).then(|| suffix.to_string()))
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn snapshots_emit_only_missing_text() {
-        assert_eq!(
-            final_suffix("hello", "hello world").unwrap().as_deref(),
-            Some(" world")
-        );
-        assert_eq!(final_suffix("hello", "hello").unwrap(), None);
-        assert!(final_suffix("hello", "different").is_err());
-    }
 }

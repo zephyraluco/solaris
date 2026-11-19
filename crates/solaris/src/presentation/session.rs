@@ -248,6 +248,7 @@ impl SessionProjection {
     pub fn apply(&mut self, event: AgentEvent) -> Effects {
         let mut effects = Effects::default();
         match event {
+            AgentEvent::QuestionRequested(_) | AgentEvent::QuestionResolved { .. } => {}
             AgentEvent::ContextUsageUpdated { context } => self.context = context,
             AgentEvent::ThinkingDelta(chunk) => {
                 if let Some(turn) = self.event_turn_mut() {

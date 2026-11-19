@@ -85,6 +85,9 @@ pub(crate) fn select_tools(
         })
         .collect();
     defaults.extend(external.iter().map(String::as_str));
+    if registry.get("question").is_some() {
+        defaults.push("question");
+    }
     if registry.get("tool_search").is_some() {
         defaults.push("tool_search");
     }

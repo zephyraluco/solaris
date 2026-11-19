@@ -22,6 +22,8 @@ use crate::{ConnectionConfig, InputError, PromptContext, ResourceSnapshot, expan
 /// What a session is told once, and keeps for every turn of it.
 #[derive(Clone)]
 pub struct AgentOptions {
+    /// Interactive request channel; absent in noninteractive sessions and children.
+    pub questions: Option<crate::Questions>,
     /// How the mode's default tool set is edited.
     pub selection: ToolSelection,
     /// Who decides whether a call may run.
@@ -49,6 +51,7 @@ pub struct AgentOptions {
 impl Default for AgentOptions {
     fn default() -> Self {
         Self {
+            questions: None,
             selection: ToolSelection::none(),
             approver: Arc::new(AlwaysApprove),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -158,6 +161,13 @@ impl Agent {
         services: crate::runtime::services::SessionServices,
         mut resources: ResourceSnapshot,
     ) -> Self {
+        let registry = if options.questions.is_some() && registry.get("question").is_none() {
+            let mut registry = registry.as_ref().clone();
+            registry.add(Arc::new(crate::questions::QuestionTool));
+            Arc::new(registry)
+        } else {
+            registry
+        };
         let approver: Arc<dyn Approver> = Arc::new(crate::PolicyApprover {
             profile: options.execution.profile,
             read_only_tools: registry
@@ -301,6 +311,10 @@ impl Agent {
         self.services.jobs.cancel(&self.session_id(), id)
     }
 
+    pub(crate) fn questions(&self) -> Option<crate::Questions> {
+        self.options.questions.clone()
+    }
+
     /// A handle that stops a turn in flight: a running command is killed and no
     /// further model call is made.
     ///
@@ -386,10 +400,6 @@ impl Agent {
     /// the usage.
     pub(crate) fn fail(&self, error: impl std::fmt::Display) {
         self.conversation.failed(error);
-    }
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn is_idle(&self) -> bool {
-        !self.active.load(std::sync::atomic::Ordering::Acquire)
     }
     pub fn conversation_len(&self) -> usize {
         self.conversation.len()
@@ -534,6 +544,7 @@ impl Agent {
         }
         crate::runtime::mode::select_tools(&self.registry, mode, &self.options.selection)
             .into_iter()
+            .filter(|tool| tool.name() != "question" || self.options.questions.is_some())
             .filter(|tool| {
                 (self.options.subagents
                     && self.services.depth < self.options.execution.subagent_depth)
@@ -720,11 +731,11 @@ impl std::fmt::Debug for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::test_support::messages::MessageFixture;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::testing::TurnRequest;
+    use crate::test_support::TurnRequest;
     use crate::{AgentEvent, AgentEventStream};
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -910,54 +921,7 @@ mod tests {
 
     /// A backend that plays a scripted list of rounds and records what it was
     /// asked.
-    struct Scripted {
-        rounds: Mutex<VecDeque<Vec<AgentEvent>>>,
-        seen: Mutex<Vec<TurnRequest>>,
-    }
-
-    impl Scripted {
-        fn new(rounds: Vec<Vec<AgentEvent>>) -> Arc<Self> {
-            Arc::new(Self {
-                rounds: Mutex::new(rounds.into()),
-                seen: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<TurnRequest> {
-            self.seen.lock().expect("lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl ModelConnector for Scripted {
-        async fn model_client(
-            self: std::sync::Arc<Self>,
-        ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
-                self.capabilities(),
-                move |request| {
-                    let fixture = std::sync::Arc::clone(&self);
-                    async move { fixture.respond(request).await }
-                },
-            ))
-        }
-
-        fn label(&self) -> &str {
-            "scripted"
-        }
-    }
-    impl Scripted {
-        async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
-            self.seen.lock().expect("lock").push(request);
-            let events = self
-                .rounds
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| vec![AgentEvent::Error("the script ran out".to_string())]);
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
+    use crate::test_support::Scripted;
 
     /// A backend that lists one model, for the pass-through checks.
     struct Listed;
@@ -967,7 +931,7 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_backend::ModelClient, solaris_backend::BackendError> {
-            Ok(crate::testing::client(
+            Ok(crate::test_support::client(
                 self.capabilities(),
                 move |request| {
                     let fixture = std::sync::Arc::clone(&self);
@@ -1041,7 +1005,7 @@ mod tests {
         let original = agent(Scripted::new(Vec::new()));
         original
             .conversation
-            .push_fixture(solaris_backend::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
         let refreshed = original.with_refreshed_backend(choice(Scripted::new(Vec::new())));
         assert_eq!(refreshed.conversation_len(), 1);
         assert!(Arc::ptr_eq(&original.conversation, &refreshed.conversation));
@@ -1063,7 +1027,7 @@ mod tests {
         assert_eq!(first.model, "claude-sonnet-4-5");
         original
             .conversation
-            .push_fixture(crate::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
 
         let mut next = choice(Scripted::new(Vec::new()));
         next.provider_id = Some("openai".into());
@@ -1080,8 +1044,12 @@ mod tests {
         assert_eq!(saved.model, "next-model");
         let resumed = store.resume(&saved.id).expect("resume");
         assert_eq!(
-            resumed.context().expect("context")[0].text(),
-            "remember this"
+            rig_memory::load(&resumed.memory_store().unwrap(), "conversation")
+                .unwrap()
+                .messages()[0]
+                .rag_text()
+                .as_deref(),
+            Some("remember this")
         );
     }
 
@@ -1097,7 +1065,7 @@ mod tests {
         original.attach_journal(journal).expect("attach");
         original
             .conversation
-            .push_fixture(crate::Message::user("private history"));
+            .push(rig_core::message::Message::user("private history"));
         rusqlite::Connection::open(&database)
             .expect("connection")
             .execute_batch(
@@ -1121,7 +1089,7 @@ mod tests {
             .with_child_backend(Arc::new(|_| Err("expired credential".into())));
         original
             .conversation
-            .push_fixture(crate::Message::user("remember this"));
+            .push(rig_core::message::Message::user("remember this"));
         let refreshed = original
             .with_refreshed_backend(choice(Scripted::new(Vec::new())))
             .with_child_backend(Arc::new(|model| {
@@ -1199,10 +1167,10 @@ mod tests {
         let agent = agent(inner.clone());
         agent
             .conversation
-            .push_fixture(crate::Message::user("earlier notification one"));
+            .push(rig_core::message::Message::user("earlier notification one"));
         agent
             .conversation
-            .push_fixture(crate::Message::user("earlier notification two"));
+            .push(rig_core::message::Message::user("earlier notification two"));
         let before = agent.conversation.native().expect("saved history");
         agent
             .steering_handle()
@@ -1291,8 +1259,8 @@ mod tests {
             .expect("request")
             .history
             .iter()
-            .filter(|message| message.role == crate::Role::User)
-            .map(crate::Message::text)
+            .filter(|message| matches!(message, rig_core::message::Message::User { .. }))
+            .map(rig_core::message::Message::text)
             .collect();
         assert_eq!(user_text.len(), 3);
         for (text, request) in user_text.iter().zip(["initial", "steer", "follow"]) {
@@ -1641,13 +1609,13 @@ mod tests {
         agent.options.compaction.keep_recent_tokens = 1;
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::user("old context"));
+            .push(rig_core::message::Message::user("old context"));
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::assistant("old reply"));
+            .push(rig_core::message::Message::assistant("old reply"));
         agent
             .conversation
-            .push_fixture(solaris_backend::Message::user("new question"));
+            .push(rig_core::message::Message::user("new question"));
         assert!(agent.compact().await.is_some());
         assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
         let context = agent.context_usage(Mode::Build);

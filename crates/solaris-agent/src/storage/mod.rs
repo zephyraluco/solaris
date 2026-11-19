@@ -10,8 +10,6 @@ use crate::AgentEvent;
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-#[cfg(any(test, feature = "test-utils"))]
-use solaris_backend::Message;
 
 /// Storage failures stop execution rather than silently discarding history.
 #[derive(Debug, thiserror::Error)]
@@ -432,19 +430,6 @@ impl SessionJournal {
         rig_memory::DirStore::open(self.store.directory.join("memory").join(&self.id))
             .map_err(|error| StoreError::Invalid(error.to_string()))
     }
-    /// Model history has exactly one source: the official memory store.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn context(&self) -> Result<Vec<Message>, StoreError> {
-        let memory = self.memory_store()?;
-        let conversation = rig_memory::load(&memory, "conversation")
-            .map_err(|error| StoreError::Invalid(error.to_string()))?;
-        Ok(conversation
-            .messages()
-            .iter()
-            .map(|message| Message::from(message.as_ref()))
-            .collect())
-    }
-
     /// Fork without copying credentials or sharing the execution lease.
     pub fn fork(&self, cwd: &Path, model: &str) -> Result<Arc<SessionJournal>, StoreError> {
         let child = self.store.create(cwd, model, Some(&self.id))?;
@@ -488,17 +473,21 @@ impl SessionJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::message::Message;
+
+    fn messages(journal: &SessionJournal) -> Vec<Message> {
+        rig_memory::load(&journal.memory_store().unwrap(), "conversation")
+            .unwrap()
+            .messages()
+            .iter()
+            .map(|message| message.as_ref().clone())
+            .collect()
+    }
 
     fn seed_memory(journal: &SessionJournal, messages: Vec<Message>) {
         let store = journal.memory_store().unwrap();
         let mut native = rig_memory::load(&store, "conversation").unwrap();
-        native.extend(
-            messages
-                .iter()
-                .map(rig_core::message::Message::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-        );
+        native.extend(messages);
         rig_memory::save(&store, "conversation", &mut native).unwrap();
     }
     #[test]
@@ -524,7 +513,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(journal.context().unwrap().is_empty());
+        assert!(messages(&journal).is_empty());
         let conversation = crate::storage::memory::Conversation::new();
         conversation.attach(Arc::clone(&journal)).unwrap();
         assert!(conversation.snapshot().is_empty());
@@ -561,8 +550,8 @@ mod tests {
         );
         copied.extend([rig_core::message::Message::user("child only")]);
         rig_memory::save(&child_store, "conversation", &mut copied).unwrap();
-        assert_eq!(parent.context().unwrap().len(), 2);
-        assert_eq!(child.context().unwrap().len(), 3);
+        assert_eq!(messages(&parent).len(), 2);
+        assert_eq!(messages(&child).len(), 3);
     }
     #[test]
     fn dropping_journal_releases_lease_despite_a_duplicated_descriptor() {
@@ -633,19 +622,13 @@ mod tests {
         assert!(store.resume(&id).is_err(), "second writer must be refused");
         drop(session);
         let session = store.resume(&id).expect("recover");
-        assert_eq!(
-            session.context().expect("context"),
-            vec![Message::user("hello")]
-        );
+        assert_eq!(messages(&session), vec![Message::user("hello")]);
         assert!(matches!(
             store.records(&id).expect("records").last(),
             Some(SessionRecord::Interrupted)
         ));
         let child = session.fork(Path::new("/project"), "model").expect("fork");
-        assert_eq!(
-            child.context().expect("fork context"),
-            session.context().expect("parent context")
-        );
+        assert_eq!(messages(&child), messages(&session));
         drop(child);
         drop(session);
         drop(store);

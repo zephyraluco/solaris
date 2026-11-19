@@ -3,39 +3,9 @@ pub(crate) mod jobs;
 mod subscription;
 pub use subscription::RuntimeSubscription;
 
-#[cfg(any(test, feature = "test-utils"))]
-use crate::SessionRecord;
 use crate::{AgentEvent, AgentEventStream, SessionJournal};
 use futures::StreamExt;
 use std::sync::Arc;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn journal_stream(
-    stream: AgentEventStream,
-    journal: Option<Arc<SessionJournal>>,
-) -> AgentEventStream {
-    let Some(journal) = journal else {
-        return stream;
-    };
-    Box::pin(futures::stream::unfold(
-        (stream, journal, false),
-        |(mut stream, journal, failed)| async move {
-            if failed {
-                return None;
-            }
-            let event = stream.next().await?;
-            match journal.append(&SessionRecord::Event {
-                event: event.clone(),
-            }) {
-                Ok(()) => Some((event, (stream, journal, false))),
-                Err(error) => Some((
-                    AgentEvent::Error(format!("cannot persist session: {error}")),
-                    (stream, journal, true),
-                )),
-            }
-        },
-    ))
-}
 
 /// The executor owns the session until its task retires.
 pub(crate) struct TurnLease {
@@ -274,6 +244,18 @@ impl SessionRuntime {
     }
     fn view(&self) -> Arc<crate::Agent> {
         Arc::clone(&self.core.view.read().unwrap_or_else(|p| p.into_inner()))
+    }
+    /// Whether a live request still accepts a reply in this session.
+    pub fn is_question_pending(&self, request_id: &str) -> bool {
+        self.view()
+            .questions()
+            .is_some_and(|questions| questions.contains(&self.snapshot().session_id, request_id))
+    }
+    /// Current live requests; historical events do not recreate pending tools.
+    pub fn pending_questions(&self) -> Vec<crate::QuestionRequest> {
+        self.view().questions().map_or_else(Vec::new, |questions| {
+            questions.pending(&self.snapshot().session_id)
+        })
     }
     pub fn jobs(&self) -> crate::Jobs {
         self.view().jobs()
@@ -567,6 +549,9 @@ async fn serve(
                     RuntimeCommand::PreparedSteer { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,false,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::PreparedQueue { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,true,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::CancelTask { id } => { if !agent.cancel_task(&id) { result = Err("task is not active".into()); } }
+                    RuntimeCommand::AnswerQuestion { request_id, response } => {
+                        result = agent.questions().ok_or_else(|| "interactive questions are unavailable".to_string()).and_then(|questions| questions.reply(&agent.session_id(), &request_id, response));
+                    }
                     RuntimeCommand::Clear if !busy => result=agent.clear_checked(),
                     RuntimeCommand::AttachImage { image } if !busy => result = agent.attach_image(image),
                     RuntimeCommand::AttachJournal { journal } if !busy => result = agent.attach_journal(journal).map_err(|e| e.to_string()),
@@ -666,6 +651,10 @@ async fn serve(
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
+    AnswerQuestion {
+        request_id: String,
+        response: crate::QuestionResponse,
+    },
     Prompt {
         text: String,
         mode: crate::Mode,
@@ -712,11 +701,12 @@ pub enum RuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::messages::MessageFixture;
     struct Connector;
     #[async_trait::async_trait]
     impl crate::ModelConnector for Connector {
         async fn model_client(self: Arc<Self>) -> Result<crate::ModelClient, crate::BackendError> {
-            Ok(crate::testing::client(
+            Ok(crate::test_support::client(
                 Default::default(),
                 |request| async move {
                     if request
