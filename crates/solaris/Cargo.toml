@@ -13,6 +13,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+base64 = "0.22"
+agent-client-protocol = { version = "5.4.0", features = ["stdio"] }
 solaris-mcp = { workspace = true }
 unicode-segmentation = { workspace = true }
 solaris-tools = { workspace = true }

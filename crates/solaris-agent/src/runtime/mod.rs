@@ -533,6 +533,18 @@ async fn serve(
                     deferred.push_back(Request {command,output,accepted});continue;
                 }
                 let mut result = Ok(());
+                let command = match command {
+                    RuntimeCommand::PromptWithImages { text, mode, images } if !busy => {
+                        let attached = agent.expand_input(&text).map_err(|error| error.to_string())
+                            .and_then(|_| agent.attach_images(images));
+                        if let Err(error) = attached {
+                            let _ = accepted.send(Err(error));
+                            continue;
+                        }
+                        RuntimeCommand::Prompt { text, mode }
+                    }
+                    command => command,
+                };
                 match command {
                     RuntimeCommand::Prompt { text, mode } if !busy => {
                         next_id += 1;
@@ -658,6 +670,12 @@ pub enum RuntimeCommand {
     Prompt {
         text: String,
         mode: crate::Mode,
+    },
+    #[serde(skip)]
+    PromptWithImages {
+        text: String,
+        mode: crate::Mode,
+        images: Vec<solaris_backend::InlineImage>,
     },
     Cancel,
     Steer {

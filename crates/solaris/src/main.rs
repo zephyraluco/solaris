@@ -5,6 +5,7 @@
 //! terminal, and hands control to [`solaris_tui::Tui::run`], which owns the event
 //! loop.
 
+mod acp;
 mod automation;
 
 use std::path::{Path, PathBuf};
@@ -76,6 +77,10 @@ struct Args {
     /// Serve newline-delimited session commands and events over stdin/stdout.
     #[arg(long, conflicts_with_all = ["print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status"])]
     rpc: bool,
+
+    /// Serve Agent Client Protocol v1 over stdin/stdout.
+    #[arg(long, conflicts_with_all = ["rpc", "print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status", "resume", "continue_session", "fork", "ephemeral", "image"])]
+    acp: bool,
 
     /// MCP configuration; defaults to mcp.json in the user config directory.
     #[arg(long)]
@@ -377,6 +382,30 @@ fn main() -> Result<()> {
             .rules
             .iter()
             .any(|r| r.effect == solaris_agent::PermissionEffect::Ask);
+    if args.acp {
+        let directory =
+            config_dir().ok_or_else(|| anyhow::anyhow!("no configuration directory"))?;
+        let store = solaris_agent::SessionStore::open(&directory.join("sessions/sessions.sqlite"))?;
+        return tokio::runtime::Runtime::new()?.block_on(acp::serve(acp::Settings {
+            store,
+            resources: resource_paths,
+            registry,
+            selection: tools,
+            execution,
+            auth,
+            auth_path,
+            backend_options,
+            model: config.model,
+            mode: config.mode,
+            model_override: args.model.is_some(),
+            provider_override: args.provider.is_some(),
+            confirm_tools: ask_approval,
+            mcp: read_mcp_config(
+                mcp_config_path(args.mcp_config.clone()).as_deref(),
+                args.mcp_config.is_some(),
+            )?,
+        }));
+    }
     let journal = if args.ephemeral || args.mcp_status {
         None
     } else {
@@ -451,19 +480,10 @@ fn main() -> Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new()?;
     let _guard = runtime.enter();
-    let mcp_path = args
-        .mcp_config
-        .clone()
-        .or_else(|| config_dir().map(|dir| dir.join("mcp.json")));
-    let mcp_config = match mcp_path.as_deref().map(std::fs::read_to_string) {
-        Some(Ok(text)) => serde_json::from_str(&text)?,
-        Some(Err(error))
-            if args.mcp_config.is_some() || error.kind() != std::io::ErrorKind::NotFound =>
-        {
-            return Err(error.into());
-        }
-        _ => solaris_mcp::McpConfig::default(),
-    };
+    let mcp_config = read_mcp_config(
+        mcp_config_path(args.mcp_config.clone()).as_deref(),
+        args.mcp_config.is_some(),
+    )?;
     let mcp = runtime.block_on(solaris_mcp::McpManager::connect(
         mcp_config,
         &std::env::current_dir()?,
@@ -761,3 +781,20 @@ mod credential_loading_tests {
 #[cfg(test)]
 #[path = "../../solaris-agent/tests/support/mod.rs"]
 mod test_support;
+
+fn mcp_config_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.or_else(|| config_dir().map(|dir| dir.join("mcp.json")))
+}
+
+fn read_mcp_config(
+    path: Option<&std::path::Path>,
+    explicit: bool,
+) -> Result<solaris_mcp::McpConfig> {
+    match path.map(std::fs::read_to_string) {
+        Some(Ok(text)) => Ok(serde_json::from_str(&text)?),
+        Some(Err(error)) if explicit || error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error.into())
+        }
+        _ => Ok(solaris_mcp::McpConfig::default()),
+    }
+}

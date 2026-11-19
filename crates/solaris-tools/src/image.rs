@@ -32,7 +32,8 @@ pub fn read_image(path: &Path) -> io::Result<Option<InlineImage>> {
     from_bytes(&bytes)
 }
 
-pub(crate) fn from_bytes(bytes: &[u8]) -> io::Result<Option<InlineImage>> {
+/// Identify and encode an in-memory image within the attachment size limit.
+pub fn from_bytes(bytes: &[u8]) -> io::Result<Option<InlineImage>> {
     let Some(media_type) = media_type(bytes) else {
         return Ok(None);
     };

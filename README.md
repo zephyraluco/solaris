@@ -428,6 +428,46 @@ or persistence failures stop the request; model requests are not automatically r
 conversation and tool data. TUI and headless clients share `SessionRuntime` commands,
 run policy, jobs, queued inputs, persistence and cancellation.
 
+### Paseo via Agent Client Protocol
+
+Run Solaris as a standard ACP v1 agent over stdin/stdout. In Paseo's
+`~/.paseo/config.json`, add an ACP provider:
+
+```json
+{
+  "version": 1,
+  "agents": {
+    "providers": {
+      "solaris": {
+        "extends": "acp",
+        "label": "Solaris",
+        "command": ["solaris", "--acp", "--confirm-tools"]
+      }
+    }
+  }
+}
+```
+
+Use the absolute executable path if the Paseo daemon cannot find Solaris.
+Solaris reads its usual credentials, model settings, tool policy and MCP
+configuration. Each ACP session supplies its own working directory. The client
+can reopen saved sessions, change Build/Plan mode, and select among the
+configured models for the active provider.
+
+ACP accepts text and inline PNG, JPEG, GIF or WebP images when the selected
+model supports them. Solaris streams text, reasoning and tool results and sends
+required tool approvals back to the client.
+
+Client-provided stdio and streamable HTTP MCP servers are scoped to each
+session. Solaris also loads its own `mcp.json`. Server names must be distinct.
+Legacy SSE transport is unavailable. Stdio servers run with the daemon user's
+process permissions.
+
+Clients that advertise ACP form elicitation can display complete Solaris
+questionnaires, including custom text. Paseo clients that expose only ACP
+permission options receive a sequence of choice prompts for multi-question
+and multi-select requests. Those clients cannot collect custom text in the picker.
+
 `solaris --rpc` provides the same session over stdin/stdout, without a network
 server. Send one JSON request per line; `id` is a string. For example:
 

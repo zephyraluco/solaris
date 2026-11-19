@@ -286,15 +286,28 @@ impl Agent {
 
     /// Attach an image at an idle boundary. Unsupported/unknown models fail locally.
     pub fn attach_image(&self, image: solaris_backend::InlineImage) -> Result<(), String> {
+        self.attach_images(vec![image])
+    }
+
+    pub(crate) fn attach_images(
+        &self,
+        images: Vec<solaris_backend::InlineImage>,
+    ) -> Result<(), String> {
+        if images.is_empty() {
+            return Ok(());
+        }
         let _lease = crate::runtime::TurnLease::acquire(Arc::clone(&self.active))
             .ok_or_else(|| "cannot attach an image during a turn".to_string())?;
         if self.capabilities().image_input != solaris_backend::Support::Supported {
             return Err("model image support is not confirmed; configure models.json or choose a vision model".into());
         }
-        let content = crate::execution::content::image(image).map_err(|error| error.to_string())?;
-        self.conversation.push(rig_core::message::Message::User {
-            content: vec![content],
-        });
+        let content = images
+            .into_iter()
+            .map(crate::execution::content::image)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        self.conversation
+            .push(rig_core::message::Message::User { content });
         self.conversation.error().map_or(Ok(()), Err)
     }
 
