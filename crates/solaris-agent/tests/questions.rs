@@ -250,8 +250,9 @@ async fn question_events_and_display_metadata_survive_replay_without_reopening_t
     let mut requested = false;
     let mut resolved = false;
     let mut metadata = false;
-    while replay.sequence() < sequence {
+    for expected in 1..=sequence {
         let event = replay.next().await.unwrap();
+        assert_eq!(event.sequence, Some(expected));
         match event.event {
             AgentEvent::QuestionRequested(_) => requested = true,
             AgentEvent::QuestionResolved { .. } => resolved = true,

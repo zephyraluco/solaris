@@ -237,20 +237,21 @@ fn automatic_continuation_keeps_user_forks_and_explicit_child_resume() {
     drop(fork);
     drop(child);
 
+    let reply = sse_reply(serde_json::json!({"content":"ok"}), "stop");
+    let (endpoint, server) = serve_responses(vec![reply.clone(), reply]);
     let output = run(
         directory.path(),
-        "http://127.0.0.1:1/v1",
-        &["--continue", "--rpc"],
+        &endpoint,
+        &["--continue", "--print", "continue user fork"],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        store.records(&fork_id).expect("fork records").len(),
-        fork_records + 1
-    );
+    assert!(store.records(&fork_id).expect("fork records")[fork_records..]
+        .iter()
+        .any(|record| matches!(record, SessionRecord::Prompt { text } if text == "continue user fork")));
     assert_eq!(
         store.records(&child_id).expect("child records").len(),
         child_records
@@ -258,18 +259,18 @@ fn automatic_continuation_keeps_user_forks_and_explicit_child_resume() {
 
     let output = run(
         directory.path(),
-        "http://127.0.0.1:1/v1",
-        &["--resume", &child_id, "--rpc"],
+        &endpoint,
+        &["--resume", &child_id, "--print", "resume delegated child"],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        store.records(&child_id).expect("child records").len(),
-        child_records + 1
-    );
+    assert!(store.records(&child_id).expect("child records")[child_records..]
+        .iter()
+        .any(|record| matches!(record, SessionRecord::Prompt { text } if text == "resume delegated child")));
+    assert_eq!(server.join().expect("server").len(), 2);
 }
 
 #[test]
@@ -297,45 +298,10 @@ fn automatic_continuation_refuses_a_directory_with_only_delegated_sessions() {
     let output = run(
         directory.path(),
         "http://127.0.0.1:1/v1",
-        &["--continue", "--rpc"],
+        &["--continue", "--print", "continue user session"],
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no saved user session"));
-}
-
-#[test]
-fn rpc_binary_accepts_commands_without_initializing_a_terminal() {
-    use std::process::Stdio;
-    let directory = tempfile::tempdir().expect("directory");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_solaris"))
-        .env("SOLARIS_CONFIG_DIR", directory.path())
-        .args(["--rpc", "--ephemeral", "--provider", "local"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("RPC binary");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"not json\n{\"id\":\"cancel\",\"command\":{\"type\":\"cancel\"}}\n")
-        .expect("requests");
-    let output = child.wait_with_output().expect("EOF exits");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-        .expect("UTF8")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("JSON response"))
-        .collect();
-    assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["ok"], false);
-    assert_eq!(responses[1]["id"], "cancel");
-    assert_eq!(responses[1]["ok"], true);
 }
 
 #[test]
@@ -360,26 +326,28 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
     memory::seed(&source, vec![Message::user("source private history")]);
     let source_id = source.id().to_owned();
     drop(source);
+    let reply = sse_reply(serde_json::json!({"content":"ok"}), "stop");
+    let (endpoint, server) = serve_responses(vec![reply.clone(), reply]);
     let mut auth = AuthStore::new();
     auth.store(
-        "openai",
+        "new-api",
         Credential::Endpoint {
-            base_url: "http://127.0.0.1:1/v1".into(),
+            base_url: endpoint.clone(),
             api_key: "test-only".into(),
         },
     );
-    auth.activate("openai");
+    auth.activate("new-api");
     std::fs::write(
         directory.path().join("auth.json"),
         auth.to_json().expect("auth"),
     )
     .expect("save auth");
     for override_provider in [false, true] {
-        let mut args = vec!["--fork", &source_id, "--rpc"];
+        let mut args = vec!["--fork", &source_id, "--print", "review fork"];
         if override_provider {
-            args.extend(["--provider", "openai"]);
+            args.extend(["--provider", "new-api"]);
         }
-        let output = run(directory.path(), "http://127.0.0.1:1/v1", &args);
+        let output = run(directory.path(), &endpoint, &args);
         assert!(
             output.status.success(),
             "{}",
@@ -393,7 +361,11 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             .expect("fork");
         assert_eq!(
             fork.provider.as_deref(),
-            Some(if override_provider { "openai" } else { "local" })
+            Some(if override_provider {
+                "new-api"
+            } else {
+                "local"
+            })
         );
         let journal = store.resume(&fork.id).expect("fork released");
         assert_eq!(
@@ -412,6 +384,7 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             .as_deref(),
         Some("local")
     );
+    assert_eq!(server.join().expect("server").len(), 2);
 }
 
 #[test]

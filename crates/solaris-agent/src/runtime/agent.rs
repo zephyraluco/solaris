@@ -266,12 +266,6 @@ impl Agent {
         self.journal()
             .map_or_else(|| self.id.clone(), |journal| journal.id().to_owned())
     }
-    pub(crate) fn enqueue_input(&self, text: &str, follow_up: bool) -> Result<(), String> {
-        let text = self.expand_input(text).map_err(|error| error.to_string())?;
-        self.jobs()
-            .enqueue(&self.session_id(), &text, follow_up, self.journal())
-            .map_err(|error| error.to_string())
-    }
     pub fn stop_reason(&self) -> Option<crate::StopReason> {
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner())
     }

@@ -49,9 +49,6 @@ impl SessionRuntime {
     }
 }
 impl RuntimeSubscription {
-    pub fn sequence(&self) -> u64 {
-        self.cursor
-    }
     pub async fn next(&mut self) -> Result<RuntimeEvent, String> {
         loop {
             if *self.closed.borrow() {

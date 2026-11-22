@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use solaris_agent::*;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::Semaphore;
@@ -10,6 +10,7 @@ struct Model {
     parent: AtomicUsize,
     background: bool,
     observed_followup: AtomicBool,
+    resume_job: Mutex<Option<String>>,
     started: Semaphore,
     release: Semaphore,
 }
@@ -40,6 +41,15 @@ impl ModelConnector for Model {
                         "subagent",
                         serde_json::json!({"agent":"explore","prompt":"inspect","background":this.background}),
                     ))]
+                } else if let Some(id) = this.resume_job.lock().unwrap().take() {
+                    vec![AgentEvent::ToolCall(ToolCall::new(
+                        "resume",
+                        "subagent",
+                        serde_json::json!({
+                            "agent": "explore", "prompt": "follow-up instructions",
+                            "background": true, "resume_id": id
+                        }),
+                    ))]
                 } else {
                     let received = request
                         .history
@@ -69,6 +79,7 @@ fn model() -> Arc<Model> {
         parent: AtomicUsize::new(0),
         background: true,
         observed_followup: AtomicBool::new(false),
+        resume_job: Mutex::new(None),
         started: Semaphore::new(0),
         release: Semaphore::new(0),
     })
@@ -118,17 +129,20 @@ async fn nested_foreground_delegation_does_not_hold_the_only_execution_slot() {
         ..Default::default()
     };
     options.execution.subagent_depth = 2;
-    let session = SessionRuntime::new(Agent::new(
-        ConnectionConfig {
-            backend: Arc::new(Nested),
-            model: "test".into(),
-            provider_id: None,
-            fallback_context_window: 128_000,
-            instructions: None,
-        },
-        Arc::new(ToolRegistry::with_tools(vec![])),
-        options,
-    ));
+    let runtime = Runtime::default();
+    let session = runtime
+        .open(Agent::new(
+            ConnectionConfig {
+                backend: Arc::new(Nested),
+                model: "test".into(),
+                provider_id: None,
+                fallback_context_window: 128_000,
+                instructions: None,
+            },
+            Arc::new(ToolRegistry::with_tools(vec![])),
+            options,
+        ))
+        .unwrap();
     let events: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         session
             .execute(RuntimeCommand::Prompt {
@@ -152,7 +166,7 @@ async fn nested_foreground_delegation_does_not_hold_the_only_execution_slot() {
             .iter()
             .any(|event| matches!(event.event, AgentEvent::Error(_)))
     );
-    assert_eq!(session.jobs().list(&session.snapshot().session_id).len(), 1);
+    assert_eq!(runtime.jobs().list(&session.snapshot().session_id).len(), 1);
 }
 fn agent(model: Arc<Model>) -> Agent {
     Agent::new(
@@ -355,10 +369,16 @@ async fn running_child_accepts_a_followup_without_starting_a_second_job() {
     model.started.acquire().await.unwrap().forget();
     let owner = session.snapshot().session_id;
     let info = runtime.jobs().list(&owner).pop().unwrap();
-    runtime
-        .jobs()
-        .send(&owner, &info.id, "follow-up instructions")
-        .unwrap();
+    *model.resume_job.lock().unwrap() = Some(info.id.clone());
+    let _: Vec<_> = session
+        .execute(RuntimeCommand::Prompt {
+            text: "send a follow-up to the running child".into(),
+            mode: Mode::Build,
+        })
+        .await
+        .unwrap()
+        .collect()
+        .await;
     model.release.add_permits(2);
     let done = tokio::time::timeout(
         std::time::Duration::from_secs(2),

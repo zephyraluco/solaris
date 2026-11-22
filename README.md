@@ -419,7 +419,7 @@ for newline-delimited envelopes containing `version`, `sequence`, `session_id` a
 `event`. A failed turn exits nonzero. Approval requests in headless mode are refused
 unless an explicit policy rule allows the call; they never wait for an invisible UI.
 Saved ChatGPT OAuth credentials refresh before model requests, including later
-prompts in long-lived RPC sessions and child requests. Refreshes are shared across
+prompts in long-lived ACP sessions and child requests. Refreshes are shared across
 models and rotating tokens are saved atomically before requests proceed. Refresh
 or persistence failures stop the request; model requests are not automatically retried.
 
@@ -467,26 +467,6 @@ Clients that advertise ACP form elicitation can display complete Solaris
 questionnaires, including custom text. Paseo clients that expose only ACP
 permission options receive a sequence of choice prompts for multi-question
 and multi-select requests. Those clients cannot collect custom text in the picker.
-
-`solaris --rpc` provides the same session over stdin/stdout, without a network
-server. Send one JSON request per line; `id` is a string. For example:
-
-```json
-{"id":"turn-1","command":{"type":"prompt","text":"review this project","mode":"plan"}}
-{"id":"stop-1","command":{"type":"cancel"}}
-```
-
-Commands are `prompt`, `cancel`, `steer` and `queue` (the last two take `text`).
-An omitted prompt mode uses the CLI mode. Responses carry `type: "response"`,
-`id`, `ok` and an optional error. Events carry `type: "event"`, `request_id`,
-`version: 1`, `sequence`, `session_id` and `event`. An `end` envelope marks stream
-completion; inspect the events for turn success or failure. One prompt runs at a
-time; a second prompt is rejected while controls remain available. Requests are
-limited to 1 MiB per line. Closing stdin cancels the current turn and exits.
-`jobs` lists this session’s jobs; `send_job` takes `id` and `text`, and `cancel_job`
-takes `id`. Automatic background events have a null `request_id`. A persistence
-failure is reported with a null `sequence`; normal events have durable sequences
-when the session is saved.
 
 ## MCP servers
 

@@ -74,12 +74,8 @@ struct Args {
     #[arg(long, requires = "print")]
     json: bool,
 
-    /// Serve newline-delimited session commands and events over stdin/stdout.
-    #[arg(long, conflicts_with_all = ["print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status"])]
-    rpc: bool,
-
     /// Serve Agent Client Protocol v1 over stdin/stdout.
-    #[arg(long, conflicts_with_all = ["rpc", "print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status", "resume", "continue_session", "fork", "ephemeral", "image"])]
+    #[arg(long, conflicts_with_all = ["print", "json", "print_config", "sessions", "export_session", "changes", "undo", "mcp_status", "resume", "continue_session", "fork", "ephemeral", "image"])]
     acp: bool,
 
     /// MCP configuration; defaults to mcp.json in the user config directory.
@@ -511,7 +507,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if args.print.is_some() || args.rpc {
+    if let Some(prompt) = &args.print {
         let mut options = solaris_agent::AgentOptions::in_directory(std::env::current_dir()?)
             .with_selection(tools);
         let session_resources = solaris_agent::ResourceSnapshot {
@@ -519,9 +515,6 @@ fn main() -> Result<()> {
             prompt: resources.prompt,
             warnings: resources.warnings,
         };
-        if args.rpc {
-            options.questions = Some(Default::default());
-        }
         options.execution = execution;
         let factory = Arc::new(solaris_provider::refreshing_backend_factory(
             auth,
@@ -558,23 +551,14 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("{} is not a supported image", path.display()))?;
             session.attach_image(image).map_err(anyhow::Error::msg)?;
         }
-        if args.rpc {
-            runtime.block_on(automation::serve_rpc(
-                &session,
-                config.mode,
-                tokio::io::stdin(),
-                std::io::stdout().lock(),
-            ))?;
-        } else if let Some(prompt) = &args.print {
-            let succeeded = runtime.block_on(automation::print_turn(
-                &session,
-                prompt,
-                config.mode,
-                args.json,
-            ))?;
-            if !succeeded {
-                anyhow::bail!("headless turn failed");
-            }
+        let succeeded = runtime.block_on(automation::print_turn(
+            &session,
+            prompt,
+            config.mode,
+            args.json,
+        ))?;
+        if !succeeded {
+            anyhow::bail!("headless turn failed");
         }
         return Ok(());
     }

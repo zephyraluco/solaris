@@ -2768,14 +2768,9 @@ mod tests {
             })
             .expect("complete");
         drop(second);
-        let mut app = app();
-        drop(
-            app.sessions
-                .agent
-                .execute(solaris_agent::RuntimeCommand::AttachJournal { journal: first })
-                .await
-                .expect("attach"),
-        );
+        let mut options = app_options();
+        options.journal = Some(first);
+        let mut app = App::new(options);
         app.switch_session(&id, false);
         for _ in 0..1000 {
             app.tick();
@@ -2891,18 +2886,16 @@ mod tests {
         )))
     }
 
-    fn app() -> App {
+    fn app_options() -> AppOptions {
         let backend = fake_backend();
         let quit: QuitFlag = Rc::new(Cell::new(false));
         let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
         let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        App::new(AppOptions::new(
-            backend,
-            Config::default(),
-            quit,
-            queue,
-            flag,
-        ))
+        AppOptions::new(backend, Config::default(), quit, queue, flag)
+    }
+
+    fn app() -> App {
+        App::new(app_options())
     }
 
     /// An app pinned to `backend` that is allowed to ask it for its models.
