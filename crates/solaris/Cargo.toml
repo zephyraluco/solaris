@@ -13,6 +13,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+base64 = "0.22"
+agent-client-protocol = { version = "5.4.0", features = ["stdio"] }
 solaris-mcp = { workspace = true }
 unicode-segmentation = { workspace = true }
 solaris-tools = { workspace = true }
@@ -24,8 +26,7 @@ crossterm = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["io-std"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

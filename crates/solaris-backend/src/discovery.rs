@@ -168,7 +168,7 @@ impl Wire for CodexModels {
     fn encode(&self, cursor: Option<String>, mode: Mode) -> Result<Encoded, EncodeError> {
         let mut encoded = self.0.encode(cursor, mode)?;
         // Codex gates the available catalog by its client protocol version.
-        let url = format!("{}?client_version=0.162.1", encoded.request.uri());
+        let url = format!("{}?client_version=0.171.0", encoded.request.uri());
         *encoded.request.uri_mut() = url
             .parse()
             .map_err(|error| EncodeError::request(format!("invalid catalog URL: {error}")))?;

@@ -17,7 +17,7 @@ fn message_contains(message: &serde_json::Value, expected: &str) -> bool {
         })
 }
 
-fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
+fn command(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_solaris"));
     command
         .env("SOLARIS_CONFIG_DIR", directory)
@@ -32,7 +32,13 @@ fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
     ] {
         command.env_remove(name);
     }
-    command.output().expect("run binary")
+    command
+}
+
+fn run(directory: &std::path::Path, endpoint: &str, args: &[&str]) -> Output {
+    command(directory, endpoint, args)
+        .output()
+        .expect("run binary")
 }
 
 fn sse_reply(delta: serde_json::Value, finish: &str) -> String {
@@ -231,20 +237,21 @@ fn automatic_continuation_keeps_user_forks_and_explicit_child_resume() {
     drop(fork);
     drop(child);
 
+    let reply = sse_reply(serde_json::json!({"content":"ok"}), "stop");
+    let (endpoint, server) = serve_responses(vec![reply.clone(), reply]);
     let output = run(
         directory.path(),
-        "http://127.0.0.1:1/v1",
-        &["--continue", "--rpc"],
+        &endpoint,
+        &["--continue", "--print", "continue user fork"],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        store.records(&fork_id).expect("fork records").len(),
-        fork_records + 1
-    );
+    assert!(store.records(&fork_id).expect("fork records")[fork_records..]
+        .iter()
+        .any(|record| matches!(record, SessionRecord::Prompt { text } if text == "continue user fork")));
     assert_eq!(
         store.records(&child_id).expect("child records").len(),
         child_records
@@ -252,18 +259,18 @@ fn automatic_continuation_keeps_user_forks_and_explicit_child_resume() {
 
     let output = run(
         directory.path(),
-        "http://127.0.0.1:1/v1",
-        &["--resume", &child_id, "--rpc"],
+        &endpoint,
+        &["--resume", &child_id, "--print", "resume delegated child"],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        store.records(&child_id).expect("child records").len(),
-        child_records + 1
-    );
+    assert!(store.records(&child_id).expect("child records")[child_records..]
+        .iter()
+        .any(|record| matches!(record, SessionRecord::Prompt { text } if text == "resume delegated child")));
+    assert_eq!(server.join().expect("server").len(), 2);
 }
 
 #[test]
@@ -291,45 +298,10 @@ fn automatic_continuation_refuses_a_directory_with_only_delegated_sessions() {
     let output = run(
         directory.path(),
         "http://127.0.0.1:1/v1",
-        &["--continue", "--rpc"],
+        &["--continue", "--print", "continue user session"],
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no saved user session"));
-}
-
-#[test]
-fn rpc_binary_accepts_commands_without_initializing_a_terminal() {
-    use std::process::Stdio;
-    let directory = tempfile::tempdir().expect("directory");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_solaris"))
-        .env("SOLARIS_CONFIG_DIR", directory.path())
-        .args(["--rpc", "--ephemeral", "--provider", "local"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("RPC binary");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"not json\n{\"id\":\"cancel\",\"command\":{\"type\":\"cancel\"}}\n")
-        .expect("requests");
-    let output = child.wait_with_output().expect("EOF exits");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-        .expect("UTF8")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("JSON response"))
-        .collect();
-    assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["ok"], false);
-    assert_eq!(responses[1]["id"], "cancel");
-    assert_eq!(responses[1]["ok"], true);
 }
 
 #[test]
@@ -354,26 +326,28 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
     memory::seed(&source, vec![Message::user("source private history")]);
     let source_id = source.id().to_owned();
     drop(source);
+    let reply = sse_reply(serde_json::json!({"content":"ok"}), "stop");
+    let (endpoint, server) = serve_responses(vec![reply.clone(), reply]);
     let mut auth = AuthStore::new();
     auth.store(
-        "openai",
+        "new-api",
         Credential::Endpoint {
-            base_url: "http://127.0.0.1:1/v1".into(),
+            base_url: endpoint.clone(),
             api_key: "test-only".into(),
         },
     );
-    auth.activate("openai");
+    auth.activate("new-api");
     std::fs::write(
         directory.path().join("auth.json"),
         auth.to_json().expect("auth"),
     )
     .expect("save auth");
     for override_provider in [false, true] {
-        let mut args = vec!["--fork", &source_id, "--rpc"];
+        let mut args = vec!["--fork", &source_id, "--print", "review fork"];
         if override_provider {
-            args.extend(["--provider", "openai"]);
+            args.extend(["--provider", "new-api"]);
         }
-        let output = run(directory.path(), "http://127.0.0.1:1/v1", &args);
+        let output = run(directory.path(), &endpoint, &args);
         assert!(
             output.status.success(),
             "{}",
@@ -387,7 +361,11 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             .expect("fork");
         assert_eq!(
             fork.provider.as_deref(),
-            Some(if override_provider { "openai" } else { "local" })
+            Some(if override_provider {
+                "new-api"
+            } else {
+                "local"
+            })
         );
         let journal = store.resume(&fork.id).expect("fork released");
         assert_eq!(
@@ -406,6 +384,7 @@ fn cli_fork_restores_the_source_provider_unless_explicitly_overridden() {
             .as_deref(),
         Some("local")
     );
+    assert_eq!(server.join().expect("server").len(), 2);
 }
 
 #[test]
@@ -539,3 +518,365 @@ fn named_model_routes_to_custom_endpoint_with_original_request_alias() {
 
 #[path = "../../solaris-agent/tests/support/memory.rs"]
 mod memory;
+
+struct AcpProcess {
+    child: std::process::Child,
+    incoming: std::sync::mpsc::Receiver<serde_json::Value>,
+}
+
+impl AcpProcess {
+    fn start(config: &std::path::Path, endpoint: &str, extra: &[&str]) -> Self {
+        Self::start_with_capabilities(config, endpoint, extra, serde_json::json!({}))
+    }
+
+    fn start_with_capabilities(
+        config: &std::path::Path,
+        endpoint: &str,
+        extra: &[&str],
+        capabilities: serde_json::Value,
+    ) -> Self {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = command(
+            config,
+            endpoint,
+            &["--acp", "--provider", "local", "--model", "test-model"],
+        )
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start ACP process");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, incoming) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut peer = Self { child, incoming };
+        peer.send(serde_json::json!({"id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":capabilities}}));
+        let (frame, _) = peer.response(1);
+        assert_eq!(frame["result"]["protocolVersion"], 1, "{frame}");
+        assert_eq!(frame["result"]["agentCapabilities"]["loadSession"], true);
+        assert_eq!(
+            frame["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+            true
+        );
+        assert_eq!(
+            frame["result"]["agentCapabilities"]["mcpCapabilities"]["http"],
+            true
+        );
+        peer
+    }
+
+    fn send(&mut self, mut frame: serde_json::Value) {
+        frame["jsonrpc"] = serde_json::json!("2.0");
+        writeln!(self.child.stdin.as_mut().unwrap(), "{frame}").unwrap();
+    }
+
+    fn recv(&self) -> serde_json::Value {
+        self.incoming
+            .recv_timeout(Duration::from_secs(12))
+            .expect("ACP frame")
+    }
+
+    fn response(&self, id: u64) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let mut updates = Vec::new();
+        loop {
+            let frame = self.recv();
+            if frame["id"] == id && frame.get("method").is_none() {
+                return (frame, updates);
+            }
+            updates.push(frame);
+        }
+    }
+
+    fn new_session(&mut self, cwd: &std::path::Path) -> String {
+        self.send(
+            serde_json::json!({"id":2,"method":"session/new","params":{"cwd":cwd,"mcpServers":[]}}),
+        );
+        let (frame, _) = self.response(2);
+        frame["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{frame}"))
+            .to_owned()
+    }
+
+    fn close(mut self) {
+        drop(self.child.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "ACP must exit on EOF");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for AcpProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn acp_streams_turns_and_replays_the_saved_session_on_reopen() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("workspace with spaces");
+    std::fs::create_dir(&cwd).unwrap();
+    let (endpoint, server) = serve_responses(vec![
+        sse_reply(json!({"content":"first reply"}), "stop"),
+        sse_reply(json!({"content":"second reply"}), "stop"),
+    ]);
+    let mut peer = AcpProcess::start(dir.path(), &endpoint, &[]);
+    let id = peer.new_session(&cwd);
+    peer.send(json!({"id":3,"method":"session/set_config_option","params":{"sessionId":id,"configId":"mode","value":"plan"}}));
+    assert_eq!(
+        peer.response(3).0["result"]["configOptions"][0]["currentValue"],
+        "plan"
+    );
+    for (request_id, prompt, reply) in [
+        (4, "first prompt", "first reply"),
+        (5, "second prompt", "second reply"),
+    ] {
+        peer.send(json!({"id":request_id,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":prompt}]}}));
+        let (stop, frames) = peer.response(request_id);
+        assert_eq!(stop["result"]["stopReason"], "end_turn", "{stop}");
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["params"]["update"]["content"]["text"] == reply)
+        );
+    }
+    peer.close();
+    let mut restored = AcpProcess::start(dir.path(), &endpoint, &[]);
+    restored.send(
+        json!({"id":2,"method":"session/load","params":{"sessionId":id,"cwd":cwd,"mcpServers":[]}}),
+    );
+    let (frame, updates) = restored.response(2);
+    assert!(frame.get("result").is_some(), "{frame}");
+    let text: Vec<_> = updates
+        .iter()
+        .filter_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "first prompt",
+            "first reply",
+            "second prompt",
+            "second reply"
+        ]
+    );
+    restored.close();
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn acp_cancels_a_turn_waiting_for_tool_approval() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let (endpoint, server) = serve_responses(vec![sse_reply(
+        json!({"tool_calls":[{"index":0,"id":"write-1","type":"function","function":{"name":"write","arguments":"{\"path\":\"marker.txt\",\"content\":\"must not run\"}"}}]}),
+        "tool_calls",
+    )]);
+    let mut peer = AcpProcess::start(dir.path(), &endpoint, &["--confirm-tools"]);
+    let id = peer.new_session(dir.path());
+    peer.send(json!({"id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"write a file"}]}}));
+    let permission = loop {
+        let frame = peer.recv();
+        assert_ne!(frame["id"], 3, "{frame}");
+        if frame["method"] == "session/request_permission" {
+            break frame;
+        }
+    };
+    assert_eq!(permission["params"]["sessionId"], id);
+    peer.send(json!({"method":"session/cancel","params":{"sessionId":id}}));
+    peer.send(json!({"id":permission["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
+    assert_eq!(peer.response(3).0["result"]["stopReason"], "cancelled");
+    assert!(!dir.path().join("marker.txt").exists());
+    peer.close();
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn acp_tool_approval_controls_execution_and_updates_the_same_call() {
+    use serde_json::json;
+    for allowed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (endpoint, server) = serve_responses(vec![
+            sse_reply(
+                json!({"tool_calls":[{"index":0,"id":"write-1","type":"function","function":{"name":"write","arguments":"{\"path\":\"marker.txt\",\"content\":\"approved\"}"}}]}),
+                "tool_calls",
+            ),
+            sse_reply(json!({"content":"done"}), "stop"),
+        ]);
+        let mut peer = AcpProcess::start(dir.path(), &endpoint, &["--confirm-tools"]);
+        let id = peer.new_session(dir.path());
+        peer.send(json!({"id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"write a file"}]}}));
+        let mut tool_id = None;
+        let permission = loop {
+            let frame = peer.recv();
+            assert_ne!(frame["id"], 3, "{frame}");
+            if frame["method"] == "session/request_permission" {
+                break frame;
+            }
+            if frame["params"]["update"]["sessionUpdate"] == "tool_call" {
+                tool_id = frame["params"]["update"]["toolCallId"]
+                    .as_str()
+                    .map(str::to_owned);
+            }
+        };
+        let approval_id = &permission["params"]["toolCall"]["toolCallId"];
+        peer.send(json!({"id":permission["id"],"result":{"outcome":{"outcome":"selected","optionId":if allowed {"allow"} else {"reject"}}}}));
+        let (response, updates) = peer.response(3);
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        for frame in &updates {
+            let update = &frame["params"]["update"];
+            if update["sessionUpdate"] == "tool_call" {
+                tool_id = update["toolCallId"].as_str().map(str::to_owned);
+            }
+        }
+        assert_eq!(tool_id.as_deref(), approval_id.as_str());
+        assert!(updates.iter().any(|frame| {
+            let update = &frame["params"]["update"];
+            update["sessionUpdate"] == "tool_call_update"
+                && &update["toolCallId"] == approval_id
+                && update["status"] == if allowed { "completed" } else { "failed" }
+        }));
+        assert_eq!(dir.path().join("marker.txt").exists(), allowed);
+        peer.close();
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn acp_validates_inline_images_and_passes_them_to_the_model() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("models.json"), r#"{"models":{"test-model":{"provider":"local","request_id":"test-model","metadata":"ollama/test-model"}},"overrides":{"ollama":{"models":{"test-model":{"tool_call":true,"reasoning":false,"modalities":{"input":["text","image"],"output":["text"]}}}}}}"#).unwrap();
+    let (endpoint, server) =
+        serve_responses(vec![sse_reply(json!({"content":"image accepted"}), "stop")]);
+    let mut peer = AcpProcess::start(dir.path(), &endpoint, &[]);
+    let id = peer.new_session(dir.path());
+    peer.send(json!({"id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"image","mimeType":"image/jpeg","data":"iVBORw0KGgo="}]}}));
+    assert!(peer.response(3).0.get("error").is_some());
+    peer.send(json!({"id":4,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}]}}));
+    let (result, _) = peer.response(4);
+    assert_eq!(result["result"]["stopReason"], "end_turn", "{result}");
+    peer.close();
+    let requests = server.join().unwrap();
+    assert!(
+        requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+                    })
+                })
+            })
+    );
+}
+
+#[test]
+fn acp_answers_multiple_questions_through_forms_or_choice_fallback() {
+    use serde_json::json;
+    for forms in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let questions = json!({"questions":[
+            {"id":"features","header":"Features","question":"Which features?", "multiple":true, "allow_custom":true,
+             "options":[{"id":"one","label":"One","description":"First feature"},{"id":"two","label":"Two","description":"Second feature"}]},
+            {"id":"mode","header":"Mode","question":"Which mode?", "allow_custom":true,
+             "options":[{"id":"plan","label":"Plan","description":"Planning"},{"id":"build","label":"Build","description":"Build changes"}]}
+        ]});
+        let (endpoint, server) = serve_responses(vec![
+            sse_reply(
+                json!({"tool_calls":[{"index":0,"id":"question-1","type":"function","function":{"name":"question","arguments":questions.to_string()}}]}),
+                "tool_calls",
+            ),
+            sse_reply(json!({"content":"thanks"}), "stop"),
+        ]);
+        let mut peer = AcpProcess::start_with_capabilities(
+            dir.path(),
+            &endpoint,
+            &[],
+            if forms {
+                json!({"elicitation":{"form":{}}})
+            } else {
+                json!({})
+            },
+        );
+        let id = peer.new_session(dir.path());
+        peer.send(json!({"id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"ask me"}]}}));
+        let method = if forms {
+            "elicitation/create"
+        } else {
+            "session/request_permission"
+        };
+        let next_request = || loop {
+            let frame = peer.recv();
+            assert_ne!(frame["id"], 3, "{frame}");
+            if frame["method"] == method {
+                break frame;
+            }
+        };
+        let request = next_request();
+        if forms {
+            assert_eq!(request["params"]["mode"], "form", "{request}");
+            peer.send(json!({"id":request["id"],"result":{"action":"accept","content":{"choice0":["one","two"],"custom1":"custom mode"}}}));
+        } else {
+            peer.send(json!({"id":request["id"],"result":{"outcome":{"outcome":"selected","optionId":"choice0"}}}));
+            for option in ["choice1", "choice0"] {
+                let request = loop {
+                    let frame = peer.recv();
+                    assert_ne!(frame["id"], 3, "{frame}");
+                    if frame["method"] == method {
+                        break frame;
+                    }
+                };
+                peer.send(json!({"id":request["id"],"result":{"outcome":{"outcome":"selected","optionId":option}}}));
+            }
+        }
+        let (result, frames) = peer.response(3);
+        assert_eq!(result["result"]["stopReason"], "end_turn", "{result}");
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["params"]["update"]["content"]["text"] == "thanks")
+        );
+        peer.close();
+        let requests = server.join().unwrap();
+        let tool_result = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        assert!(
+            message_contains(tool_result, r#""selected":["one","two"]"#),
+            "{tool_result}"
+        );
+        assert!(
+            message_contains(
+                tool_result,
+                if forms {
+                    "custom mode"
+                } else {
+                    r#""selected":["plan"]"#
+                }
+            ),
+            "{tool_result}"
+        );
+    }
+}

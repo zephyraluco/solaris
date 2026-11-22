@@ -259,15 +259,6 @@ impl Jobs {
             .get(id)
             .and_then(|entry| entry.child_runtime.clone())
     }
-    pub fn send(&self, owner: &str, id: &str, text: &str) -> Result<(), String> {
-        let info = self.get(id).ok_or("unknown job")?;
-        if info.owner_session_id != owner {
-            return Err("job belongs to another session".into());
-        }
-        self.continue_running(owner, info.target_session_id.as_deref().unwrap_or(id), text)?
-            .ok_or("job is not running")?;
-        Ok(())
-    }
     pub(crate) fn totals(&self, id: &str) -> Arc<Mutex<UsageTotals>> {
         self.0
             .entries

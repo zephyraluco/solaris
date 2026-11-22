@@ -44,7 +44,7 @@ pub use truncate::{
 pub use solaris_types::{Artifact, ToolMetadata, ToolStatus, TruncationInfo};
 
 mod image;
-pub use image::{MAX_IMAGE_BYTES, read_image};
+pub use image::{MAX_IMAGE_BYTES, from_bytes as image_from_bytes, read_image};
 pub use solaris_types::InlineImage;
 
 pub use solaris_types::{ToolCall, ToolResult, ToolSpec};

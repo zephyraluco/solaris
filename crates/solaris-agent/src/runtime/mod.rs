@@ -44,7 +44,7 @@ pub struct RuntimeEvent {
     pub event: AgentEvent,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub session_id: String,
     pub sequence: u64,
@@ -60,7 +60,7 @@ pub struct RuntimeSnapshot {
     pub stop_reason: Option<crate::StopReason>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ModeContexts {
     pub build: crate::ContextUsage,
     pub plan: crate::ContextUsage,
@@ -75,27 +75,6 @@ impl RuntimeSnapshot {
 }
 
 pub type RuntimeEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = RuntimeEvent> + Send>>;
-
-pub struct CommandReceipt {
-    ready: tokio::sync::oneshot::Receiver<Result<RuntimeSnapshot, String>>,
-    events: RuntimeEventStream,
-}
-impl CommandReceipt {
-    pub async fn accepted(self) -> Result<RuntimeEventStream, String> {
-        self.accepted_with_snapshot()
-            .await
-            .map(|(_, events)| events)
-    }
-    pub async fn accepted_with_snapshot(
-        self,
-    ) -> Result<(RuntimeSnapshot, RuntimeEventStream), String> {
-        let snapshot = self
-            .ready
-            .await
-            .map_err(|_| "session runtime stopped".to_string())??;
-        Ok((snapshot, self.events))
-    }
-}
 
 pub struct DispatchReceipt {
     ready: tokio::sync::oneshot::Receiver<Result<RuntimeSnapshot, String>>,
@@ -257,9 +236,6 @@ impl SessionRuntime {
             questions.pending(&self.snapshot().session_id)
         })
     }
-    pub fn jobs(&self) -> crate::Jobs {
-        self.view().jobs()
-    }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.core
             .snapshot
@@ -300,22 +276,6 @@ impl SessionRuntime {
             .send(request)
             .map_err(|_| "session runtime stopped".into())
     }
-    /// Enqueue synchronously so UI actions preserve submission order.
-    pub fn submit(&self, command: RuntimeCommand) -> Result<CommandReceipt, String> {
-        let (output, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (accepted, ready) = tokio::sync::oneshot::channel();
-        self.send(Request {
-            command,
-            output: Some(output),
-            accepted,
-        })?;
-        Ok(CommandReceipt {
-            ready,
-            events: Box::pin(futures::stream::unfold(rx, |mut rx| async {
-                rx.recv().await.map(|event| (event, rx))
-            })),
-        })
-    }
     /// Submit an application-owned operation. Lifetime is independent of observers;
     /// use Cancel explicitly. The receipt contains no duplicate event stream.
     pub fn dispatch(&self, command: RuntimeCommand) -> Result<DispatchReceipt, String> {
@@ -329,7 +289,19 @@ impl SessionRuntime {
     }
 
     pub async fn execute(&self, command: RuntimeCommand) -> Result<RuntimeEventStream, String> {
-        self.submit(command)?.accepted().await
+        let (output, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        self.send(Request {
+            command,
+            output: Some(output),
+            accepted,
+        })?;
+        ready
+            .await
+            .map_err(|_| "session runtime stopped".to_string())??;
+        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|event| (event, rx))
+        })))
     }
     fn idle(
         &self,
@@ -343,7 +315,7 @@ impl SessionRuntime {
         refresh(&self.core, None, crate::Mode::Build);
         Ok(())
     }
-    /// Initial configuration only. Once started, use AttachJournal.
+    /// Attach a journal before the session starts.
     pub fn attach_journal(&self, journal: Arc<SessionJournal>) -> Result<(), crate::StoreError> {
         self.idle(|agent| agent.attach_journal(journal).map_err(|e| e.to_string()))
             .map_err(crate::StoreError::Invalid)
@@ -533,6 +505,18 @@ async fn serve(
                     deferred.push_back(Request {command,output,accepted});continue;
                 }
                 let mut result = Ok(());
+                let command = match command {
+                    RuntimeCommand::PromptWithImages { text, mode, images } if !busy => {
+                        let attached = agent.expand_input(&text).map_err(|error| error.to_string())
+                            .and_then(|_| agent.attach_images(images));
+                        if let Err(error) = attached {
+                            let _ = accepted.send(Err(error));
+                            continue;
+                        }
+                        RuntimeCommand::Prompt { text, mode }
+                    }
+                    command => command,
+                };
                 match command {
                     RuntimeCommand::Prompt { text, mode } if !busy => {
                         next_id += 1;
@@ -544,8 +528,6 @@ async fn serve(
                         if let Some(output)=&output {let _=output.send(event);}
                     }
                     RuntimeCommand::Cancel => agent.cancel_handle().cancel(),
-                    RuntimeCommand::Steer { text } => { result = agent.enqueue_input(&text,false); }
-                    RuntimeCommand::Queue { text } => { result = agent.enqueue_input(&text,true); }
                     RuntimeCommand::PreparedSteer { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,false,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::PreparedQueue { text } => result=agent.jobs().enqueue(&agent.session_id(),&text,true,agent.journal()).map_err(|error|error.to_string()),
                     RuntimeCommand::CancelTask { id } => { if !agent.cancel_task(&id) { result = Err("task is not active".into()); } }
@@ -553,8 +535,6 @@ async fn serve(
                         result = agent.questions().ok_or_else(|| "interactive questions are unavailable".to_string()).and_then(|questions| questions.reply(&agent.session_id(), &request_id, response));
                     }
                     RuntimeCommand::Clear if !busy => result=agent.clear_checked(),
-                    RuntimeCommand::AttachImage { image } if !busy => result = agent.attach_image(image),
-                    RuntimeCommand::AttachJournal { journal } if !busy => result = agent.attach_journal(journal).map_err(|e| e.to_string()),
                     RuntimeCommand::ReplaceResources { resources } if !busy => agent.replace_resources(resources),
                     RuntimeCommand::ReplaceConnection { connection, children } if !busy => {
                         let mut replacement = agent.with_refreshed_backend(connection);
@@ -648,8 +628,7 @@ async fn serve(
     }
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone)]
 pub enum RuntimeCommand {
     AnswerQuestion {
         request_id: String,
@@ -659,39 +638,26 @@ pub enum RuntimeCommand {
         text: String,
         mode: crate::Mode,
     },
+    PromptWithImages {
+        text: String,
+        mode: crate::Mode,
+        images: Vec<solaris_backend::InlineImage>,
+    },
     Cancel,
-    Steer {
-        text: String,
-    },
-    Queue {
-        text: String,
-    },
     Clear,
     Compact,
-    #[serde(skip)]
     PreparedSteer {
         text: String,
     },
-    #[serde(skip)]
     PreparedQueue {
         text: String,
     },
     CancelTask {
         id: String,
     },
-    #[serde(skip)]
-    AttachImage {
-        image: solaris_backend::InlineImage,
-    },
-    #[serde(skip)]
-    AttachJournal {
-        journal: Arc<SessionJournal>,
-    },
-    #[serde(skip)]
     ReplaceResources {
         resources: crate::ResourceSnapshot,
     },
-    #[serde(skip)]
     ReplaceConnection {
         connection: crate::ConnectionConfig,
         children: Option<crate::ChildBackendFactory>,
@@ -859,7 +825,6 @@ mod tests {
             assert_eq!(event.sequence, Some(sequence));
             assert_eq!(event.task_id, Some(8));
         }
-        assert_eq!(observer.sequence(), 1500);
         let (records, sequence) = journal.history().unwrap();
         assert_eq!(sequence, 1500);
         assert_eq!(

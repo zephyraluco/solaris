@@ -243,17 +243,17 @@ async fn chatgpt_model_discovery_reads_codex_slugs_instead_of_public_api_ids() {
     let (addr, seen) = serve(response(
         "200 OK",
         "application/json",
-        r#"{"models":[{"slug":"gpt-5-codex","visibility":"list","priority":2,"supported_in_api":false},{"slug":"hidden","visibility":"hide","priority":0},{"slug":"gpt-5","visibility":"list","priority":1}]}"#,
+        r#"{"models":[{"slug":"gpt-6.2-astra","visibility":"list","priority":2,"supported_in_api":false},{"slug":"hidden","visibility":"hide","priority":0},{"slug":"gpt-6.2-sol","visibility":"list","priority":1}]}"#,
     ))
     .await;
-    let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-5-codex", 8192, None)
+    let backend = backend_with(addr, Wire::OpenAiResponses, "gpt-6.2-astra", 8192, None)
         .with_chatgpt("account".into(), u64::MAX);
     assert_eq!(
         backend.models().await.unwrap(),
-        vec!["gpt-5", "gpt-5-codex"]
+        vec!["gpt-6.2-sol", "gpt-6.2-astra"]
     );
     let request = seen.await.unwrap();
-    assert!(request.starts_with("GET /v1/models?client_version=0.162.1 "));
+    assert!(request.starts_with("GET /v1/models?client_version=0.171.0 "));
     assert!(
         request
             .to_ascii_lowercase()

@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 use solaris_tools::{ExecutionMode, Tool, ToolContext, ToolOutput};
 
 /// User-level configuration. Secret values are referenced by environment name.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerConfig {
     Stdio {
@@ -39,6 +39,18 @@ pub enum ServerConfig {
         auth_env: Option<String>,
         #[serde(default)]
         read_only_tools: BTreeSet<String>,
+    },
+    /// Session-provided values, kept separate from persistent environment bindings.
+    #[serde(skip)]
+    ClientStdio {
+        command: std::path::PathBuf,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    #[serde(skip)]
+    ClientHttp {
+        url: String,
+        headers: BTreeMap<String, String>,
     },
 }
 
@@ -88,6 +100,9 @@ impl McpManager {
                 | ServerConfig::Http {
                     read_only_tools, ..
                 } => read_only_tools.clone(),
+                ServerConfig::ClientStdio { .. } | ServerConfig::ClientHttp { .. } => {
+                    BTreeSet::new()
+                }
             };
             let service =
                 match tokio::time::timeout(Duration::from_secs(15), connect_server(server, cwd))
@@ -208,58 +223,89 @@ async fn connect_server(
         ServerConfig::Stdio {
             command, args, env, ..
         } => {
-            let mut process = tokio::process::Command::new(command);
-            process
-                .args(args)
-                .current_dir(cwd)
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true);
-            // Values are environment-variable names, never literal credentials.
-            for (target, source) in env {
-                let value = std::env::var_os(source).ok_or("missing MCP environment binding")?;
-                process.env(target, value);
-            }
-            let transport = TokioChildProcess::builder(process)
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map(|(transport, _)| transport)
-                .map_err(|_| "MCP process could not start")?;
-            ().serve(transport)
-                .await
-                .map_err(|_| "MCP initialization failed".into())
+            let env = env
+                .into_iter()
+                .map(|(target, source)| {
+                    let value =
+                        std::env::var_os(source).ok_or("missing MCP environment binding")?;
+                    Ok((target, value))
+                })
+                .collect::<Result<BTreeMap<_, _>, &str>>()?;
+            connect_stdio(Path::new(&command), args, env, cwd).await
+        }
+        ServerConfig::ClientStdio { command, args, env } => {
+            connect_stdio(&command, args, env, cwd).await
         }
         ServerConfig::Http { url, auth_env, .. } => {
-            let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid MCP URL")?;
-            if parsed.scheme() != "https"
-                && !(parsed.scheme() == "http"
-                    && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
-            {
-                return Err("MCP HTTP requires HTTPS except on loopback".into());
-            }
-            if !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-            {
-                return Err("use auth_env instead of URL credentials or query tokens".into());
-            }
-            let mut config = StreamableHttpClientTransportConfig::with_uri(url);
-            config.max_sse_event_size = 2 * 1024 * 1024;
-            config.reinit_on_expired_session = false;
-            if let Some(name) = auth_env {
-                config = config.auth_header(
-                    std::env::var(name).map_err(|_| "missing MCP auth environment binding")?,
-                );
-            }
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|_| "MCP TLS client initialization failed")?;
-            let transport = StreamableHttpClientTransport::with_client(client, config);
-            ().serve(transport)
-                .await
-                .map_err(|_| "MCP initialization failed".into())
+            let auth = auth_env
+                .map(|name| std::env::var(name).map_err(|_| "missing MCP auth environment binding"))
+                .transpose()?;
+            connect_http(url, auth, BTreeMap::new()).await
         }
+        ServerConfig::ClientHttp { url, headers } => connect_http(url, None, headers).await,
     }
+}
+
+async fn connect_stdio(
+    command: &Path,
+    args: Vec<String>,
+    env: BTreeMap<String, impl AsRef<std::ffi::OsStr>>,
+    cwd: &Path,
+) -> Result<RunningService<RoleClient, ()>, String> {
+    let mut process = tokio::process::Command::new(command);
+    process
+        .args(args)
+        .envs(env)
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let transport = TokioChildProcess::builder(process)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|(transport, _)| transport)
+        .map_err(|_| "MCP process could not start")?;
+    ().serve(transport)
+        .await
+        .map_err(|_| "MCP initialization failed".into())
+}
+
+async fn connect_http(
+    url: String,
+    auth: Option<String>,
+    headers: BTreeMap<String, String>,
+) -> Result<RunningService<RoleClient, ()>, String> {
+    let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid MCP URL")?;
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
+    {
+        return Err("MCP HTTP requires HTTPS except on loopback".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() {
+        return Err("use headers instead of URL credentials or query tokens".into());
+    }
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    for (name, value) in headers {
+        let name =
+            reqwest::header::HeaderName::try_from(name).map_err(|_| "invalid MCP header name")?;
+        let mut value = reqwest::header::HeaderValue::try_from(value)
+            .map_err(|_| "invalid MCP header value")?;
+        value.set_sensitive(true);
+        config.custom_headers.insert(name, value);
+    }
+    config.max_sse_event_size = 2 * 1024 * 1024;
+    config.reinit_on_expired_session = false;
+    if let Some(auth) = auth {
+        config = config.auth_header(auth);
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "MCP TLS client initialization failed")?;
+    let transport = StreamableHttpClientTransport::with_client(client, config);
+    ().serve(transport)
+        .await
+        .map_err(|_| "MCP initialization failed".into())
 }
 
 struct McpTool {
