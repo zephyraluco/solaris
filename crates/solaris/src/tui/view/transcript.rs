@@ -733,7 +733,10 @@ fn push_steps(
 }
 
 fn is_shell(step: &ToolStep) -> bool {
-    matches!(step.call.name.as_str(), "shell" | "bash")
+    matches!(
+        step.call.name.as_str(),
+        "shell" | "bash" | "powershell" | "cmd"
+    )
 }
 
 fn tool_group_view(
@@ -1017,7 +1020,7 @@ fn tool_counts(steps: &[ToolStep], running: bool) -> String {
             "ls" => ("listing", "listings"),
             "edit" | "patch" => ("edit", "edits"),
             "write" => ("write", "writes"),
-            "shell" | "bash" => ("command", "commands"),
+            "shell" | "bash" | "powershell" | "cmd" => ("command", "commands"),
             _ => ("tool call", "tool calls"),
         };
         *counts.entry(label).or_default() += 1;
@@ -1050,7 +1053,7 @@ fn tool_step_title(step: &ToolStep, question_summary: Option<&str>) -> String {
         "edit" => "Edit",
         "patch" => "Patch",
         "write" => "Write",
-        "shell" | "bash" => "Shell",
+        "shell" | "bash" | "powershell" | "cmd" => "Shell",
         "webfetch" => "WebFetch",
         "websearch" => "WebSearch",
         name => name,
@@ -1553,7 +1556,7 @@ mod tests {
 
     #[test]
     fn each_shell_command_has_its_own_disclosure_and_output() {
-        for name in ["shell", "bash"] {
+        for name in ["shell", "bash", "powershell", "cmd"] {
             let call = ToolCall::new(name, name, serde_json::json!({"command":"cargo test"}));
             let mut step = ToolStep::pending(call.clone());
             step.finish(

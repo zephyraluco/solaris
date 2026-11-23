@@ -53,7 +53,6 @@ The interface is complete, and a connected provider really is called. Connect a 
 
 ## Requirements
 
-- **Bash and standard utilities** (`cat`, `head`, `cp`, `ls`, `chmod`, `mkdir`, `mktemp`, `mv`, `rm`, `readlink`, `sync`) on Linux/macOS; included in the Windows runtime.
 - **Rust 1.97.1 or newer** — the workspace uses the 2024 edition.
 - A terminal that can render 24-bit colour (Windows Terminal, iTerm2, Alacritty, Kitty, …).
 - [ripgrep](https://github.com/BurntSushi/ripgrep) and [fd](https://github.com/sharkdp/fd), for the `grep` and `find` tools. Everything else works without them.
@@ -71,27 +70,12 @@ cargo build
 cargo build --release
 ```
 
-## Windows runtime
+## Shell environment
 
-Windows uses the bundled Cygwin Bash for shell commands. Extract the complete
-Windows release archive and keep `plugins/windows/cygwin/` beside `solaris.exe`.
-Source builds locate the same runtime in the repository, including when launched
-from another working directory. Startup locates the runtime without changing
-the process PATH. Bash uses only `/usr/local/bin:/usr/bin:/bin` from Cygwin;
-the Windows PATH is not inherited by Bash.
-Bash temporary files use the current user's temporary directory; startup does
-not require write access to the installation directory.
-
-All built-in tools use Bash and system utilities, including file reads, directory
-listing, atomic writes and undo. Windows starts the bundled Bash with personal
-startup files disabled and explicitly sources `/etc/profile`; it does not inherit
-the host PATH. Use `/cygdrive/c/...` for Windows system files. `rg` and `fd` are
-resolved by that same Cygwin PATH, not by Windows process lookup. Linux/macOS use
-system Bash, standard utilities, and the system PATH. Structured arguments are
-passed separately, with file content on stdin. Commands retain the session directory.
-All platforms expose the same `bash` tool and use Bash command syntax. A missing
-Windows runtime is reported explicitly. The standalone EXE is not a complete
-Windows installation.
+- **Linux/macOS**: uses system `bash` and native POSIX paths.
+- **Windows**: defaults to PowerShell (`pwsh` → `powershell` → `cmd /C`) with `-NoLogo -NoProfile -NonInteractive` and UTF-8 output encoding, native Windows paths, and the system `PATH`. No bundled runtime is required.
+  - To switch to Git Bash on Windows, pass `--tools +bash,-powershell` (auto-detects Git for Windows or `bash.exe` on `PATH`); to use Command Prompt explicitly, pass `--tools +cmd,-powershell`.
+  - You can override the shell binary with `shell_path` in `settings.json` (or `SOLARIS_SHELL_PATH`) and prepend setup commands via `shell_command_prefix` in `settings.json`.
 
 ## Run
 
@@ -184,7 +168,7 @@ The model can ask solaris to do things. A turn runs what it asks for, hands back
 | `ls` | List a directory | plan |
 | `grep` | Search file contents, respecting `.gitignore` | plan |
 | `find` | Find paths by glob, respecting `.gitignore` | plan |
-| `bash` | Run a Bash command and return what it printed; bundled Cygwin on Windows | build |
+| `bash` / `powershell` | Run a shell command and return what it printed (`bash` on Unix; `powershell` with `cmd /C` fallback on Windows) | build |
 | `subagent` | Delegate an isolated task to `explore` or `general` | build, plan (`explore` only) |
 
 Plan mode declares the four read-only tools plus delegation to read-only `explore` children, so a plan cannot change anything by accident. `--tools` replaces that set and `--exclude-tools` withdraws from it:
@@ -625,8 +609,7 @@ can be reused. Historical edits and compaction invalidate retained measurements.
 After compaction the display stays unknown until a fresh measurement; budgeting still
 estimates the new projection. Legacy histories without measurements use estimates.
 
-Rule and skill loading prepares model-visible path text, including Windows Cygwin
-conversions. `/reload` loads resources on a worker and publishes at an idle boundary;
+Rule and skill loading prepares model-visible path text. `/reload` loads resources on a worker and publishes at an idle boundary;
 loaders are serialized. Request preparation renders cached resources and retains the
 prompt/tool estimation inputs. UI polling only reads nonblocking snapshots: it never
 builds prompts, reads files or starts a shell. Restoring messages uses the same

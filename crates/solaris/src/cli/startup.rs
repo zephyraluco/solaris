@@ -52,9 +52,6 @@ impl Startup {
             Ok(selection) => selection,
             Err(message) => anyhow::bail!("{message}"),
         };
-        // A name that matches nothing is almost always a typo, and silently
-        // declaring nothing would look like the tool simply refused to run.
-        let registry = solaris_agent::agent_tool_registry();
 
         let state_dir = config_dir();
         let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
@@ -67,6 +64,29 @@ impl Startup {
         let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
         let recent = load_recent(recent_path.as_deref());
         let settings = load_settings(settings_path.as_deref());
+
+        let shell_options = solaris_agent::ShellOptions {
+            shell_path: std::env::var_os("SOLARIS_SHELL_PATH")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    settings
+                        .shell_path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                }),
+            command_prefix: settings
+                .shell_command_prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        };
+        // A name that matches nothing is almost always a typo, and silently
+        // declaring nothing would look like the tool simply refused to run.
+        let registry = solaris_agent::agent_tool_registry_with_shell(shell_options);
 
         let resource_paths = ResourcePaths {
             cwd: std::env::current_dir()?,

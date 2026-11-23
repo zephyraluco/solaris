@@ -1,13 +1,9 @@
-//! User-file operations implemented by fixed Bash scripts and system utilities.
-use std::io;
+//! Native user-file operations with bounded reads and atomic replacement.
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::Cancel;
 use crate::environment::ExecutionEnvironment;
-
-fn call(script: &str, args: &[&Path], input: &[u8]) -> io::Result<Vec<u8>> {
-    ExecutionEnvironment.checked(script, args, input, None)
-}
 
 #[cfg(test)]
 pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
@@ -23,12 +19,25 @@ pub(crate) fn read_with_cancel(
     limit: usize,
     cancel: Option<&Cancel>,
 ) -> io::Result<Vec<u8>> {
-    let size = (limit + 1).to_string();
-    let bytes = ExecutionEnvironment.checked(
-        "[[ -e $1 ]] || { printf 'file not found' >&2; exit 44; }; [[ -f $1 ]] || { printf 'not a regular file' >&2; exit 1; }; head -c \"$2\" -- \"$1\"",
-        &[path, Path::new(&size)],
-        &[], cancel,
-    )?;
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(io::Error::other("tool cancelled"));
+    }
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(io::Error::other(format!(
+            "file exceeds the {limit} byte input limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(io::Error::other("tool cancelled"));
+    }
     if bytes.len() > limit {
         return Err(io::Error::other(format!(
             "file exceeds the {limit} byte input limit"
@@ -37,92 +46,84 @@ pub(crate) fn read_with_cancel(
     Ok(bytes)
 }
 
-pub(crate) fn exists(path: &Path) -> bool {
-    call("[[ -e $1 ]]", &[path], &[]).is_ok()
-}
-pub(crate) fn is_dir(path: &Path) -> bool {
-    call("[[ -d $1 ]]", &[path], &[]).is_ok()
-}
 pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
-    call("mkdir -p -- \"$1\"", &[path], &[]).map(|_| ())
+    std::fs::create_dir_all(path)
 }
+
 pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
-    call("rm -- \"$1\"", &[path], &[]).map(|_| ())
+    std::fs::remove_file(path)
 }
+
 pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     ExecutionEnvironment.canonical_path(path)
 }
 
-/// NUL-delimited names and type tags preserve even embedded newlines.
+/// Directory entries as `(name, is_real_directory)`.
 pub(crate) fn entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
-    let output = call(
-        "[[ -d $1 ]] || { printf 'not a directory or file not found' >&2; exit 44; }; [[ -r $1 && -x $1 ]] || { printf 'permission denied' >&2; exit 43; }; shopt -s dotglob nullglob; base=${1%/}; for file in \"$base\"/*; do kind=f; [[ -d $file && ! -L $file ]] && kind=d; printf '%s\\0%s\\0' \"${file##*/}\" \"$kind\"; done",
-        &[path],
-        &[],
-    )?;
-    let mut fields = output.split(|b| *b == 0);
     let mut entries = Vec::new();
-    while let Some(name) = fields.next().filter(|name| !name.is_empty()) {
-        let directory = fields
-            .next()
-            .ok_or_else(|| io::Error::other("invalid directory response"))?
-            == b"d";
-        entries.push((String::from_utf8_lossy(name).into_owned(), directory));
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        entries.push((name, file_type.is_dir()));
     }
     Ok(entries)
 }
 
 pub(crate) fn mode(path: &Path) -> io::Result<u32> {
-    let output = call("LC_ALL=C ls -ld -- \"$1\"", &[path], &[])?;
-    let flags = output
-        .get(1..10)
-        .ok_or_else(|| io::Error::other("invalid permission response"))?;
-    let mut mode = 0;
-    for (i, flag) in flags.iter().enumerate() {
-        let present = match i % 3 {
-            0 => *flag == b'r',
-            1 => *flag == b'w',
-            _ => matches!(flag, b'x' | b's' | b't'),
-        };
-        if present {
-            mode |= 1 << (8 - i);
-        }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
     }
-    if matches!(flags[2], b's' | b'S') {
-        mode |= 0o4000;
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "POSIX file modes are unavailable on this platform",
+        ))
     }
-    if matches!(flags[5], b's' | b'S') {
-        mode |= 0o2000;
-    }
-    if matches!(flags[8], b't' | b'T') {
-        mode |= 0o1000;
-    }
-    Ok(mode)
 }
 
-/// Same-directory replacement. Data is binary stdin, never a shell argument.
+/// Same-directory atomic replacement with durability barriers.
 pub(crate) fn atomic_replace(
     path: &Path,
     bytes: &[u8],
     mode: Option<u32>,
     cancel: Option<&Cancel>,
 ) -> io::Result<()> {
-    let mode = mode.or_else(|| self::mode(path).ok());
-    let mode = mode
-        .map(|mode| format!("{:o}", mode & 0o7777))
-        .unwrap_or_default();
-    ExecutionEnvironment
-        .checked(
-            include_str!("scripts/replace.sh"),
-            &[
-                path,
-                Path::new(&mode),
-                Path::new(if cfg!(windows) { "cygwin" } else { "native" }),
-            ],
-            bytes,
-            cancel,
-        )
-        .map(|_| ())
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(io::Error::other("file change cancelled"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("file has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    let resolved_mode = mode.or_else(|| self::mode(path).ok());
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+
+    #[cfg(unix)]
+    if let Some(bits) = resolved_mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(bits & 0o7777))?;
+    }
+
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(io::Error::other("file change cancelled"));
+    }
+    file.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -130,9 +131,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_tools_round_trip_binary_and_hostile_filenames() {
+    fn native_fs_round_trips_binary_and_unicode_filenames() {
         let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("space 中文 ' ; $(echo BAD)\nfile");
+        let filename = if cfg!(windows) {
+            "space 中文 ' ; file"
+        } else {
+            "space 中文 ' ; $(echo BAD)\nfile"
+        };
+        let file = directory.path().join(filename);
         let bytes = b"\0\xff\r\noriginal\n";
         atomic_replace(&file, bytes, None, None).unwrap();
         assert_eq!(read(&file).unwrap(), bytes);
@@ -146,84 +152,7 @@ mod tests {
         );
         assert_eq!(read(&canonicalize(&file).unwrap()).unwrap(), bytes);
         remove_file(&file).unwrap();
-        assert!(!exists(&file));
-    }
-
-    #[test]
-    fn replacement_converts_native_paths_before_parent_extraction() {
-        let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("artifacts/deep/before");
-        let mapped = crate::environment::display_path(&target);
-        // Stand in for cygpath so the native-boundary regression executes on
-        // every host, including systems without a Cygwin installation.
-        let script = format!(
-            "mapped=$4; cygpath() {{ printf '%s\\n' \"$mapped\"; }};\n{}",
-            include_str!("scripts/replace.sh")
-        );
-        ExecutionEnvironment
-            .run(
-                &script,
-                &[
-                    Path::new(r"C:\Users\alice\artifacts\deep\before"),
-                    Path::new(""),
-                    Path::new("cygwin"),
-                    Path::new(&mapped),
-                ],
-                b"backup content",
-                Some(directory.path()),
-                None,
-                4096,
-            )
-            .map(|output| {
-                assert_eq!(
-                    output.code,
-                    Some(0),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            })
-            .unwrap();
-        assert_eq!(read(&target).unwrap(), b"backup content");
-    }
-
-    #[test]
-    fn replacement_flushes_before_and_after_rename_and_propagates_errors() {
-        let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("target");
-        let log = directory.path().join("barriers");
-        std::fs::write(&target, "old").unwrap();
-        let script = format!(
-            "destination=$1; log=$4; sync() {{ cat \"$destination\" >> \"$log\"; printf '\\0' >> \"$log\"; }};\n{}",
-            include_str!("scripts/replace.sh")
-        );
-        let kind = if cfg!(windows) { "cygwin" } else { "native" };
-        let args = [&target as &Path, Path::new(""), Path::new(kind), &log];
-        let output = ExecutionEnvironment
-            .run(&script, &args, b"new", Some(directory.path()), None, 4096)
-            .unwrap();
-        assert_eq!(
-            output.code,
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(read(&log).unwrap(), b"old\0new\0");
-        let script = format!(
-            "sync() {{ return 1; }};\n{}",
-            include_str!("scripts/replace.sh")
-        );
-        let output = ExecutionEnvironment
-            .run(
-                &script,
-                &args,
-                b"must not replace",
-                Some(directory.path()),
-                None,
-                4096,
-            )
-            .unwrap();
-        assert_ne!(output.code, Some(0));
-        assert_eq!(read(&target).unwrap(), b"new");
+        assert!(!file.exists());
     }
 
     #[cfg(unix)]
@@ -284,7 +213,6 @@ mod permission_tests {
             atomic_replace(&path, b"after", None, None).unwrap();
             assert_eq!(read(&path).unwrap(), b"after");
             assert_eq!(super::mode(&path).unwrap() & 0o777, mode);
-            // Reset mode for the next iteration without relying on root privileges.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }

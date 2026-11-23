@@ -72,16 +72,10 @@ cargo build --release
 
 ## 运行
 
-Windows 使用随附的 Cygwin Bash。发布包中的 `plugins/windows/cygwin/` 必须与
-`solaris.exe` 保持配套；源码构建会从仓库查找该目录。启动时定位运行库，
-不修改当前进程的 PATH。Bash 仅使用 Cygwin 的 `/usr/local/bin:/usr/bin:/bin`，
-不继承 Windows PATH，也不读取个人登录脚本；显式加载随包 `/etc/profile`。
-所有内建工具（包括读取、目录枚举、原子写入和撤销）都通过 Bash 和系统命令执行，
-Rust 负责参数校验、精确编辑、结果解析和进程控制。Windows 系统文件统一使用
-`/cygdrive/c/...`；`rg/fd` 也由相同的 Cygwin PATH 查找。Linux/macOS 使用系统
-Bash、标准工具和系统 PATH。参数独立传递，文件内容通过 stdin 输入；工作目录保持不变。
-临时文件写入当前用户的临时目录，启动无需对安装目录拥有写入权限。
-所有平台统一使用 `bash` 工具和 Bash 语法；运行库缺失时明确报错。
+- **Linux/macOS**：使用系统 `bash` 与原生 POSIX 路径。
+- **Windows**：默认使用原生 PowerShell（优先 `pwsh`，其次 `powershell`，均不可用时回退到 `cmd /C`，启用 `-NonInteractive` 并统一 UTF-8 输出）与系统 `PATH`，无需额外运行时。
+  - 可通过 `--tools +bash,-powershell` 切换到本机 Git Bash（自动探测 Git for Windows 与 `PATH`），或 `--tools +cmd,-powershell` 显式使用 `cmd.exe`。
+  - 可在 `settings.json` 中配置 `shell_path`（或设置环境变量 `SOLARIS_SHELL_PATH`）指定自定义 shell 路径，并用 `shell_command_prefix` 配置命令初始化前缀。
 
 ```bash
 # 在仓库内直接运行
@@ -172,7 +166,7 @@ solaris --print-config
 | `ls` | 列出目录内容 | plan |
 | `grep` | 搜索文件内容，遵守 `.gitignore` | plan |
 | `find` | 按 glob 查找路径，遵守 `.gitignore` | plan |
-| `bash` | 执行 Bash 命令并返回输出；Windows 使用随附的 Cygwin | build |
+| `bash` / `powershell` | 执行 shell 命令并返回输出（Unix 使用 `bash`，Windows 使用 `powershell` 并在缺失时回退到 `cmd /C`） | build |
 | `subagent` | 将独立任务委派给 `explore` 或 `general` | build、plan（仅 `explore`） |
 
 plan 模式声明四个只读工具，并允许委派给只读的 `explore` 子代理，所以计划不会失手改动任何东西。`--tools` 整体替换这套集合，`--exclude-tools` 在此基础上再撤下：
@@ -387,7 +381,7 @@ usage，后续工具结果和用户消息只补充估算。缓存 token 在该�
 模型、提示词、工具集合及压缩边界共同决定旧计量是否有效。压缩后暂时显示未知，
 内部仍估算新投影；旧会话缺少实测数据时使用估算，不从累计消耗反推上下文。
 
-加载规则和技能时准备模型可见路径，包含 Windows 的 Cygwin 路径转换。
+加载规则和技能时准备模型可见路径。
 `/reload` 在后台加载，空闲时发布，多个重载串行处理。请求准备复用已加载资源；
 UI 只读取非阻塞快照，不重建提示词、不读文件、不启动 shell。
 会话恢复直接使用消息中的计量元数据，没有独立的恢复校验回写任务。

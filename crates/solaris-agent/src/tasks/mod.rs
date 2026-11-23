@@ -20,7 +20,12 @@ const MAX_RESULT_BYTES: usize = 16 * 1024;
 /// Built-in file/shell tools plus the agent runtime's delegation declaration.
 /// Used by CLI tool-selection validation as well as sessions.
 pub fn agent_tool_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::builtin();
+    agent_tool_registry_with_shell(solaris_tools::ShellOptions::default())
+}
+
+/// Like [`agent_tool_registry`], configuring the shell runner with `options`.
+pub fn agent_tool_registry_with_shell(options: solaris_tools::ShellOptions) -> ToolRegistry {
+    let mut registry = ToolRegistry::builtin_with_shell(options);
     registry.add(Arc::new(SubagentTool));
     registry.add(Arc::new(crate::questions::QuestionTool));
     registry

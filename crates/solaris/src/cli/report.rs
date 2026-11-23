@@ -19,6 +19,7 @@ pub(super) fn print_config(startup: &Startup) -> Result<()> {
         buddy_path,
         recent,
         recent_path,
+        settings,
         ..
     } = startup;
     let skills = &resources.skills;
@@ -36,6 +37,16 @@ pub(super) fn print_config(startup: &Startup) -> Result<()> {
             .selected_names(default_tool_names(config.mode), tools)
             .join(", ")
     );
+    if let Some(shell_path) = std::env::var_os("SOLARIS_SHELL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| settings.shell_path.clone())
+    {
+        println!("shell path: {shell_path}");
+    }
+    if let Some(prefix) = &settings.shell_command_prefix {
+        println!("shell command prefix: {prefix}");
+    }
     println!(
         "skills: {}",
         if skills.is_empty() {

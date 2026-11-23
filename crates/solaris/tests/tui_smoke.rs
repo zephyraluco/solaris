@@ -166,7 +166,7 @@ impl InspectingBackend {
                 read("second"),
                 AgentEvent::ToolCall(ToolCall::new(
                     "command",
-                    "bash",
+                    solaris_agent::SHELL_TOOL,
                     serde_json::json!({"command":"echo solaris-shell-output"}),
                 )),
                 read("third"),

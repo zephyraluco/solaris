@@ -25,13 +25,6 @@ fn kill_command(pid: u32) -> std::process::Command {
     command
 }
 
-pub(crate) fn kill_tree_blocking(pid: u32) {
-    #[cfg(unix)]
-    kill_group(pid);
-    #[cfg(windows)]
-    let _ = kill_command(pid).status();
-}
-
 pub(crate) async fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;

@@ -17,16 +17,27 @@ use crate::tools::find::FindTool;
 use crate::tools::grep::GrepTool;
 use crate::tools::ls::LsTool;
 use crate::tools::read::ReadTool;
-use crate::tools::shell::{LocalShell, ShellRunner, ShellTool};
+use crate::tools::shell::{LocalShell, ShellOptions, ShellRunner, ShellTool};
 use crate::tools::write::WriteTool;
 
 /// Every tool this build implements, by name.
 ///
-/// Bash is the shell tool on every platform.
-pub const BUILTIN_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+/// Windows defaults to `powershell` and also allows opting into `bash` (via Git
+/// Bash / `shell_path`) or `cmd`. Unix only registers `bash`.
+pub const BUILTIN_TOOLS: &[&str] = &[
+    "read",
+    "bash",
+    "powershell",
+    "cmd",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+];
 
-/// The shell tool this platform has.
-pub const SHELL_TOOL: &str = "bash";
+/// The default shell tool for this platform.
+pub const SHELL_TOOL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 
 /// The tools a session can declare.
 #[derive(Clone)]
@@ -37,7 +48,15 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// A registry whose external programs are the real ones.
     pub fn builtin() -> Self {
-        Self::with_runners(Arc::new(LocalRunner), Arc::new(LocalShell))
+        Self::builtin_with_shell(ShellOptions::default())
+    }
+
+    /// A registry whose shell runner honors `options` (`shell_path` / prefix).
+    pub fn builtin_with_shell(options: ShellOptions) -> Self {
+        Self::with_runners(
+            Arc::new(LocalRunner),
+            Arc::new(LocalShell::with_options(options)),
+        )
     }
 
     /// A registry that reaches ripgrep, fd and the shell through `commands` and
@@ -58,7 +77,16 @@ impl ToolRegistry {
         registry.add(Arc::new(GrepTool::new(Arc::clone(&commands))));
         registry.add(Arc::new(FindTool::new(commands)));
 
-        registry.add(Arc::new(ShellTool::bash(shell)));
+        #[cfg(windows)]
+        {
+            registry.add(Arc::new(ShellTool::powershell(Arc::clone(&shell))));
+            registry.add(Arc::new(ShellTool::bash(Arc::clone(&shell))));
+            registry.add(Arc::new(ShellTool::cmd(shell)));
+        }
+        #[cfg(not(windows))]
+        {
+            registry.add(Arc::new(ShellTool::bash(shell)));
+        }
 
         registry
     }
@@ -271,7 +299,7 @@ mod tests {
     use super::*;
     use crate::runner::CommandOutput;
     use crate::runner::tests::StubRunner;
-    use crate::tools::shell::ShellOutcome;
+    use crate::tools::shell::{ShellConfig, ShellOutcome};
 
     struct StubShell;
 
@@ -279,6 +307,7 @@ mod tests {
     impl ShellRunner for StubShell {
         async fn run(
             &self,
+            _config: ShellConfig,
             _command: &str,
             _ctx: &crate::tool::ToolContext,
             _timeout: Option<std::time::Duration>,
@@ -302,10 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_holds_one_shell_for_this_platform() {
+    fn the_registry_holds_the_platform_shells() {
         let registry = registry();
         assert!(registry.get(SHELL_TOOL).is_some());
-        assert_eq!(SHELL_TOOL, "bash");
+        if cfg!(windows) {
+            assert!(registry.get("powershell").is_some());
+            assert!(registry.get("bash").is_some());
+            assert!(registry.get("cmd").is_some());
+        } else {
+            assert!(registry.get("bash").is_some());
+            assert!(registry.get("powershell").is_none());
+            assert!(registry.get("cmd").is_none());
+        }
         assert_eq!(registry.get("read").expect("read").name(), "read");
     }
 
@@ -366,16 +403,16 @@ mod tests {
     #[test]
     fn a_star_pattern_selects_a_family_of_tools() {
         let registry = registry();
-        // `*d` reaches the two tools whose names end in `d`, whichever shell
-        // this platform has.
         let selection = ToolSelection {
             only: vec!["*d".to_string()],
             ..Default::default()
         };
-        assert_eq!(
-            names(&registry.select(DEFAULTS, &selection)),
+        let expected = if cfg!(windows) {
+            vec!["cmd", "find", "read"]
+        } else {
             vec!["find", "read"]
-        );
+        };
+        assert_eq!(names(&registry.select(DEFAULTS, &selection)), expected);
 
         let selection = ToolSelection {
             only: vec!["gr*".to_string()],
@@ -441,10 +478,15 @@ mod tests {
                 tool.name()
             );
         }
+        let expected_len = if cfg!(windows) {
+            BUILTIN_TOOLS.len()
+        } else {
+            BUILTIN_TOOLS.len() - 2
+        };
         assert_eq!(
             registry.len(),
-            BUILTIN_TOOLS.len(),
-            "every built-in tool is available on every platform"
+            expected_len,
+            "every built-in tool for this platform is registered"
         );
         assert!(!registry.is_empty());
     }

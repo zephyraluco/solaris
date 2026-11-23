@@ -19,9 +19,6 @@ use startup::Startup;
 pub(crate) fn run() -> Result<()> {
     let args = Args::parse();
 
-    #[cfg(windows)]
-    solaris_tools::cygwin::environment().map_err(anyhow::Error::msg)?;
-
     if !args.print_config
         && let Some(command) = args.history_command()
     {

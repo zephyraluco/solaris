@@ -20,15 +20,15 @@ pub use runtime::connection::ConnectionConfig;
 pub use runtime::input::{InputError, expand_input};
 pub use runtime::mode::{Mode, default_tool_names};
 pub use runtime::queue::Queue;
-pub use tasks::{SUBAGENT_TOOL, agent_tool_registry};
+pub use tasks::{SUBAGENT_TOOL, agent_tool_registry, agent_tool_registry_with_shell};
 
 // The conversation: what a turn is written in and what it streams back.
 pub use solaris_backend::{BackendError, ContextUsage, ModelClient, ModelConnector, Usage};
 pub use solaris_types::{ToolCall, ToolResult, ToolSpec};
 // The tools, as the application sees them: what to hold, and what to hand in.
 pub use solaris_tools::{
-    BUILTIN_TOOLS, Cancel, CommandOutput, CommandRunner, LocalRunner, SHELL_TOOL, Tool,
-    ToolContext, ToolOutput, ToolRegistry, ToolSelection,
+    BUILTIN_TOOLS, Cancel, CommandOutput, CommandRunner, LocalRunner, SHELL_TOOL, ShellOptions,
+    Tool, ToolContext, ToolOutput, ToolRegistry, ToolSelection,
 };
 
 pub use storage::{SessionInfo, SessionJournal, SessionRecord, SessionStore, StoreError};

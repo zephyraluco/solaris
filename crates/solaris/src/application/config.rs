@@ -43,6 +43,12 @@ pub struct Preferences {
     /// Agent mode, as Tab left it.
     #[serde(default)]
     pub mode: Option<Mode>,
+    /// Optional explicit shell executable path (e.g. Git Bash or `pwsh.exe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_path: Option<String>,
+    /// Optional setup snippet prepended to every shell command before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_command_prefix: Option<String>,
 }
 
 impl Preferences {
@@ -75,6 +81,8 @@ mod tests {
         let stored = Preferences {
             theme: Some("light".to_string()),
             mode: Some(Mode::Plan),
+            shell_path: Some("C:/Program Files/Git/bin/bash.exe".to_string()),
+            shell_command_prefix: Some("shopt -s expand_aliases".to_string()),
         };
 
         let json = stored.to_json().expect("encode");
@@ -87,5 +95,7 @@ mod tests {
         assert_eq!(stored, Preferences::default());
         assert_eq!(stored.theme, None);
         assert_eq!(stored.mode, None);
+        assert_eq!(stored.shell_path, None);
+        assert_eq!(stored.shell_command_prefix, None);
     }
 }

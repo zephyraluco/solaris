@@ -191,22 +191,13 @@ Jobs 控制运行和取消。并发槽位只覆盖实际模型请求及普通工
 
 ## 8. 工具与执行环境
 
-所有面向模型的命令和用户文件操作统一经过 Bash。`read`、`write`、`edit`、`ls`、`grep`、`find` 与 `bash` 工具使用系统程序或固定脚本；Rust 负责进程管理、数据传递、校验和结果包装。应用配置、memory 和 journal 等内部持久化仍由 Rust/SDK 管理。
+内置文件工具（`read`、`write`、`edit`、`ls`）直接使用 Rust 原生文件系统 API 与原子替换，搜索工具（`grep`、`find`）调用宿主 `PATH` 中的 `rg` 和 `fd`，Shell 工具按宿主平台使用原生命令行环境：
 
-```text
-工具 → ExecutionEnvironment → Bash → 执行脚本或 exec "$@" → 捕获结果
-```
-
-- **Linux/macOS**：使用系统 Bash、系统 PATH 与 POSIX 路径。
-- **Windows**：启动随包 Cygwin Bash，禁用个人启动文件，显式加载 `/etc/profile`；PATH 固定为 `/usr/local/bin:/usr/bin:/bin`。系统盘通过 `/cygdrive/<letter>/` 访问，面向 agent 描述 Cygwin 环境。
-- **脚本与参数**：结构化工具的参数作为独立位置参数传递，不拼入脚本。文件内容走 stdin。Windows 将脚本、参数数量和参数以 NUL 分帧写入 stdin，后接原始文件数据；原生 argv 只携带固定 dispatcher，防止 Cygwin 启动时的 glob 和反斜杠处理破坏正则或参数。
-- **进程**：每次调用建立子进程并捕获输出，不依赖持久交互式终端。取消与超时按执行环境管理子进程。
-- **文件变更**：固定脚本处理路径规范化、替换、临时文件与同步；串行化冲突写入，保留哈希及 diff 供审阅和撤销。原子替换不代表业务级回滚。
+- **Linux/macOS**：`bash` 工具使用系统 `bash -c`，采用原生 POSIX 路径与系统 `PATH`。
+- **Windows**：默认使用 `powershell` 工具，按顺序尝试 `pwsh`（PowerShell 7）→ `powershell`（Windows PowerShell）→ `cmd /C`，使用 `-NoLogo -NoProfile -NonInteractive -Command` 并统一 UTF-8 输出编码；也可通过 `--tools +bash,-powershell` 切换到宿主机 Git Bash（自动探测 `%ProgramFiles%\Git\bin\bash.exe`、`%ProgramFiles(x86)%\Git\bin\bash.exe` 及 `PATH`）或 `--tools +cmd,-powershell` 显式使用 `cmd.exe`。支持通过 `settings.json` 中的 `shell_path`（或环境变量 `SOLARIS_SHELL_PATH`）与 `shell_command_prefix` 自定义壳路径与命令前缀。
+- **进程**：每次调用建立子进程并捕获 stdout/stderr，不依赖持久交互式终端；取消与超时按平台清理进程树（Unix 进程组，Windows `taskkill /T /F`）。
+- **文件变更**：先校验并发修改与路径规范化，再在同一目录写临时文件并落盘后原子替换，保留哈希及 diff 供审阅和撤销。原子替换不代表业务级回滚。
 - **搜索与输出**：`grep`、`find` 分别调用 `rg`、`fd`；输出按工具策略截断，并通过附件路径保留需要的完整输出。
-
-Windows 启动校验 `cygwin.rs::REQUIRED_FILES`，覆盖 Bash、Cygwin DLL、profile、路径转换、文件操作和搜索程序。校验不把 Cygwin 目录注入宿主 Windows PATH；工具查找在统一 Bash 环境内完成。HOME 和 TMPDIR 指向用户可写位置。
-
-这保证工具默认使用 Cygwin PATH，不构成阻止任意脚本显式运行宿主程序的操作系统沙箱。
 
 ## 9. MCP 与展示
 
@@ -258,11 +249,3 @@ cargo check --workspace --lib --bins --locked
 测试覆盖原生 SDK 请求、流事件、取消、审批、工具参数、费用状态、压缩、恢复与分叉、子代理、认证刷新及 TUI。HTTP 与回调测试使用本地夹具，不依赖真实模型账号。
 
 扩展优先沿现有边界进行：新工具实现工具接口，由应用注册；新 MCP 能力提供适配器；新厂商优先使用 Rig 官方连接与方言；模型事实使用官方目录/覆盖；执行策略通过 SDK hook 或统一执行连接接入。避免恢复独立协议客户端、第二份 history、独立计价器或逐轮模型驱动循环。
-
-## 附录：随包 Cygwin 工具来源
-
-`bin/readlink.exe` 与 `bin/sync.exe` 提取自官方 Cygwin coreutils 9.0-1 包。readlink 用于审批与变更路径的符号链接规范化；目录使用 Bash `cd -P`。原子替换在 rename 前同步临时文件、之后同步父目录；Linux 使用 GNU 单文件 sync，macOS/Cygwin 使用全局同步屏障。
-
-- 二进制包：<https://mirrors.kernel.org/sourceware/cygwin/x86_64/release/coreutils/coreutils-9.0-1.tar.xz>
-- SHA-512：`530f47640d878f5953580f3556c492a93786191abe573322026b70206a46c7f17d05927784db3e7f2c044d1555f35941880316f7288b887eaec770a9eda4c687`
-- 对应源码：<https://mirrors.kernel.org/sourceware/cygwin/x86_64/release/coreutils/coreutils-9.0-1-src.tar.xz>

@@ -17,8 +17,6 @@
 //!   business.
 
 pub mod changes;
-#[cfg(any(windows, test))]
-pub mod cygwin;
 mod diff;
 pub mod environment;
 mod filesystem;
@@ -37,6 +35,7 @@ pub use mutation_queue::FileMutationQueue;
 pub use registry::{BUILTIN_TOOLS, SHELL_TOOL, ToolRegistry, ToolSelection};
 pub use runner::{CommandOutput, CommandRunner, LocalRunner};
 pub use tool::{Cancel, ExecutionMode, Tool, ToolContext, ToolOutput, optional_string_arg};
+pub use tools::shell::ShellOptions;
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Limits, Removed, Truncation, format_size,
 };
