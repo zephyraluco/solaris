@@ -1,4 +1,5 @@
-use super::{McpServer, invalid};
+use super::session::invalid;
+use agent_client_protocol::v1::schema::McpServer;
 use agent_client_protocol::{Error, v1::schema::ImageContent};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use solaris_mcp::{McpConfig, ServerConfig};

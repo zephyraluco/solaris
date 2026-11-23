@@ -1,6 +1,6 @@
 # Solaris 架构
 
-本文描述当前代码实现，与 README 一起说明项目的行为与边界。Solaris 是基于 Rust、官方 Rig SDK 和 Ratatui 的终端 AI 助手，提供交互式 TUI 与 headless 入口。
+本文描述当前代码实现，与 README 一起说明项目的行为与边界。Solaris 是基于 Rust、官方 Rig SDK 和 Ratatui 的终端 AI 助手，提供交互式 TUI、Headless CLI 和 ACP v1 入口。
 
 ## 1. 模块与依赖
 
@@ -25,7 +25,7 @@ graph TD
 
 | Crate | 职责 | 主要入口 |
 | --- | --- | --- |
-| `solaris` | CLI/TUI、配置加载、认证交互、服务组装、应用状态与转录展示 | `main.rs`、`assembly.rs`、`app.rs`、`automation.rs` |
+| `solaris` | CLI、TUI、ACP 适配与共享会话组装 | `main.rs`、`application/`、`cli/`、`tui/`、`acp/` |
 | `solaris-provider` | 连接预设、用户端点、官方模型事实解析、凭据存储与刷新、远程模型列表 | `config.rs`、`selection.rs`、`credentials/`、`discovery.rs` |
 | `solaris-backend` | Rig 原生模型连接、协议选择、HTTP 策略、有限重试、请求用量与消息边界转换 | `lib.rs`、`connection.rs`、`client.rs`、`request.rs` |
 | `solaris-agent` | 会话入口、SDK 执行器集成、审批、任务调度、队列、压缩、子代理、持久化 | `runtime/`、`execution/`、`policy/`、`context/`、`tasks/`、`storage/` |
@@ -35,6 +35,13 @@ graph TD
 | `solaris-types` | 工具声明/调用/结果、能力状态、附件、截断与变更等共享数据 | `lib.rs` |
 
 应用负责组装：选择 provider、准备 agent 后端配置、建立 MCP 连接并显式注册工具。agent 不依赖 provider 或应用；MCP 不修改工具注册表。TUI 框架不承担模型执行和会话策略。
+
+### 应用 crate 的入口
+
+- `application/` 加载配置和资源，按工作目录查找历史，应用 provider 与模型覆盖项，并组装会话。CLI、TUI 和 ACP 共用会话日志的打开规则。
+- `cli/` 分派配置查询、历史操作和会话运行。Headless 适配负责单轮输入、逐行 JSON 和退出状态。
+- `tui/` 持有编辑器、弹窗、视口和会话投影。切换会话时先准备目标和历史，再绑定显示与事件订阅。
+- `acp/` 负责协议请求、每会话的 MCP 连接、事件转发与审批。每个会话从请求指定的工作目录加载项目资源。
 
 ## 2. Rig 与 Solaris 的责任边界
 

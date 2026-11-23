@@ -77,3 +77,16 @@ impl ResourceController {
         Reload::Started
     }
 }
+
+pub fn read_mcp_config(
+    path: Option<&std::path::Path>,
+    explicit: bool,
+) -> anyhow::Result<solaris_mcp::McpConfig> {
+    match path.map(std::fs::read_to_string) {
+        Some(Ok(text)) => Ok(serde_json::from_str(&text)?),
+        Some(Err(error)) if explicit || error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error.into())
+        }
+        _ => Ok(solaris_mcp::McpConfig::default()),
+    }
+}

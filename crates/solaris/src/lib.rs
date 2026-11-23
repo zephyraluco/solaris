@@ -1,42 +1,20 @@
-//! solaris chat application built on the solaris-tui framework.
+//! Solaris application services and terminal adapter.
 //!
-//! Layer map, mirroring opencode's organization:
-//! - [`app`] — the root component (the app opens straight into the session)
-//! - [`presentation`] — replayable session display state; [`state`] adds local viewport state
-//! - [`dialogs`] — dialogs as components, resolved through one overlay path
-//! - [`connect`] — the inline `/connect` wizard that takes over the prompt area
-//! - [`commands`] / [`keymap`] — the slash-command table with the views over it,
-//!   and the global bindings
-//! - [`ui`] — layouts, dialogs and cached transcript rendering
-//! - [`clipboard`] — the platform clipboard, behind an injectable pair
-//! - [`config`] — the saved preferences
-//! - [`buddy`] / [`tips`] / [`recent`] — the companion, what it says, and what
-//!   earlier sessions were about
-//!
-//! The app never talks to a model itself: [`BackendFactory`] resolves a backend
-//! from the credentials and the model, `solaris-agent` wraps it in the tool loop,
-//! and all the app ever learns is the label the backend reports.
+//! [`application`] prepares settings, connections and sessions for all entry
+//! points. [`tui`] owns terminal input, display state and rendering. The
+//! executable also provides headless and ACP adapters over the same runtime.
 
-pub mod app;
 pub mod application;
-pub mod buddy;
-pub mod desktop;
-pub use desktop::clipboard;
-pub mod commands;
 pub mod config;
-pub mod connect;
-pub mod ui;
-pub use ui::{dialogs, transcript};
-pub mod keymap;
-pub mod model;
-pub mod presentation;
+pub mod desktop;
 pub mod recent;
-pub mod state;
-pub mod tips;
+pub mod tui;
 
-// `Inline` is an implementation detail of `App`, so it stays off the crate's
-// surface.
-mod inline;
+pub use desktop::clipboard;
+pub(crate) use tui::inline;
+pub use tui::view as ui;
+pub use tui::view::{dialogs, transcript};
+pub use tui::{app, buddy, commands, connect, keymap, model, presentation, state, tips};
 
 pub use app::{App, AppOptions, BackendFactory};
 pub use buddy::{Companion, Soul};
