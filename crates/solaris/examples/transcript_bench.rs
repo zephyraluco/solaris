@@ -1,8 +1,8 @@
 //! Run with `cargo run -p solaris --release --example transcript_bench --locked`.
 //! Synthetic layout timings, not terminal/network latency or a cross-platform claim.
 use ratatui::layout::Rect;
-use solaris::state::{SessionState, Turn};
-use solaris::transcript::TranscriptView;
+use solaris::tui::state::{SessionState, Turn};
+use solaris::tui::view::transcript::TranscriptView;
 use solaris_tui::components::welcome::WelcomeData;
 use solaris_tui::theme::Theme;
 use std::hint::black_box;

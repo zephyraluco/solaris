@@ -71,7 +71,7 @@ impl App {
     }
 
     pub(super) fn open_help(&mut self) {
-        let lines = help_lines(&self.theme, crate::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&self.theme, crate::tui::commands::PROMPT_SLASH_COMMANDS);
         let dialog = TextDialog::new(
             "Help",
             "↑↓ scroll · enter or esc closes",

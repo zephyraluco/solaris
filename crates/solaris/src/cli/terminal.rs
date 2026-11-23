@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use solaris::application::{history::ConnectionOverrides, startup::greeting};
-use solaris::{App, AppOptions, BackendFactory, Clipboard, tips};
+use solaris::application::history::ConnectionOverrides;
+use solaris::tui::{greeting, tips};
+use solaris::{App, AppOptions, BackendFactory, Clipboard};
 use solaris_agent::{ExecutionSettings, SessionJournal};
 use solaris_tui::Tui;
 

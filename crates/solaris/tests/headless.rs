@@ -418,8 +418,7 @@ fn named_model_routes_to_custom_endpoint_with_original_request_alias() {
     assert!(printed.contains("anthropic/claude-sonnet-4-5"), "{printed}");
 }
 
-#[path = "../../solaris-agent/tests/support/memory.rs"]
-mod memory;
+use solaris_agent::test_support::memory;
 
 #[test]
 fn history_commands_do_not_load_provider_credentials() {

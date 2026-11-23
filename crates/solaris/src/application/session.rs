@@ -201,7 +201,7 @@ pub fn build_agent(
     resources: solaris_agent::ResourceSnapshot,
     resolve_child: impl Fn(&str) -> solaris_provider::BackendChoice + Send + Sync + 'static,
 ) -> solaris_agent::Agent {
-    solaris_agent::Agent::new(crate::agent_backend(choice), registry, options)
+    solaris_agent::Agent::new(super::assembly::agent_backend(choice), registry, options)
         .with_resources(resources)
         .with_child_backend(child_backend(resolve_child))
 }
@@ -209,7 +209,7 @@ pub fn build_agent(
 pub fn child_backend(
     resolve: impl Fn(&str) -> solaris_provider::BackendChoice + Send + Sync + 'static,
 ) -> solaris_agent::ChildBackendFactory {
-    Arc::new(move |model| Ok(crate::agent_backend(resolve(model))))
+    Arc::new(move |model| Ok(super::assembly::agent_backend(resolve(model))))
 }
 
 /// Persistent session targets. Ephemeral runs omit the journal entirely.

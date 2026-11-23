@@ -249,9 +249,9 @@ pub(super) struct SubagentTerminal {
     pub(super) target: (usize, usize),
     pub(super) scroll: usize,
     pub(super) follow_end: bool,
-    pub(super) headers: Vec<crate::transcript::CollapsibleHeader>,
-    pub(super) layout: Option<crate::transcript::SubagentTranscript>,
-    pub(super) layout_key: Option<(crate::transcript::TurnKey, u16, String)>,
+    pub(super) headers: Vec<crate::tui::view::transcript::CollapsibleHeader>,
+    pub(super) layout: Option<crate::tui::view::transcript::SubagentTranscript>,
+    pub(super) layout_key: Option<(crate::tui::view::transcript::TurnKey, u16, String)>,
 }
 
 impl App {
@@ -381,12 +381,12 @@ impl App {
         );
         self.last_transcript = content;
         let key = (
-            crate::transcript::TurnKey::from(turn),
+            crate::tui::view::transcript::TurnKey::from(turn),
             area.width,
             self.theme.name.clone(),
         );
         if view.layout_key.as_ref() != Some(&key) {
-            let layout = crate::transcript::subagent_layout(
+            let layout = crate::tui::view::transcript::subagent_layout(
                 step,
                 turn.complete,
                 area.width,

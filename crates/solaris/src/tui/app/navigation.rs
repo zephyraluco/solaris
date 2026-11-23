@@ -4,7 +4,7 @@ impl App {
     fn restore_records(&mut self, records: Vec<solaris_agent::SessionRecord>) {
         let id = self.sessions.agent.snapshot().session_id;
         let (projection, effects) =
-            crate::presentation::session::SessionProjection::restore(id, records);
+            crate::tui::presentation::session::SessionProjection::restore(id, records);
         self.session = SessionState::new();
         self.session.projection = projection;
         self.apply_effects(effects);

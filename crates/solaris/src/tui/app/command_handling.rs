@@ -128,8 +128,10 @@ impl App {
                 return;
             }
         }
-        self.notifications
-            .info(format!("steered: {}", crate::transcript::summarize(&text)));
+        self.notifications.info(format!(
+            "steered: {}",
+            crate::tui::view::transcript::summarize(&text)
+        ));
     }
 
     fn execute_command(&mut self, command: SlashCommand) {

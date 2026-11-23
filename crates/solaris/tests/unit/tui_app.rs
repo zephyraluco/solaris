@@ -1,8 +1,8 @@
 use super::*;
 use crate::application::connection::OAuthPending;
-use crate::test_support::TurnRequest;
 use crossterm::event::MouseButton;
 use solaris_agent::AgentEventStream;
+use solaris_agent::test_support::TurnRequest;
 use solaris_agent::{BackendError, SkillRoot, SkillSource, ToolCall, ToolResult, Usage};
 use solaris_provider::BackendOptions;
 use std::cell::RefCell;
@@ -99,7 +99,7 @@ impl ModelConnector for FakeBackend {
     async fn model_client(
         self: std::sync::Arc<Self>,
     ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-        Ok(crate::test_support::client(
+        Ok(solaris_agent::test_support::client(
             self.capabilities(),
             move |request| {
                 let fixture = std::sync::Arc::clone(&self);
@@ -1612,7 +1612,7 @@ fn palette_choice_runs_the_command() {
 
 #[test]
 fn streamed_events_record_interleaved_display_order() {
-    use crate::state::TurnPart;
+    use crate::tui::state::TurnPart;
     let mut app = app();
     app.session.turns.push(Turn::default());
     app.apply_event(AgentEvent::ThinkingDelta("先想".into()));

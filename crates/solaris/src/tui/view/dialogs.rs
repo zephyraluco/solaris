@@ -604,7 +604,10 @@ pub const KEY_HELP: &[(&str, &str)] = &[
 ];
 
 /// Build the help dialog contents.
-pub fn help_lines(theme: &Theme, commands: &[crate::SlashCommandSpec]) -> Vec<Line<'static>> {
+pub fn help_lines(
+    theme: &Theme,
+    commands: &[crate::tui::commands::SlashCommandSpec],
+) -> Vec<Line<'static>> {
     let heading = Style::default()
         .fg(theme.heading)
         .add_modifier(Modifier::BOLD);
@@ -715,7 +718,7 @@ pub fn skills_lines(skills: &solaris_agent::Skills, theme: &Theme) -> Vec<Line<'
 /// Build the statistics dialog contents.
 pub fn stats_lines(
     theme: &Theme,
-    session: &crate::state::SessionState,
+    session: &crate::tui::state::SessionState,
     model: &str,
     backend: &str,
     mode: solaris_agent::Mode,
@@ -1083,13 +1086,13 @@ mod tests {
     #[test]
     fn help_lines_mention_every_command() {
         let theme = Theme::dark();
-        let lines = help_lines(&theme, crate::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&theme, crate::tui::commands::PROMPT_SLASH_COMMANDS);
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        for spec in crate::PROMPT_SLASH_COMMANDS {
+        for spec in crate::tui::commands::PROMPT_SLASH_COMMANDS {
             assert!(
                 text.contains(&format!("/{}", spec.name)),
                 "missing {}",
@@ -1101,7 +1104,7 @@ mod tests {
 
     #[test]
     fn help_lines_write_a_skill_invocation_as_one_word() {
-        let lines = help_lines(&Theme::dark(), crate::PROMPT_SLASH_COMMANDS);
+        let lines = help_lines(&Theme::dark(), crate::tui::commands::PROMPT_SLASH_COMMANDS);
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -1159,13 +1162,13 @@ mod tests {
     #[test]
     fn stats_lines_report_totals() {
         let theme = Theme::dark();
-        let mut session = crate::state::SessionState::new();
+        let mut session = crate::tui::state::SessionState::new();
         session.context = solaris_agent::ContextUsage {
             tokens: Some(150),
             window: 1000,
             estimated: false,
         };
-        session.turns.push(crate::state::Turn {
+        session.turns.push(crate::tui::state::Turn {
             usage: solaris_agent::Usage::new(120, 30),
             cost_usd: 0.01,
             complete: true,
@@ -1208,14 +1211,14 @@ mod tests {
     #[test]
     fn the_context_gauge_measures_the_window_not_the_session() {
         let theme = Theme::dark();
-        let mut session = crate::state::SessionState::new();
+        let mut session = crate::tui::state::SessionState::new();
         session.context = solaris_agent::ContextUsage {
             tokens: Some(150),
             window: 1000,
             estimated: false,
         };
         for _ in 0..3 {
-            session.turns.push(crate::state::Turn {
+            session.turns.push(crate::tui::state::Turn {
                 prompt: "hi".to_string(),
                 usage: solaris_agent::Usage::new(100, 50),
                 complete: true,
@@ -1241,8 +1244,8 @@ mod tests {
     #[test]
     fn stats_lines_admit_an_estimated_turn() {
         let theme = Theme::dark();
-        let mut session = crate::state::SessionState::new();
-        session.turns.push(crate::state::Turn {
+        let mut session = crate::tui::state::SessionState::new();
+        session.turns.push(crate::tui::state::Turn {
             usage: solaris_agent::Usage {
                 estimated: true,
                 ..solaris_agent::Usage::new(100, 100)

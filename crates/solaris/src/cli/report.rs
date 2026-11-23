@@ -1,5 +1,5 @@
 use anyhow::Result;
-use solaris::tips;
+use solaris::tui::tips;
 use solaris_agent::default_tool_names;
 use solaris_provider::CredentialSource;
 

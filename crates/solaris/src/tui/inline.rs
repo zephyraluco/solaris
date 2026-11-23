@@ -10,8 +10,8 @@ use ratatui::layout::Rect;
 use solaris_tui::components::select_list::SelectItem;
 use solaris_tui::theme::Theme;
 
-use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep};
-use crate::model::{ModelOutcome, ModelPicker};
+use super::connect::{ConnectFlow, ConnectOutcome, ConnectStep};
+use super::model::{ModelOutcome, ModelPicker};
 
 /// Which inline surface owns the prompt region.
 ///

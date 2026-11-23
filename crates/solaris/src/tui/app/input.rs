@@ -82,7 +82,7 @@ impl App {
             let failure = failure.to_owned();
             self.io
                 .submit_clipboard(move || crate::desktop::Completion::Copied {
-                    ok: crate::clipboard::system_write(&text),
+                    ok: crate::desktop::clipboard::system_write(&text),
                     success,
                     failure,
                 });
@@ -119,7 +119,7 @@ impl App {
             self.io
                 .submit_clipboard(move || crate::desktop::Completion::Pasted {
                     generation,
-                    text: crate::clipboard::system_read(),
+                    text: crate::desktop::clipboard::system_read(),
                 });
             return;
         }

@@ -296,7 +296,7 @@ impl Component for App {
             && let Some(request) = self.sessions.agent.pending_questions().into_iter().next()
         {
             self.question_dialog = Some((request.session_id.clone(), request.request_id.clone()));
-            let dialog = crate::ui::question::QuestionDialog::new(
+            let dialog = crate::tui::view::question::QuestionDialog::new(
                 request,
                 Arc::clone(&self.sessions.agent),
                 &self.theme,

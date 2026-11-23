@@ -220,7 +220,7 @@ Windows 启动校验 `cygwin.rs::REQUIRED_FILES`，覆盖 Bash、Cygwin DLL、pr
 
 应用模块按职责分离：`application/session.rs` 管理当前 Runtime 接口、命令回执和带背压的事件订阅；`application/navigation.rs` 在后台串行加载列表、恢复、分叉和历史，使用请求代次拒绝旧结果；`application/connection.rs` 持有认证交互、连接工厂和模型发现状态；`application/resources.rs` 准备与延迟发布资源。
 
-`presentation/session.rs` 是实时与恢复共用的展示 reducer，按会话、执行标识和序号更新，既拒绝重复/异会话事件，也避免迟到结果污染当前轮次；子任务用量携带 Job ID，更新原发起轮次而非恰好活跃的轮次。它不是模型历史。`state::SessionState` 为其组合终端滚动状态；选择、展开、主题等展示状态不进入执行器。`ui/session.rs`、`ui/transcript.rs`、`ui/dialogs.rs` 负责应用布局、转录和弹窗；`solaris-tui` 保持不依赖执行或 provider 的通用组件。
+`presentation/session.rs` 是实时与恢复共用的展示 reducer，按会话、执行标识和序号更新，既拒绝重复/异会话事件，也避免迟到结果污染当前轮次；子任务用量携带 Job ID，更新原发起轮次而非恰好活跃的轮次。它不是模型历史。`state::SessionState` 为其组合终端滚动状态；选择、展开、主题等展示状态不进入执行器。`tui/app/session_view.rs`、`tui/view/transcript.rs`、`tui/view/dialogs.rs` 负责应用布局、转录和弹窗；`solaris-tui` 保持不依赖执行或 provider 的通用组件。
 
 转录按轮次内容版本缓存，已完成历史复用排版；活动轮次中的连续 Markdown 片段单独缓存。状态、统计与动画不使正文布局失效，spinner 和子代理活动行独立更新。选择文档按稳定 part ID 共享不可变字素索引，变化的部分重新索引，旧文档仍可供跨更新选区使用。
 

@@ -44,7 +44,7 @@ impl App {
                 });
                 self.notifications.info(format!(
                     "after this turn: {}",
-                    crate::transcript::summarize(text)
+                    crate::tui::view::transcript::summarize(text)
                 ));
             }
             Ok(_) => {}
@@ -203,7 +203,7 @@ impl App {
         );
     }
 
-    pub(super) fn apply_effects(&mut self, effects: crate::presentation::session::Effects) {
+    pub(super) fn apply_effects(&mut self, effects: crate::tui::presentation::session::Effects) {
         if effects.follow_end {
             self.session.follow_end = true;
             self.spinner_frame = 0;

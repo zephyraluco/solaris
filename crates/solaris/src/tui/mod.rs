@@ -11,3 +11,12 @@ pub mod presentation;
 pub mod state;
 pub mod tips;
 pub mod view;
+
+/// The greeting line for the welcome box.
+pub fn greeting(user: &str) -> String {
+    if user == "solaris" {
+        "Welcome back!".to_string()
+    } else {
+        format!("Welcome back {user}!")
+    }
+}

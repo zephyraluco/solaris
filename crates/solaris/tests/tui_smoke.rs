@@ -14,10 +14,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use solaris::{App, AppOptions, Clipboard, Config};
+use solaris_agent::test_support::{self, TurnRequest, messages::MessageFixture};
 use solaris_agent::{AgentEvent, AgentEventStream, BackendError, ModelConnector, ToolCall, Usage};
 use solaris_provider::BackendOptions;
 use solaris_tui::{Theme, Tui};
-use test_support::TurnRequest;
 
 const WIDTH: u16 = 90;
 const HEIGHT: u16 = 26;
@@ -1253,8 +1253,3 @@ fn the_second_provider_row_opens_its_api_key_step() {
     assert!(text.contains("Connect OpenCode Go"), "{text}");
     assert!(text.contains("Paste your API key:"), "{text}");
 }
-
-#[path = "../../solaris-agent/tests/support/mod.rs"]
-mod test_support;
-
-use test_support::messages::MessageFixture;

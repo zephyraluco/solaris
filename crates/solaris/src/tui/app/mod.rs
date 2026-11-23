@@ -47,23 +47,24 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot;
 
-use crate::buddy::{self, Companion, Soul};
-use crate::clipboard::Clipboard;
-use crate::commands::{self, SKILL_PREFIX, SlashCommand, parse_slash_command};
-use crate::config::{Config, Preferences};
-use crate::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
-use crate::dialogs::{
+use crate::application::assembly::{resolve_backend, with_tools};
+use crate::application::config::{Config, Preferences};
+use crate::application::recent::{self, RecentActivity};
+use crate::desktop::clipboard::Clipboard;
+use crate::tui::buddy::{self, Companion, Soul};
+use crate::tui::commands::{self, SKILL_PREFIX, SlashCommand, parse_slash_command};
+use crate::tui::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
+use crate::tui::inline::{Inline, InlineOutcome};
+use crate::tui::keymap;
+use crate::tui::model::{ModelOutcome, ModelPicker};
+#[cfg(test)]
+use crate::tui::state::ToolStep;
+use crate::tui::state::{NoticeKind, NotificationQueue, SessionState, Turn};
+use crate::tui::view::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
     skills_lines, stats_lines,
 };
-use crate::inline::{Inline, InlineOutcome};
-use crate::keymap;
-use crate::model::{ModelOutcome, ModelPicker};
-use crate::recent::{self, RecentActivity};
-#[cfg(test)]
-use crate::state::ToolStep;
-use crate::state::{NoticeKind, NotificationQueue, SessionState, Turn};
-use crate::transcript::{SPINNER, TranscriptView};
+use crate::tui::view::transcript::{SPINNER, TranscriptView};
 #[cfg(test)]
 use solaris_agent::{Agent, AgentOptions};
 
@@ -74,13 +75,13 @@ mod navigation;
 mod overlays;
 mod preferences;
 mod providers;
+mod session_view;
 mod terminal;
 
 #[cfg(test)]
+#[path = "../../../tests/unit/tui_app.rs"]
 mod tests;
 
-#[path = "../view/session.rs"]
-mod session_view;
 use session_view::SubagentTerminal;
 
 /// Program name shown in the welcome box title.
@@ -196,7 +197,7 @@ impl AppOptions {
             greeting: "Welcome back!".to_string(),
             buddy: Companion::new("solaris", None),
             buddy_path: None,
-            tip: crate::tips::select(0).content.to_string(),
+            tip: crate::tui::tips::select(0).content.to_string(),
             recent: RecentActivity::new(),
             recent_path: None,
             preferences: Preferences::default(),
@@ -218,8 +219,6 @@ impl AppOptions {
         }
     }
 }
-
-use crate::assembly::{resolve_backend, with_tools};
 
 /// The solaris application root component.
 pub struct App {

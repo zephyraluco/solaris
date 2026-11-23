@@ -16,7 +16,7 @@ pub struct OpenSession {
     pub fork: bool,
     pub cwd: std::path::PathBuf,
     pub runtime: Arc<solaris_agent::Runtime>,
-    pub config: crate::config::Config,
+    pub config: super::config::Config,
     pub auth: AuthStore,
     pub factory: super::connection::BackendFactory,
     pub registry: Arc<solaris_tools::ToolRegistry>,
@@ -63,11 +63,11 @@ impl OpenSession {
         let journal = open_journal(current.store(), &cwd, &config.model, target, source)
             .map_err(|error| error.to_string())?;
         let loaded = if fork { None } else { loaded };
-        let choice = crate::assembly::resolve_backend(&factory, &auth, &mut config);
+        let choice = super::assembly::resolve_backend(&factory, &auth, &mut config);
         let session = if let Some(session) = loaded {
             Arc::new(session)
         } else {
-            let session = crate::assembly::with_tools(
+            let session = super::assembly::with_tools(
                 choice.clone(),
                 registry,
                 &tools,
@@ -109,7 +109,7 @@ pub enum NavigationResult {
         session: Arc<SessionRuntime>,
         records: Vec<SessionRecord>,
         sequence: u64,
-        config: crate::config::Config,
+        config: super::config::Config,
         auth: AuthStore,
         choice: Box<BackendChoice>,
         fork: bool,

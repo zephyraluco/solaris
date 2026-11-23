@@ -1,13 +1,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use solaris::{Companion, Config, Mode, Preferences, RecentActivity};
+use solaris::tui::buddy::{Companion, load_soul};
+use solaris::{Config, Mode, Preferences, RecentActivity};
 use solaris_agent::{ResourcePaths, ResourceSnapshot, ToolSelection};
 use solaris_provider::{AuthStore, BackendChoice, BackendOptions, choose_backend, provider_spec};
 
 use solaris::application::{
     resources::read_mcp_config,
-    startup::{config_dir, home_dir, load_auth, load_recent, load_settings, load_soul, user_id},
+    startup::{config_dir, home_dir, load_auth, load_recent, load_settings, user_id},
 };
 
 use super::Args;

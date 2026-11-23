@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use solaris_provider::AuthStore;
 
-use crate::{Preferences, RecentActivity, Soul};
+use super::config::Preferences;
+use super::recent::RecentActivity;
 
 /// Where solaris keeps its state: `$SOLARIS_CONFIG_DIR` when set, otherwise the
 /// platform's per-user configuration directory.
@@ -53,13 +54,6 @@ pub fn load_auth(path: Option<&Path>) -> Result<AuthStore> {
         .with_context(|| format!("invalid credential store {}", path.display()))
 }
 
-/// The companion's saved name, if it has one.
-pub fn load_soul(path: Option<&Path>) -> Option<Soul> {
-    let path = path?;
-    let text = std::fs::read_to_string(path).ok()?;
-    Soul::from_json(&text).ok()
-}
-
 /// Read the recorded prompts, treating a missing or corrupt file as empty.
 pub fn load_recent(path: Option<&Path>) -> RecentActivity {
     let Some(path) = path else {
@@ -90,15 +84,6 @@ pub fn user_id() -> String {
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "solaris".to_string())
-}
-
-/// The greeting line for the welcome box.
-pub fn greeting(user: &str) -> String {
-    if user == "solaris" {
-        "Welcome back!".to_string()
-    } else {
-        format!("Welcome back {user}!")
-    }
 }
 
 #[cfg(test)]

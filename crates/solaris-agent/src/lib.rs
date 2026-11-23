@@ -74,7 +74,7 @@ pub type ChildBackendFactory =
 
 pub use runtime::event::AgentEvent;
 pub type AgentEventStream = std::pin::Pin<Box<dyn futures::Stream<Item = AgentEvent> + Send>>;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 extern crate self as solaris_agent;
 
 mod context;
@@ -92,6 +92,19 @@ pub use solaris_types::{
     Question, QuestionAnswer, QuestionOption, QuestionRequest, QuestionResponse,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[path = "../tests/support/mod.rs"]
-mod test_support;
+mod test_support_inner;
+
+#[cfg(any(test, feature = "test-utils"))]
+#[path = "../tests/support/memory.rs"]
+mod test_support_memory;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    pub use super::test_support_inner::*;
+
+    pub mod memory {
+        pub use super::super::test_support_memory::{messages, seed};
+    }
+}

@@ -24,8 +24,8 @@ pub fn agent_backend(choice: BackendChoice) -> ConnectionConfig {
     }
 }
 
-use crate::application::connection::BackendFactory;
-use crate::config::Config;
+use super::config::Config;
+use super::connection::BackendFactory;
 use solaris_agent::{AgentOptions, Approver, PromptContext, Skills};
 use solaris_provider::AuthStore;
 use solaris_tools::{ToolRegistry, ToolSelection};
@@ -79,7 +79,7 @@ pub(crate) fn with_tools(
     options.execution = execution.clone();
     let factory = Arc::clone(factory);
     let auth = auth.clone();
-    let agent = crate::application::session::build_agent(
+    let agent = super::session::build_agent(
         choice,
         registry,
         options,
@@ -97,7 +97,7 @@ pub(crate) fn with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TurnRequest;
+    use solaris_agent::test_support::{TurnRequest, client};
     use solaris_agent::{AgentEventStream, BackendError, ModelConnector};
     use solaris_provider::CredentialSource;
     use std::sync::Arc;
@@ -108,13 +108,10 @@ mod tests {
         async fn model_client(
             self: std::sync::Arc<Self>,
         ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
-            Ok(crate::test_support::client(
-                self.capabilities(),
-                move |request| {
-                    let fixture = std::sync::Arc::clone(&self);
-                    async move { fixture.respond(request).await }
-                },
-            ))
+            Ok(client(self.capabilities(), move |request| {
+                let fixture = std::sync::Arc::clone(&self);
+                async move { fixture.respond(request).await }
+            }))
         }
     }
     impl Backend {
