@@ -6,6 +6,23 @@ use tokio::sync::{
     oneshot,
 };
 pub type BackendFactory = Arc<dyn Fn(&AuthStore, &str) -> BackendChoice + Send + Sync>;
+
+/// Keep the main connection and delegated backend factory in sync.
+pub(crate) fn replace_connection(
+    choice: BackendChoice,
+    factory: &BackendFactory,
+    auth: &AuthStore,
+) -> solaris_agent::RuntimeCommand {
+    let factory = Arc::clone(factory);
+    let auth = auth.clone();
+    solaris_agent::RuntimeCommand::ReplaceConnection {
+        connection: super::assembly::agent_backend(choice),
+        children: Some(super::session::child_backend(move |model| {
+            factory(&auth, model)
+        })),
+    }
+}
+
 pub struct OAuthPending {
     pub url_rx: Option<UnboundedReceiver<String>>,
     pub rx: oneshot::Receiver<Result<Credential, String>>,

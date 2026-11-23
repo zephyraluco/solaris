@@ -7,13 +7,17 @@ use std::sync::{
 };
 use tokio::sync::{Semaphore, oneshot};
 
+use super::connection::replace_connection;
+use super::history::{ConnectionOverrides, find_session};
+use super::session::{SessionTarget, open_journal};
+
 pub struct OpenSession {
     pub current: Arc<SessionJournal>,
     pub id: String,
     pub fork: bool,
     pub cwd: std::path::PathBuf,
     pub runtime: Arc<solaris_agent::Runtime>,
-    pub config: crate::config::Config,
+    pub config: super::config::Config,
     pub auth: AuthStore,
     pub factory: super::connection::BackendFactory,
     pub registry: Arc<solaris_tools::ToolRegistry>,
@@ -24,7 +28,7 @@ pub struct OpenSession {
     pub execution: solaris_agent::ExecutionSettings,
 }
 impl OpenSession {
-    fn load(self) -> Result<NavigationResult, String> {
+    fn load(self, overrides: ConnectionOverrides) -> Result<NavigationResult, String> {
         let Self {
             current,
             id,
@@ -42,33 +46,41 @@ impl OpenSession {
             execution,
         } = self;
         let cwd = cwd.canonicalize().unwrap_or(cwd);
-        let info = current
-            .store()
-            .list(&cwd)
+        let info = find_session(current.store(), &cwd, &id)
             .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|session| session.id == id)
             .ok_or("session not found in this directory")?;
-        let loaded = if fork { None } else { runtime.session(&id) };
-        let journal = if fork {
-            current.fork(&cwd, &config.model)
-        } else if let Some(journal) = loaded.as_ref().and_then(|session| session.journal()) {
-            Ok(journal)
+        overrides.restore(info, &mut config.model, &mut auth);
+        let loaded = runtime.session(&id);
+        let source = if current.id() == id {
+            Some(Arc::clone(&current))
         } else {
-            current.store().resume(&id)
-        }
-        .map_err(|error| error.to_string())?;
-        if !fork {
-            config.model = info.model;
-            if let Some(provider) = info.provider {
-                auth.activate(provider);
-            }
-        }
-        let choice = crate::assembly::resolve_backend(&factory, &auth, &mut config);
+            loaded.as_ref().and_then(|session| session.journal())
+        };
+        let target = if fork {
+            SessionTarget::Fork(&id)
+        } else {
+            SessionTarget::Resume(&id)
+        };
+        let journal = open_journal(current.store(), &cwd, &config.model, target, source)
+            .map_err(|error| error.to_string())?;
+        let loaded = if fork { None } else { loaded };
+        let choice = super::assembly::resolve_backend(&factory, &auth, &mut config);
         let session = if let Some(session) = loaded {
+            let active = session.snapshot();
+            if overrides.model
+                || overrides.provider
+                || active.model != choice.model
+                || active.provider_id != choice.provider_id
+            {
+                let receipt =
+                    session.dispatch(replace_connection(choice.clone(), &factory, &auth))?;
+                // Navigation runs on a blocking worker. Wait for the runtime
+                // to apply the connection before publishing the switch.
+                tokio::runtime::Handle::current().block_on(receipt.accepted())?;
+            }
             Arc::new(session)
         } else {
-            let session = crate::assembly::with_tools(
+            let session = super::assembly::with_tools(
                 choice.clone(),
                 registry,
                 &tools,
@@ -110,7 +122,7 @@ pub enum NavigationResult {
         session: Arc<SessionRuntime>,
         records: Vec<SessionRecord>,
         sequence: u64,
-        config: crate::config::Config,
+        config: super::config::Config,
         auth: AuthStore,
         choice: Box<BackendChoice>,
         fork: bool,
@@ -136,7 +148,15 @@ impl Default for Navigation {
 }
 impl Navigation {
     pub fn open(&mut self, request: OpenSession) {
-        self.submit(move || request.load());
+        self.open_with_overrides(request, ConnectionOverrides::default());
+    }
+
+    pub(crate) fn open_with_overrides(
+        &mut self,
+        request: OpenSession,
+        overrides: ConnectionOverrides,
+    ) {
+        self.submit(move || request.load(overrides));
     }
     pub fn list(&mut self, journal: Arc<SessionJournal>, cwd: std::path::PathBuf, tree: bool) {
         self.submit(move || {

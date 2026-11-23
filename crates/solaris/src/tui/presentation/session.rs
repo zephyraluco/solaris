@@ -1,4 +1,4 @@
-use crate::state::{NoticeKind, ToolStep, Turn};
+use crate::tui::state::{NoticeKind, ToolStep, Turn};
 use solaris_agent::{AgentEvent, ContextUsage, Usage};
 /// The conversation plus its streaming state.
 #[derive(Debug, Default)]

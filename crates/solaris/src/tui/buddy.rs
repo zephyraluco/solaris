@@ -395,6 +395,13 @@ impl Soul {
     }
 }
 
+/// The companion's saved soul, if it has one.
+pub fn load_soul(path: Option<&std::path::Path>) -> Option<Soul> {
+    let path = path?;
+    let text = std::fs::read_to_string(path).ok()?;
+    Soul::from_json(&text).ok()
+}
+
 /// Bones plus the optional soul.
 #[derive(Debug, Clone)]
 pub struct Companion {

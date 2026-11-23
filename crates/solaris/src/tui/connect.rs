@@ -9,7 +9,7 @@
 //!
 //! [`ConnectFlow`] is a state machine over [`ConnectStep`] that owns key
 //! handling, mouse hit-testing and rendering. The *effects* — storing the
-//! credential and activating the provider — live in [`crate::app`], because
+//! credential and activating the provider — live in [`crate::tui::app`], because
 //! they touch application state rather than flow state.
 //! [`ConnectOutcome`] is the single funnel out of this module.
 

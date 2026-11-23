@@ -226,12 +226,12 @@ impl Turn {
 /// Viewport state is local to the terminal; product state is a display projection.
 #[derive(Debug, Default)]
 pub struct SessionState {
-    pub projection: crate::presentation::session::SessionProjection,
+    pub projection: super::presentation::session::SessionProjection,
     pub scroll: usize,
     pub follow_end: bool,
 }
 impl std::ops::Deref for SessionState {
-    type Target = crate::presentation::session::SessionProjection;
+    type Target = super::presentation::session::SessionProjection;
     fn deref(&self) -> &Self::Target {
         &self.projection
     }

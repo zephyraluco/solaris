@@ -191,3 +191,53 @@ impl SessionController {
         self.runtime_pending.load(Ordering::Acquire) > 0 || self.agent.snapshot().task_id.is_some()
     }
 }
+
+/// Assemble a session from resolved application inputs. Each adapter supplies
+/// its own approval transport and whether it can answer model questions.
+pub fn build_agent(
+    choice: solaris_provider::BackendChoice,
+    registry: Arc<solaris_agent::ToolRegistry>,
+    options: solaris_agent::AgentOptions,
+    resources: solaris_agent::ResourceSnapshot,
+    resolve_child: impl Fn(&str) -> solaris_provider::BackendChoice + Send + Sync + 'static,
+) -> solaris_agent::Agent {
+    solaris_agent::Agent::new(super::assembly::agent_backend(choice), registry, options)
+        .with_resources(resources)
+        .with_child_backend(child_backend(resolve_child))
+}
+
+pub fn child_backend(
+    resolve: impl Fn(&str) -> solaris_provider::BackendChoice + Send + Sync + 'static,
+) -> solaris_agent::ChildBackendFactory {
+    Arc::new(move |model| Ok(super::assembly::agent_backend(resolve(model))))
+}
+
+/// Persistent session targets. Ephemeral runs omit the journal entirely.
+pub enum SessionTarget<'a> {
+    New,
+    Resume(&'a str),
+    Fork(&'a str),
+}
+
+/// Open the journal for a directory-validated target. The terminal may
+/// already own the source lease when switching or forking a live session.
+pub fn open_journal(
+    store: &Arc<solaris_agent::SessionStore>,
+    cwd: &std::path::Path,
+    model: &str,
+    target: SessionTarget<'_>,
+    leased: Option<Arc<solaris_agent::SessionJournal>>,
+) -> Result<Arc<solaris_agent::SessionJournal>, solaris_agent::StoreError> {
+    let id = match target {
+        SessionTarget::New => return store.create(cwd, model, None),
+        SessionTarget::Resume(id) | SessionTarget::Fork(id) => id,
+    };
+    let journal = match leased.filter(|journal| journal.id() == id) {
+        Some(journal) => journal,
+        None => store.resume(id)?,
+    };
+    match target {
+        SessionTarget::Fork(_) => journal.fork(cwd, model),
+        _ => Ok(journal),
+    }
+}

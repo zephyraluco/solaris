@@ -1,5 +1,5 @@
 //! Project Solaris questions onto ACP elicitation or a client's choice picker.
-use super::{ClientConnection, call_id};
+use super::session::{ClientConnection, call_id};
 use agent_client_protocol::v1::schema::*;
 use solaris_agent::{
     QuestionAnswer, QuestionRequest, QuestionResponse, RuntimeCommand, SessionRuntime,

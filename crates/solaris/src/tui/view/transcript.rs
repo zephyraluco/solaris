@@ -20,7 +20,7 @@ use solaris_tui::components::{
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{truncate_to_width, wrap_text};
 
-use crate::state::{SessionState, SteeringNote, ToolStep, Turn, TurnPart};
+use crate::tui::state::{SessionState, SteeringNote, ToolStep, Turn, TurnPart};
 
 /// Spinner glyphs shared with the reusable TUI activity indicators.
 pub use solaris_tui::components::loader::SPINNER;
@@ -1154,7 +1154,7 @@ pub fn summarize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ToolStep;
+    use crate::tui::state::ToolStep;
     use solaris_agent::{ToolCall, ToolResult};
 
     fn line_text(line: &Line<'_>) -> String {
@@ -1671,7 +1671,7 @@ mod tests {
         }
         let session = session_with(Turn {
             steps,
-            steering: vec![crate::state::SteeringNote {
+            steering: vec![crate::tui::state::SteeringNote {
                 text: "check this first".into(),
                 after_steps: 1,
             }],
