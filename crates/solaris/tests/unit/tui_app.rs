@@ -87,6 +87,65 @@ async fn switching_and_forking_sessions_replays_saved_turns_without_running_tool
     );
 }
 
+#[tokio::test]
+async fn switching_to_a_loaded_session_applies_the_current_model_override() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store = solaris_agent::SessionStore::open(&directory.path().join("sessions.sqlite"))
+        .expect("store");
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let first = store.create(&cwd, "model-a", None).unwrap();
+    let first_id = first.id().to_owned();
+    let second_id = store
+        .create(&cwd, "saved-model", None)
+        .unwrap()
+        .id()
+        .to_owned();
+
+    let mut options = app_options();
+    options.config.model = "model-a".into();
+    options.journal = Some(first);
+    let mut app = App::new(options).with_connection_overrides(
+        crate::application::history::ConnectionOverrides {
+            model: true,
+            provider: false,
+        },
+    );
+
+    app.switch_session(&second_id, false);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.sessions.navigation.is_pending() {
+            app.tick();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.sessions.agent.snapshot().session_id, second_id);
+    app.set_model("model-b");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.sessions.busy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.sessions.agent.snapshot().model, "model-b");
+
+    app.switch_session(&first_id, false);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.sessions.navigation.is_pending() {
+            app.tick();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = app.sessions.agent.snapshot();
+    assert_eq!(snapshot.session_id, first_id);
+    assert_eq!(app.model(), "model-b");
+    assert_eq!(snapshot.model, "model-b");
+}
+
 /// A backend that answers with a prompt-echoing markdown reply, so the app's
 /// own behaviour can be driven without a provider and without a network.
 struct FakeBackend {

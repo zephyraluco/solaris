@@ -36,14 +36,11 @@ impl App {
 
     fn refresh_transport(&mut self, choice: BackendChoice) {
         self.connection.model_source = Arc::clone(&choice.models);
-        let factory = Arc::clone(&self.connection.backend_factory);
-        let auth = self.connection.auth.clone();
-        self.runtime_command(solaris_agent::RuntimeCommand::ReplaceConnection {
-            connection: crate::agent_backend(choice),
-            children: Some(Arc::new(move |model| {
-                Ok(crate::agent_backend(factory(&auth, model)))
-            })),
-        });
+        self.runtime_command(crate::application::connection::replace_connection(
+            choice,
+            &self.connection.backend_factory,
+            &self.connection.auth,
+        ));
     }
 
     /// Adopt the model list the provider reported.

@@ -7,6 +7,7 @@ use std::sync::{
 };
 use tokio::sync::{Semaphore, oneshot};
 
+use super::connection::replace_connection;
 use super::history::{ConnectionOverrides, find_session};
 use super::session::{SessionTarget, open_journal};
 
@@ -65,6 +66,18 @@ impl OpenSession {
         let loaded = if fork { None } else { loaded };
         let choice = super::assembly::resolve_backend(&factory, &auth, &mut config);
         let session = if let Some(session) = loaded {
+            let active = session.snapshot();
+            if overrides.model
+                || overrides.provider
+                || active.model != choice.model
+                || active.provider_id != choice.provider_id
+            {
+                let receipt =
+                    session.dispatch(replace_connection(choice.clone(), &factory, &auth))?;
+                // Navigation runs on a blocking worker. Wait for the runtime
+                // to apply the connection before publishing the switch.
+                tokio::runtime::Handle::current().block_on(receipt.accepted())?;
+            }
             Arc::new(session)
         } else {
             let session = super::assembly::with_tools(
