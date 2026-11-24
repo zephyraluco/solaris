@@ -1698,6 +1698,7 @@ mod tests {
             "write",
             json!({"path": "blocked.txt", "content": "x"}),
         );
+        let question_call = ToolCall::new("c4", "question", json!({"questions": []}));
 
         // Default: read auto-approved; mutating asks fallback (which denies here).
         let default_approver = agent.turn_approver(Mode::Default);
@@ -1712,8 +1713,12 @@ mod tests {
         assert_eq!(*asked.lock().expect("lock"), vec!["write"]);
         asked.lock().expect("lock").clear();
 
-        // Ask: both read and write ask fallback.
+        // Ask: both read and write ask fallback, while `question` is allowed directly.
         let ask_approver = agent.turn_approver(Mode::Ask);
+        assert_eq!(
+            ask_approver.approve(&question_call).await,
+            crate::Approval::Approved
+        );
         assert_eq!(
             ask_approver.approve(&read_call).await,
             crate::Approval::Denied

@@ -123,8 +123,9 @@ impl App {
 
     /// Whether `/connect` is sitting on the step that picks a model.
     fn connect_is_choosing_a_model(&self) -> bool {
-        self.inline
-            .as_ref()
+        self.session_page
+            .bottom
+            .inline()
             .and_then(Inline::step)
             .is_some_and(|step| step == ConnectStep::Model)
     }
@@ -142,7 +143,7 @@ impl App {
             let models = self.model_choices();
             let status = self.model_discovery_status();
             let current = self.config.model.clone();
-            match self.inline.as_mut() {
+            match self.session_page.bottom.inline_mut() {
                 Some(Inline::Connect(flow)) if flow.step() == ConnectStep::Model => {
                     let empty = models.is_empty();
                     flow.enter_models(models, Some(&current));
@@ -172,7 +173,7 @@ impl App {
         }
 
         let current = self.config.model.clone();
-        if let Some(flow) = self.inline.as_mut() {
+        if let Some(flow) = self.session_page.bottom.inline_mut() {
             flow.enter_models(models, Some(&current));
         }
     }
@@ -219,10 +220,10 @@ impl App {
     pub(super) fn open_model_picker(&mut self) {
         if self.uses_chatgpt() {
             self.refresh_models();
-            self.inline = Some(Inline::Model(
+            self.session_page.bottom.set_inline(Some(Inline::Model(
                 ModelPicker::new(&self.theme, Vec::new(), None)
                     .with_status(self.model_discovery_status()),
-            ));
+            )));
             self.notifications.clear();
             return;
         }
@@ -236,7 +237,9 @@ impl App {
 
         let current = self.config.model.clone();
         let picker = ModelPicker::new(&self.theme, models, Some(&current));
-        self.inline = Some(Inline::Model(picker));
+        self.session_page
+            .bottom
+            .set_inline(Some(Inline::Model(picker)));
         self.notifications.clear();
     }
 
@@ -252,7 +255,7 @@ impl App {
     }
 
     fn begin_openai_login(&mut self) {
-        if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
+        if let Some(Inline::Connect(flow)) = self.session_page.bottom.inline_mut() {
             flow.enter_browser_auth("Starting browser authorization…".into());
         }
         self.connection.begin_login();
@@ -267,7 +270,7 @@ impl App {
             .and_then(|pending| pending.url_rx.as_mut())
         {
             while let Ok(url) = urls.try_recv() {
-                if let Some(Inline::Connect(flow)) = self.inline.as_mut() {
+                if let Some(Inline::Connect(flow)) = self.session_page.bottom.inline_mut() {
                     flow.enter_browser_auth(url);
                     updated = true;
                 }
@@ -300,10 +303,12 @@ impl App {
         true
     }
 
-    /// Open the `/connect` wizard in the prompt region.
+    /// Open the `/connect` wizard in the bottom dock.
     pub(super) fn open_connect(&mut self) {
         self.connection.oauth = None;
-        self.inline = Some(Inline::Connect(ConnectFlow::new(&self.theme)));
+        self.session_page
+            .bottom
+            .set_inline(Some(Inline::Connect(ConnectFlow::new(&self.theme))));
         self.notifications.clear();
     }
 
@@ -314,18 +319,7 @@ impl App {
         if self.connection.oauth.is_some() {
             self.connection.oauth = None;
         }
-        self.inline = None;
-    }
-
-    pub(super) fn handle_inline_key(&mut self, key: KeyEvent) {
-        let outcome = match self.inline.as_mut() {
-            Some(inline) => inline.on_key(key),
-            None => return,
-        };
-        match outcome {
-            InlineOutcome::Connect(outcome) => self.apply_connect_outcome(outcome),
-            InlineOutcome::Model(outcome) => self.apply_model_outcome(outcome),
-        }
+        self.session_page.bottom.clear_inline();
     }
 
     pub(super) fn apply_connect_outcome(&mut self, outcome: ConnectOutcome) {
@@ -410,13 +404,13 @@ impl App {
             }
             AuthKind::ApiKey => {
                 let current = self.stored_api_key(provider_id);
-                if let Some(flow) = self.inline.as_mut() {
+                if let Some(flow) = self.session_page.bottom.inline_mut() {
                     flow.enter_api_key(id, provider_name, current);
                 }
             }
             AuthKind::ApiKeyWithUrl => {
                 let (url, key) = self.stored_endpoint(provider_id);
-                if let Some(flow) = self.inline.as_mut() {
+                if let Some(flow) = self.session_page.bottom.inline_mut() {
                     flow.enter_custom_provider(id, provider_name, url, key);
                 }
             }
@@ -501,7 +495,7 @@ impl App {
         let current = self.config.model.clone();
         let chatgpt = self.uses_chatgpt();
 
-        match self.inline.as_mut() {
+        match self.session_page.bottom.inline_mut() {
             Some(flow) if !models.is_empty() || pending || chatgpt => {
                 flow.enter_models(models, Some(&current));
             }

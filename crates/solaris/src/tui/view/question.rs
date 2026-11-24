@@ -18,7 +18,6 @@ use solaris_agent::{
     QuestionAnswer, QuestionRequest, QuestionResponse, RuntimeCommand, SessionRuntime,
 };
 use solaris_tui::component::{Component, KeyResult, MouseResult};
-use solaris_tui::components::editor::Editor;
 use solaris_tui::theme::Theme;
 use solaris_tui::util::{digit_count, display_width, rect_contains, truncate_to_width, wrap_text};
 use tokio::sync::mpsc::UnboundedSender;
@@ -44,7 +43,7 @@ struct PanelStyles {
 impl PanelStyles {
     fn from_theme(theme: &Theme) -> Self {
         Self {
-            border: Style::default().fg(theme.border),
+            border: Style::default().fg(theme.accent),
             tab_active: Style::default()
                 .fg(theme.bg)
                 .bg(theme.accent)
@@ -69,6 +68,7 @@ struct BodyLayout {
     lines: Vec<Line<'static>>,
     focus: usize,
     targets: Vec<(usize, Range<usize>)>,
+    cursor_pos: Option<(usize, usize)>,
 }
 
 /// Interactive question panel rendered in place of the prompt editor.
@@ -80,15 +80,16 @@ pub struct QuestionPanel {
     current: usize,
     cursor: usize,
     answers: Vec<QuestionAnswer>,
-    editing: bool,
+    custom_inputs: Vec<String>,
+    custom_cursor: usize,
     submitted: bool,
-    editor: Editor,
     styles: PanelStyles,
     sender: UnboundedSender<DialogMessage>,
     last_area: Rect,
     tab_area: Rect,
     tab_hits: Vec<(usize, Range<u16>)>,
     content_area: Rect,
+    terminal_cursor: Option<(u16, u16)>,
     scroll: u16,
     max_scroll: u16,
     manual_scroll: bool,
@@ -113,24 +114,23 @@ impl QuestionPanel {
                 custom: None,
             })
             .collect();
-        let mut editor = Editor::with_placeholder("Type your answer…");
-        editor.set_styles(crate::tui::app::editor_styles(theme));
-        editor.set_focused(true);
+        let custom_inputs = vec![String::new(); request.questions.len()];
         Self {
             request,
             session,
             current: 0,
             cursor: 0,
             answers,
-            editing: false,
+            custom_inputs,
+            custom_cursor: 0,
             submitted: false,
-            editor,
             styles: PanelStyles::from_theme(theme),
             sender,
             last_area: Rect::default(),
             tab_area: Rect::default(),
             tab_hits: Vec::new(),
             content_area: Rect::default(),
+            terminal_cursor: None,
             scroll: 0,
             max_scroll: 0,
             manual_scroll: false,
@@ -154,8 +154,6 @@ impl QuestionPanel {
 
     pub fn set_theme(&mut self, theme: &Theme) {
         self.styles = PanelStyles::from_theme(theme);
-        self.editor
-            .set_styles(crate::tui::app::editor_styles(theme));
     }
 
     fn has_submit_tab(&self) -> bool {
@@ -168,6 +166,108 @@ impl QuestionPanel {
 
     fn on_submit_tab(&self) -> bool {
         self.has_submit_tab() && self.current == self.request.questions.len()
+    }
+
+    fn on_custom_option(&self) -> bool {
+        !self.on_submit_tab()
+            && self.request.questions[self.current].allow_custom
+            && self.cursor == self.request.questions[self.current].options.len()
+    }
+
+    fn sync_custom_cursor_to_end(&mut self) {
+        if !self.on_submit_tab() {
+            self.custom_cursor = self.custom_inputs[self.current].chars().count();
+        }
+    }
+
+    fn sync_custom_answer(&mut self) {
+        let trimmed = self.custom_inputs[self.current].trim();
+        if trimmed.is_empty() {
+            self.answers[self.current].custom = None;
+        } else {
+            self.answers[self.current].custom = Some(trimmed.to_string());
+            if !self.request.questions[self.current].multiple {
+                self.answers[self.current].selected.clear();
+            }
+        }
+    }
+
+    fn insert_custom_str(&mut self, text: &str) {
+        if self.on_submit_tab() {
+            return;
+        }
+        let cleaned: String = text
+            .chars()
+            .filter_map(|ch| match ch {
+                '\r' | '\n' => Some(' '),
+                c if c.is_control() => None,
+                c => Some(c),
+            })
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        let input = &mut self.custom_inputs[self.current];
+        let byte_idx = char_to_byte(input, self.custom_cursor);
+        input.insert_str(byte_idx, &cleaned);
+        self.custom_cursor += cleaned.chars().count();
+        self.sync_custom_answer();
+    }
+
+    fn custom_backspace(&mut self) {
+        if self.on_submit_tab() || self.custom_cursor == 0 {
+            return;
+        }
+        let input = &mut self.custom_inputs[self.current];
+        let end = char_to_byte(input, self.custom_cursor);
+        let start = char_to_byte(input, self.custom_cursor - 1);
+        input.replace_range(start..end, "");
+        self.custom_cursor -= 1;
+        self.sync_custom_answer();
+    }
+
+    fn custom_delete(&mut self) {
+        if self.on_submit_tab() {
+            return;
+        }
+        let input = &mut self.custom_inputs[self.current];
+        let char_len = input.chars().count();
+        if self.custom_cursor >= char_len {
+            return;
+        }
+        let start = char_to_byte(input, self.custom_cursor);
+        let end = char_to_byte(input, self.custom_cursor + 1);
+        input.replace_range(start..end, "");
+        self.sync_custom_answer();
+    }
+
+    fn custom_clear(&mut self) {
+        if self.on_submit_tab() {
+            return;
+        }
+        self.custom_inputs[self.current].clear();
+        self.custom_cursor = 0;
+        self.sync_custom_answer();
+    }
+
+    fn custom_kill_word_back(&mut self) {
+        if self.on_submit_tab() || self.custom_cursor == 0 {
+            return;
+        }
+        let input = &mut self.custom_inputs[self.current];
+        let chars: Vec<char> = input.chars().collect();
+        let mut new_cursor = self.custom_cursor;
+        while new_cursor > 0 && chars[new_cursor - 1].is_whitespace() {
+            new_cursor -= 1;
+        }
+        while new_cursor > 0 && !chars[new_cursor - 1].is_whitespace() {
+            new_cursor -= 1;
+        }
+        let start = char_to_byte(input, new_cursor);
+        let end = char_to_byte(input, self.custom_cursor);
+        input.replace_range(start..end, "");
+        self.custom_cursor = new_cursor;
+        self.sync_custom_answer();
     }
 
     fn is_answered(&self, index: usize) -> bool {
@@ -191,8 +291,7 @@ impl QuestionPanel {
             self.cursor = 0;
             self.scroll = 0;
             self.manual_scroll = false;
-            self.editing = false;
-            self.editor.clear();
+            self.sync_custom_cursor_to_end();
         }
     }
 
@@ -258,6 +357,7 @@ impl QuestionPanel {
         let desc_width = width.saturating_sub(label_indent).max(8);
 
         let mut focus = lines.len();
+        let mut cursor_pos = None;
         for (i, option) in q.options.iter().enumerate() {
             let start = lines.len();
             let focused = i == self.cursor;
@@ -273,21 +373,25 @@ impl QuestionPanel {
                 ""
             };
             let suffix = if !q.multiple && selected { " ✓" } else { "" };
-            let head = format!("{marker}{number}{check}{}{suffix}", option.label);
+            let prefix = format!("{marker}{number}{check}");
+            let prefix_width = display_width(&prefix);
+            let label_width = width.saturating_sub(prefix_width).max(1);
+            let label_text = format!("{}{suffix}", option.label);
             let row_style = if focused {
                 self.styles.option_active
             } else {
                 self.styles.option_inactive
             };
-            for (seg_idx, seg) in wrap_text(&head, width).into_iter().enumerate() {
-                if seg_idx == 0 {
-                    lines.push(Line::from(Span::styled(seg, row_style)));
+            for (seg_idx, seg) in wrap_text(&label_text, label_width).into_iter().enumerate() {
+                let row_prefix = if seg_idx == 0 {
+                    prefix.clone()
                 } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("{desc_indent}{seg}"),
-                        row_style,
-                    )));
-                }
+                    desc_indent.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(row_prefix, row_style),
+                    Span::styled(seg, row_style),
+                ]));
             }
             if !option.description.is_empty() {
                 for seg in wrap_text(&option.description, desc_width) {
@@ -308,6 +412,7 @@ impl QuestionPanel {
                 focus = start;
             }
             let custom = self.answers[self.current].custom.as_deref();
+            let input = &self.custom_inputs[self.current];
             let marker = if focused { "❯ " } else { "  " };
             let number = format!("{:>w$}. ", target_index + 1, w = number_width);
             let check = if q.multiple {
@@ -315,28 +420,52 @@ impl QuestionPanel {
             } else {
                 ""
             };
-            let label = custom.unwrap_or("Type something.");
-            let suffix = if !q.multiple && custom.is_some() {
-                " ✓"
-            } else {
-                ""
-            };
-            let row_style = if focused {
+            let prefix = format!("{marker}{number}{check}");
+            let prefix_width = display_width(&prefix);
+            let text_width = width.saturating_sub(prefix_width).max(1);
+            let prefix_style = if focused {
                 self.styles.option_active
-            } else if custom.is_some() {
-                self.styles.option_inactive
             } else {
-                self.styles.placeholder
+                self.styles.option_inactive
             };
-            let head = format!("{marker}{number}{check}{label}{suffix}");
-            for (seg_idx, seg) in wrap_text(&head, width).into_iter().enumerate() {
-                if seg_idx == 0 {
-                    lines.push(Line::from(Span::styled(seg, row_style)));
+
+            if input.is_empty() {
+                let placeholder = truncate_to_width("Type something.", text_width, "…");
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(placeholder, self.styles.placeholder),
+                ]));
+                if focused {
+                    cursor_pos = Some((start, prefix_width));
+                }
+            } else {
+                let (wrapped, cur_row, cur_col) =
+                    wrap_input_with_cursor(input, self.custom_cursor, text_width);
+                let last_idx = wrapped.len().saturating_sub(1);
+                let suffix = if !focused && !q.multiple && custom.is_some() {
+                    " ✓"
                 } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("{desc_indent}{seg}"),
-                        row_style,
-                    )));
+                    ""
+                };
+                for (seg_idx, seg) in wrapped.into_iter().enumerate() {
+                    let row_prefix = if seg_idx == 0 {
+                        prefix.clone()
+                    } else {
+                        desc_indent.clone()
+                    };
+                    let mut spans = vec![
+                        Span::styled(row_prefix, prefix_style),
+                        Span::styled(seg, self.styles.option_inactive),
+                    ];
+                    if seg_idx == last_idx && !suffix.is_empty() {
+                        spans.push(Span::styled(suffix, self.styles.option_inactive));
+                    }
+                    lines.push(Line::from(spans));
+                }
+                if focused {
+                    let cursor_line = start + cur_row;
+                    focus = cursor_line;
+                    cursor_pos = Some((cursor_line, prefix_width + cur_col));
                 }
             }
             targets.push((target_index, start..lines.len()));
@@ -368,6 +497,7 @@ impl QuestionPanel {
             lines,
             focus,
             targets,
+            cursor_pos,
         }
     }
 
@@ -452,6 +582,7 @@ impl QuestionPanel {
             lines,
             focus,
             targets,
+            cursor_pos: None,
         }
     }
 
@@ -573,13 +704,10 @@ impl QuestionPanel {
 
         let q = &self.request.questions[self.current];
         if self.cursor == q.options.len() && q.allow_custom {
-            if q.multiple && toggle && self.answers[self.current].custom.is_some() {
-                self.answers[self.current].custom = None;
-                return KeyResult::Handled;
+            self.sync_custom_cursor_to_end();
+            if !toggle {
+                return self.advance();
             }
-            self.editor
-                .set_text(self.answers[self.current].custom.as_deref().unwrap_or(""));
-            self.editing = true;
         } else if q.multiple && self.cursor == q.options.len() + usize::from(q.allow_custom) {
             return self.advance();
         } else if let Some(option) = q.options.get(self.cursor) {
@@ -587,6 +715,8 @@ impl QuestionPanel {
             if !q.multiple {
                 answer.selected = vec![option.id.clone()];
                 answer.custom = None;
+                self.custom_inputs[self.current].clear();
+                self.custom_cursor = 0;
                 return self.advance();
             }
             if toggle {
@@ -633,6 +763,7 @@ impl Component for QuestionPanel {
         self.last_area = area;
         self.content_area = Rect::default();
         self.tab_area = Rect::default();
+        self.terminal_cursor = None;
         self.tab_hits.clear();
         self.row_targets.clear();
         if area.width < 4 || area.height < 3 {
@@ -653,10 +784,14 @@ impl Component for QuestionPanel {
 
         // Last row: dim hint line.
         let hint_y = area.y + area.height - 1;
-        let hint = if self.editing {
-            "Enter save · Esc back"
-        } else if self.on_submit_tab() {
+        let hint = if self.on_submit_tab() {
             "Enter submit · ←/→ switch tab · Esc cancel"
+        } else if self.on_custom_option() {
+            if self.has_submit_tab() {
+                "Type answer · ↑↓ move · Enter next · Tab tabs · Esc cancel"
+            } else {
+                "Type answer · ↑↓ move · Enter submit · Esc cancel"
+            }
         } else if self.request.questions[self.current].multiple {
             if self.has_submit_tab() {
                 "↑↓ move · Space toggle · Enter next · ←/→ tabs · Esc cancel"
@@ -686,41 +821,35 @@ impl Component for QuestionPanel {
             lines,
             focus,
             targets,
+            cursor_pos,
         } = self.build_body(body_area.width.max(1) as usize);
         self.row_targets = targets;
 
-        let editor_height = if self.editing {
-            body_area.height.saturating_sub(1).min(4)
-        } else {
-            0
-        };
-        let list_height = body_area.height.saturating_sub(editor_height);
-        self.content_area = Rect {
-            height: list_height,
-            ..body_area
-        };
-        self.max_scroll = (lines.len() as u16).saturating_sub(list_height);
+        self.content_area = body_area;
+        self.max_scroll = (lines.len() as u16).saturating_sub(body_area.height);
         if self.manual_scroll {
             self.scroll = self.scroll.min(self.max_scroll);
         } else {
             self.scroll = focus
-                .saturating_sub(list_height.saturating_sub(1) as usize)
+                .saturating_sub(body_area.height.saturating_sub(1) as usize)
                 .min(self.max_scroll as usize) as u16;
         }
-        if list_height > 0 {
+        if body_area.height > 0 {
             Paragraph::new(lines)
                 .scroll((self.scroll, 0))
                 .render(self.content_area, buf);
         }
-        if self.editing && editor_height > 0 {
-            self.editor.render(
-                buf,
-                Rect {
-                    y: body_area.y + list_height,
-                    height: editor_height,
-                    ..body_area
-                },
-            );
+        if let Some((line_idx, col)) = cursor_pos {
+            let scroll = usize::from(self.scroll);
+            if line_idx >= scroll && line_idx < scroll + usize::from(body_area.height) {
+                let y = body_area.y.saturating_add((line_idx - scroll) as u16);
+                let x = body_area
+                    .x
+                    .saturating_add((col as u16).min(body_area.width.saturating_sub(1)));
+                self.terminal_cursor = Some((x, y));
+                let style = buf[(x, y)].style().add_modifier(Modifier::REVERSED);
+                buf[(x, y)].set_style(style);
+            }
         }
     }
 
@@ -734,36 +863,77 @@ impl Component for QuestionPanel {
             let _ = self.session.dispatch(RuntimeCommand::Cancel);
             return KeyResult::Cancelled;
         }
-        if self.editing {
-            if key.code == KeyCode::Esc {
-                self.editing = false;
-                self.editor.clear();
-                return KeyResult::Handled;
-            }
-            self.editor.handle_key(key);
-            if let Some(text) = self.editor.take_submitted()
-                && !text.trim().is_empty()
-            {
-                self.answers[self.current].custom = Some(text.trim().into());
-                self.editing = false;
-                if !self.request.questions[self.current].multiple {
-                    self.answers[self.current].selected.clear();
-                    return self.advance();
+
+        let count = self.item_count();
+        if self.on_custom_option() {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc => return self.finish(QuestionResponse::Dismissed),
+                KeyCode::Up => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    self.manual_scroll = false;
                 }
+                KeyCode::Down => {
+                    self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
+                    self.manual_scroll = false;
+                }
+                KeyCode::BackTab if self.current > 0 => {
+                    self.switch_tab(self.current - 1);
+                }
+                KeyCode::Tab if self.current + 1 < self.tab_count() => {
+                    self.switch_tab(self.current + 1);
+                }
+                KeyCode::Left => {
+                    if self.custom_inputs[self.current].is_empty() && self.current > 0 {
+                        self.switch_tab(self.current - 1);
+                    } else {
+                        self.custom_cursor = self.custom_cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Right => {
+                    if self.custom_inputs[self.current].is_empty()
+                        && self.current + 1 < self.tab_count()
+                    {
+                        self.switch_tab(self.current + 1);
+                    } else {
+                        let max = self.custom_inputs[self.current].chars().count();
+                        self.custom_cursor = (self.custom_cursor + 1).min(max);
+                    }
+                }
+                KeyCode::Home => self.custom_cursor = 0,
+                KeyCode::End => self.sync_custom_cursor_to_end(),
+                KeyCode::Char('a') if control => self.custom_cursor = 0,
+                KeyCode::Char('e') if control => self.sync_custom_cursor_to_end(),
+                KeyCode::Char('u') if control => self.custom_clear(),
+                KeyCode::Char('w') if control => self.custom_kill_word_back(),
+                KeyCode::Backspace => self.custom_backspace(),
+                KeyCode::Delete => self.custom_delete(),
+                KeyCode::Enter => return self.advance(),
+                KeyCode::Char(ch) if !control && !alt => {
+                    let mut buf = [0u8; 4];
+                    self.insert_custom_str(ch.encode_utf8(&mut buf));
+                }
+                _ => {}
             }
             return KeyResult::Handled;
         }
 
-        let count = self.item_count();
         match key.code {
             KeyCode::Esc => return self.finish(QuestionResponse::Dismissed),
             KeyCode::Up => {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.manual_scroll = false;
+                if self.on_custom_option() {
+                    self.sync_custom_cursor_to_end();
+                }
             }
             KeyCode::Down => {
                 self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
                 self.manual_scroll = false;
+                if self.on_custom_option() {
+                    self.sync_custom_cursor_to_end();
+                }
             }
             KeyCode::Left | KeyCode::BackTab if self.current > 0 => {
                 self.switch_tab(self.current - 1);
@@ -782,9 +952,6 @@ impl Component for QuestionPanel {
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
         if self.is_finished() {
             return MouseResult::Ignored;
-        }
-        if self.editing {
-            return self.editor.handle_mouse(event);
         }
         match event.kind {
             MouseEventKind::ScrollUp
@@ -809,6 +976,9 @@ impl Component for QuestionPanel {
                 }
                 if let Some(target) = self.hit_target(event.column, event.row) {
                     self.cursor = target;
+                    if self.on_custom_option() {
+                        self.sync_custom_cursor_to_end();
+                    }
                     self.pressed_target = Some(target);
                     self.pressed_tab = None;
                     self.manual_scroll = false;
@@ -834,6 +1004,10 @@ impl Component for QuestionPanel {
                     && self.hit_target(event.column, event.row) == Some(target)
                 {
                     self.cursor = target;
+                    if self.on_custom_option() {
+                        self.sync_custom_cursor_to_end();
+                        return MouseResult::Handled;
+                    }
                     let toggle = if self.on_submit_tab() {
                         false
                     } else {
@@ -852,30 +1026,59 @@ impl Component for QuestionPanel {
     }
 
     fn cursor_position(&self) -> Option<(u16, u16)> {
-        if self.editing {
-            self.editor.cursor_position()
-        } else {
-            None
-        }
+        self.terminal_cursor
     }
 
     fn handle_paste(&mut self, text: &str) -> KeyResult {
-        if self.editing {
-            self.editor.insert_paste(text);
+        if self.on_custom_option() {
+            self.insert_custom_str(text);
         }
         KeyResult::Handled
     }
 
     fn desired_height(&mut self, width: u16) -> Option<u16> {
         let built = self.build_body(width.max(8) as usize);
-        let editor_rows = if self.editing { 4u16 } else { 0 };
-        // divider (1) + tabs (1) + blank (1) + body + editor + blank (1) + hint (1) = +5
-        Some(
-            (built.lines.len().max(1) as u16)
-                .saturating_add(editor_rows)
-                .saturating_add(5),
-        )
+        // divider (1) + tabs (1) + blank (1) + body + blank (1) + hint (1) = +5
+        Some((built.lines.len().max(1) as u16).saturating_add(5))
     }
+}
+
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(byte_idx, _)| byte_idx)
+}
+
+fn wrap_input_with_cursor(
+    text: &str,
+    cursor_char: usize,
+    max_width: usize,
+) -> (Vec<String>, usize, usize) {
+    let limit = max_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut cursor_pos = None;
+
+    for (idx, ch) in text.chars().enumerate() {
+        let ch_width = display_width(ch.encode_utf8(&mut [0u8; 4])).max(1);
+        if !current.is_empty() && current_width + ch_width > limit {
+            if idx == cursor_char {
+                cursor_pos = Some((lines.len(), current_width));
+            }
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if idx == cursor_char && cursor_pos.is_none() {
+            cursor_pos = Some((lines.len(), current_width));
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+
+    let (cur_row, cur_col) = cursor_pos.unwrap_or((lines.len(), current_width));
+    lines.push(current);
+    (lines, cur_row, cur_col)
 }
 
 impl Drop for QuestionPanel {
@@ -1050,18 +1253,21 @@ mod tests {
         assert_eq!(view.handle_key(key(KeyCode::Enter)), KeyResult::Handled);
         assert_eq!(view.current, 1);
 
-        // Select both options + custom answer on question 1.
+        // Select both options + type custom answer directly on the custom row (no Enter needed).
         view.handle_key(key(KeyCode::Char(' ')));
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Char(' ')));
         view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
-        assert!(view.editing);
+        assert!(view.on_custom_option());
+        let _ = render_lines(&mut view, 40, 16);
+        assert!(
+            view.cursor_position().is_some(),
+            "focusing custom row immediately shows inline cursor"
+        );
         view.handle_paste("自定义数据库");
         let _ = render_lines(&mut view, 40, 16);
         assert!(view.cursor_position().is_some());
-        view.handle_key(key(KeyCode::Enter));
-        assert!(!view.editing);
+        assert_eq!(view.answers[1].custom.as_deref(), Some("自定义数据库"));
 
         // Navigate back to tab 0 via BackTab, then forward via Right.
         view.handle_key(key(KeyCode::BackTab));
@@ -1097,15 +1303,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editor_escape_returns_to_choices_and_drop_dismisses_question() {
+    async fn custom_option_supports_direct_typing_and_escape_dismisses() {
         let (mut view, mut rx, _stream) = panel(vec![question(false)]).await;
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
-        assert!(view.editing);
-        assert_eq!(view.handle_key(key(KeyCode::Esc)), KeyResult::Handled);
-        assert!(rx.try_recv().is_err());
-        drop(view);
+        assert!(view.on_custom_option());
+        let (buf, _) = render_lines(&mut view, 60, 16);
+        let (cx, cy) = view.cursor_position().expect("inline cursor");
+        assert!(
+            buf[(cx, cy)].modifier.contains(Modifier::REVERSED),
+            "cursor cell must be visually highlighted"
+        );
+
+        // Type directly without pressing Enter first.
+        for ch in "hi ".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        view.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(view.answers[0].custom.as_deref(), Some("hi !"));
+
+        // Esc dismisses the question panel cleanly.
+        assert_eq!(view.handle_key(key(KeyCode::Esc)), KeyResult::Confirmed);
         assert!(matches!(
             rx.try_recv(),
             Ok(DialogMessage::Question {
@@ -1139,18 +1357,15 @@ mod tests {
         let mut q = question(true);
         q.options.clear();
         let (mut view, mut rx, _stream) = panel(vec![q]).await;
-        view.handle_key(key(KeyCode::Enter));
+        assert!(view.on_custom_option());
         view.handle_paste("first");
-        view.handle_key(key(KeyCode::Enter));
         assert_eq!(view.answers[0].custom.as_deref(), Some("first"));
-        view.handle_key(key(KeyCode::Char(' ')));
+        view.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(view.answers[0].custom.is_none());
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.handle_key(key(KeyCode::Enter)), KeyResult::Handled);
         view.handle_key(key(KeyCode::Up));
-        view.handle_key(key(KeyCode::Enter));
         view.handle_paste("final");
-        view.handle_key(key(KeyCode::Enter));
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.handle_key(key(KeyCode::Enter)), KeyResult::Confirmed);
         let DialogMessage::Question {
@@ -1182,14 +1397,34 @@ mod tests {
         let height = view.desired_height(70).unwrap();
         let (buf, lines) = render_lines(&mut view, 70, height);
 
-        // Unfocused placeholder "Type something." uses muted styling, not accent.
+        // All option numbers (including the custom row) align at the exact same column.
+        let opt1_row = lines
+            .iter()
+            .position(|row| row.contains("SQLite"))
+            .expect("option 1 row");
+        let opt2_row = lines
+            .iter()
+            .position(|row| row.contains("PostgreSQL"))
+            .expect("option 2 row");
         let custom_row = lines
             .iter()
             .position(|row| row.contains("Type something."))
-            .expect("custom row") as u16;
-        let custom_byte = lines[custom_row as usize].find("Type something.").unwrap();
-        let custom_col = lines[custom_row as usize][..custom_byte].chars().count() as u16;
-        assert_eq!(buf[(custom_col, custom_row)].fg, Theme::dark().muted);
+            .expect("custom row");
+        let col_of = |row: usize, needle: &str| {
+            let byte = lines[row].find(needle).unwrap();
+            display_width(&lines[row][..byte])
+        };
+        assert_eq!(col_of(opt1_row, "1."), col_of(opt2_row, "2."));
+        assert_eq!(col_of(opt2_row, "2."), col_of(custom_row, "3."));
+        assert_eq!(col_of(opt1_row, "SQLite"), col_of(opt2_row, "PostgreSQL"));
+        assert_eq!(
+            col_of(opt2_row, "PostgreSQL"),
+            col_of(custom_row, "Type something.")
+        );
+
+        // Unfocused placeholder "Type something." uses muted styling, not accent.
+        let custom_col = col_of(custom_row, "Type something.") as u16;
+        assert_eq!(buf[(custom_col, custom_row as u16)].fg, Theme::dark().muted);
 
         // Clicking the "Region" tab switches directly to tab 1.
         let region_byte = lines[1].find("Region").unwrap();

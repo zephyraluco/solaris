@@ -10,13 +10,7 @@ impl Component for App {
         if self.overlay_open() || self.subagent_terminal.is_some() {
             return None;
         }
-        if let Some(inline) = &self.inline {
-            return inline.cursor_position();
-        }
-        if let Some(question) = &self.question {
-            return question.cursor_position();
-        }
-        self.editor.cursor_position()
+        self.session_page.bottom.cursor_position()
     }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
         if self.subagent_terminal.is_some() {
@@ -49,21 +43,11 @@ impl Component for App {
             return KeyResult::Handled;
         }
 
-        // The inline wizard owns the keyboard while it is up — including
-        // Ctrl+C, which cancels the wizard rather than the application. It only
-        // sees that key when there is nothing to copy.
-        if self.inline.is_some() {
-            self.handle_inline_key(key);
-            return KeyResult::Handled;
-        }
-
-        // An inline question panel above the editor owns keyboard navigation
-        // until answered, dismissed, or cancelled.
-        if let Some(question) = self.question.as_mut() {
-            let result = question.handle_key(key);
-            if result.is_close() || question.is_finished() {
-                self.question = None;
-            }
+        // Peer surfaces in BottomDock (`Inline` wizard / `QuestionPanel`) own
+        // the keyboard while active — including Ctrl+C.
+        if !self.session_page.bottom.is_prompt_active() {
+            let (_, action) = self.session_page.bottom.handle_key(key, false);
+            self.apply_bottom_action(action);
             return KeyResult::Handled;
         }
 
@@ -74,7 +58,7 @@ impl Component for App {
 
         // Ctrl+D is the other half of the same gesture, and only from an empty
         // prompt: with text in it the key belongs to the editor.
-        if self.keybindings.matches("exit", &key) && self.editor.is_empty() {
+        if self.keybindings.matches("exit", &key) && self.session_page.bottom.editor().is_empty() {
             self.confirm_quit('d');
             return KeyResult::Handled;
         }
@@ -96,9 +80,8 @@ impl Component for App {
             return MouseResult::Handled;
         }
         let selected = self.selection.borrow().is_active();
-        let (summary_handled, target) = self.transcript.handle_subagent_mouse(
+        let (summary_handled, target) = self.session_page.transcript.handle_subagent_mouse(
             event,
-            self.last_transcript,
             self.session.scroll,
             selected,
         );
@@ -109,42 +92,18 @@ impl Component for App {
         if summary_handled || tool_handled {
             return MouseResult::Handled;
         }
-        // The wizard only takes mouse events inside its own area; the
-        // transcript keeps scrolling everywhere else.
-        let over_wizard = self
-            .inline
-            .as_ref()
-            .is_some_and(|inline| rect_contains(inline.area(), event.column, event.row));
-        if over_wizard {
-            let outcome = match self.inline.as_mut() {
-                Some(inline) => inline.on_mouse(event),
-                None => return MouseResult::Handled,
-            };
-            match outcome {
-                InlineOutcome::Connect(outcome) => self.apply_connect_outcome(outcome),
-                InlineOutcome::Model(outcome) => self.apply_model_outcome(outcome),
+
+        // Non-prompt peer surfaces (`Inline`, `QuestionPanel`) take mouse
+        // events inside their own area; the transcript above keeps scrolling.
+        if !self.session_page.bottom.is_prompt_active() {
+            let (result, action) = self.session_page.bottom.handle_mouse(event);
+            self.apply_bottom_action(action);
+            if result.is_handled() {
+                return MouseResult::Handled;
             }
-            return MouseResult::Handled;
         }
 
-        // The inline question panel replaces the prompt region and takes mouse
-        // events inside its own area; the transcript above keeps scrolling.
-        let over_question = self.inline.is_none()
-            && self
-                .question
-                .as_ref()
-                .is_some_and(|panel| rect_contains(panel.area(), event.column, event.row));
-        if over_question {
-            if let Some(panel) = self.question.as_mut() {
-                panel.handle_mouse(event);
-                if panel.is_finished() {
-                    self.question = None;
-                }
-            }
-            return MouseResult::Handled;
-        }
-
-        if rect_contains(self.last_transcript, event.column, event.row) {
+        if rect_contains(self.session_page.transcript.area(), event.column, event.row) {
             match event.kind {
                 MouseEventKind::ScrollUp => {
                     self.scroll_transcript(-3);
@@ -157,10 +116,12 @@ impl Component for App {
                 _ => {}
             }
         }
-        if self.inline.is_some() || self.question.is_some() {
+        if !self.session_page.bottom.is_prompt_active() {
             return MouseResult::Ignored;
         }
-        self.editor.handle_mouse(event)
+        let (result, action) = self.session_page.bottom.handle_mouse(event);
+        self.apply_bottom_action(action);
+        result
     }
 
     fn handle_paste(&mut self, text: &str) -> KeyResult {
@@ -210,7 +171,7 @@ impl Component for App {
                     self.notifications.error(error);
                 }
                 (CommandTarget::Clear, Ok(snapshot)) => {
-                    self.question = None;
+                    self.session_page.bottom.clear_question();
                     self.session = SessionState::new();
                     self.session.session_id = snapshot.session_id;
                     self.session.sequence = snapshot.sequence;
@@ -218,18 +179,19 @@ impl Component for App {
                         &self.sessions.agent,
                         snapshot.sequence,
                     );
-                    self.transcript.invalidate();
+                    self.session_page.transcript.invalidate();
                     self.selection.borrow_mut().clear();
                     self.notifications.info("transcript cleared");
                 }
                 (CommandTarget::Clear, Err(error)) => self.notifications.error(error),
                 (CommandTarget::Question(id), Err(error)) => {
                     if self
-                        .question
-                        .as_ref()
+                        .session_page
+                        .bottom
+                        .question()
                         .is_some_and(|panel| panel.request_id() == id)
                     {
-                        self.question = None;
+                        self.session_page.bottom.clear_question();
                     }
                     self.notifications.error(error);
                 }
@@ -318,20 +280,22 @@ impl Component for App {
             self.on_dialog_message(message);
         }
 
-        if self.question.as_ref().is_some_and(|panel| {
+        if self.session_page.bottom.question().is_some_and(|panel| {
             panel.session_id() != self.sessions.agent.snapshot().session_id || panel.is_finished()
         }) {
-            self.question = None;
+            self.session_page.bottom.clear_question();
             dirty = true;
         }
-        if self.question.is_none()
+        if self.session_page.bottom.question().is_none()
             && let Some(request) = self.sessions.agent.pending_questions().into_iter().next()
         {
-            self.question = Some(crate::tui::view::question::QuestionPanel::new(
-                request,
-                Arc::clone(&self.sessions.agent),
-                &self.theme,
-                self.dialog_tx.clone(),
+            self.session_page.bottom.set_question(Some(
+                crate::tui::view::question::QuestionPanel::new(
+                    request,
+                    Arc::clone(&self.sessions.agent),
+                    &self.theme,
+                    self.dialog_tx.clone(),
+                ),
             ));
             dirty = true;
         }

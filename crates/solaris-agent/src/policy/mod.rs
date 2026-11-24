@@ -92,6 +92,11 @@ impl Approver for PolicyApprover {
             return Approval::Denied;
         }
         if self.rules.is_empty() {
+            // `question` is an interactive user prompt rather than a workspace
+            // side effect, so it runs directly unless an explicit rule overrides it.
+            if call.name == "question" {
+                return Approval::Approved;
+            }
             return if self.profile == PolicyProfile::Trusted
                 || (self.profile == PolicyProfile::Ask && !read_only)
             {
@@ -141,15 +146,15 @@ impl Approver for PolicyApprover {
                     && path_rule_matches(&call.name, &rule.resource, &resource)
             })
             .map(|r| r.effect)
-            .unwrap_or(
-                if self.profile == PolicyProfile::Trusted
-                    || (self.profile == PolicyProfile::Ask && !read_only)
-                {
-                    PermissionEffect::Ask
-                } else {
-                    PermissionEffect::Allow
-                },
-            );
+            .unwrap_or(if call.name == "question" {
+                PermissionEffect::Allow
+            } else if self.profile == PolicyProfile::Trusted
+                || (self.profile == PolicyProfile::Ask && !read_only)
+            {
+                PermissionEffect::Ask
+            } else {
+                PermissionEffect::Allow
+            });
         match effect {
             PermissionEffect::Allow => Approval::Approved,
             PermissionEffect::Deny => Approval::Denied,

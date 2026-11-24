@@ -10,7 +10,7 @@
 //! command but one per skill, so the table carries the `skill:` prefix alone and
 //! [`hints`] expands it into a row per skill for the editor.
 
-use solaris_agent::{Skill, Skills};
+use solaris_agent::Skills;
 use solaris_tui::components::editor::CommandHint;
 
 /// What an invocation is written as: `/skill:<name>`.
@@ -87,13 +87,8 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "skills",
-        description: "List the skills available",
+        description: "Select a skill",
         args: "",
-    },
-    SlashCommandSpec {
-        name: SKILL_PREFIX,
-        description: "Load a skill's instructions",
-        args: "<name> [request]",
     },
     SlashCommandSpec {
         name: "clear",
@@ -171,40 +166,13 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 
 /// Completion hints for the editor's slash-command popup.
 ///
-/// The `skill:` entry is left out here even though `/help` carries
-/// it: a placeholder for a name the editor can list itself is worse than the
-/// names. Typing `/skill` offers every skill by name, with what it is for and
-/// where it came from, and picking one completes the whole invocation.
-pub fn hints(skills: &Skills) -> Vec<CommandHint> {
-    let mut hints: Vec<CommandHint> = PROMPT_SLASH_COMMANDS
+/// Only top-level slash commands (including `/skills`) are shown here; choosing
+/// `/skills` opens the inline skill picker to insert `@<skill> `.
+pub fn hints(_skills: &Skills) -> Vec<CommandHint> {
+    PROMPT_SLASH_COMMANDS
         .iter()
-        .filter(|spec| spec.name != SKILL_PREFIX)
         .map(|spec| CommandHint::new(spec.name, spec.description, spec.args))
-        .collect();
-    hints.extend(skills.iter().map(skill_hint));
-    hints
-}
-
-/// One skill as a completion row.
-///
-/// The badge comes first so the descriptions line up behind it, and the
-/// invocation carries an `args`, which is what makes the editor leave a space
-/// after it for the request.
-fn skill_hint(skill: &Skill) -> CommandHint {
-    CommandHint::new(
-        format!("{SKILL_PREFIX}{}", skill.name()),
-        format!(
-            "[{}] {}{}",
-            skill.source().badge(),
-            skill.description_inline(),
-            if skill.disable_model_invocation() {
-                " (explicit only)"
-            } else {
-                ""
-            }
-        ),
-        "[request]",
-    )
+        .collect()
 }
 
 #[cfg(test)]
@@ -260,38 +228,23 @@ mod tests {
     }
 
     #[test]
-    fn hints_cover_every_command_that_is_not_a_skill() {
-        let hints = hints(&Skills::empty());
-        let expected: Vec<&SlashCommandSpec> = PROMPT_SLASH_COMMANDS
-            .iter()
-            .filter(|spec| spec.name != SKILL_PREFIX)
-            .collect();
+    fn hints_only_include_top_level_slash_commands() {
+        let skills = skills_holding("pdf-tools", "Extract text from PDFs.");
+        let hints = hints(&skills);
 
-        assert_eq!(hints.len(), expected.len());
-        for (hint, spec) in hints.iter().zip(expected) {
+        assert_eq!(hints.len(), PROMPT_SLASH_COMMANDS.len());
+        for (hint, spec) in hints.iter().zip(PROMPT_SLASH_COMMANDS) {
             assert_eq!(hint.name, spec.name);
             assert_eq!(hint.description, spec.description);
             assert_eq!(hint.args, spec.args);
         }
-    }
-
-    #[test]
-    fn hints_offer_one_badged_row_per_skill_and_no_placeholder() {
-        let skills = skills_holding("pdf-tools", "Extract text from PDFs.");
-        let hints = hints(&skills);
-
         assert!(
-            hints.iter().all(|hint| hint.name != SKILL_PREFIX),
-            "`skill:` is a prefix, not a row: {:?}",
+            hints
+                .iter()
+                .all(|hint| !hint.name.starts_with(SKILL_PREFIX)),
+            "individual skills must not be expanded into /skill:<name> hints: {:?}",
             hints.iter().map(|hint| &hint.name).collect::<Vec<_>>()
         );
-
-        let hint = hints.last().expect("a row for the skill");
-        assert_eq!(hint.name, "skill:pdf-tools");
-        assert_eq!(hint.description, "[p] Extract text from PDFs.");
-        assert_eq!(
-            hint.args, "[request]",
-            "an args is what makes the editor leave room for the request"
-        );
+        assert!(hints.iter().any(|hint| hint.name == "skills"));
     }
 }

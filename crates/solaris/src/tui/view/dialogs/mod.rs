@@ -6,9 +6,7 @@
 
 pub mod content;
 
-pub use content::{
-    KEY_HELP, buddy_lines, help_lines, skills_lines, skills_lines_for_width, stats_lines,
-};
+pub use content::{KEY_HELP, buddy_lines, help_lines, stats_lines};
 pub use solaris_tui::components::dialog::{
     ChromeLayout, DialogStyles, HINT_CONFIRM, HINT_SELECT, draw_chrome, draw_hint,
 };

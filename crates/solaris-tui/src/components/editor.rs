@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
@@ -27,6 +28,8 @@ const PROMPT: &str = "› ";
 const CONTINUATION: &str = "  ";
 /// Undo depth.
 const MAX_UNDO: usize = 200;
+/// Maximum number of persisted input history entries.
+const MAX_HISTORY: usize = 500;
 
 /// A slash command offered by the editor's completion popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +204,30 @@ impl Editor {
         self.submitted.take()
     }
 
+    /// Replace the input history (oldest first), deduplicating consecutive entries.
+    pub fn set_history(&mut self, entries: Vec<String>) {
+        self.history.clear();
+        for entry in entries {
+            if entry.trim().is_empty() {
+                continue;
+            }
+            if self.history.last().map(String::as_str) != Some(entry.as_str()) {
+                self.history.push(entry);
+            }
+        }
+        if self.history.len() > MAX_HISTORY {
+            let drop_count = self.history.len() - MAX_HISTORY;
+            self.history.drain(0..drop_count);
+        }
+        self.history_cursor = None;
+        self.history_stash = None;
+    }
+
+    /// Recorded input history (oldest first).
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
     /// Add a submitted prompt to the history.
     pub fn push_history(&mut self, entry: impl Into<String>) {
         let entry = entry.into();
@@ -209,6 +236,10 @@ impl Editor {
         }
         if self.history.last().map(String::as_str) != Some(entry.as_str()) {
             self.history.push(entry);
+            if self.history.len() > MAX_HISTORY {
+                let drop_count = self.history.len() - MAX_HISTORY;
+                self.history.drain(0..drop_count);
+            }
         }
         self.history_cursor = None;
         self.history_stash = None;
@@ -251,6 +282,8 @@ impl Editor {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.history_cursor = None;
+        self.history_stash = None;
         self.completion_dismissed = false;
         self.bump();
     }
@@ -604,6 +637,8 @@ impl Editor {
         self.history_cursor = Some(index);
         let entry = self.history[index].clone();
         self.set_text_untracked(&entry);
+        // Keep Up/Down navigating history even when recalling a `/command`.
+        self.completion_dismissed = true;
     }
 
     fn history_next(&mut self) {
@@ -614,6 +649,7 @@ impl Editor {
             self.history_cursor = Some(current + 1);
             let entry = self.history[current + 1].clone();
             self.set_text_untracked(&entry);
+            self.completion_dismissed = true;
         } else {
             self.history_cursor = None;
             let stash = self.history_stash.take().unwrap_or_default();
@@ -736,9 +772,10 @@ impl Component for Editor {
         }
 
         let completion_rows = self.completion_rows();
-        // The frame holds the input alone; the command list is drawn underneath
-        // it. When the area is too short the list gives up rows first, then the
-        // frame shrinks down to its borders and a single text row.
+        // The command list sits above the input frame so the prompt stays
+        // anchored above the status bar. When the area is too short the list
+        // gives up rows first, then the frame shrinks down to its borders and
+        // a single text row.
         let wrap = self.wrap_width(area.width);
         let display = self.build_display(wrap);
         let wanted_text = display.len().clamp(1, MAX_TEXT_ROWS as usize) as u16;
@@ -754,17 +791,17 @@ impl Component for Editor {
             }
         }
 
-        let box_area = Rect {
+        let list_area = Rect {
             x: area.x,
             y: area.y,
             width: area.width,
-            height: box_height,
-        };
-        let list_area = Rect {
-            x: area.x,
-            y: area.y + box_height,
-            width: area.width,
             height: list_rows,
+        };
+        let box_area = Rect {
+            x: area.x,
+            y: area.y + list_rows,
+            width: area.width,
+            height: box_height,
         };
 
         let border_style = if self.focused {
@@ -772,10 +809,14 @@ impl Component for Editor {
         } else {
             self.styles.border
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
+        if let Some(index) = self.history_cursor {
+            let label = format!(" History {}/{} ", index + 1, self.history.len());
+            block = block.title(Line::from(Span::styled(label, self.styles.placeholder)));
+        }
         let inner = block.inner(box_area);
         block.render(box_area, buf);
 
@@ -995,7 +1036,7 @@ impl Component for Editor {
                 KeyResult::Handled
             }
             Up => {
-                if self.cursor_row == 0 && self.lines.len() == 1 {
+                if self.cursor_row == 0 {
                     self.history_prev();
                 } else {
                     self.move_vertical(-1);
@@ -1003,7 +1044,7 @@ impl Component for Editor {
                 KeyResult::Handled
             }
             Down => {
-                if self.cursor_row + 1 == self.lines.len() && self.lines.len() == 1 {
+                if self.cursor_row + 1 == self.lines.len() {
                     self.history_next();
                 } else {
                     self.move_vertical(1);
@@ -1207,6 +1248,21 @@ mod tests {
         assert!(text.contains("/model"), "{text}");
         assert!(text.contains("/mode"), "{text}");
         assert!(!text.contains("/clear"), "popup not filtered:\n{text}");
+
+        // Completion rows appear above the bordered input box.
+        let lines: Vec<&str> = text.lines().collect();
+        let completion_row = lines
+            .iter()
+            .position(|line| line.contains("/model"))
+            .expect("completion row");
+        let box_top_row = lines
+            .iter()
+            .position(|line| line.contains('╭'))
+            .expect("input box top border");
+        assert!(
+            completion_row < box_top_row,
+            "completions must render above the input box:\n{text}"
+        );
     }
 
     #[test]
@@ -1248,8 +1304,8 @@ mod tests {
             let byte = line.find(needle).expect("the description");
             line[..byte].chars().count()
         };
-        let first = text.lines().nth(3).expect("the first row");
-        let second = text.lines().nth(4).expect("the second row");
+        let first = text.lines().next().expect("the first row");
+        let second = text.lines().nth(1).expect("the second row");
         let one = column(first, "show help");
         let two = column(second, "switch model");
 
@@ -1322,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn the_completion_list_is_drawn_below_the_frame() {
+    fn the_completion_list_is_drawn_above_the_frame() {
         let mut editor = Editor::new();
         editor.set_hints(hints());
         type_text(&mut editor, "/");
@@ -1333,14 +1389,14 @@ mod tests {
 
         let text = buffer_text(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        // Frame rows: top border, input, bottom border.
-        assert!(lines[0].starts_with('╭'), "{text}");
-        assert!(lines[1].starts_with("│› /"), "{text}");
-        assert!(lines[2].starts_with('╰'), "{text}");
-        // The list starts under the frame, outside the borders.
-        assert!(lines[3].starts_with("› /help"), "{text}");
-        assert!(lines[4].starts_with("  /theme"), "{text}");
+        // The list sits above the frame, outside the borders.
+        assert!(lines[0].starts_with("› /help"), "{text}");
+        assert!(lines[1].starts_with("  /theme"), "{text}");
         assert!(!text.contains("│› /help"), "{text}");
+        // Frame rows sit below the list: top border, input, bottom border.
+        assert!(lines[5].starts_with('╭'), "{text}");
+        assert!(lines[6].starts_with("│› /"), "{text}");
+        assert!(lines[7].starts_with('╰'), "{text}");
     }
 
     #[test]
@@ -1350,17 +1406,17 @@ mod tests {
         type_text(&mut editor, "/");
 
         // The area is shorter than the popup wants; the frame keeps its borders
-        // and one text row, and the list takes whatever row is left.
+        // and one text row, and the list takes whatever row is left above it.
         let area = Rect::new(0, 0, 40, 4);
         let mut buf = Buffer::empty(area);
         editor.render(&mut buf, area);
 
         let text = buffer_text(&buf);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with('╭'), "{text}");
-        assert!(lines[1].starts_with("│› /"), "{text}");
-        assert!(lines[2].starts_with('╰'), "{text}");
-        assert!(lines[3].contains("/help"), "{text}");
+        assert!(lines[0].contains("/help"), "{text}");
+        assert!(lines[1].starts_with('╭'), "{text}");
+        assert!(lines[2].starts_with("│› /"), "{text}");
+        assert!(lines[3].starts_with('╰'), "{text}");
     }
 
     #[test]

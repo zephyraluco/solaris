@@ -326,17 +326,6 @@ fn app_with_auth_path(path: std::path::PathBuf) -> App {
     App::new(options)
 }
 
-/// An app that persists recent activity to `path`.
-fn app_with_recent_path(path: std::path::PathBuf) -> App {
-    let backend = fake_backend();
-    let quit: QuitFlag = Rc::new(Cell::new(false));
-    let queue: OverlayQueue = Rc::new(RefCell::new(Vec::new()));
-    let flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let mut options = AppOptions::new(backend, Config::default(), quit, queue, flag);
-    options.recent_path = Some(path);
-    App::new(options)
-}
-
 /// An app that persists its preferences to `path`.
 fn app_with_settings_path(path: std::path::PathBuf) -> App {
     let backend = fake_backend();
@@ -587,7 +576,7 @@ fn the_app_opens_straight_into_the_session() {
     for ch in "hi".chars() {
         app.handle_key(key(KeyCode::Char(ch)));
     }
-    assert_eq!(app.editor.text(), "hi");
+    assert_eq!(app.session_page.bottom.editor().text(), "hi");
 }
 
 #[test]
@@ -600,10 +589,6 @@ fn the_empty_transcript_shows_the_welcome_box() {
     assert!(
         text.contains("Tips for getting started"),
         "tip heading missing:\n{text}"
-    );
-    assert!(
-        text.contains("No recent activity"),
-        "activity placeholder missing:\n{text}"
     );
     assert!(text.contains('╭') && text.contains('╯'), "{text}");
 
@@ -654,43 +639,6 @@ fn the_welcome_box_scrolls_away_with_the_first_turn() {
     let text = rendered_text(&mut app, 90, 26);
     assert!(!text.contains("Welcome back!"), "{text}");
     assert!(text.contains("there"), "{text}");
-}
-
-#[tokio::test]
-async fn submitting_a_prompt_records_recent_activity() {
-    let dir = std::env::temp_dir().join("solaris-recent-test");
-    let path = dir.join("recent.json");
-    let _ = std::fs::remove_file(&path);
-
-    let mut app = app_with_recent_path(path.clone());
-    app.submit("  fix the parser\nand the lexer  ".to_string());
-
-    assert_eq!(app.recent.len(), 1);
-    assert_eq!(app.recent.entries()[0].label, "fix the parser");
-
-    app.poll_io(true);
-    let saved = std::fs::read_to_string(&path).expect("recent file");
-    let reloaded = RecentActivity::from_json(&saved).expect("valid json");
-    assert_eq!(reloaded.entries()[0].label, "fix the parser");
-
-    // Slash commands are not activity.
-    app.submit("/stats".to_string());
-    assert_eq!(app.recent.len(), 1);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn the_recent_list_appears_in_the_welcome_box() {
-    let mut app = app();
-    app.recent.record("fix the parser", recent::now_ms());
-    app.recent.record("add the welcome box", recent::now_ms());
-
-    let text = rendered_text(&mut app, 90, 26);
-    assert!(text.contains("Recent activity"), "{text}");
-    assert!(text.contains("fix the parser"), "{text}");
-    assert!(text.contains("just now"), "{text}");
-    assert!(!text.contains("No recent activity"), "{text}");
 }
 
 #[test]
@@ -918,7 +866,7 @@ fn the_model_command_opens_the_inline_picker() {
     // It takes the prompt region like `/connect`, and leaves the overlay
     // stack alone.
     assert!(app.overlay_queue.borrow().is_empty());
-    assert!(app.inline.is_some());
+    assert!(app.session_page.bottom.inline().is_some());
     let text = rendered_text(&mut app, 80, 24);
     assert!(text.contains("Select a model:"), "{text}");
     assert!(text.contains(current.as_str()), "{text}");
@@ -932,7 +880,10 @@ fn the_model_command_opens_the_inline_picker() {
     // The active model is the highlighted row, so Enter keeps it.
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.model(), current);
-    assert!(app.inline.is_none(), "the picker stayed open");
+    assert!(
+        app.session_page.bottom.inline().is_none(),
+        "the picker stayed open"
+    );
 }
 
 #[test]
@@ -942,7 +893,7 @@ fn a_model_picker_with_nothing_connected_says_so() {
 
     // Nothing to choose between, so the picker stays shut and the notice
     // says what to do about it.
-    assert!(app.inline.is_none());
+    assert!(app.session_page.bottom.inline().is_none());
     let (kind, text) = app.notifications.current().expect("a notice was shown");
     assert_eq!(kind, NoticeKind::Warning);
     assert!(text.contains("/connect"), "{text}");
@@ -968,7 +919,10 @@ fn the_inline_model_picker_switches_the_model() {
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.model(), names[(start + 1) % names.len()]);
-    assert!(app.inline.is_none(), "the picker stayed open");
+    assert!(
+        app.session_page.bottom.inline().is_none(),
+        "the picker stayed open"
+    );
 }
 
 #[test]
@@ -980,7 +934,7 @@ fn escaping_the_model_picker_keeps_the_model() {
     app.handle_key(key(KeyCode::Esc));
 
     assert_eq!(app.model(), current);
-    assert!(app.inline.is_none());
+    assert!(app.session_page.bottom.inline().is_none());
 }
 
 #[test]
@@ -1179,7 +1133,7 @@ async fn a_declined_prompt_denies_the_call() {
 }
 
 #[tokio::test]
-async fn stacked_approval_dialogs_resolve_their_own_tool_even_out_of_order_and_on_dismiss() {
+async fn inline_approval_panels_queue_in_bottom_dock_without_opening_dialogs() {
     let mut app = app();
     let (first_reply, first_answer) = oneshot::channel();
     let (second_reply, second_answer) = oneshot::channel();
@@ -1192,31 +1146,39 @@ async fn stacked_approval_dialogs_resolve_their_own_tool_even_out_of_order_and_o
         reply: second_reply,
     });
     assert_eq!(app.pending_approvals.len(), 2);
-
-    // Pop the top (second) dialog first as the LIFO overlay stack does, approve it,
-    // then drop the bottom (first) dialog without answering (simulating outside click).
-    let mut overlays = app.overlay_queue.borrow_mut().drain(..).collect::<Vec<_>>();
-    assert_eq!(overlays.len(), 2);
-    let (mut top_second, _) = overlays.pop().unwrap();
-    let (bottom_first, _) = overlays.pop().unwrap();
-
-    assert_eq!(
-        top_second.handle_key(key(KeyCode::Char('y'))),
-        KeyResult::Confirmed
+    assert!(
+        app.overlay_queue.borrow().is_empty(),
+        "tool approvals must render inline in BottomDock, not as modal overlays"
     );
-    drop(top_second);
-    drop(bottom_first);
-    app.tick();
 
+    // First queued approval renders inline and replaces the editor + status bar.
+    let first_frame = rendered_text(&mut app, 80, 14);
+    assert!(first_frame.contains("Run write?"), "{first_frame}");
+    assert!(first_frame.contains("Yes"), "{first_frame}");
+    assert!(first_frame.contains("No"), "{first_frame}");
+    assert!(
+        !first_frame.contains("Ask anything"),
+        "approval panel must replace the prompt editor:\n{first_frame}"
+    );
+
+    // Approve first via inline keyboard shortcut (`y`); second immediately appears.
+    app.handle_key(key(KeyCode::Char('y')));
     assert_eq!(
-        second_answer.await.expect("second answered"),
+        first_answer.await.expect("first answered"),
         Approval::Approved
     );
+    let second_frame = rendered_text(&mut app, 80, 14);
+    assert!(second_frame.contains("Run bash?"), "{second_frame}");
+
+    // Decline second with Esc; prompt container returns cleanly.
+    app.handle_key(key(KeyCode::Esc));
     assert_eq!(
-        first_answer.await.expect("first denied on drop"),
+        second_answer.await.expect("second declined"),
         Approval::Denied
     );
     assert!(app.pending_approvals.is_empty());
+    let restored = rendered_text(&mut app, 80, 14);
+    assert!(restored.contains("Ask anything"), "{restored}");
 }
 
 #[test]
@@ -1436,7 +1398,10 @@ fn child_title_click_opens_terminal_and_escape_restores_main_view() {
     assert!(!app.session.turns[1].steps[0].disclosure.is_expanded());
     let main_scroll = app.session.scroll;
     let main_follow = app.session.follow_end;
-    app.editor.set_text("unfinished prompt");
+    app.session_page
+        .bottom
+        .editor_mut()
+        .set_text("unfinished prompt");
     app.handle_mouse(pointer(MouseEventKind::Down(MouseButton::Left), 2));
     app.handle_mouse(pointer(MouseEventKind::Up(MouseButton::Left), 2));
     assert_eq!(app.subagent_terminal.as_ref().unwrap().target, (1, 0));
@@ -1483,8 +1448,8 @@ fn arrow_keys_cycle_child_terminals_across_turns_without_editing_the_prompt() {
     app.handle_paste("should not reach the main prompt");
     app.handle_key(key(KeyCode::Char('x')));
     app.handle_key(key(KeyCode::Esc));
-    assert!(app.editor.is_empty());
-    app.editor.set_text("draft");
+    assert!(app.session_page.bottom.editor().is_empty());
+    app.session_page.bottom.editor_mut().set_text("draft");
     app.handle_key(key(KeyCode::Left));
     assert!(app.subagent_terminal.is_none());
 }
@@ -1705,7 +1670,7 @@ fn expanding_tool_disclosures_at_the_viewport_bottom_reveals_their_bodies() {
         assert!(app.session.scroll > 0);
         let title = if shell { "Shell:" } else { "Explored:" };
         let row = text.lines().position(|line| line.contains(title)).unwrap() as u16;
-        assert_eq!(row, app.last_transcript.bottom() - 1);
+        assert_eq!(row, app.session_page.transcript.area().bottom() - 1);
         for kind in [
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
@@ -1859,8 +1824,8 @@ fn footer_shows_context_percentage_bar_with_status_colors() {
         out
     };
 
-    // Zero context tokens renders 0% with 10 light shade blocks in success colour,
-    // without raw token count or cost.
+    // Zero context tokens renders a ratatui Gauge with 0% label, surface track,
+    // and no dotted blocks, raw token count, or cost.
     app.session.context = solaris_agent::ContextUsage {
         tokens: Some(0),
         window: 1000,
@@ -1870,72 +1835,105 @@ fn footer_shows_context_percentage_bar_with_status_colors() {
     app.render(&mut buf, area);
     let footer = read_row(&buf, area.height - 1);
     assert!(
-        footer.contains("上下文 ░░░░░░░░░░ 0%"),
+        footer.contains("上下文") && footer.contains("0%"),
         "unexpected empty context gauge: {footer:?}"
     );
     assert!(
-        !footer.contains("tok"),
-        "raw token counter should be gone: {footer:?}"
+        !footer.contains('░') && !footer.contains("tok") && !footer.contains('$'),
+        "dotted bar, raw token counter, and cost should be absent: {footer:?}"
     );
     assert!(
-        !footer.contains('$'),
-        "cost should only be shown in /stats: {footer:?}"
+        (0..area.width).any(|x| buf[(x, area.height - 1)].bg == app.theme.surface),
+        "gauge track should use surface background"
     );
-    let empty_bar_x = (0..area.width)
-        .find(|&x| buf[(x, area.height - 1)].symbol() == "░")
-        .expect("empty bar cell");
-    assert_eq!(buf[(empty_bar_x, area.height - 1)].fg, app.theme.success);
 
-    // 50% fills half the bar in success colour.
-    app.session.context.tokens = Some(500);
-    let mut buf = Buffer::empty(area);
-    app.render(&mut buf, area);
-    let footer = read_row(&buf, area.height - 1);
-    assert!(
-        footer.contains("上下文 █████░░░░░ 50%"),
-        "unexpected 50% context gauge: {footer:?}"
-    );
-    let bar_x = (0..area.width)
-        .find(|&x| buf[(x, area.height - 1)].symbol() == "█")
-        .expect("filled bar cell");
-    assert_eq!(buf[(bar_x, area.height - 1)].fg, app.theme.success);
-
-    // 75% switches to warning colour; 92% switches to error colour.
-    for (tokens, expected, expected_fg) in [
-        (750, "上下文 ████████░░ 75%", app.theme.warning),
-        (920, "上下文 █████████░ 92%", app.theme.error),
+    // 50%, 75%, and 92% render the Gauge label and status colour (success / warning / error).
+    for (tokens, expected_pct, expected_color) in [
+        (500, "50%", app.theme.success),
+        (750, "75%", app.theme.warning),
+        (920, "92%", app.theme.error),
     ] {
         app.session.context.tokens = Some(tokens);
         let mut buf = Buffer::empty(area);
         app.render(&mut buf, area);
         let footer = read_row(&buf, area.height - 1);
-        assert!(footer.contains(expected), "{footer:?}");
-        let bar_x = (0..area.width)
-            .find(|&x| buf[(x, area.height - 1)].symbol() == "█")
-            .expect("filled bar cell");
-        assert_eq!(buf[(bar_x, area.height - 1)].fg, expected_fg);
+        assert!(footer.contains(expected_pct), "{footer:?}");
+        assert!(
+            (0..area.width).any(|x| {
+                let cell = &buf[(x, area.height - 1)];
+                cell.bg == expected_color || cell.fg == expected_color
+            }),
+            "gauge fill should use {expected_color:?} for {expected_pct}"
+        );
     }
 }
 
 #[test]
-fn a_notice_wider_than_the_footer_is_ellipsised_not_dropped() {
+fn footer_omits_working_status_and_error_notices() {
     let mut app = app();
-    app.notifications.warning(
-        "the provider listed no models — check its URL in /connect, or name one with \
-             /model <name>",
-    );
+    app.session.turns.push(Turn {
+        prompt: "hi".into(),
+        ..Turn::default()
+    });
+    app.session.status = Some("working".into());
+    app.notifications.error("boom");
 
-    // Narrower than the notice: the facts give way, and the message is cut
-    // short rather than hidden — it is the only place the failure is said.
-    let area = Rect::new(0, 0, 40, 8);
+    let area = Rect::new(0, 0, 100, 8);
     let mut buf = Buffer::empty(area);
     app.render(&mut buf, area);
 
-    let footer: String = (0..area.width)
-        .map(|x| buf[(x, area.height - 1)].symbol())
-        .collect();
-    assert!(footer.starts_with("! the provider listed no"), "{footer:?}");
-    assert!(footer.ends_with('…'), "{footer:?}");
+    let mut footer = String::new();
+    let mut x = 0u16;
+    while x < area.width {
+        let sym = buf[(x, area.height - 1)].symbol();
+        footer.push_str(sym);
+        x += (display_width(sym).max(1)) as u16;
+    }
+    assert!(!footer.contains("working"), "{footer:?}");
+    assert!(!footer.contains("boom"), "{footer:?}");
+    assert!(footer.contains(keymap::FOOTER_HINT), "{footer:?}");
+}
+
+#[test]
+fn global_command_history_persists_across_sessions_and_navigates_with_up_down() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let history_path = dir.path().join("history.json");
+
+    let mut options = app_options();
+    options.history_path = Some(history_path.clone());
+    let mut first = App::new(options);
+    first.submit("随便问我几个问题".to_string());
+    first.submit("/theme".to_string());
+    first.poll_io(true);
+
+    let loaded = crate::application::startup::load_history(Some(&history_path));
+    assert_eq!(loaded, vec!["随便问我几个问题", "/theme"]);
+
+    let mut second_options = app_options();
+    second_options.history = loaded;
+    second_options.history_path = Some(history_path);
+    let mut second = App::new(second_options);
+
+    // Up recalls `/theme` without hijacking Up/Down for slash completion.
+    second.handle_key(key(KeyCode::Up));
+    assert_eq!(second.session_page.bottom.editor().text(), "/theme");
+    let frame = rendered_text(&mut second, 80, 12);
+    assert!(frame.contains("History 2/2"), "{frame}");
+
+    // Second Up recalls the earlier prompt.
+    second.handle_key(key(KeyCode::Up));
+    assert_eq!(
+        second.session_page.bottom.editor().text(),
+        "随便问我几个问题"
+    );
+    let frame = rendered_text(&mut second, 80, 12);
+    assert!(frame.contains("History 1/2"), "{frame}");
+
+    // Down steps forward again, then back to empty draft.
+    second.handle_key(key(KeyCode::Down));
+    assert_eq!(second.session_page.bottom.editor().text(), "/theme");
+    second.handle_key(key(KeyCode::Down));
+    assert_eq!(second.session_page.bottom.editor().text(), "");
 }
 
 // ------------------------------------------------------------- /connect
@@ -1953,7 +1951,9 @@ fn chatgpt_credential() -> Credential {
 fn connect_chatgpt_for_test(app: &mut App) {
     let mut flow = ConnectFlow::new(&app.theme);
     flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
-    app.inline = Some(Inline::Connect(flow));
+    app.session_page
+        .bottom
+        .set_inline(Some(Inline::Connect(flow)));
     app.finish_connect("openai".into(), "OpenAI".into(), Some(chatgpt_credential()));
 }
 
@@ -2039,7 +2039,9 @@ async fn browser_authorization_completion_stores_credentials_and_opens_model_pic
     let mut app = app();
     let mut flow = ConnectFlow::new(&app.theme);
     flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
-    app.inline = Some(Inline::Connect(flow));
+    app.session_page
+        .bottom
+        .set_inline(Some(Inline::Connect(flow)));
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = tx.send(Ok(chatgpt_credential()));
@@ -2083,7 +2085,9 @@ async fn cancelling_browser_authorization_discards_late_credentials() {
     let mut app = app();
     let mut flow = ConnectFlow::new(&app.theme);
     flow.enter_browser_auth("https://auth.openai.com/oauth/authorize".into());
-    app.inline = Some(Inline::Connect(flow));
+    app.session_page
+        .bottom
+        .set_inline(Some(Inline::Connect(flow)));
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(std::future::pending());
     app.connection.oauth = Some(OAuthPending {
@@ -2370,7 +2374,7 @@ async fn ctrl_v_pastes_the_clipboard_into_the_prompt() {
 
     app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
 
-    assert_eq!(app.editor.text(), "pasted text");
+    assert_eq!(app.session_page.bottom.editor().text(), "pasted text");
 }
 
 #[test]
@@ -2446,8 +2450,15 @@ async fn a_blank_cell_survives_a_copy_then_paste_round_trip() {
     // Paste them back: the prompt holds the blanks, invisible as they are.
     app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
 
-    assert_eq!(app.editor.text(), "  ", "the blanks did not round-trip");
-    assert!(!app.editor.is_empty(), "the prompt still counts as empty");
+    assert_eq!(
+        app.session_page.bottom.editor().text(),
+        "  ",
+        "the blanks did not round-trip"
+    );
+    assert!(
+        !app.session_page.bottom.editor().is_empty(),
+        "the prompt still counts as empty"
+    );
 }
 
 #[tokio::test]
@@ -2468,7 +2479,10 @@ async fn an_empty_clipboard_says_so() {
 
     app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
 
-    assert!(app.editor.is_empty(), "something was pasted");
+    assert!(
+        app.session_page.bottom.editor().is_empty(),
+        "something was pasted"
+    );
     assert!(
         rendered_text(&mut app, 60, 12).contains("clipboard is empty"),
         "an empty clipboard went unmentioned"
@@ -2634,10 +2648,13 @@ fn ctrl_c_clears_the_prompt_before_it_means_quit() {
     for ch in "half typed".chars() {
         app.handle_key(key(KeyCode::Char(ch)));
     }
-    assert!(!app.editor.is_empty());
+    assert!(!app.session_page.bottom.editor().is_empty());
 
     app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(app.editor.is_empty(), "the prompt survived");
+    assert!(
+        app.session_page.bottom.editor().is_empty(),
+        "the prompt survived"
+    );
     assert!(!app.quit.get());
 }
 
@@ -2657,7 +2674,7 @@ fn ctrl_d_only_quits_from_an_empty_prompt() {
     typing.handle_key(ctrl_d);
     typing.handle_key(ctrl_d);
     assert!(!typing.quit.get());
-    assert_eq!(typing.editor.text(), "x");
+    assert_eq!(typing.session_page.bottom.editor().text(), "x");
 }
 
 #[tokio::test]
@@ -2933,7 +2950,7 @@ async fn failed_reload_preserves_previous_resources() {
 }
 
 #[test]
-fn hidden_skill_is_offered_to_user_but_not_advertised_to_model() {
+fn hidden_skill_is_offered_in_inline_picker_but_not_advertised_to_model() {
     let skills = skills_holding("hidden-completion", "manual", "Manual work", "Body");
     let path = skills.get("manual").expect("skill").path().to_path_buf();
     std::fs::write(
@@ -2942,17 +2959,18 @@ fn hidden_skill_is_offered_to_user_but_not_advertised_to_model() {
     )
     .expect("skill");
     let skills = Skills::load(&[], &[path]);
-    let hints = commands::hints(&skills);
-    assert!(
-        hints
-            .iter()
-            .any(|hint| hint.name == "skill:manual" && hint.description.contains("explicit only"))
-    );
     assert_eq!(skills.visible().count(), 0);
+
+    let mut app = app_with_skills(skills);
+    app.submit("/skills".to_string());
+    assert!(app.overlay_queue.borrow().is_empty());
+    let text = rendered_text(&mut app, 100, 20);
+    assert!(text.contains("manual"), "{text}");
+    assert!(text.contains("explicit only"), "{text}");
 }
 
 #[tokio::test]
-async fn the_skill_prefix_offers_every_skill_by_name() {
+async fn slash_skills_opens_inline_picker_and_inserts_at_mention() {
     let skills = skills_holding(
         "offered",
         "pdf-tools",
@@ -2961,20 +2979,32 @@ async fn the_skill_prefix_offers_every_skill_by_name() {
     );
     let mut app = app_with_skills(skills);
 
+    // Typing `/skill` only shows `/skills`, not `/skill:<name>` rows.
     for character in "/skill".chars() {
         app.handle_key(key(KeyCode::Char(character)));
     }
+    let menu = rendered_text(&mut app, 100, 30);
+    assert!(menu.contains("› /skills"), "{menu}");
+    assert!(
+        !menu.contains("/skill:pdf-tools"),
+        "individual skills must not clutter the slash menu:\n{menu}"
+    );
 
-    let text = rendered_text(&mut app, 100, 30);
-    assert!(text.contains("› /skills"), "{text}");
+    // Running `/skills` opens the inline SkillPicker (not a modal overlay).
+    app.handle_key(key(KeyCode::Enter));
     assert!(
-        text.contains("  /skill:pdf-tools [p] Extract text from PDFs."),
-        "every skill is offered, with what it is for and where it came from: {text}"
+        app.overlay_queue.borrow().is_empty(),
+        "/skills must open inline, not as a dialog overlay"
     );
-    assert!(
-        !text.lines().any(|line| line.trim_end() == "› /skill"),
-        "the bare prefix is a prefix, not a row of its own: {text}"
-    );
+    let picker = rendered_text(&mut app, 100, 20);
+    assert!(picker.contains("Select a skill:"), "{picker}");
+    assert!(picker.contains("pdf-tools"), "{picker}");
+    assert!(picker.contains("Extract text from PDFs."), "{picker}");
+
+    // Selecting the skill closes the picker and inserts `@<skill> ` into the editor.
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.session_page.bottom.inline().is_none());
+    assert_eq!(app.session_page.bottom.editor().text(), "@pdf-tools ");
 }
 
 #[test]
@@ -3005,7 +3035,8 @@ fn the_skill_prefix_on_its_own_lists_what_there_is() {
 
     app.submit("/skill:".to_string());
 
-    assert_eq!(app.overlay_queue.borrow().len(), 1);
+    assert!(app.overlay_queue.borrow().is_empty());
+    assert!(app.session_page.bottom.inline().is_some());
     assert!(app.session.turns.is_empty());
 }
 
@@ -3049,8 +3080,11 @@ fn listing_skills_shows_the_ones_that_were_found() {
 
     app.submit("/skills".to_string());
 
-    assert_eq!(app.overlay_queue.borrow().len(), 1);
+    assert!(app.overlay_queue.borrow().is_empty());
+    assert!(app.session_page.bottom.inline().is_some());
     assert_eq!(app.resources.skills.len(), 1);
+    let text = rendered_text(&mut app, 100, 20);
+    assert!(text.contains("pdf-tools"), "{text}");
 }
 
 #[tokio::test]

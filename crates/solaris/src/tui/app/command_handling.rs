@@ -39,17 +39,10 @@ impl App {
         self.config.theme = theme.name.clone();
         self.persist_settings();
         self.theme = theme;
-        self.editor.set_styles(editor_styles(&self.theme));
         self.selection
             .borrow_mut()
             .set_style(self.theme.selection_fg, self.theme.selection_bg);
-        self.transcript.invalidate();
-        if let Some(flow) = self.inline.as_mut() {
-            flow.set_theme(&self.theme);
-        }
-        if let Some(question) = self.question.as_mut() {
-            question.set_theme(&self.theme);
-        }
+        self.session_page.set_theme(&self.theme);
         self.notifications
             .info(format!("theme: {}", self.config.theme));
     }
@@ -98,13 +91,14 @@ impl App {
         // A fresh prompt is the natural point to drop stale banners.
         self.notifications.clear();
 
+        // Persist every submitted prompt and slash command in global history.
+        self.session_page.bottom.editor_mut().push_history(&trimmed);
+        self.persist_history();
+
         if let Some(command) = parse_slash_command(&trimmed) {
             self.execute_command(command);
             return;
         }
-
-        // Only real prompts count as activity, not slash commands.
-        self.record_activity(&trimmed);
 
         if self.session.is_streaming() {
             self.steer(trimmed);

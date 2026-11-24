@@ -2,13 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use solaris::tui::buddy::{Companion, load_soul};
-use solaris::{Config, Mode, Preferences, RecentActivity};
+use solaris::{Config, Mode, Preferences};
 use solaris_agent::{ResourcePaths, ResourceSnapshot, ToolSelection};
 use solaris_provider::{AuthStore, BackendChoice, BackendOptions, choose_backend, provider_spec};
 
 use solaris::application::{
     resources::read_mcp_config,
-    startup::{config_dir, home_dir, load_auth, load_recent, load_settings, user_id},
+    startup::{config_dir, home_dir, load_auth, load_history, load_settings, user_id},
 };
 
 use super::Args;
@@ -19,8 +19,8 @@ pub(super) struct Startup {
     pub(super) auth_path: Option<PathBuf>,
     pub(super) buddy: Companion,
     pub(super) buddy_path: Option<PathBuf>,
-    pub(super) recent: RecentActivity,
-    pub(super) recent_path: Option<PathBuf>,
+    pub(super) history: Vec<String>,
+    pub(super) history_path: Option<PathBuf>,
     pub(super) settings: Preferences,
     pub(super) settings_path: Option<PathBuf>,
     pub(super) user: String,
@@ -61,13 +61,13 @@ impl Startup {
         let state_dir = config_dir();
         let auth_path = state_dir.as_ref().map(|dir| dir.join("auth.json"));
         let buddy_path = state_dir.as_ref().map(|dir| dir.join("companion.json"));
-        let recent_path = state_dir.as_ref().map(|dir| dir.join("recent.json"));
+        let history_path = state_dir.as_ref().map(|dir| dir.join("history.json"));
         let settings_path = state_dir.as_ref().map(|dir| dir.join("settings.json"));
 
         let mut auth = load_auth(auth_path.as_deref())?;
         let user = user_id();
         let buddy = Companion::new(&user, load_soul(buddy_path.as_deref()));
-        let recent = load_recent(recent_path.as_deref());
+        let history = load_history(history_path.as_deref());
         let settings = load_settings(settings_path.as_deref());
 
         let shell_options = solaris_agent::ShellOptions {
@@ -168,8 +168,8 @@ impl Startup {
             auth_path,
             buddy,
             buddy_path,
-            recent,
-            recent_path,
+            history,
+            history_path,
             settings,
             settings_path,
             user,

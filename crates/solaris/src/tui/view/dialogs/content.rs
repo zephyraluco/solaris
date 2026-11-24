@@ -4,7 +4,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use solaris_tui::theme::Theme;
-use solaris_tui::util::{display_width, pad_to_width, wrap_text};
+use solaris_tui::util::{display_width, pad_to_width};
 
 use crate::tui::buddy::{self, Companion};
 
@@ -92,60 +92,6 @@ pub fn help_lines(
             Span::styled(padding, muted),
             Span::styled(spec.description, text_style),
         ]));
-    }
-
-    lines
-}
-
-/// Default wrap width used by [`skills_lines`] when no viewport width is given.
-const DEFAULT_SKILL_TEXT_WIDTH: usize = 72;
-
-/// Build the skills dialog contents at the default wrap width.
-pub fn skills_lines(skills: &solaris_agent::Skills, theme: &Theme) -> Vec<Line<'static>> {
-    skills_lines_for_width(skills, theme, (DEFAULT_SKILL_TEXT_WIDTH + 4) as u16)
-}
-
-/// Build the skills dialog contents wrapped to fit `content_width`.
-///
-/// A skill the model is not told about is marked, because that is the one thing
-/// about it a reader cannot tell from the list.
-pub fn skills_lines_for_width(
-    skills: &solaris_agent::Skills,
-    theme: &Theme,
-    content_width: u16,
-) -> Vec<Line<'static>> {
-    let heading = Style::default()
-        .fg(theme.heading)
-        .add_modifier(Modifier::BOLD);
-    let name_style = Style::default().fg(theme.accent);
-    let text_style = Style::default().fg(theme.fg);
-    let muted = Style::default().fg(theme.muted);
-    let wrap_width = usize::from(content_width).saturating_sub(4).max(12);
-
-    let mut lines = vec![Line::from(Span::styled("Skills", heading)), Line::default()];
-
-    for skill in skills.iter() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}", skill.name()), name_style),
-            Span::styled(format!("  ({})", skill.source().as_str()), muted),
-        ]));
-
-        for segment in wrap_text(skill.description(), wrap_width) {
-            lines.push(Line::from(Span::styled(
-                format!("    {segment}"),
-                text_style,
-            )));
-        }
-
-        let mut location = skill.path().display().to_string();
-        if skill.disable_model_invocation() {
-            location.push_str("  ·  /skill:<name> only");
-        }
-        for segment in wrap_text(&location, wrap_width) {
-            lines.push(Line::from(Span::styled(format!("    {segment}"), muted)));
-        }
-
-        lines.push(Line::default());
     }
 
     lines
@@ -333,63 +279,6 @@ mod tests {
         }
         assert!(text.contains("ctrl+t"));
         assert!(!text.contains("ctrl+k"));
-    }
-
-    #[test]
-    fn help_lines_write_a_skill_invocation_as_one_word() {
-        let lines = help_lines(&Theme::dark(), crate::tui::commands::PROMPT_SLASH_COMMANDS);
-        let text: String = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("/skill:<name> [request]"), "{text}");
-        assert!(!text.contains("/skill: <name>"), "{text}");
-    }
-
-    #[test]
-    fn skills_lines_name_each_skill_show_its_description_and_mark_the_hidden() {
-        let dir =
-            std::env::temp_dir().join(format!("solaris-dialogs-skills-{}", std::process::id()));
-        let path = dir.join("secret").join("SKILL.md");
-        std::fs::create_dir_all(path.parent().expect("a skill directory")).expect("skills dir");
-        std::fs::write(
-            &path,
-            "---\ndescription: Only on request.\ndisable-model-invocation: true\n---\nBody.\n",
-        )
-        .expect("the skill was written");
-
-        let skills = solaris_agent::Skills::load(
-            &[solaris_agent::SkillRoot::new(
-                &dir,
-                solaris_agent::SkillSource::Project,
-            )],
-            &[],
-        );
-        let lines = skills_lines(&skills, &Theme::dark());
-        let text: String = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("secret"), "{text}");
-        assert!(text.contains("Only on request."), "{text}");
-        assert!(text.contains("project"), "{text}");
-        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(normalized.contains("/skill:<name> only"), "{text}");
-
-        // The file is wrapped, so it is compared with the wrapping taken out.
-        let file = skills
-            .iter()
-            .next()
-            .expect("found")
-            .path()
-            .display()
-            .to_string();
-        let unbroken: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(unbroken.contains(&file), "{text}");
     }
 
     #[test]

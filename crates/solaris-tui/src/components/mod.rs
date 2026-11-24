@@ -38,4 +38,4 @@ pub use select_list::{SelectItem, SelectList};
 pub use spacer::Spacer;
 pub use subagent_summary::{SubagentSummary, SubagentSummaryStatus};
 pub use text::Text;
-pub use welcome::{WelcomeData, WelcomeEntry, WelcomeStyles, render_welcome};
+pub use welcome::{WelcomeData, WelcomeStyles, render_welcome};

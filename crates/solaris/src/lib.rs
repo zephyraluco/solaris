@@ -11,7 +11,6 @@ pub mod tui;
 pub use application::assembly::agent_backend;
 pub use application::config::{Config, Preferences};
 pub use application::connection::BackendFactory;
-pub use application::recent::{RecentActivity, RecentEntry};
 pub use desktop::clipboard::{Clipboard, ClipboardReader, ClipboardWriter};
 pub use tui::app::{App, AppOptions};
 

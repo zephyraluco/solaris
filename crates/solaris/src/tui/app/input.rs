@@ -4,8 +4,8 @@ impl App {
     // ------------------------------------------------------------------- input
 
     pub(super) fn handle_session_key(&mut self, key: KeyEvent) -> KeyResult {
-        if self.inline.is_none()
-            && self.editor.is_empty()
+        if self.session_page.bottom.is_prompt_active()
+            && self.session_page.bottom.editor().is_empty()
             && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Left | KeyCode::Right)
             && !self.subagent_targets().is_empty()
@@ -15,7 +15,7 @@ impl App {
         }
         // Global shortcuts work regardless of the editor contents.
         if self.keybindings.matches("help", &key)
-            || (self.editor.is_empty() && key.code == KeyCode::Char('?'))
+            || (self.session_page.bottom.editor().is_empty() && key.code == KeyCode::Char('?'))
         {
             self.open_help();
             return KeyResult::Handled;
@@ -34,7 +34,7 @@ impl App {
         }
 
         // Transcript scrolling stays available while the editor has focus.
-        let page = self.last_transcript.height.max(1) as i32;
+        let page = self.session_page.transcript.area().height.max(1) as i32;
         match key.code {
             KeyCode::PageUp => {
                 self.scroll_transcript(-page);
@@ -47,24 +47,45 @@ impl App {
             _ => {}
         }
 
-        let result = self.editor.handle_key(key);
-
-        if let Some(text) = self.editor.take_submitted() {
-            self.submit(text);
-            return KeyResult::Handled;
-        }
-
-        if result.is_handled() {
-            return result;
-        }
-
-        // The editor ignores Tab when its completion popup is closed.
-        if self.keybindings.matches("toggle_mode", &key) {
-            self.toggle_mode();
-            return KeyResult::Handled;
-        }
-
+        let is_toggle_mode = self.keybindings.matches("toggle_mode", &key);
+        let (result, action) = self.session_page.bottom.handle_key(key, is_toggle_mode);
+        self.apply_bottom_action(action);
         result
+    }
+
+    pub(super) fn apply_bottom_action(&mut self, action: crate::tui::containers::BottomAction) {
+        use crate::tui::containers::{BottomAction, PromptAction};
+        match action {
+            BottomAction::None | BottomAction::QuestionClosed => {}
+            BottomAction::Prompt(PromptAction::None) => {}
+            BottomAction::Prompt(PromptAction::Submit(text)) => self.submit(text),
+            BottomAction::Prompt(PromptAction::ToggleMode) => self.toggle_mode(),
+            BottomAction::Inline(InlineOutcome::Connect(outcome)) => {
+                self.apply_connect_outcome(outcome)
+            }
+            BottomAction::Inline(InlineOutcome::Model(outcome)) => {
+                self.apply_model_outcome(outcome)
+            }
+            BottomAction::Inline(InlineOutcome::Skill(outcome)) => {
+                self.apply_skill_outcome(outcome)
+            }
+            BottomAction::Approval { id, accepted } => self.resolve_approval(id, accepted),
+        }
+    }
+
+    pub(super) fn apply_skill_outcome(&mut self, outcome: crate::tui::skill::SkillOutcome) {
+        use crate::tui::skill::SkillOutcome;
+        match outcome {
+            SkillOutcome::Handled => {}
+            SkillOutcome::Closed => self.close_inline(),
+            SkillOutcome::Picked { skill_name } => {
+                self.close_inline();
+                self.session_page
+                    .bottom
+                    .editor_mut()
+                    .insert_paste(&format!("@{skill_name} "));
+            }
+        }
     }
 
     pub(super) fn scroll_transcript(&mut self, delta: i32) {
@@ -129,13 +150,7 @@ impl App {
     /// the prompt otherwise. The wizard drops a paste when its current step has
     /// no field, rather than leaking the payload into the prompt behind it.
     pub(super) fn insert_pasted(&mut self, text: &str) {
-        if let Some(flow) = self.inline.as_mut() {
-            flow.insert_paste(text);
-        } else if let Some(question) = self.question.as_mut() {
-            question.handle_paste(text);
-        } else {
-            self.editor.handle_paste(text);
-        }
+        self.session_page.bottom.handle_paste(text);
     }
 
     /// Copy the selection when a range was drawn, reporting whether there was one.
@@ -175,8 +190,8 @@ impl App {
 
         // With nothing running, the prompt is what the key clears — Claude
         // Code and claurst both drop the typed text on the first press.
-        if !self.editor.is_empty() {
-            self.editor.clear();
+        if !self.session_page.bottom.editor().is_empty() {
+            self.session_page.bottom.editor_mut().clear();
         }
         self.confirm_quit('c');
     }

@@ -33,15 +33,16 @@ use solaris_provider::{
 use solaris_tui::component::{Component, KeyResult, MouseResult};
 use solaris_tui::components::editor::{Editor, EditorStyles};
 use solaris_tui::components::select_list::SelectItem;
-use solaris_tui::components::welcome::{WelcomeData, WelcomeEntry};
-use solaris_tui::components::{CollapsibleAction, CollapsibleHit, CollapsibleInteraction};
+use solaris_tui::components::welcome::WelcomeData;
+use solaris_tui::components::{CollapsibleAction, CollapsibleHit};
 use solaris_tui::keys::Keybindings;
-use solaris_tui::layout::{self, Axis, Entry};
 use solaris_tui::overlay::{OverlayOptions, SizeValue};
 use solaris_tui::selection::{Selection, SelectionHandle};
 use solaris_tui::theme::Theme;
 use solaris_tui::tui::{OverlayQueue, QuitFlag};
-use solaris_tui::util::{display_width, rect_contains, truncate_to_width};
+#[cfg(test)]
+use solaris_tui::util::display_width;
+use solaris_tui::util::{rect_contains, truncate_to_width};
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
@@ -49,11 +50,11 @@ use tokio::sync::oneshot;
 
 use crate::application::assembly::{resolve_backend, with_tools};
 use crate::application::config::{Config, Preferences};
-use crate::application::recent::{self, RecentActivity};
 use crate::desktop::clipboard::Clipboard;
 use crate::tui::buddy::{self, Companion, Soul};
 use crate::tui::commands::{self, SKILL_PREFIX, SlashCommand, parse_slash_command};
 use crate::tui::connect::{ConnectFlow, ConnectOutcome, ConnectStep, ConnectSubmit};
+use crate::tui::containers::{SessionContainer, StatusBarState};
 use crate::tui::inline::{Inline, InlineOutcome};
 use crate::tui::keymap;
 use crate::tui::model::{ModelOutcome, ModelPicker};
@@ -62,9 +63,9 @@ use crate::tui::state::ToolStep;
 use crate::tui::state::{NoticeKind, NotificationQueue, SessionState, Turn};
 use crate::tui::view::dialogs::{
     ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog,
-    buddy_lines, help_lines, skills_lines_for_width, stats_lines,
+    buddy_lines, help_lines, stats_lines,
 };
-use crate::tui::view::transcript::{SPINNER, TranscriptView};
+use crate::tui::view::transcript::SPINNER;
 #[cfg(test)]
 use solaris_agent::{Agent, AgentOptions};
 
@@ -121,10 +122,10 @@ pub struct AppOptions {
     pub buddy_path: Option<PathBuf>,
     /// The tip shown under "Tips for getting started".
     pub tip: String,
-    /// Prompts recorded by earlier sessions.
-    pub recent: RecentActivity,
-    /// Where recent activity is persisted; `None` keeps it session-scoped.
-    pub recent_path: Option<PathBuf>,
+    /// Globally persisted input history (oldest first).
+    pub history: Vec<String>,
+    /// Where input history is persisted; `None` keeps it session-scoped.
+    pub history_path: Option<PathBuf>,
     /// What the last session left behind: theme, mode and the model chosen for
     /// its provider.
     pub preferences: Preferences,
@@ -198,8 +199,8 @@ impl AppOptions {
             buddy: Companion::new("solaris", None),
             buddy_path: None,
             tip: crate::tui::tips::select(0).content.to_string(),
-            recent: RecentActivity::new(),
-            recent_path: None,
+            history: Vec::new(),
+            history_path: None,
             preferences: Preferences::default(),
             settings_path: None,
             quit,
@@ -233,10 +234,9 @@ pub struct App {
     pub(crate) theme: Theme,
     pub(crate) session: SessionState,
     pub(crate) notifications: NotificationQueue,
-    transcript: TranscriptView,
+    pub(crate) session_page: SessionContainer,
     /// A child terminal has its own viewport, leaving the main session intact.
     subagent_terminal: Option<SubagentTerminal>,
-    editor: Editor,
     keybindings: Keybindings,
     quit: QuitFlag,
     overlay_queue: OverlayQueue,
@@ -248,9 +248,6 @@ pub struct App {
     dialog_tx: UnboundedSender<DialogMessage>,
     dialog_rx: UnboundedReceiver<DialogMessage>,
     spinner_frame: u16,
-    last_transcript: Rect,
-    /// Shared disclosure interaction; targets identify transcript records.
-    collapsible_mouse: CollapsibleInteraction<(usize, usize, bool)>,
     /// Credentials collected by `/connect`.
     /// Where credentials are saved after a change.
     /// The companion shown in the welcome box and by `/buddy`.
@@ -261,9 +258,8 @@ pub struct App {
     version: String,
     greeting: String,
     tip: String,
-    /// Prompts recorded by earlier sessions, and where they are saved.
-    recent: RecentActivity,
-    recent_path: Option<PathBuf>,
+    /// Where global input history is saved.
+    history_path: Option<PathBuf>,
     /// Theme, mode and model as the last session left them, and where they are
     /// saved.
     preferences: Preferences,
@@ -273,8 +269,6 @@ pub struct App {
     buddy_started: Instant,
     /// Which quit key was pressed first, and when — the two-press quit.
     quit_press: Option<(char, Instant)>,
-    /// The inline `/connect` wizard while it owns the prompt region.
-    inline: Option<Inline>,
     /// Models the active provider reported, once it has reported any. Empty
     /// until then, which is what makes the catalogue the fallback rather than
     /// the only answer.
@@ -305,8 +299,6 @@ pub struct App {
     /// Answers the loop is still waiting for, keyed by approval ID so stacked
     /// overlays can be answered in any order without cross-matching.
     pending_approvals: HashMap<u64, oneshot::Sender<Approval>>,
-    /// Active interactive question panel occupying the prompt region.
-    question: Option<crate::tui::view::question::QuestionPanel>,
 }
 
 impl App {
@@ -322,8 +314,8 @@ impl App {
             buddy,
             buddy_path,
             tip,
-            recent,
-            recent_path,
+            history,
+            history_path,
             preferences,
             settings_path,
             quit,
@@ -391,6 +383,7 @@ impl App {
         let mut editor = Editor::with_placeholder("Ask anything…  /help for commands");
         editor.set_hints(commands::hints(&skills));
         editor.set_styles(editor_styles(&theme));
+        editor.set_history(history);
 
         let sessions = crate::application::session::SessionController::new(agent, runtime);
         let _ = sessions.agent.activate();
@@ -404,6 +397,7 @@ impl App {
         );
         let resources =
             crate::application::resources::ResourceController::new(skills, resource_paths);
+        let session_page = SessionContainer::new(editor, &theme);
         let mut app = Self {
             connection,
             resources,
@@ -414,9 +408,8 @@ impl App {
             theme,
             session: SessionState::new(),
             notifications: NotificationQueue::new(),
-            transcript: TranscriptView::new(),
+            session_page,
             subagent_terminal: None,
-            editor,
             keybindings: keymap::default_bindings(),
             quit,
             overlay_queue,
@@ -426,21 +419,17 @@ impl App {
             dialog_tx,
             dialog_rx,
             spinner_frame: 0,
-            last_transcript: Rect::default(),
-            collapsible_mouse: CollapsibleInteraction::default(),
             buddy,
             buddy_path,
             version,
             greeting,
             tip,
-            recent,
-            recent_path,
+            history_path,
             preferences,
             settings_path,
             buddy_step: 0,
             buddy_started: Instant::now(),
             quit_press: None,
-            inline: None,
             compact_rx: None,
             tools,
             registry,
@@ -451,7 +440,6 @@ impl App {
             approval_rx,
             next_approval_id: 0,
             pending_approvals: HashMap::new(),
-            question: None,
         };
 
         if let Some(journal) = journal {
@@ -477,12 +465,15 @@ impl App {
 
     /// Whether the `/connect` wizard is on screen.
     pub fn connect_open(&self) -> bool {
-        self.inline.as_ref().is_some_and(Inline::is_connect)
+        self.session_page
+            .bottom
+            .inline()
+            .is_some_and(Inline::is_connect)
     }
 
     /// The wizard's current step, when it is open.
     pub fn connect_step(&self) -> Option<ConnectStep> {
-        self.inline.as_ref().and_then(|inline| inline.step())
+        self.session_page.bottom.inline().and_then(Inline::step)
     }
 
     /// The active agent mode.

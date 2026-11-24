@@ -12,6 +12,7 @@ use solaris_tui::theme::Theme;
 
 use super::connect::{ConnectFlow, ConnectOutcome, ConnectStep};
 use super::model::{ModelOutcome, ModelPicker};
+use super::skill::{SkillOutcome, SkillPicker};
 
 /// Which inline surface owns the prompt region.
 ///
@@ -27,19 +28,22 @@ pub(crate) enum Inline {
     Connect(ConnectFlow),
     /// The `/model` picker.
     Model(ModelPicker),
+    /// The `/skills` picker.
+    Skill(SkillPicker),
 }
 
 /// What an inline surface made of an event.
 pub(crate) enum InlineOutcome {
     Connect(ConnectOutcome),
     Model(ModelOutcome),
+    Skill(SkillOutcome),
 }
 
 impl Inline {
     pub(crate) fn cursor_position(&self) -> Option<(u16, u16)> {
         match self {
             Self::Connect(flow) => flow.cursor_position(),
-            Self::Model(_) => None,
+            Self::Model(_) | Self::Skill(_) => None,
         }
     }
 
@@ -50,7 +54,7 @@ impl Inline {
     pub(crate) fn step(&self) -> Option<ConnectStep> {
         match self {
             Self::Connect(flow) => Some(flow.step()),
-            Self::Model(_) => None,
+            Self::Model(_) | Self::Skill(_) => None,
         }
     }
 
@@ -58,6 +62,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => flow.area(),
             Self::Model(picker) => picker.area(),
+            Self::Skill(picker) => picker.area(),
         }
     }
 
@@ -65,6 +70,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => flow.set_theme(theme),
             Self::Model(picker) => picker.set_theme(theme),
+            Self::Skill(picker) => picker.set_theme(theme),
         }
     }
 
@@ -72,6 +78,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => flow.insert_paste(text),
             Self::Model(picker) => picker.insert_paste(text),
+            Self::Skill(picker) => picker.insert_paste(text),
         }
     }
 
@@ -79,6 +86,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => InlineOutcome::Connect(flow.on_key(key)),
             Self::Model(picker) => InlineOutcome::Model(picker.on_key(key)),
+            Self::Skill(picker) => InlineOutcome::Skill(picker.on_key(key)),
         }
     }
 
@@ -86,6 +94,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => InlineOutcome::Connect(flow.on_mouse(mouse)),
             Self::Model(picker) => InlineOutcome::Model(picker.on_mouse(mouse)),
+            Self::Skill(picker) => InlineOutcome::Skill(picker.on_mouse(mouse)),
         }
     }
 
@@ -93,6 +102,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => flow.desired_height(width),
             Self::Model(picker) => picker.desired_height(width),
+            Self::Skill(picker) => picker.desired_height(width),
         }
     }
 
@@ -100,6 +110,7 @@ impl Inline {
         match self {
             Self::Connect(flow) => flow.render(buf, area),
             Self::Model(picker) => picker.render(buf, area),
+            Self::Skill(picker) => picker.render(buf, area),
         }
     }
 

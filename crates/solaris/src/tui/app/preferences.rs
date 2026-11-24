@@ -50,20 +50,16 @@ impl App {
         dirty
     }
 
-    /// Record a submitted prompt and persist the history, best-effort.
-    pub(super) fn record_activity(&mut self, prompt: &str) {
-        self.recent.record(prompt, recent::now_ms());
-        self.persist_recent();
-    }
-
-    fn persist_recent(&mut self) {
-        let Some(path) = self.recent_path.clone() else {
+    /// Persist global input history, best-effort.
+    pub(super) fn persist_history(&mut self) {
+        let Some(path) = self.history_path.clone() else {
             return;
         };
 
-        let json = self.recent.to_json().map_err(|error| error.to_string());
+        let entries = self.session_page.bottom.editor().history().to_vec();
+        let json = serde_json::to_string_pretty(&entries).map_err(|error| error.to_string());
         self.io.submit(move || crate::desktop::Completion::Saved {
-            label: "recent activity",
+            label: "input history",
             result: json.and_then(|json| write_json(&path, &json)),
         });
     }
@@ -118,12 +114,6 @@ impl App {
             hint: "/help for commands  ·  ? for shortcuts".to_string(),
             mascot: buddy::render_lines(&self.buddy.bones, self.buddy_step),
             tip: self.tip.clone(),
-            recent: self
-                .recent
-                .rows(recent::now_ms())
-                .into_iter()
-                .map(|(label, when)| WelcomeEntry { label, when })
-                .collect(),
         }
     }
 

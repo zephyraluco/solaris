@@ -17,18 +17,7 @@ impl App {
             DialogMessage::Confirm {
                 action: ConfirmAction::RunTool(id),
                 accepted,
-            } => {
-                // The loop is still waiting on this answer, so it is sent even
-                // when the prompt was dismissed: a denial is a real answer.
-                if let Some(reply) = self.pending_approvals.remove(&id) {
-                    let answer = if accepted {
-                        Approval::Approved
-                    } else {
-                        Approval::Denied
-                    };
-                    let _ = reply.send(answer);
-                }
-            }
+            } => self.resolve_approval(id, accepted),
             DialogMessage::Confirm {
                 action: ConfirmAction::ClearTranscript,
                 accepted: true,
@@ -48,6 +37,20 @@ impl App {
         self.overlay_queue.borrow_mut().push((component, options));
     }
 
+    pub(super) fn resolve_approval(&mut self, id: u64, accepted: bool) {
+        self.session_page.bottom.remove_approval(id);
+        // The loop is still waiting on this answer, so it is sent even when
+        // the prompt was dismissed: a denial is a real answer.
+        if let Some(reply) = self.pending_approvals.remove(&id) {
+            let answer = if accepted {
+                Approval::Approved
+            } else {
+                Approval::Denied
+            };
+            let _ = reply.send(answer);
+        }
+    }
+
     /// Answer a call the loop is waiting on.
     ///
     /// The policy layer has already decided this call needs confirmation,
@@ -58,17 +61,13 @@ impl App {
         let id = self.next_approval_id;
         self.next_approval_id = self.next_approval_id.wrapping_add(1);
         self.pending_approvals.insert(id, reply);
-        let dialog = ConfirmDialog::new(
-            format!("Run {}?", call.name),
+        let panel = crate::tui::containers::ApprovalPanel::new(
+            id,
+            &call.name,
             describe_call(&call),
-            ConfirmAction::RunTool(id),
             &self.theme,
-            self.dialog_tx.clone(),
         );
-        self.push_overlay(
-            Box::new(dialog),
-            OverlayOptions::centered().width(SizeValue::Percent(64)),
-        );
+        self.session_page.bottom.push_approval(panel);
     }
 
     pub(super) fn open_help(&mut self) {
@@ -88,7 +87,7 @@ impl App {
         );
     }
 
-    /// Show the skills this session found, and where each one lives.
+    /// Open the inline `/skills` picker in `BottomDock`.
     pub(super) fn open_skills(&mut self) {
         if self.resources.skills.is_empty() {
             self.notifications
@@ -96,21 +95,11 @@ impl App {
             return;
         }
 
-        let skills = self.resources.skills.clone();
-        let theme = self.theme.clone();
-        let dialog = TextDialog::reflowable(
-            "Skills",
-            "↑↓ scroll · enter or esc closes",
-            &self.theme,
-            move |width| skills_lines_for_width(&skills, &theme, width),
-            self.dialog_tx.clone(),
-        );
-        self.push_overlay(
-            Box::new(dialog),
-            OverlayOptions::centered()
-                .width(SizeValue::Percent(74))
-                .max_height(SizeValue::Percent(85)),
-        );
+        let picker = crate::tui::skill::SkillPicker::new(&self.theme, &self.resources.skills);
+        self.session_page
+            .bottom
+            .set_inline(Some(Inline::Skill(picker)));
+        self.notifications.clear();
     }
 
     pub(super) fn open_stats(&mut self) {
@@ -180,6 +169,10 @@ impl App {
         }
 
         let name = name.chars().take(24).collect::<String>();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
         self.buddy.soul = Some(Soul::new(
             name.clone(),
             self.buddy
@@ -187,7 +180,7 @@ impl App {
                 .as_ref()
                 .map(|soul| soul.personality.clone())
                 .unwrap_or_default(),
-            recent::now_ms(),
+            now_ms,
         ));
         self.persist_buddy();
         self.notifications.info(format!(

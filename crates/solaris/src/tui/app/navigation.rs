@@ -8,7 +8,7 @@ impl App {
         self.session = SessionState::new();
         self.session.projection = projection;
         self.apply_effects(effects);
-        self.transcript.invalidate();
+        self.session_page.transcript.invalidate();
     }
 
     pub(super) fn recover_projection(&mut self) {
@@ -167,7 +167,7 @@ impl App {
                 self.config = config;
                 self.connection.auth = auth;
                 self.subagent_terminal = None;
-                self.question = None;
+                self.session_page.bottom.clear_question();
                 self.selection.borrow_mut().clear();
                 self.notifications.clear();
                 self.restore_records(records);

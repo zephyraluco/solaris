@@ -25,23 +25,11 @@ pub const BOX_HEIGHT: u16 = 9;
 
 /// Content rows available between the borders.
 const CONTENT_ROWS: usize = BOX_HEIGHT as usize - 2;
-/// Rows the tip may take before it is cut short, so recent activity never gets
-/// pushed out of the box.
-const MAX_TIP_ROWS: usize = 2;
-/// Rows kept for recent activity.
-const MAX_ACTIVITY_ROWS: usize = 2;
+/// Rows the tip may take before it is cut short.
+const MAX_TIP_ROWS: usize = CONTENT_ROWS - 1;
 /// Cells the frame spends on padding and the column divider: `"│ "`, `"│"`,
 /// `" "`, `" "` and `"│"` — everything except the two column widths.
 const CHROME: usize = 6;
-
-/// One line of the "Recent activity" list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WelcomeEntry {
-    /// What was done, already trimmed to a single line.
-    pub label: String,
-    /// How long ago, already formatted ("5m ago").
-    pub when: String,
-}
 
 /// Everything the box displays, free of styling so the app can build it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,8 +46,6 @@ pub struct WelcomeData {
     pub mascot: Vec<String>,
     /// The tip shown under "Tips for getting started".
     pub tip: String,
-    /// Recent activity, newest first.
-    pub recent: Vec<WelcomeEntry>,
 }
 
 /// Colours used while drawing the box.
@@ -217,7 +203,7 @@ fn left_column(data: &WelcomeData, width: usize, styles: &WelcomeStyles) -> Vec<
     rows
 }
 
-/// Tip, then recent activity.
+/// Tips for getting started.
 fn right_column(data: &WelcomeData, width: usize, styles: &WelcomeStyles) -> Vec<Row> {
     let mut rows: Vec<Row> = vec![("Tips for getting started".to_string(), styles.heading)];
     rows.extend(
@@ -226,23 +212,6 @@ fn right_column(data: &WelcomeData, width: usize, styles: &WelcomeStyles) -> Vec
             .take(MAX_TIP_ROWS)
             .map(|line| (line, styles.body)),
     );
-    rows.push((String::new(), styles.body));
-    rows.push(("Recent activity".to_string(), styles.heading));
-
-    if data.recent.is_empty() {
-        rows.push(("No recent activity".to_string(), styles.muted));
-    } else {
-        for entry in data.recent.iter().take(MAX_ACTIVITY_ROWS) {
-            let when = format!(" {}", entry.when);
-            let label_width = width.saturating_sub(display_width(&when)).max(1);
-            let label = pad_to_width(
-                &truncate_to_width(&entry.label, label_width, "…"),
-                label_width,
-            );
-            rows.push((format!("{label}{when}"), styles.muted));
-        }
-    }
-
     rows
 }
 
@@ -288,23 +257,7 @@ mod tests {
                 "  (\")_(\")   ".to_string(),
             ],
             tip: "Tab switches between build and plan mode.".to_string(),
-            recent: Vec::new(),
         }
-    }
-
-    fn with_activity() -> WelcomeData {
-        let mut data = data();
-        data.recent = vec![
-            WelcomeEntry {
-                label: "fix the parser".to_string(),
-                when: "5m ago".to_string(),
-            },
-            WelcomeEntry {
-                label: "add the welcome box".to_string(),
-                when: "2h ago".to_string(),
-            },
-        ];
-        data
     }
 
     fn rendered(data: &WelcomeData, width: u16, height: u16) -> Vec<String> {
@@ -359,14 +312,12 @@ mod tests {
     #[test]
     fn every_row_is_exactly_the_box_width() {
         for width in [MIN_WIDTH, 60, 80, 120, 200] {
-            for data in [data(), with_activity()] {
-                for line in rendered(&data, width, BOX_HEIGHT) {
-                    assert_eq!(
-                        display_width(&line),
-                        width as usize,
-                        "row {line:?} is not {width} cells"
-                    );
-                }
+            for line in rendered(&data(), width, BOX_HEIGHT) {
+                assert_eq!(
+                    display_width(&line),
+                    width as usize,
+                    "row {line:?} is not {width} cells"
+                );
             }
         }
     }
@@ -396,28 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn recent_activity_lists_entries_newest_first() {
-        let text = rendered(&with_activity(), 80, BOX_HEIGHT).join("\n");
-        assert!(text.contains("Recent activity"), "{text}");
-        let first = text.find("fix the parser").expect("newest entry");
-        let second = text.find("add the welcome box").expect("older entry");
-        assert!(first < second, "{text}");
-        assert!(text.contains("5m ago"), "{text}");
-
-        // And without entries the placeholder takes over.
-        let empty = rendered(&data(), 80, BOX_HEIGHT).join("\n");
-        assert!(empty.contains("No recent activity"), "{empty}");
-    }
-
-    #[test]
-    fn the_tip_is_wrapped_and_keeps_the_activity_section() {
+    fn the_tip_is_wrapped_without_recent_activity() {
         let mut data = data();
         data.tip = "Start with small features or bug fixes, propose a plan, and verify the edits."
             .to_string();
 
         let text = rendered(&data, 80, BOX_HEIGHT).join("\n");
         assert!(text.contains("Start with small"), "{text}");
-        assert!(text.contains("No recent activity"), "activity kept: {text}");
+        assert!(!text.contains("Recent activity"), "{text}");
     }
 
     #[test]
@@ -460,10 +397,6 @@ mod tests {
         let mut data = data();
         data.tip = "x".repeat(200);
         data.greeting = "Welcome back someone-with-a-very-long-name!".to_string();
-        data.recent = vec![WelcomeEntry {
-            label: "y".repeat(200),
-            when: "3d ago".to_string(),
-        }];
 
         for line in rendered(&data, 60, BOX_HEIGHT) {
             assert_eq!(display_width(&line), 60, "{line:?}");
@@ -500,6 +433,5 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[1].contains("Tips for getting started"), "{lines:?}");
-        assert!(lines[4].contains("Recent activity"), "{lines:?}");
     }
 }

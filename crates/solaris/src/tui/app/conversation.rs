@@ -89,7 +89,9 @@ impl App {
                     .map(|warning| format!("{} — {}", warning.path.display(), warning.message))
                     .collect::<Vec<_>>();
                 self.resources.skills = snapshot.skills.clone();
-                self.editor
+                self.session_page
+                    .bottom
+                    .editor_mut()
                     .set_hints(commands::hints(&self.resources.skills));
                 if diagnostics.is_empty() {
                     self.notifications.info(format!(
@@ -159,14 +161,14 @@ impl App {
 
     pub(super) fn start_turn(&mut self, submitted: String, prompt: String) {
         if self.sessions.runtime_events.is_failed() {
-            self.editor.set_text(&submitted);
+            self.session_page.bottom.editor_mut().set_text(&submitted);
             self.notifications
                 .error("cancel active work and use /clear to restart the event subscription");
             return;
         }
         if self.sessions.navigation.is_pending() || self.sessions.agent.snapshot().task_id.is_some()
         {
-            self.editor.set_text(&submitted);
+            self.session_page.bottom.editor_mut().set_text(&submitted);
             self.notifications
                 .info("wait for the current session operation to finish");
             return;

@@ -1407,7 +1407,6 @@ mod tests {
             hint: "/help for commands".to_string(),
             mascot: vec!["  /\\_/\\".to_string()],
             tip: "Tab switches mode.".to_string(),
-            recent: Vec::new(),
         }
     }
 
@@ -1498,7 +1497,7 @@ mod tests {
         assert!(text.contains("Welcome back zeal!"), "{text}");
         assert!(text.contains("/\\_/\\"), "the companion is missing: {text}");
         assert!(text.contains("Tips for getting started"), "{text}");
-        assert!(text.contains("No recent activity"), "{text}");
+        assert!(text.contains("Tips for getting started"), "{text}");
     }
 
     #[test]

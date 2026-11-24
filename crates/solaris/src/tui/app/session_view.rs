@@ -1,114 +1,51 @@
 //! Solaris terminal layout and input hit targets; no execution lifecycle.
 use super::*;
+
 impl App {
-    /// Render the transcript, the prompt region, and the status footer.
+    /// Render the main session page (`TranscriptContainer` + `BottomDock`).
     pub(super) fn render_session(&mut self, buf: &mut Buffer, area: Rect) {
-        if area.width < 12 || area.height < 4 {
-            self.last_transcript = Rect::default();
-            self.collapsible_mouse.cancel();
-            self.transcript.cancel_subagent_interaction();
-            return;
-        }
-
-        // Active questions take over both the prompt region and the bottom
-        // status footer so the panel's hint line sits flush at the bottom edge.
-        if self.inline.is_none()
-            && let Some(question) = self.question.as_mut()
-        {
-            let max_panel = area.height.saturating_sub(1).max(3);
-            let panel_height = question
-                .desired_height(area.width)
-                .unwrap_or(8)
-                .clamp(3, max_panel);
-            let rows = layout::split(
-                area,
-                Axis::Vertical,
-                &[Entry::auto().grow(1).min(1), Entry::px(panel_height)],
-            );
-
-            self.render_transcript(buf, rows[0]);
-            if let Some(question) = self.question.as_mut() {
-                question.render(buf, rows[1]);
-            }
-            return;
-        }
-
-        let max_editor = area.height.saturating_sub(2).max(3);
-        // Inline flows (`/connect`, `/model`) take over the prompt region
-        // instead of opening an overlay, replacing the input box.
-        let prompt_height = match self.inline.as_mut() {
-            Some(flow) => flow.desired_height(area.width),
-            None => self.editor.desired_height(area.width).unwrap_or(3),
+        let snapshot = self.sessions.agent.snapshot();
+        let context = if self.session.context.window > 0 {
+            self.session.context
+        } else {
+            snapshot.context(self.config.mode)
         };
-        let prompt_height = prompt_height.clamp(3, max_editor);
-
-        let rows = layout::split(
-            area,
-            Axis::Vertical,
-            &[
-                Entry::auto().grow(1).min(1),
-                Entry::px(prompt_height),
-                Entry::px(1),
-            ],
-        );
-
-        self.render_transcript(buf, rows[0]);
-        match self.inline.as_mut() {
-            Some(flow) => flow.render(buf, rows[1]),
-            None => {
-                self.editor.set_focused(!self.overlay_open());
-                self.editor.render(buf, rows[1]);
-            }
-        }
-        self.render_footer(buf, rows[2]);
-    }
-
-    pub(super) fn render_transcript(&mut self, buf: &mut Buffer, area: Rect) {
-        self.last_transcript = area;
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
+        let status_state = StatusBarState {
+            label: snapshot.label,
+            model: snapshot.model,
+            mode: self.config.mode,
+            context,
+            notice: self
+                .notifications
+                .current()
+                .filter(|(kind, _)| *kind != NoticeKind::Error)
+                .map(|(kind, text)| (kind, text.to_string())),
+        };
+        self.session_page
+            .bottom
+            .sync_prompt(status_state, !self.overlay_open());
 
         let spinner = self.session.is_streaming().then_some(self.spinner_frame);
         let welcome = self.welcome_data();
-        let lines = self
-            .transcript
-            .lines(&self.session, area, &self.theme, spinner, &welcome);
-
-        let visible = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(visible);
-
-        if self.session.follow_end {
-            self.session.scroll = max_scroll;
-        }
-        self.session.scroll = self.session.scroll.min(max_scroll);
-        // Re-arm following once the view is back at the bottom.
-        if self.session.scroll >= max_scroll {
-            self.session.follow_end = true;
-        }
-
-        for (row, line) in lines
-            .iter()
-            .skip(self.session.scroll)
-            .take(visible)
-            .enumerate()
-        {
-            buf.set_line(area.x, area.y + row as u16, line, area.width);
-        }
-        self.selection.borrow_mut().set_document(
+        self.session_page.render(
+            buf,
             area,
-            self.session.scroll,
-            self.transcript.document(),
+            &mut self.session,
+            &self.theme,
+            spinner,
+            &welcome,
+            &self.selection,
         );
     }
 
     pub(super) fn handle_collapsible_mouse(&mut self, event: MouseEvent) -> bool {
-        let over_transcript = rect_contains(self.last_transcript, event.column, event.row);
+        let transcript_area = self.session_page.transcript.area();
+        let over_transcript = rect_contains(transcript_area, event.column, event.row);
         let scroll = self
             .subagent_terminal
             .as_ref()
             .map_or(self.session.scroll, |view| view.scroll);
-        let row = scroll + usize::from(event.row.saturating_sub(self.last_transcript.y));
+        let row = scroll + usize::from(event.row.saturating_sub(transcript_area.y));
         let header = over_transcript
             .then(|| match &self.subagent_terminal {
                 Some(view) => view
@@ -116,23 +53,23 @@ impl App {
                     .iter()
                     .find(|header| header.row == row)
                     .copied(),
-                None => self.transcript.collapsible_at(row),
+                None => self.session_page.transcript.collapsible_at(row),
             })
             .flatten();
         let hit = header.map(|header| {
             CollapsibleHit::new(
                 (header.target.0, header.target.1, header.detail),
-                Rect::new(
-                    self.last_transcript.x,
-                    event.row,
-                    self.last_transcript.width,
-                    1,
-                ),
+                Rect::new(transcript_area.x, event.row, transcript_area.width, 1),
                 header.marker_offset,
             )
         });
         let selected = self.selection.borrow().is_active();
-        match self.collapsible_mouse.handle_mouse(event, hit, selected) {
+        match self
+            .session_page
+            .transcript
+            .collapsible_mouse_mut()
+            .handle_mouse(event, hit, selected)
+        {
             CollapsibleAction::Ignored => false,
             CollapsibleAction::Handled => true,
             CollapsibleAction::Toggle((turn, step, detail)) => {
@@ -160,9 +97,9 @@ impl App {
                         // its details, not expand entirely below the screen.
                         let reveal = header
                             .map_or(0, |header| header.body_rows)
-                            .min(usize::from(self.last_transcript.height.saturating_sub(1)));
-                        let end = usize::from(event.row - self.last_transcript.y) + 1 + reveal;
-                        let shift = end.saturating_sub(usize::from(self.last_transcript.height));
+                            .min(usize::from(transcript_area.height.saturating_sub(1)));
+                        let end = usize::from(event.row - transcript_area.y) + 1 + reveal;
+                        let shift = end.saturating_sub(usize::from(transcript_area.height));
                         if let Some(view) = &mut self.subagent_terminal {
                             view.scroll = view.scroll.saturating_add(shift);
                         } else {
@@ -185,163 +122,6 @@ impl App {
             }
         }
     }
-
-    pub(super) fn render_footer(&mut self, buf: &mut Buffer, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let notice = self.notifications.current();
-        let (right, style) = if let Some((kind, text)) = notice {
-            let style = match kind {
-                NoticeKind::Error => Style::default()
-                    .fg(self.theme.error)
-                    .add_modifier(Modifier::BOLD),
-                NoticeKind::Warning => Style::default().fg(self.theme.warning),
-                NoticeKind::Info => Style::default().fg(self.theme.muted),
-            };
-            (format!("{} {} ", kind.marker(), text), style)
-        } else if self.session.is_streaming() {
-            let glyph = SPINNER[self.spinner_frame as usize % SPINNER.len()];
-            let status = self.session.status.as_deref().unwrap_or("working");
-            // Child activity is shown by its summary component.
-            if status.starts_with("subagent ") {
-                (String::new(), Style::default())
-            } else {
-                (
-                    format!("{glyph} {status} "),
-                    Style::default().fg(self.theme.accent),
-                )
-            }
-        } else {
-            (
-                format!("{} ", keymap::FOOTER_HINT),
-                Style::default().fg(self.theme.dim),
-            )
-        };
-
-        // The right slot wins the space it needs; the left one is truncated to
-        // whatever remains so the two never overlap. A notice is shown even
-        // when it is wider than the footer — truncated, because dropping it
-        // would hide the one message that says what just went wrong — while the
-        // standing hint and the spinner give way to the facts beside them.
-        let right_width = display_width(&right) as u16;
-        let show_right = notice.is_some() || right_width + 4 < area.width;
-        let left_budget = if show_right {
-            area.width.saturating_sub(right_width.min(area.width))
-        } else {
-            area.width
-        };
-
-        // The model slot disappears while no model is named, so the footer
-        // never shows an empty gap between two separators.
-        let snapshot = self.sessions.agent.snapshot();
-        let muted = Style::default().fg(self.theme.muted);
-        let context = if self.session.context.window > 0 {
-            self.session.context
-        } else {
-            snapshot.context(self.config.mode)
-        };
-        let (gauge, gauge_style) = context_gauge(context, &self.theme);
-        let mut prefix_facts = vec![snapshot.label];
-        if !snapshot.model.is_empty() {
-            prefix_facts.push(snapshot.model);
-        }
-        prefix_facts.push(self.config.mode.label().to_string());
-        let segments = [
-            (format!(" {} · 上下文 ", prefix_facts.join(" · ")), muted),
-            (gauge, gauge_style),
-            (" ".to_string(), muted),
-        ];
-        draw_footer_segments(buf, area.x, area.y, left_budget as usize, &segments, muted);
-
-        if show_right {
-            let width = right_width.min(area.width);
-            buf.set_string(
-                area.x + area.width - width,
-                area.y,
-                truncate_to_width(&right, width as usize, "…"),
-                style,
-            );
-        }
-    }
-}
-
-const CONTEXT_BAR_WIDTH: usize = 10;
-
-/// Format the context usage gauge (`░░░░░░░░░░ 0%`) and pick its status colour.
-fn context_gauge(context: solaris_agent::ContextUsage, theme: &Theme) -> (String, Style) {
-    let ratio = if context.window == 0 {
-        0.0
-    } else {
-        f64::from(context.tokens.unwrap_or(0)) / f64::from(context.window)
-    };
-    let percent = (ratio * 100.0).round().max(0.0) as u32;
-    let filled = ((ratio.clamp(0.0, 1.0) * CONTEXT_BAR_WIDTH as f64).round() as usize)
-        .min(CONTEXT_BAR_WIDTH);
-    let empty = CONTEXT_BAR_WIDTH - filled;
-    let mut bar = String::with_capacity(CONTEXT_BAR_WIDTH * 3 + 6);
-    for _ in 0..filled {
-        bar.push('█');
-    }
-    for _ in 0..empty {
-        bar.push('░');
-    }
-    bar.push(' ');
-    bar.push_str(&format!("{percent}%"));
-
-    let color = if percent >= 90 {
-        theme.error
-    } else if percent >= 70 {
-        theme.warning
-    } else {
-        theme.success
-    };
-    (bar, Style::default().fg(color))
-}
-
-fn draw_footer_segments(
-    buf: &mut Buffer,
-    start_x: u16,
-    y: u16,
-    budget: usize,
-    segments: &[(String, Style)],
-    ellipsis_style: Style,
-) {
-    if budget == 0 {
-        return;
-    }
-    let total: usize = segments.iter().map(|(text, _)| display_width(text)).sum();
-    if total <= budget {
-        let mut x = start_x;
-        for (text, style) in segments {
-            buf.set_string(x, y, text, *style);
-            x = x.saturating_add(display_width(text) as u16);
-        }
-        return;
-    }
-
-    let content_budget = budget.saturating_sub(1);
-    let mut used = 0usize;
-    'outer: for (text, style) in segments {
-        let seg_start = used;
-        let mut slice_end = 0usize;
-        for (idx, ch) in text.char_indices() {
-            let ch_width = display_width(&text[idx..idx + ch.len_utf8()]);
-            if used + ch_width > content_budget {
-                if slice_end > 0 {
-                    buf.set_string(start_x + seg_start as u16, y, &text[..slice_end], *style);
-                }
-                break 'outer;
-            }
-            used += ch_width;
-            slice_end = idx + ch.len_utf8();
-        }
-        if slice_end > 0 {
-            buf.set_string(start_x + seg_start as u16, y, &text[..slice_end], *style);
-        }
-    }
-    buf.set_string(start_x + used as u16, y, "…", ellipsis_style);
 }
 
 #[derive(Default)]
@@ -376,8 +156,7 @@ impl App {
             follow_end: true,
             ..Default::default()
         });
-        self.collapsible_mouse.cancel();
-        self.transcript.cancel_subagent_interaction();
+        self.session_page.transcript.cancel_interactions();
         self.selection.borrow_mut().clear();
     }
 
@@ -407,12 +186,12 @@ impl App {
     }
 
     pub(super) fn handle_subagent_key(&mut self, key: KeyEvent) -> KeyResult {
-        let page = i32::from(self.last_transcript.height.max(1));
+        let page = i32::from(self.session_page.transcript.area().height.max(1));
         match key.code {
             KeyCode::Esc => {
                 self.subagent_terminal = None;
-                self.collapsible_mouse.cancel();
-                self.last_transcript = Rect::default();
+                self.session_page.transcript.cancel_collapsible();
+                self.session_page.transcript.set_area(Rect::default());
                 self.selection.borrow_mut().clear();
             }
             KeyCode::Left => self.switch_subagent(false),
@@ -479,7 +258,7 @@ impl App {
             area.width,
             area.height.saturating_sub(2),
         );
-        self.last_transcript = content;
+        self.session_page.transcript.set_area(content);
         let key = (
             crate::tui::view::transcript::TurnKey::from(turn),
             area.width,

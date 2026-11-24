@@ -17,8 +17,7 @@ pub(super) fn print_config(startup: &Startup) -> Result<()> {
         auth_path,
         buddy,
         buddy_path,
-        recent,
-        recent_path,
+        history,
         settings,
         ..
     } = startup;
@@ -108,24 +107,7 @@ pub(super) fn print_config(startup: &Startup) -> Result<()> {
         Some(path) => println!("companion: {}", path.display()),
         None => println!("companion: (unsaved — no config directory)"),
     }
-    match recent_path {
-        Some(path) => println!("recent activity: {}", path.display()),
-        None => println!("recent activity: (unsaved — no config directory)"),
-    }
-    println!(
-        "recent prompts: {}",
-        if recent.is_empty() {
-            "none".to_string()
-        } else {
-            recent
-                .entries()
-                .iter()
-                .map(|entry| entry.label.as_str())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        }
-    );
-    println!("tip: {}", tips::select(recent.len()).content);
+    println!("tip: {}", tips::select(history.len()).content);
     Ok(())
 }
 
