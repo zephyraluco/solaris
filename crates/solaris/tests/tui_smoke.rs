@@ -1082,6 +1082,38 @@ async fn cells_inside_a_dialog_are_selectable_too() {
 }
 
 #[tokio::test]
+async fn ctrl_c_copies_selected_text_inside_a_dialog_without_closing_it() {
+    let (clipboard, copied) = clipboard_for(None);
+    let mut harness = Harness::with_clipboard(clipboard);
+    harness.key(KeyCode::F(1));
+
+    let frame = harness.draw();
+    let row = frame
+        .lines()
+        .position(|line| line.contains("Keyboard"))
+        .expect("help dialog") as u16;
+    let line = frame.lines().nth(row as usize).unwrap();
+    let byte = line.find("Keyboard").unwrap();
+    let col = line[..byte].chars().count() as u16;
+    let end = col + "Keyboard".len() as u16 - 1;
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), end, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), end, row);
+    let _ = harness.draw();
+
+    harness.ctrl('c');
+    harness.tui.tick();
+    let after = harness.draw();
+
+    assert_eq!(copied.borrow().as_slice(), ["Keyboard"]);
+    assert!(
+        after.contains("Keyboard"),
+        "copying must keep the dialog open:\n{after}"
+    );
+}
+
+#[tokio::test]
 async fn mode_toggle_repaints_the_footer() {
     let mut harness = Harness::new();
     assert!(harness.draw().contains("BUILD"));

@@ -1,6 +1,6 @@
 //! Interactive question presentation. Runtime owns request validity and settlement.
-use super::dialogs::{DialogMessage, DialogStyles};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::dialogs::{DialogMessage, DialogStyles, draw_chrome, draw_hint};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -11,13 +11,20 @@ use solaris_agent::{
     QuestionAnswer, QuestionRequest, QuestionResponse, RuntimeCommand, SessionRuntime,
 };
 use solaris_tui::{
-    component::{Component, KeyResult},
+    component::{Component, KeyResult, MouseResult},
     components::editor::Editor,
     theme::Theme,
-    util::wrap_text,
+    util::{rect_contains, wrap_text},
 };
+use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+
+struct QuestionLines {
+    lines: Vec<Line<'static>>,
+    focus: usize,
+    targets: Vec<(usize, Range<usize>)>,
+}
 
 pub struct QuestionDialog {
     request: QuestionRequest,
@@ -30,6 +37,12 @@ pub struct QuestionDialog {
     editor: Editor,
     styles: DialogStyles,
     sender: UnboundedSender<DialogMessage>,
+    content_area: Rect,
+    scroll: u16,
+    max_scroll: u16,
+    manual_scroll: bool,
+    row_targets: Vec<(usize, Range<usize>)>,
+    pressed_target: Option<usize>,
 }
 impl QuestionDialog {
     pub fn new(
@@ -61,6 +74,12 @@ impl QuestionDialog {
             editor,
             styles: DialogStyles::from_theme(theme),
             sender,
+            content_area: Rect::default(),
+            scroll: 0,
+            max_scroll: 0,
+            manual_scroll: false,
+            row_targets: Vec::new(),
+            pressed_target: None,
         }
     }
     fn finish(&mut self, response: QuestionResponse) -> KeyResult {
@@ -84,46 +103,24 @@ impl QuestionDialog {
         }
         self.current += 1;
         self.cursor = 0;
+        self.scroll = 0;
+        self.manual_scroll = false;
         KeyResult::Handled
     }
-}
-impl Component for QuestionDialog {
-    fn is_finished(&self) -> bool {
-        !self.session.is_question_pending(&self.request.request_id)
-    }
-    fn render(&mut self, buf: &mut Buffer, area: Rect) {
-        buf.set_style(area, self.styles.surface);
-        let area = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
+    fn build_lines(&self, width: usize) -> QuestionLines {
         let q = &self.request.questions[self.current];
         let mut lines = Vec::new();
-        let mut add = |text: String, style| {
-            for line in wrap_text(&text, area.width as usize) {
-                lines.push(Line::from(Span::styled(line, style)));
-            }
-        };
-        add(
-            format!(
-                "Waiting for your answer · {} ({}/{})",
-                q.header,
-                self.current + 1,
-                self.request.questions.len()
-            ),
-            self.styles.title,
-        );
-        add(q.question.clone(), self.styles.text);
-        add(String::new(), self.styles.text);
+        let mut targets = Vec::new();
+        for line in wrap_text(&q.question, width) {
+            lines.push(Line::from(Span::styled(line, self.styles.text)));
+        }
+        lines.push(Line::default());
+
         let mut focus = lines.len();
         for (i, o) in q.options.iter().enumerate() {
+            let start = lines.len();
             if i == self.cursor {
-                focus = lines.len();
+                focus = start;
             }
             let checked = if self.answers[self.current].selected.contains(&o.id) {
                 "x"
@@ -136,64 +133,170 @@ impl Component for QuestionDialog {
                 checked,
                 o.label
             );
-            for line in wrap_text(&text, area.width as usize) {
-                lines.push(Line::from(Span::styled(
-                    line,
-                    if i == self.cursor {
-                        self.styles.accent
-                    } else {
-                        self.styles.text
-                    },
-                )));
+            let style = if i == self.cursor {
+                self.styles.accent
+            } else {
+                self.styles.text
+            };
+            for line in wrap_text(&text, width) {
+                lines.push(Line::from(Span::styled(line, style)));
             }
             if !o.description.is_empty() {
-                for line in wrap_text(&format!("    {}", o.description), area.width as usize) {
+                for line in wrap_text(&format!("    {}", o.description), width) {
                     lines.push(Line::from(Span::styled(line, self.styles.muted)));
                 }
             }
+            targets.push((i, start..lines.len()));
         }
         if q.allow_custom {
-            if self.cursor == q.options.len() {
-                focus = lines.len();
+            let target_index = q.options.len();
+            let start = lines.len();
+            let focused = self.cursor == target_index;
+            if focused {
+                focus = start;
             }
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} Custom: {}",
-                    if self.cursor == q.options.len() {
-                        ">"
-                    } else {
-                        " "
-                    },
-                    self.answers[self.current]
-                        .custom
-                        .as_deref()
-                        .unwrap_or("Type your own answer")
-                ),
-                self.styles.accent,
-            )));
+            let style = if focused {
+                self.styles.accent
+            } else {
+                self.styles.text
+            };
+            let text = format!(
+                "{} Custom: {}",
+                if focused { ">" } else { " " },
+                self.answers[self.current]
+                    .custom
+                    .as_deref()
+                    .unwrap_or("Type your own answer")
+            );
+            for line in wrap_text(&text, width) {
+                lines.push(Line::from(Span::styled(line, style)));
+            }
+            targets.push((target_index, start..lines.len()));
         }
         if q.multiple {
-            let selected = self.cursor == q.options.len() + usize::from(q.allow_custom);
-            if selected {
-                focus = lines.len();
+            let target_index = q.options.len() + usize::from(q.allow_custom);
+            let start = lines.len();
+            let focused = self.cursor == target_index;
+            if focused {
+                focus = start;
             }
+            let style = if focused {
+                self.styles.accent
+            } else {
+                self.styles.text
+            };
             lines.push(Line::from(Span::styled(
-                format!("{} Continue", if selected { ">" } else { " " }),
-                self.styles.accent,
+                format!("{} Continue", if focused { ">" } else { " " }),
+                style,
             )));
+            targets.push((target_index, start..lines.len()));
         }
+        QuestionLines {
+            lines,
+            focus,
+            targets,
+        }
+    }
+    fn activate_cursor(&mut self, toggle: bool) -> KeyResult {
+        let q = &self.request.questions[self.current];
+        if self.cursor == q.options.len() && q.allow_custom {
+            if q.multiple && toggle && self.answers[self.current].custom.is_some() {
+                self.answers[self.current].custom = None;
+                return KeyResult::Handled;
+            }
+            self.editor
+                .set_text(self.answers[self.current].custom.as_deref().unwrap_or(""));
+            self.editing = true;
+        } else if q.multiple && self.cursor == q.options.len() + usize::from(q.allow_custom) {
+            return self.next();
+        } else if let Some(o) = q.options.get(self.cursor) {
+            let answer = &mut self.answers[self.current];
+            if !q.multiple {
+                answer.selected = vec![o.id.clone()];
+                answer.custom = None;
+                return self.next();
+            }
+            if toggle {
+                if answer.selected.contains(&o.id) {
+                    answer.selected.retain(|id| id != &o.id);
+                } else {
+                    answer.selected.push(o.id.clone());
+                }
+            } else {
+                return self.next();
+            }
+        }
+        KeyResult::Handled
+    }
+    fn hit_target(&self, column: u16, row: u16) -> Option<usize> {
+        if !rect_contains(self.content_area, column, row) {
+            return None;
+        }
+        let line = usize::from(self.scroll) + usize::from(row.saturating_sub(self.content_area.y));
+        self.row_targets
+            .iter()
+            .find(|(_, range)| range.contains(&line))
+            .map(|(target, _)| *target)
+    }
+}
+impl Component for QuestionDialog {
+    fn is_finished(&self) -> bool {
+        self.submitted || !self.session.is_question_pending(&self.request.request_id)
+    }
+    fn render(&mut self, buf: &mut Buffer, area: Rect) {
+        let q = &self.request.questions[self.current];
+        let title = format!(
+            "Waiting for your answer · {} ({}/{})",
+            q.header,
+            self.current + 1,
+            self.request.questions.len()
+        );
+        let Some(layout) = draw_chrome(buf, area, &title, &self.styles) else {
+            self.content_area = Rect::default();
+            self.row_targets.clear();
+            return;
+        };
+        let content = layout.content;
+        let QuestionLines {
+            lines,
+            focus,
+            targets,
+        } = self.build_lines(content.width.max(1) as usize);
+        self.row_targets = targets;
+
         let editor_height = if self.editing {
-            area.height.saturating_sub(2).min(5)
+            content.height.saturating_sub(1).min(5)
         } else {
             0
         };
-        let height = area.height.saturating_sub(2 + editor_height);
-        let scroll = focus
-            .saturating_sub(height.saturating_sub(1) as usize)
-            .min(u16::MAX as usize) as u16;
-        Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .render(Rect { height, ..area }, buf);
+        let list_height = content.height.saturating_sub(editor_height);
+        self.content_area = Rect {
+            height: list_height,
+            ..content
+        };
+        self.max_scroll = (lines.len() as u16).saturating_sub(list_height);
+        if self.manual_scroll {
+            self.scroll = self.scroll.min(self.max_scroll);
+        } else {
+            self.scroll = focus
+                .saturating_sub(list_height.saturating_sub(1) as usize)
+                .min(self.max_scroll as usize) as u16;
+        }
+        if list_height > 0 {
+            Paragraph::new(lines)
+                .scroll((self.scroll, 0))
+                .render(self.content_area, buf);
+        }
+        if self.editing && editor_height > 0 {
+            self.editor.render(
+                buf,
+                Rect {
+                    y: content.y + list_height,
+                    height: editor_height,
+                    ..content
+                },
+            );
+        }
         let hint = if self.editing {
             "Enter save · Esc back"
         } else if q.multiple {
@@ -201,26 +304,10 @@ impl Component for QuestionDialog {
         } else {
             "↑↓ move · Enter choose · Shift+Tab back · Esc dismiss"
         };
-        if self.editing {
-            self.editor.render(
-                buf,
-                Rect {
-                    y: area.y + height,
-                    height: editor_height,
-                    ..area
-                },
-            );
-        }
-        Paragraph::new(hint).style(self.styles.hint).render(
-            Rect {
-                y: area.y + height + editor_height,
-                height: area.height - height - editor_height,
-                ..area
-            },
-            buf,
-        );
+        draw_hint(buf, layout.hint, hint, &self.styles, None);
     }
     fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        self.pressed_target = None;
         if self.is_finished() {
             return KeyResult::Cancelled;
         }
@@ -251,48 +338,80 @@ impl Component for QuestionDialog {
         let count = q.options.len() + usize::from(q.allow_custom) + usize::from(q.multiple);
         match key.code {
             KeyCode::Esc => return self.finish(QuestionResponse::Dismissed),
-            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down => self.cursor = (self.cursor + 1).min(count.saturating_sub(1)),
+            KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.manual_scroll = false;
+            }
+            KeyCode::Down => {
+                self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
+                self.manual_scroll = false;
+            }
             KeyCode::BackTab if self.current > 0 => {
                 self.current -= 1;
                 self.cursor = 0;
+                self.scroll = 0;
+                self.manual_scroll = false;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if self.cursor == q.options.len() && q.allow_custom {
-                    if q.multiple
-                        && key.code == KeyCode::Char(' ')
-                        && self.answers[self.current].custom.is_some()
-                    {
-                        self.answers[self.current].custom = None;
-                        return KeyResult::Handled;
-                    }
-                    self.editor
-                        .set_text(self.answers[self.current].custom.as_deref().unwrap_or(""));
-                    self.editing = true;
-                } else if q.multiple && self.cursor == q.options.len() + usize::from(q.allow_custom)
-                {
-                    return self.next();
-                } else if let Some(o) = q.options.get(self.cursor) {
-                    let answer = &mut self.answers[self.current];
-                    if !q.multiple {
-                        answer.selected = vec![o.id.clone()];
-                        answer.custom = None;
-                        return self.next();
-                    }
-                    if key.code == KeyCode::Char(' ') {
-                        if answer.selected.contains(&o.id) {
-                            answer.selected.retain(|id| id != &o.id);
-                        } else {
-                            answer.selected.push(o.id.clone());
-                        }
-                    } else {
-                        return self.next();
-                    }
-                }
+                return self.activate_cursor(key.code == KeyCode::Char(' '));
             }
             _ => {}
         }
         KeyResult::Handled
+    }
+    fn handle_mouse(&mut self, event: MouseEvent) -> MouseResult {
+        if self.is_finished() {
+            return MouseResult::Ignored;
+        }
+        if self.editing {
+            return self.editor.handle_mouse(event);
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp
+                if rect_contains(self.content_area, event.column, event.row) =>
+            {
+                self.scroll = self.scroll.saturating_sub(3);
+                self.manual_scroll = true;
+                MouseResult::Handled
+            }
+            MouseEventKind::ScrollDown
+                if rect_contains(self.content_area, event.column, event.row) =>
+            {
+                self.scroll = self.scroll.saturating_add(3).min(self.max_scroll);
+                self.manual_scroll = true;
+                MouseResult::Handled
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self.hit_target(event.column, event.row) {
+                    self.cursor = target;
+                    self.pressed_target = Some(target);
+                    self.manual_scroll = false;
+                    return MouseResult::Handled;
+                }
+                self.pressed_target = None;
+                MouseResult::Ignored
+            }
+            MouseEventKind::Drag(_) => {
+                self.pressed_target = None;
+                MouseResult::Ignored
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let pressed = self.pressed_target.take();
+                if let Some(target) = pressed
+                    && self.hit_target(event.column, event.row) == Some(target)
+                {
+                    self.cursor = target;
+                    let q = &self.request.questions[self.current];
+                    let is_continue =
+                        q.multiple && target == q.options.len() + usize::from(q.allow_custom);
+                    let toggle = q.multiple && !is_continue;
+                    let _ = self.activate_cursor(toggle);
+                    return MouseResult::Handled;
+                }
+                MouseResult::Ignored
+            }
+            _ => MouseResult::Ignored,
+        }
     }
     fn cursor_position(&self) -> Option<(u16, u16)> {
         if self.editing {
@@ -306,6 +425,17 @@ impl Component for QuestionDialog {
             self.editor.insert_paste(text);
         }
         KeyResult::Handled
+    }
+    fn desired_height(&mut self, width: u16) -> Option<u16> {
+        let inner_width = width.saturating_sub(2).max(4) as usize;
+        let built = self.build_lines(inner_width);
+        let editor_rows = if self.editing { 5u16 } else { 0 };
+        // panel padding 2 + title 1 + blank 1 + content + editor + blank 1 + hint 1 = +6
+        Some(
+            (built.lines.len().max(1) as u16)
+                .saturating_add(editor_rows)
+                .saturating_add(6),
+        )
     }
 }
 
@@ -544,5 +674,57 @@ mod tests {
             let area = Rect::new(0, 0, width, height);
             view.render(&mut Buffer::empty(area), area);
         }
+    }
+
+    #[tokio::test]
+    async fn question_dialog_uses_shared_chrome_focus_styling_and_mouse_clicks() {
+        let (mut view, mut rx, _stream) = dialog(vec![question(false)]).await;
+        let height = view.desired_height(60).unwrap();
+        assert!(height < 18, "short question should shrink: {height}");
+        let area = Rect::new(0, 0, 60, height);
+        let mut buf = Buffer::empty(area);
+        view.render(&mut buf, area);
+
+        let lines: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let custom_row = lines
+            .iter()
+            .position(|row| row.contains("Custom:"))
+            .expect("custom row") as u16;
+        let custom_col = lines[custom_row as usize].find("Custom:").unwrap() as u16;
+        // Cursor starts on option 0, so unfocused Custom row must use normal text colour, not accent.
+        assert_eq!(buf[(custom_col, custom_row)].fg, Theme::dark().fg);
+
+        let pg_row = lines
+            .iter()
+            .position(|row| row.contains("PostgreSQL"))
+            .expect("option b row") as u16;
+        let pg_col = lines[pg_row as usize].find("PostgreSQL").unwrap() as u16;
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pg_col,
+            row: pg_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: pg_col,
+            row: pg_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(view.is_finished());
+        let DialogMessage::Question {
+            response: QuestionResponse::Answered { answers },
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected mouse answer");
+        };
+        assert_eq!(answers[0].selected, ["b"]);
     }
 }

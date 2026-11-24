@@ -12,7 +12,7 @@
 use futures::StreamExt;
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use solaris_agent::{
     AgentEvent, AlwaysApprove, Approval, ApprovalRequest, Approver, ChannelApprover, Mode,
     ModelConnector, PromptContext, ResourcePaths, Skills, ToolCall, ToolRegistry, ToolSelection,
@@ -41,7 +41,7 @@ use solaris_tui::overlay::{OverlayOptions, SizeValue};
 use solaris_tui::selection::{Selection, SelectionHandle};
 use solaris_tui::theme::Theme;
 use solaris_tui::tui::{OverlayQueue, QuitFlag};
-use solaris_tui::util::{display_width, pad_to_width, rect_contains, truncate_to_width};
+use solaris_tui::util::{display_width, rect_contains, truncate_to_width};
 use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
 };
@@ -61,8 +61,8 @@ use crate::tui::model::{ModelOutcome, ModelPicker};
 use crate::tui::state::ToolStep;
 use crate::tui::state::{NoticeKind, NotificationQueue, SessionState, Turn};
 use crate::tui::view::dialogs::{
-    ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog, help_lines,
-    skills_lines, stats_lines,
+    ConfirmAction, ConfirmDialog, DialogMessage, HINT_SELECT, SelectDialog, TextDialog,
+    buddy_lines, help_lines, skills_lines_for_width, stats_lines,
 };
 use crate::tui::view::transcript::{SPINNER, TranscriptView};
 #[cfg(test)]
@@ -300,8 +300,11 @@ pub struct App {
     /// Calls waiting for the user's answer; `None` when the session approves
     /// everything without asking.
     approval_rx: Option<UnboundedReceiver<ApprovalRequest>>,
-    /// Answers the loop is still waiting for, oldest first.
-    pending_approvals: VecDeque<oneshot::Sender<Approval>>,
+    /// Monotonic identifier correlating each approval prompt to its tool call.
+    next_approval_id: u64,
+    /// Answers the loop is still waiting for, keyed by approval ID so stacked
+    /// overlays can be answered in any order without cross-matching.
+    pending_approvals: HashMap<u64, oneshot::Sender<Approval>>,
     question_dialog: Option<(String, String)>,
 }
 
@@ -445,7 +448,8 @@ impl App {
             approver,
             execution,
             approval_rx,
-            pending_approvals: VecDeque::new(),
+            next_approval_id: 0,
+            pending_approvals: HashMap::new(),
             question_dialog: None,
         };
 
@@ -523,70 +527,6 @@ fn write_json(path: &Path, json: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     std::fs::write(path, json).map_err(|error| error.to_string())
-}
-
-/// Lines for the `/buddy` card: the sprite with its name and face, then every
-/// trait.
-fn buddy_lines(companion: &Companion, theme: &Theme) -> Vec<Line<'static>> {
-    let heading = Style::default()
-        .fg(theme.heading)
-        .add_modifier(Modifier::BOLD);
-    let label = Style::default().fg(theme.muted);
-    let value = Style::default().fg(theme.fg);
-    let accent = Style::default().fg(theme.accent);
-
-    let sprite = buddy::render_lines(&companion.bones, 0);
-    let sprite_width = sprite
-        .iter()
-        .map(|row| display_width(row))
-        .max()
-        .unwrap_or(0)
-        + 4;
-
-    let mut lines = Vec::new();
-    for (index, row) in sprite.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            pad_to_width(&format!("  {row}"), sprite_width),
-            accent,
-        )];
-        match index {
-            0 => spans.push(Span::styled(companion.display_name().to_string(), heading)),
-            1 => spans.push(Span::styled(buddy::render_face(&companion.bones), accent)),
-            _ => {}
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines.push(Line::default());
-
-    // Everything but the trait summary, which is split over two rows so it fits
-    // the card's width instead of being cut mid-value.
-    let mut card = companion.card().into_iter().skip(1);
-    for _ in 0..5 {
-        if let Some((name, text)) = card.next() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<10}", format!("{name}:")), label),
-                Span::styled(text, value),
-            ]));
-        }
-    }
-
-    let traits: Vec<String> = companion
-        .bones
-        .stats
-        .rows()
-        .iter()
-        .map(|(name, value)| format!("{name} {value}"))
-        .collect();
-    for (index, chunk) in traits.chunks(3).enumerate() {
-        let name = if index == 0 { "stats:" } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {name:<10}"), label),
-            Span::styled(chunk.join(" · "), value),
-        ]));
-    }
-
-    lines
 }
 
 /// One-line description shown after the ` · ` separator in the theme picker.

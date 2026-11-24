@@ -1078,9 +1078,10 @@ async fn explicit_ask_rules_for_read_only_tools_wait_for_user_confirmation() {
         });
         app.request_approval(rx.recv().await.expect("policy requested confirmation"));
         assert_eq!(app.pending_approvals.len(), 1);
+        let id = *app.pending_approvals.keys().next().unwrap();
         assert!(!answer.is_finished(), "read must wait for the user");
         app.on_dialog_message(DialogMessage::Confirm {
-            action: ConfirmAction::RunTool,
+            action: ConfirmAction::RunTool(id),
             accepted: false,
         });
         assert_eq!(answer.await.expect("approval task"), Approval::Denied);
@@ -1124,13 +1125,14 @@ async fn a_mutating_call_waits_for_the_users_answer() {
 
     // The loop is parked until the prompt is answered.
     assert_eq!(app.pending_approvals.len(), 1);
+    let id = *app.pending_approvals.keys().next().unwrap();
     assert!(
         answer.try_recv().is_err(),
         "the call must not be answered before the user is"
     );
 
     app.on_dialog_message(DialogMessage::Confirm {
-        action: ConfirmAction::RunTool,
+        action: ConfirmAction::RunTool(id),
         accepted: true,
     });
 
@@ -1147,12 +1149,54 @@ async fn a_declined_prompt_denies_the_call() {
         reply,
     });
 
+    let id = *app.pending_approvals.keys().next().unwrap();
     app.on_dialog_message(DialogMessage::Confirm {
-        action: ConfirmAction::RunTool,
+        action: ConfirmAction::RunTool(id),
         accepted: false,
     });
 
     assert_eq!(answer.await.expect("an answer"), Approval::Denied);
+}
+
+#[tokio::test]
+async fn stacked_approval_dialogs_resolve_their_own_tool_even_out_of_order_and_on_dismiss() {
+    let mut app = app();
+    let (first_reply, first_answer) = oneshot::channel();
+    let (second_reply, second_answer) = oneshot::channel();
+    app.request_approval(ApprovalRequest {
+        call: ToolCall::new("call-1", "write", serde_json::json!({ "path": "a.txt" })),
+        reply: first_reply,
+    });
+    app.request_approval(ApprovalRequest {
+        call: ToolCall::new("call-2", "bash", serde_json::json!({ "command": "rm -rf" })),
+        reply: second_reply,
+    });
+    assert_eq!(app.pending_approvals.len(), 2);
+
+    // Pop the top (second) dialog first as the LIFO overlay stack does, approve it,
+    // then drop the bottom (first) dialog without answering (simulating outside click).
+    let mut overlays = app.overlay_queue.borrow_mut().drain(..).collect::<Vec<_>>();
+    assert_eq!(overlays.len(), 2);
+    let (mut top_second, _) = overlays.pop().unwrap();
+    let (bottom_first, _) = overlays.pop().unwrap();
+
+    assert_eq!(
+        top_second.handle_key(key(KeyCode::Char('y'))),
+        KeyResult::Confirmed
+    );
+    drop(top_second);
+    drop(bottom_first);
+    app.tick();
+
+    assert_eq!(
+        second_answer.await.expect("second answered"),
+        Approval::Approved
+    );
+    assert_eq!(
+        first_answer.await.expect("first denied on drop"),
+        Approval::Denied
+    );
+    assert!(app.pending_approvals.is_empty());
 }
 
 #[test]

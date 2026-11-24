@@ -16,12 +16,12 @@ impl App {
             DialogMessage::Session(id) => self.switch_session(&id, false),
             DialogMessage::Command(text) => self.submit(text),
             DialogMessage::Confirm {
-                action: ConfirmAction::RunTool,
+                action: ConfirmAction::RunTool(id),
                 accepted,
             } => {
                 // The loop is still waiting on this answer, so it is sent even
                 // when the prompt was dismissed: a denial is a real answer.
-                if let Some(reply) = self.pending_approvals.pop_front() {
+                if let Some(reply) = self.pending_approvals.remove(&id) {
                     let answer = if accepted {
                         Approval::Approved
                     } else {
@@ -56,11 +56,13 @@ impl App {
     pub(super) fn request_approval(&mut self, request: ApprovalRequest) {
         let ApprovalRequest { call, reply } = request;
 
-        self.pending_approvals.push_back(reply);
+        let id = self.next_approval_id;
+        self.next_approval_id = self.next_approval_id.wrapping_add(1);
+        self.pending_approvals.insert(id, reply);
         let dialog = ConfirmDialog::new(
             format!("Run {}?", call.name),
             describe_call(&call),
-            ConfirmAction::RunTool,
+            ConfirmAction::RunTool(id),
             &self.theme,
             self.dialog_tx.clone(),
         );
@@ -95,12 +97,13 @@ impl App {
             return;
         }
 
-        let lines = skills_lines(&self.resources.skills, &self.theme);
-        let dialog = TextDialog::new(
+        let skills = self.resources.skills.clone();
+        let theme = self.theme.clone();
+        let dialog = TextDialog::reflowable(
             "Skills",
             "↑↓ scroll · enter or esc closes",
-            lines,
             &self.theme,
+            move |width| skills_lines_for_width(&skills, &theme, width),
             self.dialog_tx.clone(),
         );
         self.push_overlay(
@@ -196,7 +199,6 @@ impl App {
 
     pub(super) fn open_palette(&mut self) {
         let items = commands::palette_items();
-        let count = items.len();
         let dialog = SelectDialog::new(
             "Commands",
             HINT_SELECT,
@@ -208,9 +210,7 @@ impl App {
         .label("Select a command:");
         self.push_overlay(
             Box::new(dialog),
-            OverlayOptions::centered()
-                .width(SizeValue::Percent(72))
-                .height(SizeValue::Cells(SelectDialog::height_for(count))),
+            OverlayOptions::centered().width(SizeValue::Percent(72)),
         );
     }
 
@@ -220,7 +220,6 @@ impl App {
             .iter()
             .map(|name| SelectItem::new(*name, *name).description(theme_description(name)))
             .collect::<Vec<_>>();
-        let count = Theme::NAMES.len();
         let dialog = SelectDialog::new(
             "Theme",
             HINT_SELECT,
@@ -233,9 +232,7 @@ impl App {
         .selected(&current);
         self.push_overlay(
             Box::new(dialog),
-            OverlayOptions::centered()
-                .width(SizeValue::Percent(50))
-                .height(SizeValue::Cells(SelectDialog::height_for(count))),
+            OverlayOptions::centered().width(SizeValue::Percent(50)),
         );
     }
 
@@ -250,9 +247,7 @@ impl App {
         );
         self.push_overlay(
             Box::new(dialog),
-            OverlayOptions::centered()
-                .width(SizeValue::Percent(50))
-                .height(SizeValue::Cells(ConfirmDialog::height_for(body, 60))),
+            OverlayOptions::centered().width(SizeValue::Percent(50)),
         );
     }
 

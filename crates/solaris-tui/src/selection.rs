@@ -62,6 +62,9 @@ pub struct Selection {
     document: Option<(Rect, usize, Arc<TextDocument>)>,
     semantic: Option<(TextAnchor, TextAnchor, String)>,
     semantic_press: Option<TextAnchor>,
+    /// Screen regions currently covered by modal overlays; drags touching them
+    /// read rendered screen cells instead of the hidden transcript document.
+    overlay_rects: Vec<Rect>,
 }
 
 impl Default for Selection {
@@ -88,6 +91,7 @@ impl Selection {
             document: None,
             semantic: None,
             semantic_press: None,
+            overlay_rects: Vec::new(),
         }
     }
 
@@ -124,6 +128,17 @@ impl Selection {
         self.document = Some((area, offset, document));
         self.scroll_content = None;
         self.content_range = None;
+    }
+
+    /// Record the opaque overlay rectangles currently painted above the root.
+    pub fn set_overlays(&mut self, rects: Vec<Rect>) {
+        self.overlay_rects = rects;
+    }
+
+    fn over_overlay(&self, point: Point) -> bool {
+        self.overlay_rects
+            .iter()
+            .any(|rect| rect_contains(*rect, point.0, point.1))
     }
 
     /// Register transcript rows and their viewport, keeping selection in content coordinates.
@@ -252,7 +267,11 @@ impl Selection {
         ) && let (Some((area, offset, document)), Some(anchor), Some(focus)) =
             (&self.document, self.anchor, self.focus)
         {
-            if rect_contains(*area, anchor.0, anchor.1) && rect_contains(*area, focus.0, focus.1) {
+            if !self.over_overlay(anchor)
+                && !self.over_overlay(focus)
+                && rect_contains(*area, anchor.0, anchor.1)
+                && rect_contains(*area, focus.0, focus.1)
+            {
                 let hit = |point: Point| {
                     document.anchor(offset + usize::from(point.1 - area.y), point.0 - area.x)
                 };
@@ -273,7 +292,11 @@ impl Selection {
         ) && let (Some((area, offset, _)), Some(anchor), Some(focus)) =
             (&self.scroll_content, self.anchor, self.focus)
         {
-            if rect_contains(*area, anchor.0, anchor.1) && rect_contains(*area, focus.0, focus.1) {
+            if !self.over_overlay(anchor)
+                && !self.over_overlay(focus)
+                && rect_contains(*area, anchor.0, anchor.1)
+                && rect_contains(*area, focus.0, focus.1)
+            {
                 let logical = |point: Point| (point.0, point.1 - area.y + offset);
                 if matches!(event.kind, MouseEventKind::Down(_)) || self.content_range.is_none() {
                     self.content_range = Some((logical(anchor), logical(focus)));

@@ -100,16 +100,14 @@ impl OverlayOptions {
     }
 }
 
-/// Resolve the overlay rectangle within `area`.
-pub fn resolve(area: Rect, options: &OverlayOptions) -> Rect {
+/// Resolve the overlay width within `area`, used to query a component's
+/// natural height before final placement.
+pub fn resolve_width(area: Rect, options: &OverlayOptions) -> u16 {
     if area.width == 0 || area.height == 0 {
-        return Rect::new(area.x, area.y, 0, 0);
+        return 0;
     }
-
     let margin = options.margin.min(area.width / 2).min(area.height / 2);
     let max_width = area.width.saturating_sub(margin * 2).max(1);
-    let max_height = area.height.saturating_sub(margin * 2).max(1);
-
     let mut width = options
         .width
         .map(|value| value.resolve(area.width))
@@ -119,12 +117,35 @@ pub fn resolve(area: Rect, options: &OverlayOptions) -> Rect {
     if let Some(max) = options.max_width {
         width = width.min(max.resolve(area.width)).min(max_width);
     }
+    width
+}
+
+/// Resolve the overlay rectangle within `area`.
+pub fn resolve(area: Rect, options: &OverlayOptions) -> Rect {
+    resolve_with_desired_height(area, options, None)
+}
+
+/// Resolve the overlay rectangle within `area`, using `desired_height` when
+/// `options.height` is unset.
+pub fn resolve_with_desired_height(
+    area: Rect,
+    options: &OverlayOptions,
+    desired_height: Option<u16>,
+) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+
+    let margin = options.margin.min(area.width / 2).min(area.height / 2);
+    let max_height = area.height.saturating_sub(margin * 2).max(1);
+    let width = resolve_width(area, options);
 
     let mut height = options
         .height
         .map(|value| value.resolve(area.height))
+        .or(desired_height)
         .unwrap_or(max_height)
-        .min(max_height);
+        .clamp(1, max_height);
     if let Some(max) = options.max_height {
         height = height.min(max.resolve(area.height)).min(max_height);
     }

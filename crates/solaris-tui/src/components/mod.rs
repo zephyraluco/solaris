@@ -5,6 +5,7 @@
 //! welcome box.
 
 pub mod collapsible;
+pub mod dialog;
 pub mod editor;
 pub mod fuzzy;
 pub mod inline_select;
@@ -21,6 +22,10 @@ pub mod welcome;
 pub use collapsible::{
     Collapsible, CollapsibleAction, CollapsibleHit, CollapsibleInteraction, CollapsibleLayout,
     CollapsibleRow, CollapsibleState, CollapsibleStatus, CollapsibleStyles,
+};
+pub use dialog::{
+    ChromeLayout, ConfirmDialog, DialogStyles, HINT_CONFIRM, HINT_SELECT, SelectDialog, TextDialog,
+    draw_chrome, draw_hint,
 };
 pub use editor::{CommandHint, Editor};
 pub use fuzzy::{fuzzy_match, fuzzy_score};

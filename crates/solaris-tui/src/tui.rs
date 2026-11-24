@@ -16,11 +16,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Clear, Widget};
 
 use crate::component::Component;
@@ -224,9 +225,21 @@ impl Tui {
         }
 
         for entry in self.overlays.iter_mut() {
-            let rect = overlay::resolve(area, &entry.options);
+            let resolved_width = overlay::resolve_width(area, &entry.options);
+            let desired_height = if entry.options.height.is_none() {
+                entry.component.desired_height(resolved_width)
+            } else {
+                None
+            };
+            let rect = overlay::resolve_with_desired_height(area, &entry.options, desired_height);
             entry.rect = rect;
             if rect.width > 0 && rect.height > 0 {
+                // Dim the underlying canvas so the borderless modal card stands out.
+                for y in area.y..area.bottom() {
+                    for x in area.x..area.right() {
+                        buf[(x, y)].modifier.insert(Modifier::DIM);
+                    }
+                }
                 // Opaque overlay: hide whatever is underneath.
                 Clear.render(rect, buf);
                 entry.component.render(buf, rect);
@@ -235,15 +248,36 @@ impl Tui {
 
         // The selection paints over the finished frame, so it covers the root
         // and every overlay, and it records what each row now says.
-        self.selection.borrow_mut().highlight(buf);
+        let overlay_rects = self
+            .overlays
+            .iter()
+            .map(|entry| entry.rect)
+            .filter(|rect| rect.width > 0 && rect.height > 0)
+            .collect();
+        let mut selection = self.selection.borrow_mut();
+        selection.set_overlays(overlay_rects);
+        selection.highlight(buf);
     }
 
-    /// Route a key event. Overlays are modal and swallow everything.
+    /// Route a key event. Overlays are modal and swallow everything except
+    /// `Ctrl+C` while an active text selection is being copied.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if !self.overlays.is_empty()
+            && self.selection.borrow().is_active()
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if let Some(root) = self.root.as_mut() {
+                root.handle_key(key);
+            }
+            return;
+        }
+
         if let Some(top) = self.overlays.last_mut() {
             let result = top.component.handle_key(key);
-            if result.is_close() {
+            if result.is_close() || top.component.is_finished() {
                 self.overlays.pop();
+                self.overlay_flag.set(!self.overlays.is_empty());
             }
             return;
         }
@@ -265,11 +299,15 @@ impl Tui {
             if !inside {
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.overlays.pop();
-                    self.overlay_flag.set(false);
+                    self.overlay_flag.set(!self.overlays.is_empty());
                 }
                 return;
             }
             top.component.handle_mouse(mouse);
+            if top.component.is_finished() {
+                self.overlays.pop();
+                self.overlay_flag.set(!self.overlays.is_empty());
+            }
             return;
         }
 
@@ -282,8 +320,9 @@ impl Tui {
     pub fn handle_paste(&mut self, text: &str) {
         if let Some(top) = self.overlays.last_mut() {
             let result = top.component.handle_paste(text);
-            if result.is_close() {
+            if result.is_close() || top.component.is_finished() {
                 self.overlays.pop();
+                self.overlay_flag.set(!self.overlays.is_empty());
             }
             return;
         }
@@ -453,5 +492,66 @@ mod tests {
         assert!(!rect_contains(rect, 6, 4));
         assert!(!rect_contains(rect, 2, 5));
         assert!(!rect_contains(Rect::new(0, 0, 0, 0), 0, 0));
+    }
+
+    #[test]
+    fn overlay_uses_desired_height_dims_backdrop_and_keeps_flag_while_stacked() {
+        struct FixedOverlay(u16);
+        impl Component for FixedOverlay {
+            fn render(&mut self, buf: &mut Buffer, area: Rect) {
+                buf.set_string(area.x, area.y, "modal", Style::default());
+            }
+            fn desired_height(&mut self, _width: u16) -> Option<u16> {
+                Some(self.0)
+            }
+        }
+
+        let mut tui = Tui::new();
+        tui.set_root(Box::new(EmptyComponent));
+        tui.overlay_queue().borrow_mut().push((
+            Box::new(FixedOverlay(6)),
+            OverlayOptions::centered().width(crate::overlay::SizeValue::Cells(30)),
+        ));
+        tui.overlay_queue().borrow_mut().push((
+            Box::new(FixedOverlay(4)),
+            OverlayOptions::centered().width(crate::overlay::SizeValue::Cells(20)),
+        ));
+
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        tui.render(&mut buf, area);
+
+        assert_eq!(tui.overlays[0].rect.height, 6);
+        assert_eq!(tui.overlays[1].rect.height, 4);
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::DIM),
+            "backdrop outside overlay should be dimmed"
+        );
+        assert!(
+            !buf[(tui.overlays[1].rect.x, tui.overlays[1].rect.y)]
+                .modifier
+                .contains(Modifier::DIM),
+            "top overlay cells should stay bright"
+        );
+
+        // Clicking outside the top overlay pops only the top one; flag stays true.
+        tui.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(tui.overlays.len(), 1);
+        assert!(tui.overlay_flag().get());
+
+        // Clicking outside again pops the last overlay; flag becomes false.
+        tui.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(tui.overlays.is_empty());
+        assert!(!tui.overlay_flag().get());
     }
 }
