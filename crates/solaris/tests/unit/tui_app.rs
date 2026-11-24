@@ -348,7 +348,12 @@ fn late_clipboard_result_cannot_paste_into_a_changed_destination() {
     app.handle_key(key(KeyCode::Char('x')));
     app.poll_io(true);
     assert!(!rendered_text(&mut app, 80, 24).contains("secret"));
-    assert!(rendered_text(&mut app, 80, 24).contains("paste destination changed"));
+    assert!(
+        app.notifications
+            .current()
+            .is_some_and(|(kind, text)| kind == NoticeKind::Warning
+                && text.contains("paste destination changed"))
+    );
 }
 
 #[tokio::test]
@@ -668,9 +673,18 @@ fn the_buddy_command_names_the_companion() {
     let soul = Soul::from_json(&saved).expect("valid json");
     assert_eq!(soul.name, "Pip");
 
-    // The welcome box greets with the new name.
-    let text = rendered_text(&mut app, 90, 26);
-    assert!(text.contains("Pip"), "{text}");
+    // The companion card and notification reflect the new name.
+    assert!(
+        app.notifications
+            .current()
+            .is_some_and(|(kind, text)| kind == NoticeKind::Info && text.contains("Pip"))
+    );
+    let card: String = buddy_lines(&app.buddy, &app.theme)
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(card.contains("Pip"), "{card}");
 
     // An empty name is rejected instead of clearing it.
     app.submit("/buddy name".to_string());
@@ -1869,13 +1883,41 @@ fn footer_shows_context_percentage_bar_with_status_colors() {
 }
 
 #[test]
-fn footer_omits_working_status_and_error_notices() {
+fn fresh_session_starts_at_zero_context_percent_despite_prompt_and_tools() {
+    let mut options = app_options();
+    options.prompt_context.project_rules.push(solaris_agent::PromptFile {
+        path: PathBuf::from("AGENTS.md"),
+        content: "Project instruction paragraph. ".repeat(400),
+    });
+    let mut app = App::new(options);
+    app.tick();
+
+    let area = Rect::new(0, 0, 100, 8);
+    let mut buf = Buffer::empty(area);
+    app.render(&mut buf, area);
+    let mut footer = String::new();
+    let mut x = 0u16;
+    while x < area.width {
+        let sym = buf[(x, area.height - 1)].symbol();
+        footer.push_str(sym);
+        x += (display_width(sym).max(1)) as u16;
+    }
+    assert!(
+        footer.contains("上下文") && footer.contains("0%"),
+        "expected fresh session footer to show 0%, got: {footer:?}"
+    );
+}
+
+#[test]
+fn footer_omits_working_status_and_notices() {
     let mut app = app();
     app.session.turns.push(Turn {
         prompt: "hi".into(),
         ..Turn::default()
     });
     app.session.status = Some("working".into());
+    app.notifications.info("ASK mode");
+    app.notifications.warning("heads up");
     app.notifications.error("boom");
 
     let area = Rect::new(0, 0, 100, 8);
@@ -1890,6 +1932,8 @@ fn footer_omits_working_status_and_error_notices() {
         x += (display_width(sym).max(1)) as u16;
     }
     assert!(!footer.contains("working"), "{footer:?}");
+    assert!(!footer.contains("ASK mode"), "{footer:?}");
+    assert!(!footer.contains("heads up"), "{footer:?}");
     assert!(!footer.contains("boom"), "{footer:?}");
     assert!(footer.contains(keymap::FOOTER_HINT), "{footer:?}");
 }
@@ -2484,7 +2528,10 @@ async fn an_empty_clipboard_says_so() {
         "something was pasted"
     );
     assert!(
-        rendered_text(&mut app, 60, 12).contains("clipboard is empty"),
+        app.notifications
+            .current()
+            .is_some_and(|(kind, text)| kind == NoticeKind::Warning
+                && text.contains("clipboard is empty")),
         "an empty clipboard went unmentioned"
     );
 }
@@ -3366,8 +3413,11 @@ async fn ctrl_c_copies_what_was_dragged() {
     assert_eq!(copied.borrow().as_slice(), ["› hello world".to_string()]);
     assert!(!app.quit.get(), "copying a selection must not quit");
     assert!(
-        rendered_text(&mut app, 60, 12).contains("copied 13 characters"),
-        "the footer never announced the copy"
+        app.notifications
+            .current()
+            .is_some_and(|(kind, text)| kind == NoticeKind::Info
+                && text.contains("copied 13 characters")),
+        "copy notification was not recorded"
     );
 }
 
@@ -3456,7 +3506,9 @@ async fn a_clipboard_that_refuses_is_reported() {
 
     assert_eq!(copied.borrow().len(), 1, "the write was attempted");
     assert!(
-        rendered_text(&mut app, 60, 12).contains("clipboard"),
+        app.notifications
+            .current()
+            .is_some_and(|(kind, text)| kind == NoticeKind::Warning && text.contains("clipboard")),
         "a failed copy went unreported"
     );
 }

@@ -681,7 +681,11 @@ fn tab_on_the_slash_menu_fills_the_command_in() {
     harness.key(KeyCode::Enter);
     harness.tui.tick();
     let text = harness.draw();
-    assert!(text.contains("theme: light"), "{text}");
+    assert!(!text.contains("/theme light"), "{text}");
+    assert_eq!(
+        harness.terminal.backend().buffer()[(1, FOOTER)].fg,
+        Theme::light().muted
+    );
 }
 
 #[tokio::test]
@@ -751,7 +755,10 @@ fn theme_picker_applies_the_highlighted_theme() {
     let text = harness.draw();
 
     assert!(!text.contains("Select a theme:"), "{text}");
-    assert!(text.contains("theme: light"), "{text}");
+    assert_eq!(
+        harness.terminal.backend().buffer()[(1, FOOTER)].fg,
+        Theme::light().muted
+    );
 }
 
 #[test]
@@ -777,7 +784,11 @@ fn theme_command_applies_immediately() {
     harness.type_str("/theme light");
     harness.key(KeyCode::Enter);
     let text = harness.draw();
-    assert!(text.contains("light"), "{text}");
+    assert!(!text.contains("Select a theme:"), "{text}");
+    assert_eq!(
+        harness.terminal.backend().buffer()[(1, FOOTER)].fg,
+        Theme::light().muted
+    );
 }
 
 #[tokio::test]
@@ -900,12 +911,15 @@ async fn the_model_command_needs_a_provider_then_lists_its_models() {
     let mut harness = Harness::new();
 
     // With nothing connected there is no model list to choose from, so the
-    // command explains itself instead of opening an empty picker.
+    // command does not open an empty picker.
     harness.type_str("/model");
     harness.key(KeyCode::Enter);
     let frame = harness.draw();
     assert!(!frame.contains("Select a model:"), "{frame}");
-    assert!(frame.contains("/connect"), "no advice was shown:\n{frame}");
+    assert!(
+        frame.contains(solaris::tui::keymap::FOOTER_HINT),
+        "footer hint missing:\n{frame}"
+    );
 
     // Connect a provider by API key; the wizard's own model step takes the
     // first model it offers.
@@ -932,12 +946,19 @@ async fn the_model_command_needs_a_provider_then_lists_its_models() {
         "{frame}"
     );
 
+    let chosen = solaris_provider::ProviderConfig::default().models("anthropic")[1]
+        .0
+        .clone();
     harness.key(KeyCode::Down);
     harness.key(KeyCode::Enter);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        harness.tui.tick();
+    }
 
     let after = harness.draw();
     assert!(!after.contains("Select a model:"), "the picker stayed up");
-    assert!(after.contains("model:"), "the choice was not announced");
+    assert!(after.contains(&chosen), "the footer did not adopt {chosen}:\n{after}");
 }
 
 #[tokio::test]
@@ -1178,7 +1199,10 @@ async fn two_ctrl_c_presses_quit_while_one_only_asks() {
     harness.ctrl('c');
     let asked = harness.draw();
     assert!(!quit.get(), "one press must not quit");
-    assert!(asked.contains("press ctrl+c again to quit"), "{asked}");
+    assert!(
+        asked.contains(solaris::tui::keymap::FOOTER_HINT),
+        "footer hint should stay visible:\n{asked}"
+    );
 
     harness.ctrl('c');
     assert!(quit.get());
@@ -1196,8 +1220,11 @@ async fn ctrl_c_stops_the_turn_that_is_streaming() {
     let stopped = harness.draw();
 
     assert!(!stopped.contains("generating"), "{stopped}");
-    assert!(stopped.contains("cancelled"), "{stopped}");
     assert!(stopped.contains("hello"), "the prompt stays:\n{stopped}");
+    assert!(
+        stopped.contains(solaris::tui::keymap::FOOTER_HINT),
+        "footer hint should stay visible:\n{stopped}"
+    );
 }
 
 // --------------------------------------------------------------- /connect

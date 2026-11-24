@@ -15,11 +15,6 @@ impl App {
             model: snapshot.model,
             mode: self.config.mode,
             context,
-            notice: self
-                .notifications
-                .current()
-                .filter(|(kind, _)| *kind != NoticeKind::Error)
-                .map(|(kind, text)| (kind, text.to_string())),
         };
         self.session_page
             .bottom

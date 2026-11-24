@@ -337,7 +337,6 @@ mod tests {
                     window: 1000,
                     estimated: false,
                 },
-                notice: None,
             },
             true,
         );

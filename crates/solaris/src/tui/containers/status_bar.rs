@@ -10,7 +10,6 @@ use solaris_tui::theme::Theme;
 use solaris_tui::util::{display_width, truncate_to_width};
 
 use crate::tui::keymap;
-use crate::tui::state::NoticeKind;
 
 const CONTEXT_GAUGE_WIDTH: u16 = 10;
 
@@ -21,10 +20,9 @@ pub(crate) struct StatusBarState {
     pub(crate) model: String,
     pub(crate) mode: Mode,
     pub(crate) context: ContextUsage,
-    pub(crate) notice: Option<(NoticeKind, String)>,
 }
 
-/// Single-row footer displaying backend/model/mode, context gauge, and notices.
+/// Single-row footer displaying backend/model/mode, context gauge, and shortcut hints.
 pub(crate) struct StatusBar {
     state: StatusBarState,
     theme: Theme,
@@ -57,28 +55,13 @@ impl Component for StatusBar {
             return;
         }
 
-        let visible_notice = self
-            .state
-            .notice
-            .as_ref()
-            .filter(|(kind, _)| *kind != NoticeKind::Error);
-        let (right, style) = if let Some((kind, text)) = visible_notice {
-            let style = match kind {
-                NoticeKind::Warning => Style::default().fg(self.theme.warning),
-                NoticeKind::Info | NoticeKind::Error => Style::default().fg(self.theme.muted),
-            };
-            (format!("{} {} ", kind.marker(), text), style)
-        } else {
-            (
-                format!("{} ", keymap::FOOTER_HINT),
-                Style::default().fg(self.theme.dim),
-            )
-        };
+        let right = format!("{} ", keymap::FOOTER_HINT);
+        let style = Style::default().fg(self.theme.dim);
 
         // The right slot wins the space it needs; the left one is truncated to
         // whatever remains so the two never overlap.
         let right_width = display_width(&right) as u16;
-        let show_right = visible_notice.is_some() || right_width + 4 < area.width;
+        let show_right = right_width + 4 < area.width;
         let left_budget = if show_right {
             area.width.saturating_sub(right_width.min(area.width))
         } else {

@@ -115,6 +115,13 @@ impl Projection {
         self.pending = Some(measured);
     }
     pub fn context(&mut self, header: &Header, sent: bool) -> ContextUsage {
+        if !sent && self.history.messages().is_empty() {
+            return ContextUsage {
+                tokens: Some(0),
+                window: 0,
+                estimated: false,
+            };
+        }
         let request = rig_memory::Prepared {
             model: &header.model,
             prompt: (!header.system.is_empty()).then_some(header.system.as_str()),
@@ -215,5 +222,32 @@ mod tests {
         let mut projection = Projection::default();
         projection.sync(&messages("restored"));
         assert!(projection.context(&header, false).estimated);
+    }
+    #[test]
+    fn empty_unsent_history_reports_zero_context_tokens() {
+        let header = Header::new(
+            "model",
+            &"system prompt ".repeat(500),
+            &[ToolSpec::new(
+                "read",
+                "Read a file",
+                serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            )],
+        );
+        let mut projection = Projection::default();
+        projection.sync(&[]);
+        assert_eq!(
+            projection.context(&header, false),
+            ContextUsage {
+                tokens: Some(0),
+                window: 0,
+                estimated: false,
+            }
+        );
+
+        projection.sync(&messages("hello"));
+        let active = projection.context(&header, false);
+        assert!(active.estimated);
+        assert!(active.tokens.unwrap_or(0) > 1000);
     }
 }
