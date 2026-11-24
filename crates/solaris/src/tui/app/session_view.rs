@@ -236,24 +236,24 @@ impl App {
         // The model slot disappears while no model is named, so the footer
         // never shows an empty gap between two separators.
         let snapshot = self.sessions.agent.snapshot();
-        let mut facts = vec![snapshot.label];
-        if !snapshot.model.is_empty() {
-            facts.push(snapshot.model);
-        }
-        facts.push(self.config.mode.label().to_string());
-        facts.push(format!("{} tok", self.session.total_tokens()));
-        facts.push(if snapshot.capabilities.price_known == Some(false) {
-            "$?".into()
+        let muted = Style::default().fg(self.theme.muted);
+        let context = if self.session.context.window > 0 {
+            self.session.context
         } else {
-            format!("${:.4}", self.session.total_cost())
-        });
-        let left = format!(" {} ", facts.join(" · "));
-        buf.set_string(
-            area.x,
-            area.y,
-            truncate_to_width(&left, left_budget as usize, "…"),
-            Style::default().fg(self.theme.muted),
-        );
+            snapshot.context(self.config.mode)
+        };
+        let (gauge, gauge_style) = context_gauge(context, &self.theme);
+        let mut prefix_facts = vec![snapshot.label];
+        if !snapshot.model.is_empty() {
+            prefix_facts.push(snapshot.model);
+        }
+        prefix_facts.push(self.config.mode.label().to_string());
+        let segments = [
+            (format!(" {} · 上下文 ", prefix_facts.join(" · ")), muted),
+            (gauge, gauge_style),
+            (" ".to_string(), muted),
+        ];
+        draw_footer_segments(buf, area.x, area.y, left_budget as usize, &segments, muted);
 
         if show_right {
             let width = right_width.min(area.width);
@@ -265,6 +265,83 @@ impl App {
             );
         }
     }
+}
+
+const CONTEXT_BAR_WIDTH: usize = 10;
+
+/// Format the context usage gauge (`░░░░░░░░░░ 0%`) and pick its status colour.
+fn context_gauge(context: solaris_agent::ContextUsage, theme: &Theme) -> (String, Style) {
+    let ratio = if context.window == 0 {
+        0.0
+    } else {
+        f64::from(context.tokens.unwrap_or(0)) / f64::from(context.window)
+    };
+    let percent = (ratio * 100.0).round().max(0.0) as u32;
+    let filled = ((ratio.clamp(0.0, 1.0) * CONTEXT_BAR_WIDTH as f64).round() as usize)
+        .min(CONTEXT_BAR_WIDTH);
+    let empty = CONTEXT_BAR_WIDTH - filled;
+    let mut bar = String::with_capacity(CONTEXT_BAR_WIDTH * 3 + 6);
+    for _ in 0..filled {
+        bar.push('█');
+    }
+    for _ in 0..empty {
+        bar.push('░');
+    }
+    bar.push(' ');
+    bar.push_str(&format!("{percent}%"));
+
+    let color = if percent >= 90 {
+        theme.error
+    } else if percent >= 70 {
+        theme.warning
+    } else {
+        theme.success
+    };
+    (bar, Style::default().fg(color))
+}
+
+fn draw_footer_segments(
+    buf: &mut Buffer,
+    start_x: u16,
+    y: u16,
+    budget: usize,
+    segments: &[(String, Style)],
+    ellipsis_style: Style,
+) {
+    if budget == 0 {
+        return;
+    }
+    let total: usize = segments.iter().map(|(text, _)| display_width(text)).sum();
+    if total <= budget {
+        let mut x = start_x;
+        for (text, style) in segments {
+            buf.set_string(x, y, text, *style);
+            x = x.saturating_add(display_width(text) as u16);
+        }
+        return;
+    }
+
+    let content_budget = budget.saturating_sub(1);
+    let mut used = 0usize;
+    'outer: for (text, style) in segments {
+        let seg_start = used;
+        let mut slice_end = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let ch_width = display_width(&text[idx..idx + ch.len_utf8()]);
+            if used + ch_width > content_budget {
+                if slice_end > 0 {
+                    buf.set_string(start_x + seg_start as u16, y, &text[..slice_end], *style);
+                }
+                break 'outer;
+            }
+            used += ch_width;
+            slice_end = idx + ch.len_utf8();
+        }
+        if slice_end > 0 {
+            buf.set_string(start_x + seg_start as u16, y, &text[..slice_end], *style);
+        }
+    }
+    buf.set_string(start_x + used as u16, y, "…", ellipsis_style);
 }
 
 #[derive(Default)]

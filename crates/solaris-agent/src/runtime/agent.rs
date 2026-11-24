@@ -122,7 +122,7 @@ pub struct Agent {
     /// serialising against the same per-file locks for the whole session.
     registry: Arc<ToolRegistry>,
     options: AgentOptions,
-    approver: Arc<dyn Approver>,
+    read_only_tools: std::collections::BTreeSet<String>,
     services: crate::runtime::services::SessionServices,
     /// Stops the turn in flight, tools included.
     cancel: Cancel,
@@ -168,17 +168,11 @@ impl Agent {
         } else {
             registry
         };
-        let approver: Arc<dyn Approver> = Arc::new(crate::PolicyApprover {
-            profile: options.execution.profile,
-            read_only_tools: registry
-                .names()
-                .into_iter()
-                .filter(|name| registry.get(name).is_some_and(|tool| tool.is_read_only()))
-                .collect(),
-            cwd: options.cwd.clone(),
-            rules: options.execution.rules.clone(),
-            fallback: Arc::clone(&options.approver),
-        });
+        let read_only_tools: std::collections::BTreeSet<String> = registry
+            .names()
+            .into_iter()
+            .filter(|name| registry.get(name).is_some_and(|tool| tool.is_read_only()))
+            .collect();
         let registry = if options.subagents && services.depth < options.execution.subagent_depth {
             let mut registry = registry.as_ref().clone();
             registry.add(Arc::new(SubagentTool));
@@ -211,7 +205,7 @@ impl Agent {
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registry,
             options,
-            approver,
+            read_only_tools,
             services,
             cancel: Cancel::new(),
             conversation: Arc::new(Conversation::new()),
@@ -346,7 +340,7 @@ impl Agent {
             active: Arc::clone(&self.active),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
-            approver: Arc::clone(&self.approver),
+            read_only_tools: self.read_only_tools.clone(),
             services: self.services.clone(),
             cancel: self.cancel.clone(),
             conversation: Arc::clone(&self.conversation),
@@ -457,7 +451,7 @@ impl Agent {
     fn rebuild_prompts(&self) {
         let resources = self.resources.read().unwrap_or_else(|p| p.into_inner());
         let mut prompts = Vec::new();
-        for mode in [Mode::Build, Mode::Plan] {
+        for mode in Mode::ALL {
             let tools = self.turn_tools(mode);
             let text = prompt::build_system_prompt(
                 mode,
@@ -517,12 +511,10 @@ impl Agent {
         let Ok(prompts) = self.prompts.try_read() else {
             return unknown;
         };
-        prompts
-            .get(if mode == Mode::Build { 0 } else { 1 })
-            .map_or(unknown, |prompt| {
-                self.conversation
-                    .context_usage(&prompt.header.base_id, unknown.window)
-            })
+        prompts.get(mode.index()).map_or(unknown, |prompt| {
+            self.conversation
+                .context_usage(&prompt.header.base_id, unknown.window)
+        })
     }
 
     pub fn usage_totals(&self) -> Option<crate::UsageTotals> {
@@ -558,9 +550,54 @@ impl Agent {
                     || tool.name() != crate::SUBAGENT_TOOL
             })
             .filter(|tool| {
-                mode == Mode::Build || !tool.name().starts_with("mcp_") || tool.is_read_only()
+                !mode.is_read_only() || !tool.name().starts_with("mcp_") || tool.is_read_only()
             })
             .collect()
+    }
+
+    /// Build the effective tool approver for a turn in `mode`.
+    ///
+    /// A session-level `ReadOnly` execution profile acts as a hard ceiling that
+    /// no mode can relax. Otherwise, the mode chooses the approval policy:
+    /// - `Plan`: read-only ceiling (mutating calls denied).
+    /// - `Default`: read-only calls auto-approved; mutating calls ask `fallback`.
+    /// - `Ask`: every tool call (including read-only) asks `fallback`.
+    /// - `Auto`: auto-approves calls without asking `fallback`, while explicit
+    ///   `Deny` rules still reject matching calls.
+    fn turn_approver(&self, mode: Mode) -> Arc<dyn Approver> {
+        let (profile, fallback) =
+            if self.options.execution.profile == crate::PolicyProfile::ReadOnly {
+                (
+                    crate::PolicyProfile::ReadOnly,
+                    Arc::clone(&self.options.approver),
+                )
+            } else {
+                match mode {
+                    Mode::Plan => (
+                        crate::PolicyProfile::ReadOnly,
+                        Arc::clone(&self.options.approver),
+                    ),
+                    Mode::Default => (
+                        crate::PolicyProfile::Ask,
+                        Arc::clone(&self.options.approver),
+                    ),
+                    Mode::Ask => (
+                        crate::PolicyProfile::Trusted,
+                        Arc::clone(&self.options.approver),
+                    ),
+                    Mode::Auto => (
+                        crate::PolicyProfile::Trusted,
+                        Arc::new(AlwaysApprove) as Arc<dyn Approver>,
+                    ),
+                }
+            };
+        Arc::new(crate::PolicyApprover {
+            profile,
+            read_only_tools: self.read_only_tools.clone(),
+            cwd: self.options.cwd.clone(),
+            rules: self.options.execution.rules.clone(),
+            fallback,
+        })
     }
 
     /// Replace resources for future turns without clearing conversation or queues.
@@ -666,7 +703,7 @@ impl Agent {
             }
         };
         let mut turn_options = self.options.clone();
-        turn_options.approver = Arc::clone(&self.approver);
+        turn_options.approver = self.turn_approver(mode);
         let services = self.services.clone();
         let tools = self.turn_tools(mode);
         let subagent = tools
@@ -685,9 +722,7 @@ impl Agent {
                 })
             });
 
-        let cached = self.prompts.read().unwrap_or_else(|p| p.into_inner())
-            [if mode == Mode::Build { 0 } else { 1 }]
-        .clone();
+        let cached = self.prompts.read().unwrap_or_else(|p| p.into_inner())[mode.index()].clone();
         let system = cached.text;
         drop(resources);
 
@@ -832,7 +867,7 @@ mod tests {
             Arc::new(ToolRegistry::builtin()),
             AgentOptions::in_directory(&dir),
         );
-        let events = drain(agent.run_turn("write", Mode::Build)).await;
+        let events = drain(agent.run_turn("write", Mode::Default)).await;
         assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { result, .. } if result.is_error && result.output.contains("invalid tool arguments"))));
         assert!(!dir.join("should-not-exist").exists());
         std::fs::remove_dir_all(dir).expect("cleanup");
@@ -909,7 +944,7 @@ mod tests {
             Arc::new(ToolRegistry::with_tools(tools)),
             AgentOptions::default(),
         );
-        let events = drain(agent.run_turn("use external tool", Mode::Build)).await;
+        let events = drain(agent.run_turn("use external tool", Mode::Default)).await;
         let requests = inner.requests();
         assert!(
             requests[0]
@@ -1082,7 +1117,7 @@ mod tests {
             .expect("inject write failure");
         let backend = Scripted::new(Vec::new());
         let refreshed = original.with_refreshed_backend(choice(backend.clone()));
-        let events = drain(refreshed.run_turn("next prompt", Mode::Build)).await;
+        let events = drain(refreshed.run_turn("next prompt", Mode::Default)).await;
         assert!(events.iter().any(|event| matches!(event, AgentEvent::Error(error) if error.contains("model persistence unavailable"))));
         assert!(
             backend.requests().is_empty(),
@@ -1290,7 +1325,7 @@ mod tests {
     async fn invalid_skill_input_never_reaches_backend_or_conversation() {
         let inner = Scripted::new(Vec::new());
         let agent = agent(inner.clone());
-        let events = drain(agent.run_turn("/skill:missing request", Mode::Build)).await;
+        let events = drain(agent.run_turn("/skill:missing request", Mode::Default)).await;
         assert!(
             matches!(events.as_slice(), [AgentEvent::Error(message)] if message.contains("no skill named"))
         );
@@ -1361,7 +1396,7 @@ mod tests {
     fn build_mode_offers_more_than_plan_mode() {
         let agent = agent(Scripted::new(Vec::new()));
 
-        let build = agent.tool_names(Mode::Build);
+        let build = agent.tool_names(Mode::Default);
         assert!(build.contains(&"read".to_string()));
         assert!(build.contains(&SHELL_TOOL.to_string()));
         assert!(build.contains(&"edit".to_string()));
@@ -1381,7 +1416,7 @@ mod tests {
             only("read"),
         );
 
-        assert_eq!(agent.tool_names(Mode::Build), ["read"]);
+        assert_eq!(agent.tool_names(Mode::Default), ["read"]);
         assert_eq!(agent.tool_names(Mode::Plan), ["read"]);
     }
 
@@ -1411,7 +1446,7 @@ mod tests {
             only("cancel-now"),
         );
 
-        drain(agent.run_turn("hi", Mode::Build)).await;
+        drain(agent.run_turn("hi", Mode::Default)).await;
 
         let spec = &inner.requests()[0].tools[0];
         assert_eq!(spec.name, tool.name());
@@ -1452,7 +1487,7 @@ mod tests {
         next.fallback_context_window = 64_000;
         let refreshed = original.with_refreshed_backend(next);
         assert_eq!(refreshed.context_window(), 64_000);
-        drain(refreshed.run_turn("hi", Mode::Build)).await;
+        drain(refreshed.run_turn("hi", Mode::Default)).await;
         let requests = backend.requests();
         let system = requests[0].history[0].text();
         assert!(
@@ -1497,7 +1532,7 @@ mod tests {
         // the stop has to reach the loop that is running.
         *tool.cancel.lock().expect("lock") = Some(agent.cancel_handle());
 
-        let events = drain(agent.run_turn("hi", Mode::Build)).await;
+        let events = drain(agent.run_turn("hi", Mode::Default)).await;
 
         assert_eq!(tool.runs.load(Ordering::SeqCst), 1);
         let Some(AgentEvent::Error(message)) = events.last() else {
@@ -1521,11 +1556,11 @@ mod tests {
             },
         ]]));
         first.attach_journal(Arc::clone(&journal)).expect("attach");
-        drain(first.run_turn("hello", Mode::Build)).await;
+        drain(first.run_turn("hello", Mode::Default)).await;
         let backend = Scripted::new(vec![]);
         let restored = agent(backend.clone());
         restored.attach_journal(journal).expect("restore");
-        let context = restored.context_usage(Mode::Build);
+        let context = restored.context_usage(Mode::Default);
         assert!(context.estimated);
         assert!(context.tokens.is_some_and(|tokens| tokens > 0));
         assert_ne!(
@@ -1569,7 +1604,7 @@ mod tests {
         );
         let before = calls.load(Ordering::SeqCst);
         for _ in 0..20 {
-            agent.context_usage(Mode::Build);
+            agent.context_usage(Mode::Default);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
     }
@@ -1595,7 +1630,7 @@ mod tests {
         original
             .attach_journal(Arc::clone(&journal))
             .expect("attach");
-        let events = drain(original.run_turn("work", Mode::Build)).await;
+        let events = drain(original.run_turn("work", Mode::Default)).await;
         assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
         assert_eq!(original.usage_totals().expect("totals").usage.total(), 110);
         let restored = agent(Scripted::new(vec![]));
@@ -1625,11 +1660,114 @@ mod tests {
             .push(rig_core::message::Message::user("new question"));
         assert!(agent.compact().await.is_some());
         assert_eq!(agent.usage_totals().expect("totals").usage.total(), 550);
-        let context = agent.context_usage(Mode::Build);
+        let context = agent.context_usage(Mode::Default);
         assert!(
             context.estimated,
             "summary billing is not a context measurement"
         );
         assert_ne!(context.tokens, Some(550));
+    }
+
+    #[tokio::test]
+    async fn turn_approver_enforces_default_plan_auto_and_ask_semantics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&asked);
+        let mut options = AgentOptions::in_directory(dir.path()).with_approver(Arc::new(
+            crate::FnApprover::new(move |call: &ToolCall| {
+                seen.lock().expect("lock").push(call.name.clone());
+                crate::Approval::Denied
+            }),
+        ));
+        options.execution.rules.push(crate::PermissionRule {
+            tool: "write".into(),
+            resource: "*blocked.txt".into(),
+            effect: crate::PermissionEffect::Deny,
+        });
+
+        let agent = Agent::new(
+            choice(Scripted::new(vec![])),
+            Arc::new(ToolRegistry::builtin()),
+            options,
+        );
+
+        let read_call = ToolCall::new("c1", "read", json!({"path": "ok.txt"}));
+        let write_call = ToolCall::new("c2", "write", json!({"path": "ok.txt", "content": "x"}));
+        let blocked_write = ToolCall::new(
+            "c3",
+            "write",
+            json!({"path": "blocked.txt", "content": "x"}),
+        );
+
+        // Default: read auto-approved; mutating asks fallback (which denies here).
+        let default_approver = agent.turn_approver(Mode::Default);
+        assert_eq!(
+            default_approver.approve(&read_call).await,
+            crate::Approval::Approved
+        );
+        assert_eq!(
+            default_approver.approve(&write_call).await,
+            crate::Approval::Denied
+        );
+        assert_eq!(*asked.lock().expect("lock"), vec!["write"]);
+        asked.lock().expect("lock").clear();
+
+        // Ask: both read and write ask fallback.
+        let ask_approver = agent.turn_approver(Mode::Ask);
+        assert_eq!(
+            ask_approver.approve(&read_call).await,
+            crate::Approval::Denied
+        );
+        assert_eq!(
+            ask_approver.approve(&write_call).await,
+            crate::Approval::Denied
+        );
+        assert_eq!(*asked.lock().expect("lock"), vec!["read", "write"]);
+        asked.lock().expect("lock").clear();
+
+        // Auto: read and normal write auto-approved without consulting fallback;
+        // explicit Deny rules still reject matching calls.
+        let auto_approver = agent.turn_approver(Mode::Auto);
+        assert_eq!(
+            auto_approver.approve(&read_call).await,
+            crate::Approval::Approved
+        );
+        assert_eq!(
+            auto_approver.approve(&write_call).await,
+            crate::Approval::Approved
+        );
+        assert_eq!(
+            auto_approver.approve(&blocked_write).await,
+            crate::Approval::Denied
+        );
+        assert!(asked.lock().expect("lock").is_empty());
+
+        // Plan: read auto-approved; write denied without consulting fallback.
+        let plan_approver = agent.turn_approver(Mode::Plan);
+        assert_eq!(
+            plan_approver.approve(&read_call).await,
+            crate::Approval::Approved
+        );
+        assert_eq!(
+            plan_approver.approve(&write_call).await,
+            crate::Approval::Denied
+        );
+        assert!(asked.lock().expect("lock").is_empty());
+
+        // ReadOnly execution ceiling cannot be relaxed by Auto mode.
+        let mut ro_options = AgentOptions::in_directory(dir.path());
+        ro_options.execution.profile = crate::PolicyProfile::ReadOnly;
+        let ro_agent = Agent::new(
+            choice(Scripted::new(vec![])),
+            Arc::new(ToolRegistry::builtin()),
+            ro_options,
+        );
+        assert_eq!(
+            ro_agent
+                .turn_approver(Mode::Auto)
+                .approve(&write_call)
+                .await,
+            crate::Approval::Denied
+        );
     }
 }

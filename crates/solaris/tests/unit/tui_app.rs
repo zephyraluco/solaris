@@ -734,18 +734,38 @@ fn the_buddy_command_names_the_companion() {
 #[test]
 fn tab_toggles_mode_when_no_completion_is_open() {
     let mut app = app();
-    assert_eq!(app.mode(), Mode::Build);
+    assert_eq!(app.mode(), Mode::Default);
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.mode(), Mode::Plan);
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.mode(), Mode::Build);
+    assert_eq!(app.mode(), Mode::Auto);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.mode(), Mode::Ask);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.mode(), Mode::Default);
 }
 
 #[test]
-fn slash_mode_command_toggles_mode() {
+fn slash_mode_command_toggles_or_sets_mode() {
     let mut app = app();
     app.submit("/mode".to_string());
     assert_eq!(app.mode(), Mode::Plan);
+
+    app.submit("/mode auto".to_string());
+    assert_eq!(app.mode(), Mode::Auto);
+
+    app.submit("/mode ask".to_string());
+    assert_eq!(app.mode(), Mode::Ask);
+
+    app.submit("/mode default".to_string());
+    assert_eq!(app.mode(), Mode::Default);
+
+    app.submit("/mode bogus".to_string());
+    assert_eq!(app.mode(), Mode::Default);
+    assert_eq!(
+        app.notifications.current().map(|(kind, _)| kind),
+        Some(NoticeKind::Error)
+    );
 }
 
 #[test]
@@ -1710,13 +1730,6 @@ fn expanding_tool_disclosures_at_the_viewport_bottom_reveals_their_bodies() {
 }
 
 #[test]
-fn palette_choice_runs_the_command() {
-    let mut app = app();
-    app.on_dialog_message(DialogMessage::Command("/mode".into()));
-    assert_eq!(app.mode(), Mode::Plan);
-}
-
-#[test]
 fn streamed_events_record_interleaved_display_order() {
     use crate::tui::state::TurnPart;
     let mut app = app();
@@ -1808,7 +1821,7 @@ fn footer_slots_do_not_overlap() {
     let mut app = app();
 
     // Narrow enough that the status segment would run into the hint.
-    let width = 60u16;
+    let width = 45u16;
     let area = Rect::new(0, 0, width, 8);
     let mut buf = Buffer::empty(area);
     app.render(&mut buf, area);
@@ -1829,6 +1842,79 @@ fn footer_slots_do_not_overlap() {
         left.ends_with('…'),
         "status segment not ellipsised: {left:?}"
     );
+}
+
+#[test]
+fn footer_shows_context_percentage_bar_with_status_colors() {
+    let mut app = app();
+    let area = Rect::new(0, 0, 100, 8);
+    let read_row = |buf: &Buffer, y: u16| -> String {
+        let mut out = String::new();
+        let mut x = 0u16;
+        while x < area.width {
+            let sym = buf[(x, y)].symbol();
+            out.push_str(sym);
+            x += (display_width(sym).max(1)) as u16;
+        }
+        out
+    };
+
+    // Zero context tokens renders 0% with 10 light shade blocks in success colour,
+    // without raw token count or cost.
+    app.session.context = solaris_agent::ContextUsage {
+        tokens: Some(0),
+        window: 1000,
+        estimated: false,
+    };
+    let mut buf = Buffer::empty(area);
+    app.render(&mut buf, area);
+    let footer = read_row(&buf, area.height - 1);
+    assert!(
+        footer.contains("上下文 ░░░░░░░░░░ 0%"),
+        "unexpected empty context gauge: {footer:?}"
+    );
+    assert!(
+        !footer.contains("tok"),
+        "raw token counter should be gone: {footer:?}"
+    );
+    assert!(
+        !footer.contains('$'),
+        "cost should only be shown in /stats: {footer:?}"
+    );
+    let empty_bar_x = (0..area.width)
+        .find(|&x| buf[(x, area.height - 1)].symbol() == "░")
+        .expect("empty bar cell");
+    assert_eq!(buf[(empty_bar_x, area.height - 1)].fg, app.theme.success);
+
+    // 50% fills half the bar in success colour.
+    app.session.context.tokens = Some(500);
+    let mut buf = Buffer::empty(area);
+    app.render(&mut buf, area);
+    let footer = read_row(&buf, area.height - 1);
+    assert!(
+        footer.contains("上下文 █████░░░░░ 50%"),
+        "unexpected 50% context gauge: {footer:?}"
+    );
+    let bar_x = (0..area.width)
+        .find(|&x| buf[(x, area.height - 1)].symbol() == "█")
+        .expect("filled bar cell");
+    assert_eq!(buf[(bar_x, area.height - 1)].fg, app.theme.success);
+
+    // 75% switches to warning colour; 92% switches to error colour.
+    for (tokens, expected, expected_fg) in [
+        (750, "上下文 ████████░░ 75%", app.theme.warning),
+        (920, "上下文 █████████░ 92%", app.theme.error),
+    ] {
+        app.session.context.tokens = Some(tokens);
+        let mut buf = Buffer::empty(area);
+        app.render(&mut buf, area);
+        let footer = read_row(&buf, area.height - 1);
+        assert!(footer.contains(expected), "{footer:?}");
+        let bar_x = (0..area.width)
+            .find(|&x| buf[(x, area.height - 1)].symbol() == "█")
+            .expect("filled bar cell");
+        assert_eq!(buf[(bar_x, area.height - 1)].fg, expected_fg);
+    }
 }
 
 #[test]
@@ -2040,8 +2126,8 @@ fn the_wizard_owns_the_keyboard() {
     let mut app = app();
     app.submit("/connect".to_string());
 
-    // Ctrl+K would open the palette for the session screen.
-    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    // F1 would open the help overlay for the session screen.
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()));
 
     assert!(
         app.overlay_queue.borrow().is_empty(),

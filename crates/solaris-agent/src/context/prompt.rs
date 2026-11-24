@@ -228,17 +228,17 @@ mod tests {
 
     #[test]
     fn the_prompt_names_what_solaris_is_and_what_it_may_do() {
-        let build = system_prompt(Mode::Build, &tools(Mode::Build), &Skills::empty(), None);
-        assert!(build.contains("You are solaris"));
-        assert!(build.contains("build mode"));
-        assert!(build.contains("# Using the tools"), "{build}");
+        let default = system_prompt(Mode::Default, &tools(Mode::Default), &Skills::empty(), None);
+        assert!(default.contains("You are solaris"));
+        assert!(default.contains("default mode"));
+        assert!(default.contains("# Using the tools"), "{default}");
         assert!(
-            build.contains("`read`:"),
-            "tool guidance is listed: {build}"
+            default.contains("`read`:"),
+            "tool guidance is listed: {default}"
         );
-        assert!(build.contains("# How to work"), "{build}");
+        assert!(default.contains("# How to work"), "{default}");
         assert!(
-            !build.contains("# This endpoint"),
+            !default.contains("# This endpoint"),
             "no note without a provider"
         );
     }
@@ -255,13 +255,13 @@ mod tests {
 
     #[test]
     fn only_the_tools_of_this_turn_are_described() {
-        let build = system_prompt(Mode::Build, &tools(Mode::Build), &Skills::empty(), None);
+        let default = system_prompt(Mode::Default, &tools(Mode::Default), &Skills::empty(), None);
         let plan = system_prompt(Mode::Plan, &tools(Mode::Plan), &Skills::empty(), None);
 
-        // The shell is declared in build mode and withdrawn in plan mode.
+        // The shell is declared in default mode and withdrawn in plan mode.
         assert!(
-            build.contains(&format!("`{}`:", solaris_tools::SHELL_TOOL)),
-            "{build}"
+            default.contains(&format!("`{}`:", solaris_tools::SHELL_TOOL)),
+            "{default}"
         );
         assert!(
             !plan.contains(&format!("`{}`:", solaris_tools::SHELL_TOOL)),
@@ -274,8 +274,8 @@ mod tests {
     fn application_instructions_are_used_without_catalogue_lookup() {
         let supplied = "Custom backend instructions, resolved by the caller.";
         let prompt = system_prompt(
-            Mode::Build,
-            &tools(Mode::Build),
+            Mode::Default,
+            &tools(Mode::Default),
             &Skills::empty(),
             Some(supplied),
         );
@@ -283,7 +283,7 @@ mod tests {
             prompt.contains(&format!("# This endpoint\n{supplied}")),
             "{prompt}"
         );
-        let without = system_prompt(Mode::Build, &[], &Skills::empty(), None);
+        let without = system_prompt(Mode::Default, &[], &Skills::empty(), None);
         assert!(!without.contains("# This endpoint"), "{without}");
     }
 
@@ -298,7 +298,7 @@ mod tests {
             Skill::sample("release", "Cut a release.", "/skills/release/SKILL.md"),
         ]);
 
-        let prompt = system_prompt(Mode::Build, &tools(Mode::Build), &skills, None);
+        let prompt = system_prompt(Mode::Default, &tools(Mode::Default), &skills, None);
         assert!(prompt.contains("# Skills"), "{prompt}");
         assert!(
             prompt.contains("- `pdf-tools`: Extract text from PDFs."),
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_session_without_skills_says_nothing_about_them() {
-        let prompt = system_prompt(Mode::Build, &tools(Mode::Build), &Skills::empty(), None);
+        let prompt = system_prompt(Mode::Default, &tools(Mode::Default), &Skills::empty(), None);
         assert!(!prompt.contains("# Skills"), "{prompt}");
     }
 
@@ -326,7 +326,7 @@ mod tests {
         let skills =
             Skills::from_skills(vec![Skill::sample("a", "Something.", "/skills/a/SKILL.md")]);
 
-        let prompt = system_prompt(Mode::Build, &[], &skills, None);
+        let prompt = system_prompt(Mode::Default, &[], &skills, None);
         assert!(prompt.contains("read its file"), "{prompt}");
         assert!(!prompt.contains("`read` tool"), "{prompt}");
     }
@@ -357,7 +357,7 @@ mod tests {
         }
 
         let tools: Vec<std::sync::Arc<dyn Tool>> = vec![std::sync::Arc::new(Bare)];
-        let prompt = system_prompt(Mode::Build, &tools, &Skills::empty(), None);
+        let prompt = system_prompt(Mode::Default, &tools, &Skills::empty(), None);
         assert!(!prompt.contains("`bare`"), "{prompt}");
         assert!(
             !prompt.contains("# Using the tools"),

@@ -14,9 +14,8 @@ pub const KEY_HELP: &[(&str, &str)] = &[
     ("alt+enter", "insert a newline"),
     (
         "tab",
-        "toggle build / plan mode — or fill in the `/` command",
+        "cycle mode (default / plan / auto / ask) — or fill in the `/` command",
     ),
-    ("ctrl+k", "command palette"),
     ("ctrl+t", "cycle the theme"),
     ("ctrl+o", "toggle thinking blocks"),
     ("ctrl+l", "clear the transcript"),
@@ -332,7 +331,8 @@ mod tests {
                 spec.name
             );
         }
-        assert!(text.contains("ctrl+k"));
+        assert!(text.contains("ctrl+t"));
+        assert!(!text.contains("ctrl+k"));
     }
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
             &session,
             "claude-sonnet-4-5",
             "anthropic",
-            solaris_agent::Mode::Build,
+            solaris_agent::Mode::Default,
             1000,
             None,
         );
@@ -426,7 +426,7 @@ mod tests {
         assert!(text.contains("claude-sonnet-4-5"));
         assert!(text.contains("150"), "the buckets are summed: {text}");
         assert!(text.contains("120"));
-        assert!(text.contains("BUILD"));
+        assert!(text.contains("DEFAULT"));
         assert!(text.contains("15.0%"));
         // A measured session makes no apology for its numbers.
         assert!(!text.contains('≈'), "{text}");
@@ -464,7 +464,7 @@ mod tests {
             &session,
             "claude-sonnet-4-5",
             "anthropic",
-            solaris_agent::Mode::Build,
+            solaris_agent::Mode::Default,
             1000,
             None,
         ));

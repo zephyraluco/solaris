@@ -79,14 +79,28 @@ pub struct RuntimeSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModeContexts {
-    pub build: crate::ContextUsage,
+    pub default: crate::ContextUsage,
     pub plan: crate::ContextUsage,
+    pub auto: crate::ContextUsage,
+    pub ask: crate::ContextUsage,
+}
+impl ModeContexts {
+    fn from_agent(agent: &crate::Agent) -> Self {
+        Self {
+            default: agent.context_usage(crate::Mode::Default),
+            plan: agent.context_usage(crate::Mode::Plan),
+            auto: agent.context_usage(crate::Mode::Auto),
+            ask: agent.context_usage(crate::Mode::Ask),
+        }
+    }
 }
 impl RuntimeSnapshot {
     pub fn context(&self, mode: crate::Mode) -> crate::ContextUsage {
         match mode {
-            crate::Mode::Build => self.contexts.build,
+            crate::Mode::Default => self.contexts.default,
             crate::Mode::Plan => self.contexts.plan,
+            crate::Mode::Auto => self.contexts.auto,
+            crate::Mode::Ask => self.contexts.ask,
         }
     }
 }
@@ -214,14 +228,11 @@ impl SessionRuntime {
             sequence,
             task_id: None,
             model: agent.model().into(),
-            mode: crate::Mode::Build,
+            mode: crate::Mode::Default,
             label: agent.label().into(),
             provider_id: agent.provider_id().map(str::to_owned),
             capabilities: agent.capabilities(),
-            contexts: ModeContexts {
-                build: agent.context_usage(crate::Mode::Build),
-                plan: agent.context_usage(crate::Mode::Plan),
-            },
+            contexts: ModeContexts::from_agent(&agent),
             active_tasks: agent.active_tasks(),
             billing: agent.usage_totals(),
             stop_reason: agent.stop_reason(),
@@ -329,7 +340,7 @@ impl SessionRuntime {
             return Err("use a runtime command after session startup".into());
         }
         operation(&self.view())?;
-        refresh(&self.core, None, crate::Mode::Build);
+        refresh(&self.core, None, crate::Mode::Default);
         Ok(())
     }
     /// Attach a journal before the session starts.
@@ -375,10 +386,7 @@ fn refresh(core: &Core, task_id: Option<u64>, mode: crate::Mode) {
     let view = core.view.read().unwrap_or_else(|p| p.into_inner());
     // Compute services before taking the UI snapshot lock: Jobs may be waiting
     // for persistence, but drawing must still be able to read the previous view.
-    let contexts = ModeContexts {
-        build: view.context_usage(crate::Mode::Build),
-        plan: view.context_usage(crate::Mode::Plan),
-    };
+    let contexts = ModeContexts::from_agent(&view);
     let tasks = view.active_tasks();
     let billing = view.usage_totals();
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
@@ -613,7 +621,7 @@ async fn serve(
                     }
                     _ => result = Err("session already has an active operation".into()),
                 }
-                refresh(&core, active.as_ref().map(|a| a.id), active.as_ref().map_or(crate::Mode::Build, |a| a.mode));
+                refresh(&core, active.as_ref().map(|a| a.id), active.as_ref().map_or(crate::Mode::Default, |a| a.mode));
                 let _ = accepted.send(result.map(|()|core.snapshot.read().unwrap_or_else(|p|p.into_inner()).clone()));
             }
             event = progress.recv() => {
@@ -669,7 +677,7 @@ async fn serve(
                             let event = publish_with_meta(&core, Some(run.id), run.mode, terminal, None, completion);
                             if let Some(output) = &run.output { let _ = output.send(event); }
                         }
-                        refresh(&core, None, crate::Mode::Build);
+                        refresh(&core, None, crate::Mode::Default);
                     }
                 }
             }
@@ -678,7 +686,7 @@ async fn serve(
     let running = active.is_some();
     drop(active);
     if let Some(core) = weak.upgrade() {
-        refresh(&core, None, crate::Mode::Build);
+        refresh(&core, None, crate::Mode::Default);
         if running && *closed.borrow() {
             core.snapshot
                 .write()
@@ -781,7 +789,7 @@ mod tests {
             session
                 .dispatch(RuntimeCommand::Prompt {
                     text: "no".into(),
-                    mode: crate::Mode::Build
+                    mode: crate::Mode::Default
                 })
                 .is_err()
         );
@@ -793,7 +801,7 @@ mod tests {
         session
             .dispatch(RuntimeCommand::Prompt {
                 text: "wait".into(),
-                mode: crate::Mode::Build,
+                mode: crate::Mode::Default,
             })
             .unwrap()
             .accepted()
@@ -830,7 +838,7 @@ mod tests {
         let accepted = runtime
             .dispatch(RuntimeCommand::Prompt {
                 text: "wait".into(),
-                mode: crate::Mode::Build,
+                mode: crate::Mode::Default,
             })
             .unwrap()
             .accepted()
@@ -873,7 +881,7 @@ mod tests {
             publish(
                 &runtime.core,
                 Some(8),
-                crate::Mode::Build,
+                crate::Mode::Default,
                 AgentEvent::TextDelta(index.to_string()),
             );
         }
@@ -903,7 +911,7 @@ mod tests {
             publish(
                 &runtime.core,
                 None,
-                crate::Mode::Build,
+                crate::Mode::Default,
                 AgentEvent::Status("status".into()),
             );
         }
@@ -926,7 +934,7 @@ mod tests {
         publish(
             &source.core,
             Some(1),
-            crate::Mode::Build,
+            crate::Mode::Default,
             AgentEvent::TextDelta("saved".into()),
         );
         let fork = journal.fork(dir.path(), "fixture").unwrap();
@@ -937,7 +945,7 @@ mod tests {
             branch
                 .execute(RuntimeCommand::Prompt {
                     text: "next".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -964,7 +972,7 @@ mod tests {
         let running = runtime
             .execute(RuntimeCommand::Prompt {
                 text: "wait".into(),
-                mode: crate::Mode::Build,
+                mode: crate::Mode::Default,
             })
             .await
             .unwrap();
@@ -973,7 +981,7 @@ mod tests {
             runtime
                 .execute(RuntimeCommand::Prompt {
                     text: "other".into(),
-                    mode: crate::Mode::Build
+                    mode: crate::Mode::Default
                 })
                 .await
                 .is_err()
@@ -988,7 +996,7 @@ mod tests {
             runtime
                 .execute(RuntimeCommand::Prompt {
                     text: "next".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -1009,7 +1017,7 @@ mod tests {
             runtime
                 .execute(RuntimeCommand::Prompt {
                     text: "one".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -1019,7 +1027,7 @@ mod tests {
             runtime
                 .execute(RuntimeCommand::Prompt {
                     text: "two".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -1045,7 +1053,7 @@ mod tests {
         let stream = runtime
             .execute(RuntimeCommand::Prompt {
                 text: "wait".into(),
-                mode: crate::Mode::Build,
+                mode: crate::Mode::Default,
             })
             .await
             .unwrap();
@@ -1061,7 +1069,7 @@ mod tests {
             runtime
                 .execute(RuntimeCommand::Prompt {
                     text: "next".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -1100,7 +1108,7 @@ mod tests {
             second
                 .execute(RuntimeCommand::Prompt {
                     text: "second".into(),
-                    mode: crate::Mode::Build,
+                    mode: crate::Mode::Default,
                 })
                 .await
                 .unwrap(),
@@ -1132,7 +1140,7 @@ mod tests {
             let snapshot = runtime.snapshot();
             assert_eq!(snapshot.model, model);
             assert_eq!(snapshot.provider_id.as_deref(), Some(provider.as_str()));
-            assert_eq!(snapshot.context(crate::Mode::Build).window, window);
+            assert_eq!(snapshot.context(crate::Mode::Default).window, window);
             assert_eq!(snapshot.context(crate::Mode::Plan).window, window);
             assert!(snapshot.task_id.is_none());
         }

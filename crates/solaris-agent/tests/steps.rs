@@ -78,7 +78,7 @@ async fn execute(steps: Option<std::num::NonZeroU32>) -> (usize, usize, Vec<Runt
     let events = runtime
         .execute(RuntimeCommand::Prompt {
             text: "inspect".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()

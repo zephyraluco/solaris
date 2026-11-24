@@ -126,10 +126,18 @@ fn acp_streams_turns_and_replays_the_saved_session_on_reopen() {
     let mut peer = AcpProcess::start(dir.path(), &endpoint, &[]);
     let id = peer.new_session(&cwd);
     peer.send(json!({"id":3,"method":"session/set_config_option","params":{"sessionId":id,"configId":"mode","value":"plan"}}));
+    let mode_update = peer.response(3).0;
     assert_eq!(
-        peer.response(3).0["result"]["configOptions"][0]["currentValue"],
+        mode_update["result"]["configOptions"][0]["currentValue"],
         "plan"
     );
+    let mode_ids: Vec<&str> = mode_update["result"]["configOptions"][0]["options"]
+        .as_array()
+        .expect("mode options")
+        .iter()
+        .filter_map(|option| option["value"].as_str())
+        .collect();
+    assert_eq!(mode_ids, ["default", "plan", "auto", "ask"]);
     for (request_id, prompt, reply) in [
         (4, "first prompt", "first reply"),
         (5, "second prompt", "second reply"),

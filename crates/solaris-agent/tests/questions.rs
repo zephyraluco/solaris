@@ -73,7 +73,7 @@ async fn start(session: &SessionRuntime) -> (RuntimeEventStream, QuestionRequest
     let mut stream = session
         .execute(RuntimeCommand::Prompt {
             text: "choose".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap();
@@ -215,7 +215,7 @@ fn noninteractive_sessions_do_not_advertise_question_even_with_explicit_selectio
         Arc::new(agent_tool_registry()),
         options,
     );
-    assert!(!agent.tool_names(Mode::Build).contains(&"question".into()));
+    assert!(!agent.tool_names(Mode::Default).contains(&"question".into()));
 }
 
 #[tokio::test]

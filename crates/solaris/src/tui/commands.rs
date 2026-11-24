@@ -1,7 +1,7 @@
 //! The slash commands the prompt accepts, and the views built over them.
 //!
 //! [`PROMPT_SLASH_COMMANDS`] is the single source of truth: parsing, the
-//! editor's completion popup, the Ctrl+K palette and the help dialog all read
+//! editor's completion popup, and the help dialog all read
 //! this one table rather than each keeping a list of their own. Running a
 //! command is deliberately not here — the table is data, and
 //! `App::execute_command` is what decides what each name does.
@@ -12,7 +12,6 @@
 
 use solaris_agent::{Skill, Skills};
 use solaris_tui::components::editor::CommandHint;
-use solaris_tui::components::select_list::SelectItem;
 
 /// What an invocation is written as: `/skill:<name>`.
 ///
@@ -68,8 +67,8 @@ pub const PROMPT_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "mode",
-        description: "Toggle build / plan mode",
-        args: "",
+        description: "Switch mode (default / plan / auto / ask)",
+        args: "[default|plan|auto|ask]",
     },
     SlashCommandSpec {
         name: "compact",
@@ -172,7 +171,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 
 /// Completion hints for the editor's slash-command popup.
 ///
-/// The `skill:` entry is left out here even though `/help` and the palette carry
+/// The `skill:` entry is left out here even though `/help` carries
 /// it: a placeholder for a name the editor can list itself is worse than the
 /// names. Typing `/skill` offers every skill by name, with what it is for and
 /// where it came from, and picking one completes the whole invocation.
@@ -206,21 +205,6 @@ fn skill_hint(skill: &Skill) -> CommandHint {
         ),
         "[request]",
     )
-}
-
-/// Items for the Ctrl+K command palette.
-pub fn palette_items() -> Vec<SelectItem> {
-    PROMPT_SLASH_COMMANDS
-        .iter()
-        .map(|spec| {
-            let item = SelectItem::new(spec.name, format!("/{}", spec.name));
-            if spec.args.is_empty() {
-                item.description(spec.description)
-            } else {
-                item.description(format!("{} — {}", spec.description, spec.args))
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -309,17 +293,5 @@ mod tests {
             hint.args, "[request]",
             "an args is what makes the editor leave room for the request"
         );
-    }
-
-    #[test]
-    fn palette_items_are_every_command_named_with_a_slash() {
-        let items = palette_items();
-        assert_eq!(items.len(), PROMPT_SLASH_COMMANDS.len());
-        for (item, spec) in items.iter().zip(PROMPT_SLASH_COMMANDS) {
-            // The value is fed back through `App::submit`, which re-adds the
-            // slash; the label is what the palette shows.
-            assert_eq!(item.value, spec.name);
-            assert_eq!(item.label, format!("/{}", spec.name));
-        }
     }
 }

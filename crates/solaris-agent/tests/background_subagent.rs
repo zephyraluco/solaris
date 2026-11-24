@@ -147,7 +147,7 @@ async fn nested_foreground_delegation_does_not_hold_the_only_execution_slot() {
         session
             .execute(RuntimeCommand::Prompt {
                 text: "root".into(),
-                mode: Mode::Build,
+                mode: Mode::Default,
             })
             .await
             .unwrap()
@@ -191,7 +191,7 @@ async fn background_job_outlives_parent_turn_and_delivers_to_idle_session() {
         session
             .execute(RuntimeCommand::Prompt {
                 text: "delegate".into(),
-                mode: Mode::Build,
+                mode: Mode::Default,
             })
             .await
             .unwrap()
@@ -236,7 +236,7 @@ async fn application_shutdown_marks_running_jobs_interrupted() {
     let _: Vec<_> = session
         .execute(RuntimeCommand::Prompt {
             text: "delegate".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()
@@ -262,7 +262,7 @@ async fn explicit_job_cancel_stops_only_the_requested_child() {
     let _: Vec<_> = session
         .execute(RuntimeCommand::Prompt {
             text: "delegate".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()
@@ -292,7 +292,7 @@ async fn cancelling_foreground_wait_cancels_the_child_job() {
     let events = session
         .execute(RuntimeCommand::Prompt {
             text: "delegate".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap();
@@ -326,7 +326,7 @@ async fn restart_restores_interrupted_jobs_without_replaying_tools() {
     let _: Vec<_> = session
         .execute(RuntimeCommand::Prompt {
             text: "delegate".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()
@@ -360,7 +360,7 @@ async fn running_child_accepts_a_followup_without_starting_a_second_job() {
     let _: Vec<_> = session
         .execute(RuntimeCommand::Prompt {
             text: "delegate".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()
@@ -373,7 +373,7 @@ async fn running_child_accepts_a_followup_without_starting_a_second_job() {
     let _: Vec<_> = session
         .execute(RuntimeCommand::Prompt {
             text: "send a follow-up to the running child".into(),
-            mode: Mode::Build,
+            mode: Mode::Default,
         })
         .await
         .unwrap()

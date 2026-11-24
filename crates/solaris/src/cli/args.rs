@@ -15,7 +15,11 @@ pub(super) struct Args {
     #[arg(long, value_parser = ["dark", "light"])]
     pub(super) theme: Option<String>,
 
-    /// Start in plan mode instead of build mode.
+    /// Operating mode (`default`, `plan`, `auto`, or `ask`); omitted means the remembered one, or `default`.
+    #[arg(long, value_parser = ["default", "plan", "auto", "ask"], conflicts_with = "plan")]
+    pub(super) mode: Option<String>,
+
+    /// Start in plan mode (shorthand for `--mode plan`).
     #[arg(long)]
     pub(super) plan: bool,
 

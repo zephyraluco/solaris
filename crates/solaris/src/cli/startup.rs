@@ -35,12 +35,17 @@ pub(super) struct Startup {
 
 impl Startup {
     pub(super) fn load(args: &Args) -> Result<Self> {
+        let explicit_mode = if args.plan {
+            Some(Mode::Plan)
+        } else {
+            args.mode.as_deref().and_then(Mode::parse)
+        };
         let mut config = Config {
             theme: args
                 .theme
                 .clone()
                 .unwrap_or_else(|| Config::default().theme),
-            mode: if args.plan { Mode::Plan } else { Mode::Build },
+            mode: explicit_mode.unwrap_or(Mode::Default),
             ..Config::default()
         };
         if let Some(model) = &args.model {
@@ -112,7 +117,7 @@ impl Startup {
         {
             config.theme = theme.clone();
         }
-        if !args.plan
+        if explicit_mode.is_none()
             && let Some(mode) = settings.mode
         {
             config.mode = mode;

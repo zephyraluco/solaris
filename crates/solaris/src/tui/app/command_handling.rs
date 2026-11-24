@@ -18,11 +18,15 @@ impl App {
         self.notifications.info("cancelled");
     }
 
-    pub(super) fn toggle_mode(&mut self) {
-        self.config.mode = self.config.mode.next();
+    pub(super) fn set_mode(&mut self, mode: Mode) {
+        self.config.mode = mode;
         self.persist_settings();
         self.notifications
             .info(format!("{} mode", self.config.mode.label()));
+    }
+
+    pub(super) fn toggle_mode(&mut self) {
+        self.set_mode(self.config.mode.next());
     }
 
     pub(super) fn cycle_theme(&mut self) {
@@ -172,7 +176,17 @@ impl App {
                     self.set_model(args);
                 }
             }
-            "mode" => self.toggle_mode(),
+            "mode" => {
+                if args.is_empty() {
+                    self.toggle_mode();
+                } else if let Some(mode) = Mode::parse(args) {
+                    self.set_mode(mode);
+                } else {
+                    self.notifications.error(format!(
+                        "unknown mode `{args}` — expected default, plan, auto, or ask"
+                    ));
+                }
+            }
             "clear" => self.open_clear_confirm(),
             "compact" => self.compact_now(),
             "queue" => self.queue_follow_up(args),

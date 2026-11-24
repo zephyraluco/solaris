@@ -42,7 +42,7 @@ pub(super) fn run(
     ));
     let choice = factory(&config.model);
     // A noninteractive run cannot wait for an approval prompt.
-    if ask_approval {
+    if ask_approval || config.mode == Mode::Ask {
         options.approver = Arc::new(solaris_agent::DenyAll);
     }
     let sessions = solaris_agent::Runtime::default();

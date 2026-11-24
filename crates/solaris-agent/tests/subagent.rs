@@ -260,7 +260,7 @@ async fn child_has_independent_context_and_only_returns_its_final_report() {
     let agent = solaris_agent::SessionRuntime::new(
         build_agent(Arc::clone(&model), AgentOptions::default(), &runs).with_resources(resources),
     );
-    let events = run(&agent, Mode::Build).await;
+    let events = run(&agent, Mode::Default).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(result(&events).output, "child final report");
     let text: String = events
@@ -333,7 +333,7 @@ async fn general_child_executes_tools_and_obeys_inherited_approval() {
             },
         )));
         let agent = agent(Arc::new(model), options, &runs);
-        let events = run(&agent, Mode::Build).await;
+        let events = run(&agent, Mode::Default).await;
         assert_eq!(runs.load(Ordering::SeqCst), usize::from(allowed));
         assert!(matches!(
             events.last(),
@@ -353,7 +353,7 @@ async fn explore_cannot_gain_write_access_through_an_explicit_allowlist() {
         ..Default::default()
     });
     let agent = agent(Arc::clone(&model), options, &runs);
-    run(&agent, Mode::Build).await;
+    run(&agent, Mode::Default).await;
     assert_eq!(runs.load(Ordering::SeqCst), 0);
     let requests = model.requests();
     let child = requests.iter().find(|request| is_child(request)).unwrap();
@@ -374,7 +374,7 @@ async fn a_general_child_preserves_explicitly_selected_tools_outside_build_defau
         }),
         &runs,
     );
-    run(&agent, Mode::Build).await;
+    run(&agent, Mode::Default).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     let requests = model.requests();
     let child = requests.iter().find(|request| is_child(request)).unwrap();
@@ -427,7 +427,7 @@ async fn children_cannot_recursively_delegate_even_if_the_model_asks() {
         AgentOptions::default(),
         &Arc::new(AtomicUsize::new(0)),
     );
-    run(&agent, Mode::Build).await;
+    run(&agent, Mode::Default).await;
     let requests = model.requests();
     assert_eq!(
         requests.iter().filter(|request| is_child(request)).count(),
@@ -456,7 +456,7 @@ async fn child_failure_is_a_tool_error_not_a_parent_terminal_event() {
         AgentOptions::default(),
         &Arc::new(AtomicUsize::new(0)),
     );
-    let events = run(&agent, Mode::Build).await;
+    let events = run(&agent, Mode::Default).await;
     assert!(result(&events).is_error);
     assert!(result(&events).output.contains("child backend unavailable"));
     assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
@@ -476,7 +476,7 @@ async fn child_steps_return_a_report_without_sharing_a_parent_budget() {
     let mut options = AgentOptions::default();
     options.execution.steps = std::num::NonZeroU32::new(24);
     let agent = agent(Arc::clone(&model), options, &runs);
-    let events = run(&agent, Mode::Build).await;
+    let events = run(&agent, Mode::Default).await;
     assert!(!result(&events).is_error);
     assert_eq!(
         result(&events).metadata.details["finish_reason"],
@@ -507,7 +507,7 @@ async fn independent_subagents_run_concurrently_and_keep_result_order() {
         AgentOptions::default(),
         &Arc::new(AtomicUsize::new(0)),
     );
-    let events = run(&agent, Mode::Build).await;
+    let events = run(&agent, Mode::Default).await;
     let results: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -542,7 +542,7 @@ async fn parallel_child_tools_with_identical_ids_keep_distinct_display_task_ids(
         AgentOptions::default(),
         &Arc::new(AtomicUsize::new(0)),
     );
-    let events = run(&agent, Mode::Build).await;
+    let events = run(&agent, Mode::Default).await;
     let mut scopes: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -577,7 +577,8 @@ async fn cancellation_and_dropped_parent_stream_stop_pending_child_network_reque
             AgentOptions::default(),
             &Arc::new(AtomicUsize::new(0)),
         );
-        let mut stream = test_support::run_turn(&agent, "ROOT_PRIVATE_CONTEXT", Mode::Build).await;
+        let mut stream =
+            test_support::run_turn(&agent, "ROOT_PRIVATE_CONTEXT", Mode::Default).await;
         tokio::time::timeout(Duration::from_secs(1), model.started.notified())
             .await
             .unwrap();
@@ -617,7 +618,7 @@ fn delegation_can_be_disabled_or_excluded_by_tool_selection() {
     );
     assert!(
         !disabled
-            .tool_names(Mode::Build)
+            .tool_names(Mode::Default)
             .contains(&"subagent".to_string())
     );
     let excluded = build_agent(
@@ -630,7 +631,7 @@ fn delegation_can_be_disabled_or_excluded_by_tool_selection() {
     );
     assert!(
         !excluded
-            .tool_names(Mode::Build)
+            .tool_names(Mode::Default)
             .contains(&"subagent".to_string())
     );
     assert!(
@@ -675,7 +676,7 @@ async fn child_sessions_persist_and_explicit_model_overrides_use_the_factory() {
             .with_child_backend(child_factory),
     );
     parent.attach_journal(journal).expect("attach");
-    let events = run(&parent, Mode::Build).await;
+    let events = run(&parent, Mode::Default).await;
     assert_eq!(factory_called.load(Ordering::SeqCst), 1);
     let requests = model.requests();
     let child_request = requests
@@ -721,7 +722,7 @@ async fn blank_child_selectors_inherit_the_parent_without_a_factory_or_saved_ses
             AgentOptions::default(),
             &Arc::new(AtomicUsize::new(0)),
         );
-        let events = run(&parent, Mode::Build).await;
+        let events = run(&parent, Mode::Default).await;
         let output = result(&events);
         assert!(!output.is_error, "{}", output.output);
         assert_eq!(output.output, "child final report");
@@ -740,7 +741,7 @@ async fn blank_child_model_does_not_invoke_the_override_factory() {
         build_agent(Arc::new(model), options, &Arc::new(AtomicUsize::new(0)))
             .with_child_backend(child_factory),
     );
-    let events = run(&parent, Mode::Build).await;
+    let events = run(&parent, Mode::Default).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
 
@@ -765,7 +766,7 @@ async fn child_model_override_is_trimmed_before_resolving_the_backend() {
         build_agent(model, options, &Arc::new(AtomicUsize::new(0)))
             .with_child_backend(child_factory),
     );
-    let events = run(&parent, Mode::Build).await;
+    let events = run(&parent, Mode::Default).await;
     assert!(!result(&events).is_error, "{}", result(&events).output);
 }
 
@@ -785,7 +786,7 @@ async fn invalid_child_model_is_rejected_before_resolving_or_running_a_child() {
             build_agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
                 .with_child_backend(child_factory),
         );
-        let events = run(&parent, Mode::Build).await;
+        let events = run(&parent, Mode::Default).await;
         let output = result(&events);
         assert!(output.is_error);
         assert!(output.output.contains(message), "{}", output.output);
@@ -805,7 +806,7 @@ async fn an_explicit_child_model_failure_is_reported_without_falling_back() {
         build_agent(Arc::clone(&model), options, &Arc::new(AtomicUsize::new(0)))
             .with_child_backend(child_factory),
     );
-    let events = run(&parent, Mode::Build).await;
+    let events = run(&parent, Mode::Default).await;
     assert!(result(&events).is_error);
     assert!(
         result(&events)

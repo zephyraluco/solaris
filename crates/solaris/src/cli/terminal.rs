@@ -13,7 +13,7 @@ pub(super) fn run(
     startup: Startup,
     overrides: ConnectionOverrides,
     execution: ExecutionSettings,
-    ask_approval: bool,
+    _ask_approval: bool,
     journal: Option<Arc<SessionJournal>>,
 ) -> Result<()> {
     let Startup {
@@ -68,7 +68,10 @@ pub(super) fn run(
         skills: resources.skills,
         prompt_context: resources.prompt,
         resource_paths: Some(resource_paths),
-        ask_approval,
+        // Interactive TUI sessions always attach the confirmation channel so
+        // `default` confirms mutating tools, `ask` confirms every tool, and
+        // `auto` runs tools automatically without prompting.
+        ask_approval: true,
         execution,
         registry: Some(registry),
         journal,

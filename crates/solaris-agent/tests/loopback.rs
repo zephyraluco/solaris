@@ -178,7 +178,7 @@ fn agent(addr: SocketAddr, dir: &Path) -> solaris_agent::SessionRuntime {
 
 /// Read a turn's stream to its end.
 async fn drain(agent: &solaris_agent::SessionRuntime, prompt: &str) -> Vec<AgentEvent> {
-    let mut stream = test_support::run_turn(agent, prompt, Mode::Build).await;
+    let mut stream = test_support::run_turn(agent, prompt, Mode::Default).await;
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);

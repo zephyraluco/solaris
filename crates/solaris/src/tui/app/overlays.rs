@@ -14,7 +14,6 @@ impl App {
             DialogMessage::Cancelled => {}
             DialogMessage::Theme(name) => self.set_theme(&name),
             DialogMessage::Session(id) => self.switch_session(&id, false),
-            DialogMessage::Command(text) => self.submit(text),
             DialogMessage::Confirm {
                 action: ConfirmAction::RunTool(id),
                 accepted,
@@ -195,23 +194,6 @@ impl App {
             "buddy: {name} the {}",
             self.buddy.bones.species.as_str()
         ));
-    }
-
-    pub(super) fn open_palette(&mut self) {
-        let items = commands::palette_items();
-        let dialog = SelectDialog::new(
-            "Commands",
-            HINT_SELECT,
-            items,
-            &self.theme,
-            self.dialog_tx.clone(),
-            |value| DialogMessage::Command(format!("/{value}")),
-        )
-        .label("Select a command:");
-        self.push_overlay(
-            Box::new(dialog),
-            OverlayOptions::centered().width(SizeValue::Percent(72)),
-        );
     }
 
     pub(super) fn open_theme_dialog(&mut self) {

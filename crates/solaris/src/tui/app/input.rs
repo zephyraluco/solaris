@@ -14,10 +14,6 @@ impl App {
             return KeyResult::Handled;
         }
         // Global shortcuts work regardless of the editor contents.
-        if self.keybindings.matches("palette", &key) {
-            self.open_palette();
-            return KeyResult::Handled;
-        }
         if self.keybindings.matches("help", &key)
             || (self.editor.is_empty() && key.code == KeyCode::Char('?'))
         {

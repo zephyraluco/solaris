@@ -4,8 +4,7 @@
 //! kill-ring, an undo stack, history, and slash-command completion that is
 //! rendered inside the input frame.
 //!
-//! `Ctrl+K` is deliberately *not* bound here: the application uses it for the
-//! command palette. `Ctrl+U` / `Ctrl+W` still delete backwards.
+//! `Ctrl+U` / `Ctrl+W` delete backwards.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;

@@ -642,7 +642,7 @@ fn the_first_frame_is_the_terminal_ready_for_input() {
         "activity placeholder missing:\n{text}"
     );
     assert!(text.contains("Ask anything"), "{text}");
-    assert!(text.contains("BUILD"), "{text}");
+    assert!(text.contains("DEFAULT"), "{text}");
     // The footer names the backend that would answer, which under test is the
     // stand-in rather than a provider.
     assert!(text.contains("fake"), "{text}");
@@ -737,37 +737,6 @@ fn filtering_the_slash_completion_popup_renders_the_single_match() {
 }
 
 #[test]
-fn command_palette_renders_the_claude_picker_and_captures_input() {
-    let mut harness = Harness::new();
-    harness.ctrl('k');
-
-    let text = harness.draw();
-    assert!(text.contains("Commands"), "{text}");
-    assert!(text.contains("Select a command:"), "{text}");
-    assert!(text.contains("Enter to select · Esc to cancel"), "{text}");
-
-    // The palette numbers its rows to fit however many commands there are, so
-    // only the row's own text is asserted here; that the first row is the
-    // selected one is the next test's business.
-    assert!(text.contains("❯"), "{text}");
-    assert!(
-        text.contains("1. /help · Show keyboard shortcuts"),
-        "{text}"
-    );
-
-    // While the overlay is modal, typing filters the palette, not the editor.
-    harness.type_str("mode");
-    let text = harness.draw();
-    assert!(text.contains("filter: mode"), "{text}");
-    assert!(text.contains("/mode"), "{text}");
-
-    // Escape closes it.
-    harness.key(KeyCode::Esc);
-    let text = harness.draw();
-    assert!(!text.contains("Select a command:"), "{text}");
-}
-
-#[test]
 fn theme_picker_applies_the_highlighted_theme() {
     let mut harness = Harness::new();
     harness.type_str("/theme");
@@ -796,7 +765,8 @@ fn help_overlay_opens_and_closes() {
 
     let text = harness.draw();
     assert!(text.contains("Keyboard"), "{text}");
-    assert!(text.contains("ctrl+k"), "{text}");
+    assert!(text.contains("ctrl+t"), "{text}");
+    assert!(!text.contains("ctrl+k"), "{text}");
 
     harness.key(KeyCode::Esc);
     let text = harness.draw();
@@ -833,8 +803,11 @@ async fn prompt_streams_a_reply_rendered_as_markdown() {
             .any(|line| line.trim_start().starts_with("✓ ") && line.contains("fake")),
         "completion footer missing:\n{text}"
     );
-    // The footer reports the tokens the backend reported.
-    assert!(text.contains("tok"), "token counter missing:\n{text}");
+    // The footer reports context usage as a percentage bar.
+    assert!(
+        text.contains("上下文") && text.contains('%'),
+        "context gauge missing:\n{text}"
+    );
 }
 
 #[tokio::test]
@@ -1000,16 +973,16 @@ async fn dragging_the_footer_then_ctrl_c_copies_what_it_shows() {
         .expect("a footer row")
         .chars()
         .collect();
-    let expected: String = footer[1..=14].iter().collect();
+    let expected: String = footer[1..=16].iter().collect();
     assert!(
-        expected.contains("fake") && expected.contains("BUILD"),
+        expected.contains("fake") && expected.contains("DEFAULT"),
         "unexpected footer: {expected:?}"
     );
 
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 1, FOOTER);
-    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 14, FOOTER);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 16, FOOTER);
     let _ = harness.draw();
-    harness.mouse(MouseEventKind::Up(MouseButton::Left), 14, FOOTER);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 16, FOOTER);
     harness.tui.tick();
 
     assert!(
@@ -1116,12 +1089,27 @@ async fn ctrl_c_copies_selected_text_inside_a_dialog_without_closing_it() {
 #[tokio::test]
 async fn mode_toggle_repaints_the_footer() {
     let mut harness = Harness::new();
-    assert!(harness.draw().contains("BUILD"));
+    assert!(harness.draw().contains("DEFAULT"));
 
     harness.key(KeyCode::Tab);
     let text = harness.draw();
     assert!(text.contains("PLAN"), "{text}");
-    assert!(!text.contains("BUILD"), "{text}");
+    assert!(!text.contains("DEFAULT"), "{text}");
+
+    harness.key(KeyCode::Tab);
+    let text = harness.draw();
+    assert!(text.contains("AUTO"), "{text}");
+    assert!(!text.contains("PLAN"), "{text}");
+
+    harness.key(KeyCode::Tab);
+    let text = harness.draw();
+    assert!(text.contains("ASK"), "{text}");
+    assert!(!text.contains("AUTO"), "{text}");
+
+    harness.key(KeyCode::Tab);
+    let text = harness.draw();
+    assert!(text.contains("DEFAULT"), "{text}");
+    assert!(!text.contains("ASK"), "{text}");
 }
 
 #[tokio::test]
@@ -1366,7 +1354,7 @@ async fn question_panel_replaces_the_editor_without_opening_an_overlay() {
         "question panel must replace the prompt editor:\n{text}"
     );
     assert!(
-        !text.contains("BUILD") && !text.contains("tok"),
+        !text.contains("DEFAULT") && !text.contains("上下文"),
         "question panel must also hide the status footer:\n{text}"
     );
 
@@ -1378,7 +1366,7 @@ async fn question_panel_replaces_the_editor_without_opening_an_overlay() {
         "panel should close:\n{done}"
     );
     assert!(
-        done.contains("Ask anything") && done.contains("BUILD"),
+        done.contains("Ask anything") && done.contains("DEFAULT"),
         "editor and footer should return once the question is answered:\n{done}"
     );
 }

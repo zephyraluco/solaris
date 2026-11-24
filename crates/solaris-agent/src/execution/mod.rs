@@ -429,6 +429,19 @@ impl Runner {
             .into();
         }
 
+        let parsed_subagent = if call.name == SUBAGENT_TOOL {
+            let Some(subagent) = &self.subagent else {
+                return ToolResult::error(call, "subagent delegation is disabled in this session")
+                    .into();
+            };
+            match subagent.parse(call.input.clone()) {
+                Ok(task) => Some((Arc::clone(subagent), task)),
+                Err(output) => return ToolResult::error(call, output.text).into(),
+            }
+        } else {
+            None
+        };
+
         let approval = tokio::select! {
             biased;
             _ = wait_for_cancel(&self.cancel) => return ToolResult::error(call, "the turn was cancelled while waiting for approval").into(),
@@ -511,15 +524,7 @@ impl Runner {
                 ),
                 crate::UsageTotals::default(),
             )
-        } else if call.name == SUBAGENT_TOOL {
-            let Some(subagent) = &self.subagent else {
-                return ToolResult::error(call, "subagent delegation is disabled in this session")
-                    .into();
-            };
-            let task = match subagent.parse(call.input.clone()) {
-                Ok(task) => task,
-                Err(output) => return ToolResult::error(call, output.text).into(),
-            };
+        } else if let Some((subagent, task)) = parsed_subagent {
             let background = task.background;
             let existing = match task
                 .resume_id
@@ -535,10 +540,7 @@ impl Runner {
             };
             let id = match existing {
                 Some(id) => id,
-                None => match self
-                    .jobs
-                    .start(Arc::clone(subagent), task, ctx, tx.clone(), &call.id)
-                {
+                None => match self.jobs.start(subagent, task, ctx, tx.clone(), &call.id) {
                     Ok(id) => id,
                     Err(error) => return ToolResult::error(call, error.to_string()).into(),
                 },
@@ -1070,7 +1072,7 @@ mod tests {
                 follow_up: self.follow_up,
                 conversation: Arc::clone(&self.conversation),
                 system: crate::context::prompt::system_prompt(
-                    Mode::Build,
+                    Mode::Default,
                     &[],
                     &crate::context::skills::Skills::empty(),
                     None,
@@ -1561,7 +1563,7 @@ mod tests {
             follow_up: Queue::new(),
             conversation: Arc::new(Conversation::new()),
             system: crate::context::prompt::system_prompt(
-                Mode::Build,
+                Mode::Default,
                 &[],
                 &crate::context::skills::Skills::empty(),
                 None,

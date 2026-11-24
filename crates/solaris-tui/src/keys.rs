@@ -116,7 +116,6 @@ impl Keybindings {
                 ("submit".into(), "enter".into()),
                 ("newline".into(), "alt+enter".into()),
                 ("quit".into(), "ctrl+c".into()),
-                ("palette".into(), "ctrl+k".into()),
                 ("help".into(), "f1".into()),
                 ("toggle_mode".into(), "tab".into()),
                 ("clear".into(), "ctrl+l".into()),

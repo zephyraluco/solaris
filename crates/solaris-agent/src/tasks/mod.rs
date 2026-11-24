@@ -41,7 +41,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a self-contained task to an isolated subagent using the current model or an explicit model override: explore (read-only) or general (Build mode only). Waits by default; background=true returns a task ID immediately and notifies you when it finishes."
+        "Delegate a self-contained task to an isolated subagent using the current model or an explicit model override: explore (read-only) or general (non-plan modes only). Waits by default; background=true returns a task ID immediately and notifies you when it finishes."
     }
 
     fn parameters(&self) -> Value {
@@ -62,7 +62,7 @@ impl Tool for SubagentTool {
 
     fn guideline(&self) -> Option<&'static str> {
         Some(
-            "Use explore for focused read-only codebase research, general for a bounded implementation task in Build mode. Give each task a short name for its summary. Supply all relevant context; children see project instructions but not this conversation. Foreground calls wait by default; independent calls in the same round may run in parallel. Set background=true to receive a task ID immediately and continue other work; completion reports arrive automatically as background notifications before a later model round. Do not poll or repeat a task while it runs. When you have no more work, finish your response; background jobs continue and notify this session when ready. Give concurrent writing tasks disjoint files. Children share the workspace, not a filesystem sandbox; delegation is bounded by the configured depth. Review their results before relying on them. Return a concise final report; optional steps are counted independently for each run.",
+            "Use explore for focused read-only codebase research, general for a bounded implementation task outside Plan mode. Give each task a short name for its summary. Supply all relevant context; children see project instructions but not this conversation. Foreground calls wait by default; independent calls in the same round may run in parallel. Set background=true to receive a task ID immediately and continue other work; completion reports arrive automatically as background notifications before a later model round. Do not poll or repeat a task while it runs. When you have no more work, finish your response; background jobs continue and notify this session when ready. Give concurrent writing tasks disjoint files. Children share the workspace, not a filesystem sandbox; delegation is bounded by the configured depth. Review their results before relying on them. Return a concise final report; optional steps are counted independently for each run.",
         )
     }
 

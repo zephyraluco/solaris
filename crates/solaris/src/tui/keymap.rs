@@ -6,12 +6,9 @@ use solaris_tui::keys::Keybindings;
 ///
 /// Kept short: the footer shares its row with the status segment, so a long
 /// hint is the first thing to be truncated on an 80-column terminal.
-pub const FOOTER_HINT: &str = "? help · ctrl+k commands · tab mode";
+pub const FOOTER_HINT: &str = "? help · tab mode";
 
 /// The default action → key bindings.
-///
-/// `ctrl+k` is reserved for the command palette, so the editor intentionally
-/// does not bind kill-to-end-of-line.
 pub fn default_bindings() -> Keybindings {
     let mut bindings = Keybindings::new();
     bindings.set("submit", "enter");
@@ -19,7 +16,6 @@ pub fn default_bindings() -> Keybindings {
     bindings.set("quit", "ctrl+c");
     bindings.set("exit", "ctrl+d");
     bindings.set("paste", "ctrl+v");
-    bindings.set("palette", "ctrl+k");
     bindings.set("help", "f1");
     bindings.set("toggle_mode", "tab");
     bindings.set("clear", "ctrl+l");
@@ -44,7 +40,6 @@ mod tests {
         assert!(bindings.matches("quit", &key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("exit", &key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("paste", &key(KeyCode::Char('v'), KeyModifiers::CONTROL)));
-        assert!(bindings.matches("palette", &key(KeyCode::Char('k'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("theme", &key(KeyCode::Char('t'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("clear", &key(KeyCode::Char('l'), KeyModifiers::CONTROL)));
         assert!(bindings.matches("help", &key(KeyCode::F(1), KeyModifiers::empty())));
@@ -52,11 +47,11 @@ mod tests {
     }
 
     #[test]
-    fn palette_binding_does_not_collide_with_submit() {
+    fn global_bindings_do_not_collide_with_submit() {
         let bindings = default_bindings();
-        let ctrl_k = key(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        assert!(!bindings.matches("submit", &ctrl_k));
+        let ctrl_t = key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!bindings.matches("submit", &ctrl_t));
         let enter = key(KeyCode::Enter, KeyModifiers::empty());
-        assert!(!bindings.matches("palette", &enter));
+        assert!(!bindings.matches("theme", &enter));
     }
 }

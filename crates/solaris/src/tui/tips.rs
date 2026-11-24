@@ -17,10 +17,7 @@ pub const TIPS: &[Tip] = &[
         content: "Type /help for commands, or press ? for the shortcut list.",
     },
     Tip {
-        content: "Tab switches between build and plan mode.",
-    },
-    Tip {
-        content: "Ctrl+K opens the command palette.",
+        content: "Tab cycles modes (default, plan, auto, ask).",
     },
     Tip {
         content: "Alt+Enter adds a line without sending the prompt.",

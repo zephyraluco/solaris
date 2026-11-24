@@ -98,4 +98,10 @@ mod tests {
         assert_eq!(stored.shell_path, None);
         assert_eq!(stored.shell_command_prefix, None);
     }
+
+    #[test]
+    fn legacy_build_mode_deserializes_to_default() {
+        let stored = Preferences::from_json(r#"{"mode":"build"}"#).expect("decode");
+        assert_eq!(stored.mode, Some(Mode::Default));
+    }
 }

@@ -965,7 +965,7 @@ mod tests {
         let mut stream = session
             .execute(RuntimeCommand::Prompt {
                 text: "ask".into(),
-                mode: Mode::Build,
+                mode: Mode::Default,
             })
             .await
             .unwrap();

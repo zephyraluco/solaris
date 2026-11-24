@@ -37,8 +37,6 @@ pub enum DialogMessage {
     Theme(String),
     /// A saved session was chosen.
     Session(String),
-    /// A slash command should be executed (from the palette).
-    Command(String),
     /// A confirmation was answered.
     Confirm {
         action: ConfirmAction,

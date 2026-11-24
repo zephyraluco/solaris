@@ -69,8 +69,10 @@ impl Config {
                 "Mode",
                 mode_id(self.mode),
                 vec![
-                    SessionConfigSelectOption::new("build", "Build"),
+                    SessionConfigSelectOption::new("default", "Default"),
                     SessionConfigSelectOption::new("plan", "Plan"),
+                    SessionConfigSelectOption::new("auto", "Auto"),
+                    SessionConfigSelectOption::new("ask", "Ask"),
                 ],
             )
             .category(SessionConfigOptionCategory::Mode),
@@ -94,10 +96,7 @@ impl Config {
 }
 
 fn mode_id(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Build => "build",
-        Mode::Plan => "plan",
-    }
+    mode.id()
 }
 
 pub(super) fn invalid(message: impl ToString) -> Error {
@@ -518,8 +517,10 @@ pub(super) async fn configure(
     match request.config_id.0.as_ref() {
         "mode" => {
             config.mode = match value.0.as_ref() {
-                "build" => Mode::Build,
+                "default" | "build" => Mode::Default,
                 "plan" => Mode::Plan,
+                "auto" => Mode::Auto,
+                "ask" => Mode::Ask,
                 _ => return Err(invalid("unknown mode")),
             }
         }
