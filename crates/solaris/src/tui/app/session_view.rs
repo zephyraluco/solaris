@@ -10,9 +10,32 @@ impl App {
             return;
         }
 
+        // Active questions take over both the prompt region and the bottom
+        // status footer so the panel's hint line sits flush at the bottom edge.
+        if self.inline.is_none()
+            && let Some(question) = self.question.as_mut()
+        {
+            let max_panel = area.height.saturating_sub(1).max(3);
+            let panel_height = question
+                .desired_height(area.width)
+                .unwrap_or(8)
+                .clamp(3, max_panel);
+            let rows = layout::split(
+                area,
+                Axis::Vertical,
+                &[Entry::auto().grow(1).min(1), Entry::px(panel_height)],
+            );
+
+            self.render_transcript(buf, rows[0]);
+            if let Some(question) = self.question.as_mut() {
+                question.render(buf, rows[1]);
+            }
+            return;
+        }
+
         let max_editor = area.height.saturating_sub(2).max(3);
-        // The inline wizard takes over the prompt region, the way claurst's
-        // `/connect` does: it is not an overlay, it replaces the input line.
+        // Inline flows (`/connect`, `/model`) take over the prompt region
+        // instead of opening an overlay, replacing the input box.
         let prompt_height = match self.inline.as_mut() {
             Some(flow) => flow.desired_height(area.width),
             None => self.editor.desired_height(area.width).unwrap_or(3),

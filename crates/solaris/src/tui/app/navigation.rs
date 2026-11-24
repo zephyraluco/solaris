@@ -167,6 +167,7 @@ impl App {
                 self.config = config;
                 self.connection.auth = auth;
                 self.subagent_terminal = None;
+                self.question = None;
                 self.selection.borrow_mut().clear();
                 self.notifications.clear();
                 self.restore_records(records);

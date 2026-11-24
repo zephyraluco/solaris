@@ -305,7 +305,8 @@ pub struct App {
     /// Answers the loop is still waiting for, keyed by approval ID so stacked
     /// overlays can be answered in any order without cross-matching.
     pending_approvals: HashMap<u64, oneshot::Sender<Approval>>,
-    question_dialog: Option<(String, String)>,
+    /// Active interactive question panel occupying the prompt region.
+    question: Option<crate::tui::view::question::QuestionPanel>,
 }
 
 impl App {
@@ -450,7 +451,7 @@ impl App {
             approval_rx,
             next_approval_id: 0,
             pending_approvals: HashMap::new(),
-            question_dialog: None,
+            question: None,
         };
 
         if let Some(journal) = journal {

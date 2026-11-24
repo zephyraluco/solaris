@@ -10,10 +10,13 @@ impl Component for App {
         if self.overlay_open() || self.subagent_terminal.is_some() {
             return None;
         }
-        match &self.inline {
-            Some(inline) => inline.cursor_position(),
-            None => self.editor.cursor_position(),
+        if let Some(inline) = &self.inline {
+            return inline.cursor_position();
         }
+        if let Some(question) = &self.question {
+            return question.cursor_position();
+        }
+        self.editor.cursor_position()
     }
     fn render(&mut self, buf: &mut Buffer, area: Rect) {
         if self.subagent_terminal.is_some() {
@@ -51,6 +54,16 @@ impl Component for App {
         // sees that key when there is nothing to copy.
         if self.inline.is_some() {
             self.handle_inline_key(key);
+            return KeyResult::Handled;
+        }
+
+        // An inline question panel above the editor owns keyboard navigation
+        // until answered, dismissed, or cancelled.
+        if let Some(question) = self.question.as_mut() {
+            let result = question.handle_key(key);
+            if result.is_close() || question.is_finished() {
+                self.question = None;
+            }
             return KeyResult::Handled;
         }
 
@@ -114,6 +127,23 @@ impl Component for App {
             return MouseResult::Handled;
         }
 
+        // The inline question panel replaces the prompt region and takes mouse
+        // events inside its own area; the transcript above keeps scrolling.
+        let over_question = self.inline.is_none()
+            && self
+                .question
+                .as_ref()
+                .is_some_and(|panel| rect_contains(panel.area(), event.column, event.row));
+        if over_question {
+            if let Some(panel) = self.question.as_mut() {
+                panel.handle_mouse(event);
+                if panel.is_finished() {
+                    self.question = None;
+                }
+            }
+            return MouseResult::Handled;
+        }
+
         if rect_contains(self.last_transcript, event.column, event.row) {
             match event.kind {
                 MouseEventKind::ScrollUp => {
@@ -126,6 +156,9 @@ impl Component for App {
                 }
                 _ => {}
             }
+        }
+        if self.inline.is_some() || self.question.is_some() {
+            return MouseResult::Ignored;
         }
         self.editor.handle_mouse(event)
     }
@@ -177,6 +210,7 @@ impl Component for App {
                     self.notifications.error(error);
                 }
                 (CommandTarget::Clear, Ok(snapshot)) => {
+                    self.question = None;
                     self.session = SessionState::new();
                     self.session.session_id = snapshot.session_id;
                     self.session.sequence = snapshot.sequence;
@@ -191,11 +225,11 @@ impl Component for App {
                 (CommandTarget::Clear, Err(error)) => self.notifications.error(error),
                 (CommandTarget::Question(id), Err(error)) => {
                     if self
-                        .question_dialog
+                        .question
                         .as_ref()
-                        .is_some_and(|(_, request)| request == &id)
+                        .is_some_and(|panel| panel.request_id() == id)
                     {
-                        self.question_dialog = None;
+                        self.question = None;
                     }
                     self.notifications.error(error);
                 }
@@ -284,30 +318,21 @@ impl Component for App {
             self.on_dialog_message(message);
         }
 
-        if self.question_dialog.as_ref().is_some_and(|(session, id)| {
-            session != &self.sessions.agent.snapshot().session_id
-                || !self.sessions.agent.is_question_pending(id)
+        if self.question.as_ref().is_some_and(|panel| {
+            panel.session_id() != self.sessions.agent.snapshot().session_id || panel.is_finished()
         }) {
-            self.question_dialog = None;
+            self.question = None;
             dirty = true;
         }
-        if self.question_dialog.is_none()
-            && !self.overlay_open()
+        if self.question.is_none()
             && let Some(request) = self.sessions.agent.pending_questions().into_iter().next()
         {
-            self.question_dialog = Some((request.session_id.clone(), request.request_id.clone()));
-            let dialog = crate::tui::view::question::QuestionDialog::new(
+            self.question = Some(crate::tui::view::question::QuestionPanel::new(
                 request,
                 Arc::clone(&self.sessions.agent),
                 &self.theme,
                 self.dialog_tx.clone(),
-            );
-            self.push_overlay(
-                Box::new(dialog),
-                OverlayOptions::centered()
-                    .width(SizeValue::Percent(80))
-                    .max_height(SizeValue::Percent(85)),
-            );
+            ));
             dirty = true;
         }
 

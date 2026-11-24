@@ -133,13 +133,12 @@ impl App {
     /// the prompt otherwise. The wizard drops a paste when its current step has
     /// no field, rather than leaking the payload into the prompt behind it.
     pub(super) fn insert_pasted(&mut self, text: &str) {
-        match self.inline.as_mut() {
-            Some(flow) => {
-                flow.insert_paste(text);
-            }
-            None => {
-                self.editor.handle_paste(text);
-            }
+        if let Some(flow) = self.inline.as_mut() {
+            flow.insert_paste(text);
+        } else if let Some(question) = self.question.as_mut() {
+            question.handle_paste(text);
+        } else {
+            self.editor.handle_paste(text);
         }
     }
 

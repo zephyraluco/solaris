@@ -43,6 +43,9 @@ impl App {
         if let Some(flow) = self.inline.as_mut() {
             flow.set_theme(&self.theme);
         }
+        if let Some(question) = self.question.as_mut() {
+            question.set_theme(&self.theme);
+        }
         self.notifications
             .info(format!("theme: {}", self.config.theme));
     }

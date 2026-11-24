@@ -1291,3 +1291,94 @@ fn the_second_provider_row_opens_its_api_key_step() {
     assert!(text.contains("Connect OpenCode Go"), "{text}");
     assert!(text.contains("Paste your API key:"), "{text}");
 }
+
+struct QuestionBackend;
+
+#[async_trait::async_trait]
+impl ModelConnector for QuestionBackend {
+    async fn model_client(
+        self: std::sync::Arc<Self>,
+    ) -> Result<solaris_agent::ModelClient, solaris_agent::BackendError> {
+        Ok(test_support::client(self.capabilities(), move |request| {
+            let fixture = std::sync::Arc::clone(&self);
+            async move { fixture.respond(request).await }
+        }))
+    }
+
+    fn label(&self) -> &str {
+        "question"
+    }
+}
+
+impl QuestionBackend {
+    async fn respond(&self, request: TurnRequest) -> Result<AgentEventStream, BackendError> {
+        let answered = request
+            .history
+            .iter()
+            .any(|message| message.tool_results().next().is_some());
+        let event = if answered {
+            AgentEvent::TextDelta("Got your project goal.".into())
+        } else {
+            AgentEvent::ToolCall(ToolCall::new(
+                "ask-1",
+                "question",
+                serde_json::json!({
+                    "questions": [{
+                        "id": "goal",
+                        "header": "Project Goal",
+                        "question": "What is the main goal for this project?",
+                        "options": [
+                            {"id": "daily", "label": "Personal daily use", "description": "Fast startup and ergonomics."},
+                            {"id": "oss", "label": "Open source release", "description": "Cross-platform docs and polish."}
+                        ],
+                        "multiple": false,
+                        "allow_custom": true
+                    }]
+                }),
+            ))
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            event,
+            AgentEvent::TurnComplete {
+                usage: Usage::new(2, 1),
+                cost_usd: 0.0,
+            },
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn question_panel_replaces_the_editor_without_opening_an_overlay() {
+    let mut harness = Harness::with_backend(Arc::new(QuestionBackend));
+    harness.type_str("plan");
+    harness.key(KeyCode::Enter);
+
+    let text = harness.settle_on("Personal daily use").await;
+    assert!(
+        !harness.tui.overlay_flag().get(),
+        "questions must not open a modal overlay"
+    );
+    assert!(text.contains("Project Goal"), "{text}");
+    assert!(text.contains("1. Personal daily use"), "{text}");
+    assert!(text.contains("3. Type something."), "{text}");
+    assert!(
+        !text.contains("Ask anything"),
+        "question panel must replace the prompt editor:\n{text}"
+    );
+    assert!(
+        !text.contains("BUILD") && !text.contains("tok"),
+        "question panel must also hide the status footer:\n{text}"
+    );
+
+    harness.key(KeyCode::Enter);
+    let done = harness.settle_turn("Got your project goal.").await;
+    assert!(done.contains("Got your project goal."), "{done}");
+    assert!(
+        !done.contains("Type something."),
+        "panel should close:\n{done}"
+    );
+    assert!(
+        done.contains("Ask anything") && done.contains("BUILD"),
+        "editor and footer should return once the question is answered:\n{done}"
+    );
+}
