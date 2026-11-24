@@ -236,7 +236,7 @@ impl SessionProjection {
             }
             return Ok(effects);
         }
-        let result = self.apply(event.event);
+        let result = self.apply_with_completion(event.event, event.completion);
         if let Some(id) = event.task_id
             && let Some(index) = self.target
         {
@@ -246,6 +246,13 @@ impl SessionProjection {
         Ok(result)
     }
     pub fn apply(&mut self, event: AgentEvent) -> Effects {
+        self.apply_with_completion(event, None)
+    }
+    fn apply_with_completion(
+        &mut self,
+        event: AgentEvent,
+        completion: Option<solaris_agent::TurnCompletion>,
+    ) -> Effects {
         let mut effects = Effects::default();
         match event {
             AgentEvent::QuestionRequested(_) | AgentEvent::QuestionResolved { .. } => {}
@@ -398,6 +405,7 @@ impl SessionProjection {
                     turn.complete = true;
                     turn.usage = usage;
                     turn.cost_usd = cost_usd;
+                    turn.completion = completion;
                 }
                 self.status = None;
             }
@@ -432,6 +440,7 @@ impl SessionProjection {
             AgentEvent::FollowUp { prompt } => {
                 if let Some(turn) = self.event_turn_mut() {
                     turn.complete = true;
+                    turn.completion = completion;
                     if turn.reply.is_empty() {
                         turn.push_text("_(superseded by the queued prompt)_");
                     }
@@ -475,6 +484,7 @@ mod tests {
             sequence: Some(sequence),
             task_id: Some(run),
             prompt: prompt.map(str::to_owned),
+            completion: None,
             event,
         }
     }
@@ -614,5 +624,59 @@ mod tests {
         assert_eq!(state.sequence, 1);
         assert_eq!(state.turns.len(), 1);
         assert_eq!(state.turns[0].reply, "answer");
+    }
+
+    #[test]
+    fn turn_completion_metadata_survives_live_and_restored_projections() {
+        let first_meta = solaris_agent::TurnCompletion {
+            duration_ms: 850,
+            completed_at_ms: 1_764_000_000_000,
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-6".into()),
+        };
+        let second_meta = solaris_agent::TurnCompletion {
+            duration_ms: 3_200,
+            completed_at_ms: 1_764_000_005_000,
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+        };
+        let mut followup = envelope(
+            2,
+            10,
+            None,
+            AgentEvent::FollowUp {
+                prompt: "second".into(),
+            },
+        );
+        followup.completion = Some(first_meta.clone());
+        let mut done = envelope(
+            4,
+            10,
+            None,
+            AgentEvent::TurnComplete {
+                usage: Default::default(),
+                cost_usd: 0.0,
+            },
+        );
+        done.completion = Some(second_meta.clone());
+        let events = vec![
+            envelope(1, 10, Some("first"), AgentEvent::TextDelta("one".into())),
+            followup,
+            envelope(3, 10, None, AgentEvent::TextDelta("two".into())),
+            done,
+        ];
+        let mut live = SessionProjection::default();
+        for event in &events {
+            live.apply_runtime(event.clone()).unwrap();
+        }
+        assert_eq!(live.turns[0].completion.as_ref(), Some(&first_meta));
+        assert_eq!(live.turns[1].completion.as_ref(), Some(&second_meta));
+
+        let records = events
+            .into_iter()
+            .map(|envelope| solaris_agent::SessionRecord::RuntimeEvent { envelope })
+            .collect();
+        let (restored, _) = SessionProjection::restore("session".into(), records);
+        assert_eq!(restored.turns, live.turns);
     }
 }

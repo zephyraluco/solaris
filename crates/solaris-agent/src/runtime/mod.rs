@@ -33,6 +33,21 @@ impl Drop for TurnLease {
     }
 }
 
+/// Summary metadata recorded when a turn finishes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnCompletion {
+    /// Working duration of the turn in milliseconds.
+    pub duration_ms: u64,
+    /// Wall-clock completion timestamp in Unix epoch milliseconds.
+    pub completed_at_ms: u64,
+    /// Backend or provider display label used for the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model identifier used for the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Ordered product event. Sequence numbers belong to the session, not a client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeEvent {
@@ -41,6 +56,8 @@ pub struct RuntimeEvent {
     pub task_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TurnCompletion>,
     pub event: AgentEvent,
 }
 
@@ -389,20 +406,37 @@ fn refresh(core: &Core, task_id: Option<u64>, mode: crate::Mode) {
         snapshot.billing = Some(billing);
     }
 }
+fn build_completion(core: &Core, started_at: std::time::Instant) -> TurnCompletion {
+    let snapshot = core.snapshot.read().unwrap_or_else(|p| p.into_inner());
+    let provider = (!snapshot.label.is_empty()).then(|| snapshot.label.clone());
+    let model = (!snapshot.model.is_empty()).then(|| snapshot.model.clone());
+    let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let completed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    TurnCompletion {
+        duration_ms,
+        completed_at_ms,
+        provider,
+        model,
+    }
+}
 fn publish(
     core: &Core,
     task_id: Option<u64>,
     mode: crate::Mode,
     event: AgentEvent,
 ) -> RuntimeEvent {
-    publish_with_prompt(core, task_id, mode, event, None)
+    publish_with_meta(core, task_id, mode, event, None, None)
 }
-fn publish_with_prompt(
+fn publish_with_meta(
     core: &Core,
     task_id: Option<u64>,
     mode: crate::Mode,
     event: AgentEvent,
     prompt: Option<String>,
+    completion: Option<TurnCompletion>,
 ) -> RuntimeEvent {
     refresh(core, if event.is_terminal() { None } else { task_id }, mode);
     let mut event = event;
@@ -411,9 +445,9 @@ fn publish_with_prompt(
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .journal();
-    let persisted = journal
-        .as_ref()
-        .map(|journal| journal.publish_runtime_event(task_id, &event, prompt.clone()));
+    let persisted = journal.as_ref().map(|journal| {
+        journal.publish_runtime_event(task_id, &event, prompt.clone(), completion.clone())
+    });
     let mut history = core.history.lock().unwrap_or_else(|p| p.into_inner());
     let mut snapshot = core.snapshot.write().unwrap_or_else(|p| p.into_inner());
     let sequence = match persisted {
@@ -438,6 +472,7 @@ fn publish_with_prompt(
         sequence,
         task_id,
         prompt,
+        completion,
         event,
     };
     history.push_back(event.clone());
@@ -453,7 +488,8 @@ struct Active {
     mode: crate::Mode,
     stream: AgentEventStream,
     output: Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>,
-    terminal: Option<AgentEvent>,
+    terminal: Option<(AgentEvent, Option<TurnCompletion>)>,
+    turn_started_at: std::time::Instant,
 }
 async fn serve(
     weak: std::sync::Weak<Core>,
@@ -488,6 +524,7 @@ async fn serve(
                     stream: agent.run_pending(mode),
                     output: None,
                     terminal: None,
+                    turn_started_at: std::time::Instant::now(),
                 });
             }
         }
@@ -522,9 +559,16 @@ async fn serve(
                         next_id += 1;
                         let display=text.clone();
                         let stream = agent.run_turn(text, mode);
-                        active = Some(Active { id: next_id, mode, stream, output: output.clone(), terminal: None });
+                        active = Some(Active {
+                            id: next_id,
+                            mode,
+                            stream,
+                            output: output.clone(),
+                            terminal: None,
+                            turn_started_at: std::time::Instant::now(),
+                        });
                         refresh(&core, Some(next_id), mode);
-                        let event=publish_with_prompt(&core,Some(next_id),mode,AgentEvent::Status("working".into()),Some(display));
+                        let event=publish_with_meta(&core,Some(next_id),mode,AgentEvent::Status("working".into()),Some(display),None);
                         if let Some(output)=&output {let _=output.send(event);}
                     }
                     RuntimeCommand::Cancel => agent.cancel_handle().cancel(),
@@ -558,7 +602,14 @@ async fn serve(
                             }
                         });
                         let _ = ready.await;
-                        active = Some(Active { id: next_id, mode, stream: receiver(rx), output: output.clone(), terminal: None });
+                        active = Some(Active {
+                            id: next_id,
+                            mode,
+                            stream: receiver(rx),
+                            output: output.clone(),
+                            terminal: None,
+                            turn_started_at: std::time::Instant::now(),
+                        });
                     }
                     _ => result = Err("session already has an active operation".into()),
                 }
@@ -595,18 +646,27 @@ async fn serve(
                 let Some(core) = weak.upgrade() else { break };
                 match event {
                     Some(event) => {
-                        let run = active.as_ref().unwrap();
+                        let run = active.as_mut().unwrap();
                         if event.is_terminal() {
-                            active.as_mut().unwrap().terminal = Some(event);
+                            let completion = matches!(event, AgentEvent::TurnComplete { .. })
+                                .then(|| build_completion(&core, run.turn_started_at));
+                            run.terminal = Some((event, completion));
                             continue;
                         }
-                        let event = publish(&core, Some(run.id), run.mode, event);
+                        let completion = if matches!(event, AgentEvent::FollowUp { .. }) {
+                            let meta = build_completion(&core, run.turn_started_at);
+                            run.turn_started_at = std::time::Instant::now();
+                            Some(meta)
+                        } else {
+                            None
+                        };
+                        let event = publish_with_meta(&core, Some(run.id), run.mode, event, None, completion);
                         if let Some(output) = &run.output && output.send(event).is_err() { core.view.read().unwrap_or_else(|p| p.into_inner()).cancel_handle().cancel(); }
                     }
                     None => {
                         let run = active.take().unwrap();
-                        if let Some(terminal) = run.terminal {
-                            let event = publish(&core, Some(run.id), run.mode, terminal);
+                        if let Some((terminal, completion)) = run.terminal {
+                            let event = publish_with_meta(&core, Some(run.id), run.mode, terminal, None, completion);
                             if let Some(output) = &run.output { let _ = output.send(event); }
                         }
                         refresh(&core, None, crate::Mode::Build);

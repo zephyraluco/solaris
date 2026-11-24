@@ -330,13 +330,14 @@ impl SessionJournal {
     }
     #[cfg(test)]
     pub(crate) fn publish_event(&self, event: &AgentEvent) -> Result<u64, StoreError> {
-        self.publish_runtime_event(None, event, None)
+        self.publish_runtime_event(None, event, None, None)
     }
     pub(crate) fn publish_runtime_event(
         &self,
         task_id: Option<u64>,
         event: &AgentEvent,
         prompt: Option<String>,
+        completion: Option<crate::TurnCompletion>,
     ) -> Result<u64, StoreError> {
         let mut connection = self.store.lock()?;
         let tx = connection.transaction()?;
@@ -352,6 +353,7 @@ impl SessionJournal {
                 sequence: Some(sequence),
                 task_id,
                 prompt,
+                completion,
                 event: event.clone(),
             },
         };

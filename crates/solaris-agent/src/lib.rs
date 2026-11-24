@@ -66,7 +66,7 @@ impl Default for ExecutionSettings {
 pub use runtime::jobs::{JobInfo, JobResult, JobStatus, Jobs, StopReason};
 pub use runtime::{
     DispatchReceipt, ModeContexts, Runtime, RuntimeCommand, RuntimeEvent, RuntimeEventStream,
-    RuntimeSnapshot, RuntimeSubscription, SessionRuntime,
+    RuntimeSnapshot, RuntimeSubscription, SessionRuntime, TurnCompletion,
 };
 
 pub type ChildBackendFactory =

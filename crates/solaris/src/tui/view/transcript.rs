@@ -63,6 +63,7 @@ pub(crate) struct TurnKey {
     revision: u64,
     lengths: (usize, usize, usize, usize, usize),
     complete: bool,
+    completion: Option<solaris_agent::TurnCompletion>,
     thinking_expanded: bool,
     compacted: usize,
     disclosures: Vec<(bool, bool)>,
@@ -79,6 +80,7 @@ impl From<&Turn> for TurnKey {
                 turn.steps.len(),
             ),
             complete: turn.complete,
+            completion: turn.completion.clone(),
             thinking_expanded: turn.thinking_expanded,
             compacted: turn.compacted,
             disclosures: turn
@@ -452,9 +454,11 @@ fn push_turn(
             Span::styled(format!("{glyph} "), Style::default().fg(theme.accent)),
             Span::styled("generating…", Style::default().fg(theme.muted)),
         ]));
+        headers.parts.resize(out.len(), u64::MAX);
+    } else if let Some(completion) = &turn.completion {
+        push_completion(out, completion, width, theme);
+        headers.parts.resize(out.len(), part + 8);
     }
-
-    headers.parts.resize(out.len(), u64::MAX);
 }
 
 // Only adjacent tool references are grouped. A text, thinking or steering
@@ -1141,6 +1145,90 @@ fn push_compaction(out: &mut Vec<Line<'static>>, turn: &Turn, theme: &Theme) {
             Style::default().fg(theme.muted),
         ),
     ]));
+}
+
+/// A metadata footer shown below a completed turn: elapsed duration, completion
+/// timestamp, and provider/model identity.
+fn push_completion(
+    out: &mut Vec<Line<'static>>,
+    completion: &solaris_agent::TurnCompletion,
+    width: usize,
+    theme: &Theme,
+) {
+    let summary = format_turn_completion(completion);
+    if summary.is_empty() {
+        return;
+    }
+    let body_width = width.saturating_sub(2).max(1);
+    out.push(Line::default());
+    out.push(Line::from(vec![
+        Span::styled("✓ ", Style::default().fg(theme.success)),
+        Span::styled(
+            truncate_to_width(&summary, body_width, "…"),
+            Style::default().fg(theme.dim),
+        ),
+    ]));
+}
+
+fn format_turn_completion(completion: &solaris_agent::TurnCompletion) -> String {
+    let mut parts = Vec::with_capacity(3);
+    parts.push(format_duration(completion.duration_ms));
+    if let Some(timestamp) = format_local_timestamp(completion.completed_at_ms) {
+        parts.push(timestamp);
+    }
+    if let Some(model) =
+        format_model_info(completion.provider.as_deref(), completion.model.as_deref())
+    {
+        parts.push(model);
+    }
+    parts.join(" · ")
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms}ms");
+    }
+    let tenths = duration_ms.saturating_add(50) / 100;
+    if tenths < 600 {
+        return format!("{}.{}s", tenths / 10, tenths % 10);
+    }
+    let total_secs = duration_ms.saturating_add(500) / 1_000;
+    let hours = total_secs / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn format_local_timestamp(completed_at_ms: u64) -> Option<String> {
+    if completed_at_ms == 0 {
+        return None;
+    }
+    let millis = i64::try_from(completed_at_ms).ok()?;
+    let utc = chrono::DateTime::from_timestamp_millis(millis)?;
+    let local = utc.with_timezone(&chrono::Local);
+    Some(local.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+fn format_model_info(provider: Option<&str>, model: Option<&str>) -> Option<String> {
+    let provider = provider.map(str::trim).filter(|s| !s.is_empty());
+    let model = model.map(str::trim).filter(|s| !s.is_empty());
+    let raw = match (provider, model) {
+        (Some(provider), Some(model)) => {
+            if model.starts_with(provider) && model.as_bytes().get(provider.len()) == Some(&b'/') {
+                model.to_string()
+            } else {
+                format!("{provider}/{model}")
+            }
+        }
+        (None, Some(model)) => model.to_string(),
+        (Some(provider), None) => provider.to_string(),
+        (None, None) => return None,
+    };
+    Some(single_line(&raw))
 }
 
 /// First line of `text`, trimmed and shortened for the collapsed thinking label.
@@ -2313,5 +2401,89 @@ mod tests {
             .lines(&session, area(40, 20), &theme, None, &welcome())
             .len();
         assert!(third >= second);
+    }
+
+    #[test]
+    fn duration_and_model_formatting_cover_boundaries() {
+        assert_eq!(format_duration(0), "0ms");
+        assert_eq!(format_duration(420), "420ms");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_000), "1.0s");
+        assert_eq!(format_duration(1_249), "1.2s");
+        assert_eq!(format_duration(1_250), "1.3s");
+        assert_eq!(format_duration(59_949), "59.9s");
+        assert_eq!(format_duration(59_950), "1m 0s");
+        assert_eq!(format_duration(65_000), "1m 5s");
+        assert_eq!(format_duration(3_599_499), "59m 59s");
+        assert_eq!(format_duration(3_599_500), "1h 0m 0s");
+        assert_eq!(format_duration(3_665_000), "1h 1m 5s");
+
+        assert_eq!(
+            format_model_info(Some("anthropic"), Some("claude-sonnet-4-6")).as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(
+            format_model_info(Some("openai"), Some("openai/gpt-4o")).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        assert_eq!(
+            format_model_info(None, Some("gpt-4o")).as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            format_model_info(Some("fake"), None).as_deref(),
+            Some("fake")
+        );
+        assert_eq!(format_model_info(None, None), None);
+    }
+
+    #[test]
+    fn completed_turn_renders_completion_footer_below_reply() {
+        let completion = solaris_agent::TurnCompletion {
+            duration_ms: 2_350,
+            completed_at_ms: 1_764_000_000_000,
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-6".into()),
+        };
+        let expected_time = format_local_timestamp(completion.completed_at_ms).unwrap();
+        let mut session = session_with(Turn {
+            prompt: "hi".into(),
+            reply: "done".into(),
+            complete: true,
+            completion: Some(completion),
+            ..Default::default()
+        });
+        let theme = Theme::dark();
+        let lines = build(&session, area(80, 20), &theme, None, &welcome());
+        let last = lines.last().expect("completion footer");
+        let text = line_text(last);
+        assert_eq!(
+            text,
+            format!("✓ 2.4s · {expected_time} · anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(last.spans[0].style.fg, Some(theme.success));
+        assert_eq!(last.spans[1].style.fg, Some(theme.dim));
+
+        // Narrow terminals truncate without overflowing or losing the prefix.
+        let narrow = build(&session, area(16, 20), &theme, None, &welcome());
+        assert!(narrow.iter().all(|line| line.width() <= 16));
+        assert!(line_text(narrow.last().unwrap()).starts_with("✓ "));
+
+        // Updating completion metadata invalidates the cached layout.
+        let mut view = TranscriptView::new();
+        let before = view
+            .lines(&session, area(80, 20), &theme, None, &welcome())
+            .last()
+            .map(line_text)
+            .unwrap();
+        session.turns[0].completion.as_mut().unwrap().model = Some("claude-opus-4".into());
+        session.bump();
+        let after = view
+            .lines(&session, area(80, 20), &theme, None, &welcome())
+            .last()
+            .map(line_text)
+            .unwrap();
+        assert_ne!(before, after);
+        assert!(after.contains("anthropic/claude-opus-4"), "{after}");
     }
 }

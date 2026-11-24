@@ -150,6 +150,8 @@ pub struct Turn {
     pub subagent_tokens: u32,
     /// Cost reported for this turn.
     pub cost_usd: f64,
+    /// Timing and model metadata recorded when the turn finished.
+    pub completion: Option<solaris_agent::TurnCompletion>,
     /// Whether streamed events for this turn finished.
     pub complete: bool,
 }

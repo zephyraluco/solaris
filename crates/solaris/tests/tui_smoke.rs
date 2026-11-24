@@ -827,6 +827,12 @@ async fn prompt_streams_a_reply_rendered_as_markdown() {
     assert!(text.contains("Reply"), "reply missing:\n{text}");
     assert!(!text.contains("## Reply"), "raw markdown leaked:\n{text}");
     assert!(!text.contains("generating"), "spinner stuck:\n{text}");
+    // Completed turn displays working duration, completion timestamp, and model/backend info.
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("✓ ") && line.contains("fake")),
+        "completion footer missing:\n{text}"
+    );
     // The footer reports the tokens the backend reported.
     assert!(text.contains("tok"), "token counter missing:\n{text}");
 }

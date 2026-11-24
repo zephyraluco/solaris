@@ -372,6 +372,7 @@ async fn producer_eof_waits_for_the_bounded_transcript_backlog() {
         events
             .try_send(Ok(solaris_agent::RuntimeEvent {
                 prompt: None,
+                completion: None,
                 session_id: "session".into(),
                 sequence: Some(sequence),
                 task_id: Some(1),
@@ -382,6 +383,7 @@ async fn producer_eof_waits_for_the_bounded_transcript_backlog() {
     events
         .try_send(Ok(solaris_agent::RuntimeEvent {
             prompt: None,
+            completion: None,
             session_id: "session".into(),
             sequence: Some(201),
             task_id: Some(1),
@@ -412,6 +414,7 @@ async fn a_large_event_backlog_is_not_drained_in_one_tick() {
         events
             .try_send(Ok(solaris_agent::RuntimeEvent {
                 prompt: None,
+                completion: None,
                 session_id: "session".into(),
                 sequence: Some(sequence),
                 task_id: Some(1),
